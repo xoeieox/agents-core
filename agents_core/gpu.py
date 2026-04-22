@@ -62,8 +62,19 @@ MAX_COMPLETED = 100  # Keep last N completed tasks before pruning
 # falls back to pre-registry behavior.
 # ---------------------------------------------------------------------------
 
+import logging as _logging
+
+_ir_log = _logging.getLogger("gpu.intention-bridge")
+
+
 def _load_intention_registry():
-    """Lazy-load the intention_registry module, returning None on failure."""
+    """Lazy-load the intention_registry module, returning None on failure.
+
+    TODO: intention_registry currently lives under /srv/agents/scripts (the
+    conductor repo). Future cleanup: migrate it into agents_core proper so
+    this sys.path probe disappears and the dependency edge flips the right
+    way. Tracking in conductor#118 review findings (2026-04-22).
+    """
     try:
         import importlib
         import sys as _sys
@@ -71,12 +82,15 @@ def _load_intention_registry():
         if scripts_dir not in _sys.path:
             _sys.path.append(scripts_dir)
         return importlib.import_module("intention_registry")
-    except Exception:
+    except Exception as e:
+        _ir_log.warning(f"intention_registry unavailable — ops layer disabled: {e}")
         return None
 
 
-def _project_intention_for_task(task: dict):
-    """Run intention projection for a pending task. Returns ProjectionResult or None."""
+def _project_intention_for_task(task: dict, task_id: str):
+    """Run intention projection for a pending task. task_id is passed through
+    so the registry writes linked_task_id atomically with the intention,
+    closing the attach-race window. Returns ProjectionResult or None."""
     reg = _load_intention_registry()
     if reg is None:
         return None
@@ -86,20 +100,11 @@ def _project_intention_for_task(task: dict):
             projected_by=task.get("submitted_by") or "unknown",
             proposed_change=task.get("description") or task.get("task_type"),
             target_heading=(task.get("payload") or {}).get("target_heading"),
+            task_id=task_id,
         )
-    except Exception:
+    except Exception as e:
+        _ir_log.warning(f"intention projection failed for {task.get('id')}: {e}")
         return None
-
-
-def _attach_task_id_to_intention(intention_id: str, task_id: str) -> None:
-    """Record the GPU task id on a freshly-projected intention."""
-    reg = _load_intention_registry()
-    if reg is None:
-        return
-    try:
-        reg.attach_task_id(intention_id, task_id)
-    except Exception:
-        pass
 
 
 def _manifest_intention_for_task(task: dict) -> None:
@@ -112,8 +117,8 @@ def _manifest_intention_for_task(task: dict) -> None:
         return
     try:
         reg.manifest(intention_id, linked_task_id=task.get("id"))
-    except Exception:
-        pass
+    except Exception as e:
+        _ir_log.warning(f"intention manifest failed for {intention_id}: {e}")
 
 
 def _compost_intention_for_task(task: dict, reason: str) -> None:
@@ -126,8 +131,8 @@ def _compost_intention_for_task(task: dict, reason: str) -> None:
         return
     try:
         reg.compost(intention_id, reason=reason)
-    except Exception:
-        pass
+    except Exception as e:
+        _ir_log.warning(f"intention compost failed for {intention_id}: {e}")
 
 
 class Priority:
@@ -264,14 +269,26 @@ class GPUQueue:
     # Public API
     # ------------------------------------------------------------------
 
-    def submit(self, task_dict: dict) -> str | None:
-        """Submit a task to the queue. Returns task ID, or None when the
-        intention registry says the work is already done (match_manifested
-        within lookback). When a second agent reinforces an in-flight
-        intention, returns the shared task_id without queuing new GPU work.
+    def submit(self, task_dict: dict) -> str:
+        """Submit a task to the queue. Always returns a task_id (str).
 
-        Opt out of the registry by setting payload['_ignore_intention_registry']
-        to True (e.g. for stochastic-variance reruns).
+        Intention-registry behavior (opt-out via
+        payload['_ignore_intention_registry']=True):
+
+        - Novel signature → a new GPU task is queued; returns the new id.
+        - Matches an in-flight intention → no new GPU task is queued; this
+          caller joins the in-flight task by receiving the existing (shared)
+          task_id. Callers that poll `completed_dir/<task_id>.yaml` will see
+          the same result as the original submitter when the task finishes.
+        - Matches a recently-manifested intention → no new GPU task; returns
+          the prior task_id. `find_similar` gates this to cases where the
+          prior task file still exists in completed/failed, so callers never
+          receive an id whose yaml has been pruned.
+
+        The task_id is generated before intention projection and passed into
+        the registry so the intention's linked_task_id is written atomically,
+        preventing races where a concurrent submit reads the intention before
+        the task_id has been attached.
         """
         missing = REQUIRED_FIELDS - set(task_dict.keys())
         if missing:
@@ -288,7 +305,9 @@ class GPUQueue:
 
         projection = None
         if not ignore_registry:
-            projection = _project_intention_for_task(task)
+            # Pass task["id"] so the registry can write the intention with
+            # linked_task_id already set, eliminating the attach-race window.
+            projection = _project_intention_for_task(task, task["id"])
 
         if projection is not None and projection.decision in (
             "match_reinforce", "match_manifested"
@@ -304,13 +323,18 @@ class GPUQueue:
                 "reinforces": projection.intention.reinforces,
                 "shared_task_id": shared,
             })
-            if projection.decision == "match_reinforce":
-                # Second agent joins work in flight; return the shared task_id
-                # so the caller can monitor/poll the same work.
+            # Both match_reinforce and match_manifested: return the shared
+            # task_id (not None) so callers can poll the same completed-dir
+            # entry. find_similar guarantees the prior task file still exists.
+            if shared:
                 return shared
-            # match_manifested — prior work already done within lookback.
-            # Return None; caller can read the prior output if it wants.
-            return None
+            # Defensive fallback: shouldn't happen given find_similar gating,
+            # but if we somehow get a match with no task_id, fall through and
+            # queue a fresh task rather than returning None to callers.
+            _ir_log.warning(
+                f"intention match for {task['id']} had no shared_task_id; "
+                f"falling back to queueing a fresh task"
+            )
 
         # projected / sibling / registry disabled → queue the task normally.
         if projection is not None:
@@ -328,9 +352,6 @@ class GPUQueue:
             "submitted_by": task.get("submitted_by", "unknown"),
             "intention_id": task.get("intention_id"),
         })
-
-        if projection is not None:
-            _attach_task_id_to_intention(projection.intention.intention_id, task["id"])
 
         state = self._read_state()
         self._update_queue_depth(state)
