@@ -31,6 +31,28 @@ def test_set_get_search(tmp_path: Path):
     store.close()
 
 
+def test_list_all_multi_tag_intersection(tmp_path: Path):
+    store = MemoryStore(db_path=tmp_path / "multitag.db")
+    store.set("review/finding/1", "x", tags=["review-finding", "repo-a"])
+    store.set("review/finding/2", "y", tags=["review-finding", "repo-b"])
+    store.set("review/debt/a/1", "z", tags=["review-debt", "repo-a", "debt-open"])
+
+    # single-tag form still works
+    assert len(store.list_all(tag="review-finding")) == 2
+
+    # intersection via tags list
+    hits = store.list_all(tags=["review-finding", "repo-a"])
+    assert [h["key"] for h in hits] == ["review/finding/1"]
+
+    # tag + tags combined
+    hits = store.list_all(tag="review-debt", tags=["repo-a", "debt-open"])
+    assert [h["key"] for h in hits] == ["review/debt/a/1"]
+
+    # no match on bogus intersection
+    assert store.list_all(tags=["review-finding", "repo-z"]) == []
+    store.close()
+
+
 def test_delete_and_stats(tmp_path: Path):
     store = MemoryStore(db_path=tmp_path / "smoke2.db")
     store.set("a", "apple")
