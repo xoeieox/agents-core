@@ -136,15 +136,25 @@ class MemoryStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
-    def list_all(self, tag: str = "", since: str = "",
-                 limit: int = 50) -> list[dict]:
-        """List memories with optional tag/date filters."""
+    def list_all(self, tag: str = "", tags: list[str] | None = None,
+                 since: str = "", limit: int = 50) -> list[dict]:
+        """List memories with optional tag/date filters.
+
+        `tag` and `tags` may both be supplied and are combined (all required,
+        AND intersection). Each tag is matched exactly against the normalized
+        CSV tag column.
+        """
         sql = "SELECT * FROM memories WHERE 1=1 "
         params: list = []
 
+        required_tags: list[str] = []
         if tag:
+            required_tags.append(tag)
+        if tags:
+            required_tags.extend(tags)
+        for t in required_tags:
             sql += "AND (',' || tags || ',') LIKE ? "
-            params.append(f"%,{tag},%")
+            params.append(f"%,{t},%")
         if since:
             sql += "AND updated_at >= ? "
             params.append(since)
