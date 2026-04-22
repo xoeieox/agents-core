@@ -118,6 +118,83 @@ class Target:
                 return stage["name"]
         return None
 
+    @property
+    def created_date(self) -> date | None:
+        val = self.data.get("created")
+        if isinstance(val, date):
+            return val
+        if isinstance(val, str):
+            try:
+                return date.fromisoformat(val)
+            except ValueError:
+                return None
+        return None
+
+    @property
+    def product(self) -> str:
+        return self.data.get("product") or "Research"
+
+    @property
+    def stages_progress(self) -> str | None:
+        stages = self.data.get("stages", [])
+        if not stages:
+            return None
+        done = sum(1 for s in stages if s.get("status") == "completed")
+        return f"{done}/{len(stages)}"
+
+    @property
+    def stages_list(self) -> list[dict]:
+        out = []
+        for stage in self.data.get("stages", []):
+            out.append({
+                "name": stage.get("name", "—"),
+                "status": stage.get("status", "pending"),
+                "note": stage.get("note", ""),
+            })
+        return out
+
+    @property
+    def arc_doc_path(self) -> str:
+        return f"/srv/lapis/lapis-state/{self.id}.md"
+
+    @property
+    def arc_doc_exists(self) -> bool:
+        return Path(self.arc_doc_path).is_file()
+
+    def to_dashboard_dict(self) -> dict:
+        stages = self.data.get("stages", [])
+        total = len(stages)
+        done = sum(1 for s in stages if s.get("status") == "completed")
+        current = None
+        for s in stages:
+            if s.get("status") == "active" and current is None:
+                current = s.get("name", "—")
+        return {
+            "id": self.id,
+            "title": self.title,
+            "status": self.status,
+            "category": self.category,
+            "product": self.product,
+            "urgency": self.urgency,
+            "work_mode": self.work_mode,
+            "current_stage": current,
+            "stages_done": done,
+            "stages_total": total,
+            "decay_days": self.days_idle,
+            "decay_threshold": self.decay_threshold,
+            "is_decaying": self.is_decaying,
+            "touched": str(self.data.get("touched", "")),
+            "created": str(self.data.get("created", "")),
+            "tags": self.data.get("tags", []),
+            "description": self.data.get("description", ""),
+            "stages": self.stages_list,
+            "pm_bound": self.pm_bound,
+            "pm_repo": self.pm_repo,
+            "pm_authority": self.pm_authority,
+            "paused": self.paused,
+            "paused_reason": self.paused_reason,
+        }
+
     # --- Lapis PM fields (set by `lapis-pm bind`) ---
     @property
     def pm_bound(self) -> bool:
