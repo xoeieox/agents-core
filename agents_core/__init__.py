@@ -10,4 +10,4 @@ Modules:
     mem       — cross-instance memory store library (MemoryStore)
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

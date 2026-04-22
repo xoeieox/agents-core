@@ -56,42 +56,76 @@ MAX_COMPLETED = 100  # Keep last N completed tasks before pruning
 
 
 # ---------------------------------------------------------------------------
-# Intention registry bridge (Lapis Ops Layer, 2026-04-22).
-# Soft-coupled: the intention_registry module lives under /srv/agents/scripts
-# for now. If the import fails (registry disabled, fresh install), the queue
-# falls back to pre-registry behavior.
+# Task coordinator hook (Lapis Ops Layer).
+#
+# agents_core.gpu is a primitive — it knows nothing about the ops layer or
+# intention-negotiation policy. Instead it exposes `register_coordinator()`
+# as an extension point. A coordinator that is registered receives lifecycle
+# events (submit/complete/fail) and decides how to coordinate intentions.
+#
+# When no coordinator is registered, lifecycle hooks are silent no-ops and
+# the queue behaves like a plain priority queue.
+#
+# Coordinator contract — the object passed to register_coordinator() must
+# expose the following callables:
+#
+#   project_from_task(task, *, projected_by, proposed_change, target_heading,
+#                     task_id) -> ProjectionResult | None
+#       Called on every non-opt-out submit. ProjectionResult must have:
+#           .decision       str — "projected" | "match_reinforce" |
+#                                 "match_manifested" | "sibling"
+#           .shared_task_id str | None — non-None when decision is a match,
+#                                        points at the prior task's id
+#           .intention      object with `.intention_id` and `.reinforces`
+#
+#   manifest(intention_id, *, linked_task_id) -> None
+#       Called when a task completes. Moves the intention from in-flight to
+#       manifested. Must reinforce-match the consensus-negotiation rule (the
+#       original reinforcers cascade too — this is the coordinator's concern,
+#       not agents_core's).
+#
+#   compost(intention_id, *, reason) -> None
+#       Called when a task fails. Moves the intention to composted.
+#
+# Registration patterns:
+#   - ops-layer's intention_registry.py auto-registers itself at module load
+#     (import side-effect), so `import intention_registry` is sufficient.
+#   - `ops_layer_init.register()` is an explicit helper for callers that
+#     don't want the side-effect import.
+#   - Any future coordinator plugs in the same way; this module does not
+#     know about intention_registry by name.
 # ---------------------------------------------------------------------------
 
 import logging as _logging
 
-_ir_log = _logging.getLogger("gpu.intention-bridge")
+_coord_log = _logging.getLogger("gpu.coordinator")
+
+_coordinator = None
 
 
-def _load_intention_registry():
-    """Lazy-load the intention_registry module, returning None on failure.
+def register_coordinator(coordinator) -> None:
+    """Bind a task coordinator. See module docstring for the required surface.
 
-    TODO: intention_registry currently lives under /srv/agents/scripts (the
-    conductor repo). Future cleanup: migrate it into agents_core proper so
-    this sys.path probe disappears and the dependency edge flips the right
-    way. Tracking in conductor#118 review findings (2026-04-22).
+    Safe to call multiple times — the last registration wins. Pass None to
+    unregister (tests can restore no-coordinator mode this way).
     """
-    try:
-        import importlib
-        import sys as _sys
-        scripts_dir = "/srv/agents/scripts"
-        if scripts_dir not in _sys.path:
-            _sys.path.append(scripts_dir)
-        return importlib.import_module("intention_registry")
-    except Exception as e:
-        _ir_log.warning(f"intention_registry unavailable — ops layer disabled: {e}")
-        return None
+    global _coordinator
+    _coordinator = coordinator
+
+
+def get_coordinator():
+    """Return the currently registered coordinator, or None."""
+    return _coordinator
 
 
 def _project_intention_for_task(task: dict, task_id: str):
-    """Run intention projection for a pending task. task_id is passed through
-    so the registry writes linked_task_id atomically with the intention,
-    closing the attach-race window. Returns ProjectionResult or None."""
-    reg = _load_intention_registry()
+    """Run intention projection via the registered coordinator.
+
+    task_id is passed through so the coordinator can write its
+    linked_task_id atomically with the intention, closing the attach-race
+    window. Returns the coordinator's ProjectionResult (or None if no
+    coordinator is registered or the call raises)."""
+    reg = _coordinator
     if reg is None:
         return None
     try:
@@ -103,36 +137,39 @@ def _project_intention_for_task(task: dict, task_id: str):
             task_id=task_id,
         )
     except Exception as e:
-        _ir_log.warning(f"intention projection failed for {task.get('id')}: {e}")
+        _coord_log.warning(
+            f"coordinator.project_from_task failed for {task.get('id')}: {e}")
         return None
 
 
 def _manifest_intention_for_task(task: dict) -> None:
-    """Move the task's intention from in-flight to manifested."""
+    """Notify the coordinator a task completed."""
     intention_id = task.get("intention_id")
     if not intention_id:
         return
-    reg = _load_intention_registry()
+    reg = _coordinator
     if reg is None:
         return
     try:
         reg.manifest(intention_id, linked_task_id=task.get("id"))
     except Exception as e:
-        _ir_log.warning(f"intention manifest failed for {intention_id}: {e}")
+        _coord_log.warning(
+            f"coordinator.manifest failed for {intention_id}: {e}")
 
 
 def _compost_intention_for_task(task: dict, reason: str) -> None:
-    """Move the task's intention to composted when a task fails."""
+    """Notify the coordinator a task failed."""
     intention_id = task.get("intention_id")
     if not intention_id:
         return
-    reg = _load_intention_registry()
+    reg = _coordinator
     if reg is None:
         return
     try:
         reg.compost(intention_id, reason=reason)
     except Exception as e:
-        _ir_log.warning(f"intention compost failed for {intention_id}: {e}")
+        _coord_log.warning(
+            f"coordinator.compost failed for {intention_id}: {e}")
 
 
 class Priority:
@@ -747,6 +784,46 @@ def main():
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Coordinator auto-discovery (entry points).
+#
+# Plugins declare themselves via:
+#
+#     [project.entry-points."agents_core.gpu_coordinators"]
+#     <name> = "<module_that_calls_register_coordinator_on_import>"
+#
+# At module load we iterate matching entry points and import them. Each
+# plugin is expected to call register_coordinator() as a side effect of its
+# own import (that is the plugin's contract, not ours — we only load).
+#
+# Failures are swallowed: a broken plugin must never prevent agents_core.gpu
+# from loading. The queue degrades to no-coordinator mode.
+#
+# Callers can still register_coordinator() manually at any time; entry-point
+# discovery is a convenience, not the only supported path.
+# ---------------------------------------------------------------------------
+
+def _autoload_coordinators() -> None:
+    try:
+        from importlib.metadata import entry_points
+    except Exception:  # pragma: no cover — 3.10+ always has this
+        return
+    try:
+        eps = entry_points(group="agents_core.gpu_coordinators")
+    except Exception as e:
+        _coord_log.debug(f"entry_points lookup failed: {e}")
+        return
+    for ep in eps:
+        try:
+            ep.load()  # side-effect: plugin registers itself
+        except Exception as e:
+            _coord_log.warning(
+                f"coordinator plugin {ep.name!r} failed to load: {e}")
+
+
+_autoload_coordinators()
 
 
 if __name__ == "__main__":
