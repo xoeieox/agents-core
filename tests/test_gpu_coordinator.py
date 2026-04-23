@@ -176,6 +176,23 @@ def test_fail_calls_compost(tmp_path, _restore_coordinator):
     assert coord.manifested == []
 
 
+def test_cancel_calls_compost(tmp_path, _restore_coordinator):
+    # Regression: cancel() used to skip the compost cascade, leaving
+    # intentions stuck in-flight forever. See 2026-04-23 zombie report.
+    coord = _RecordingCoordinator()
+    coord.next_decision = "projected"
+    coord.next_intention_id = "int-to-cancel"
+    register_coordinator(coord)
+
+    q = GPUQueue(queue_dir=tmp_path)
+    tid = q.submit({"task_type": "pytest"})
+    assert q.cancel(tid, reason="no longer needed")
+
+    assert coord.composted and coord.composted[0][0] == "int-to-cancel"
+    assert "no longer needed" in coord.composted[0][1]
+    assert coord.manifested == []
+
+
 def test_ignore_intention_registry_opt_out(tmp_path, _restore_coordinator):
     coord = _RecordingCoordinator()
     register_coordinator(coord)
