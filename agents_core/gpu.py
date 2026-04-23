@@ -595,6 +595,14 @@ class GPUQueue:
         task = self._read_task(pending_path)
         pending_path.unlink(missing_ok=True)
 
+        # Compost the intention so it doesn't linger in-flight forever.
+        # fail() already does this; cancel() was missing the cascade and
+        # left intentions orphaned (2026-04-23: 3 psych-rerun-batch zombies).
+        if task:
+            _compost_intention_for_task(
+                task, reason=f"task_cancelled: {reason or 'no reason given'}"
+            )
+
         self._append_event({
             "event": "cancelled",
             "id": task_id,
