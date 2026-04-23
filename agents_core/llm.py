@@ -151,6 +151,7 @@ def call_claude_cli(
     json_mode: bool = False,
     log=None,
     return_envelope: bool = False,
+    cwd: str | None = None,
 ):
     """Call Claude via `claude -p` CLI (Max subscription).
 
@@ -167,6 +168,12 @@ def call_claude_cli(
             text. Envelope is the parsed --output-format json response (or None
             on failure). Used by lapis-pm shaped-agent runner for tool-use
             detection / confabulation heuristics.
+        cwd: Working directory for the `claude` subprocess. Determines which
+            CLAUDE.md (and thus SessionStart hooks like chub-inject.py) the
+            subprocess picks up. Defaults to "/srv/agents" to preserve the
+            behavior this call had before the kwarg existed; shaped-agent
+            dispatch passes the repo working clone so the agent inherits
+            repo CLAUDE.md + chub injection + per-project auto-memory.
 
     Returns:
         str | None on default (text or None on failure), or
@@ -195,7 +202,7 @@ def call_claude_cli(
             capture_output=True,
             text=True,
             timeout=timeout,
-            cwd="/srv/agents",
+            cwd=cwd or "/srv/agents",
         )
     except subprocess.TimeoutExpired:
         if log:
