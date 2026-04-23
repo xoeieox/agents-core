@@ -152,6 +152,7 @@ def call_claude_cli(
     log=None,
     return_envelope: bool = False,
     cwd: str | None = None,
+    permission_mode: str | None = None,
 ):
     """Call Claude via `claude -p` CLI (Max subscription).
 
@@ -174,6 +175,14 @@ def call_claude_cli(
             behavior this call had before the kwarg existed; shaped-agent
             dispatch passes the repo working clone so the agent inherits
             repo CLAUDE.md + chub injection + per-project auto-memory.
+        permission_mode: Optional `claude -p` permission mode — one of
+            "acceptEdits" | "auto" | "bypassPermissions" | "default" |
+            "dontAsk" | "plan". When `-p` is used, the workspace-trust
+            dialog is skipped, so Write/Edit to an un-trusted cwd returns
+            a "please allow writes" message rather than succeeding. Shaped
+            agents running headless should pass "bypassPermissions" so
+            their Write/Edit work without a human to approve. None means
+            don't pass the flag (current behavior).
 
     Returns:
         str | None on default (text or None on failure), or
@@ -185,6 +194,8 @@ def call_claude_cli(
         "--no-session-persistence",
         "--output-format", "json",
     ]
+    if permission_mode:
+        cmd += ["--permission-mode", permission_mode]
     if system:
         cmd += ["--append-system-prompt", system]
 
