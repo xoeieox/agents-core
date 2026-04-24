@@ -20,3 +20,8 @@ test = ["pytest"]
 where = ["."]
 include = ["agents_core*"]
 exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: real backend calls (mem, chub, *-rag); run with -m integration",
+]
