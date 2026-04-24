@@ -8,6 +8,11 @@ Modules:
     comments  — per-target comment log (Comment, CommentStore)
     gpu       — GPU task queue (GPUQueue, Priority)
     mem       — cross-instance memory store library (MemoryStore)
+    retrieval — Synapse retrieval engine (Hit, retrieve)
 """
 
+from agents_core.retrieval import Hit, retrieve
+
 __version__ = "0.3.0"
+
+__all__ = ["Hit", "retrieve"]
