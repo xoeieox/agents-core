@@ -2,9 +2,15 @@
 """ClaudeQueue — file-based queue for `claude -p` subprocess tasks.
 
 Separate from agents_core.gpu.GPUQueue because Qwen-shaped semantics
-(preempt / stop_llm_server / model-affinity tiebreak / intention-registry
-coordinator) do not apply to API-backed shaped-agent subprocesses. See
+(preempt / stop_llm_server / model-affinity tiebreak) do not apply to
+API-backed shaped-agent subprocesses. See
 /srv/lapis/planning/specs/agents-core-claude-queue.md for the design rationale.
+
+Intention-registry parity with GPUQueue (2026-04-24 ops-layer integration,
+see /srv/lapis/planning/specs/agents-core-claude-queue-ops-layer-integration.md):
+ClaudeQueue carries its own coordinator slot, separate from agents_core.gpu.
+The coordinator plumbing is duplicated rather than shared; factor out to
+agents_core/_coordinator.py only when a third queue arrives.
 
 Storage:
     /srv/lapis/claude-queue/
@@ -31,6 +37,7 @@ Usage:
 
 import fcntl
 import json
+import logging as _logging
 import os
 import sys
 import tempfile
@@ -42,6 +49,114 @@ import yaml
 from agents_core.gpu import PACIFIC, Priority, _now_iso, _now_pacific  # noqa: F401
 
 CLAUDE_QUEUE_DIR = Path("/srv/lapis/claude-queue")
+
+# ---------------------------------------------------------------------------
+# Task coordinator hook (Lapis Ops Layer parity).
+#
+# Mirrors agents_core.gpu's coordinator extension point but maintains its own
+# registration slot. The coordinator contract (project_from_task / manifest /
+# compost) is identical — intention_registry satisfies both GPU and Claude
+# because the interface is queue-agnostic. See gpu.py's module docstring for
+# the full contract.
+#
+# Registration patterns:
+#   - _autoload_coordinators() below attempts to import intention_registry at
+#     module load and bind it, so any process importing agents_core.claude_queue
+#     gets coordination wired automatically.
+#   - Callers may override via claude_queue.register_coordinator(obj); pass
+#     None to unregister (tests use this for isolation).
+#
+# TODO (factor-out): when a third queue arrives, move register_coordinator /
+# get_coordinator / _project_* / _manifest_* / _compost_* into
+# agents_core/_coordinator.py. Deduplication is deferred per the 2026-04-24
+# ops-layer integration spec (§Architecture item 1(a)).
+# ---------------------------------------------------------------------------
+
+_coord_log = _logging.getLogger("claude_queue.coordinator")
+
+_coordinator = None
+
+
+def register_coordinator(coordinator) -> None:
+    """Bind a task coordinator. See agents_core.gpu for the required surface.
+
+    Safe to call multiple times — the last registration wins. Pass None to
+    unregister (tests can restore no-coordinator mode this way).
+    """
+    global _coordinator
+    _coordinator = coordinator
+
+
+def get_coordinator():
+    """Return the currently registered coordinator, or None."""
+    return _coordinator
+
+
+def _project_intention_for_task(task: dict, task_id: str):
+    reg = _coordinator
+    if reg is None:
+        return None
+    try:
+        return reg.project_from_task(
+            task,
+            projected_by=task.get("submitted_by") or "unknown",
+            proposed_change=task.get("description") or task.get("task_type"),
+            target_heading=(task.get("payload") or {}).get("target_heading"),
+            task_id=task_id,
+        )
+    except Exception as e:
+        _coord_log.warning(
+            f"coordinator.project_from_task failed for {task.get('id')}: {e}")
+        return None
+
+
+def _manifest_intention_for_task(task: dict) -> None:
+    intention_id = task.get("intention_id")
+    if not intention_id:
+        return
+    reg = _coordinator
+    if reg is None:
+        return
+    try:
+        reg.manifest(intention_id, linked_task_id=task.get("id"))
+    except Exception as e:
+        _coord_log.warning(
+            f"coordinator.manifest failed for {intention_id}: {e}")
+
+
+def _compost_intention_for_task(task: dict, reason: str) -> None:
+    intention_id = task.get("intention_id")
+    if not intention_id:
+        return
+    reg = _coordinator
+    if reg is None:
+        return
+    try:
+        reg.compost(intention_id, reason=reason)
+    except Exception as e:
+        _coord_log.warning(
+            f"coordinator.compost failed for {intention_id}: {e}")
+
+
+def _unlink_orphaned_spec(spec_path: str | None, shared_task_id: str | None) -> None:
+    """On match_reinforce / match_manifested, the second submitter's pre-written
+    spec JSON is orphaned — its referenced task_id diverges from the shared
+    one. Unlink it and log a warning identifying what was dropped.
+
+    Resolves §1 of the ops-layer integration spec. Safe to call with None.
+    """
+    if not spec_path:
+        return
+    try:
+        p = Path(spec_path)
+        if p.exists():
+            p.unlink()
+            _coord_log.warning(
+                f"match fired (shared_task_id={shared_task_id}); "
+                f"unlinked orphan spec {spec_path}")
+    except OSError as e:
+        _coord_log.warning(
+            f"failed to unlink orphan spec {spec_path}: {e}")
 
 REQUIRED_FIELDS = {"task_type"}
 
@@ -168,6 +283,17 @@ class ClaudeQueue:
         `submit()` returns, and the runner could claim the task in between —
         seeing a spec missing `task_id` and `worktree_required`. See spec
         §Shaper routing.
+
+        Intention-registry behavior (opt-out via
+        payload['_ignore_intention_registry']=True), parity with GPUQueue:
+
+        - Novel signature → new task queued; returns the new id.
+        - Matches an in-flight intention → no new task queued; caller joins
+          the in-flight task by receiving the shared id. The caller's
+          pre-written spec (payload['spec_path']) is unlinked because the
+          shared task_id points at the first submitter's spec.
+        - Matches a recently-manifested intention → no new task; returns the
+          prior id. Caller's orphan spec is unlinked.
         """
         missing = REQUIRED_FIELDS - set(task_dict.keys())
         if missing:
@@ -181,6 +307,40 @@ class ClaudeQueue:
         task["submitted_at"] = _now_iso()
         task["status"] = "pending"
 
+        payload = task.get("payload") or {}
+        ignore_registry = bool(payload.get("_ignore_intention_registry"))
+
+        projection = None
+        if not ignore_registry:
+            projection = _project_intention_for_task(task, task["id"])
+
+        if projection is not None and projection.decision in (
+            "match_reinforce", "match_manifested"
+        ):
+            shared = projection.shared_task_id
+            self._append_event({
+                "event": f"intention_{projection.decision}",
+                "id": task["id"],
+                "timestamp": task["submitted_at"],
+                "task_type": task["task_type"],
+                "submitted_by": task.get("submitted_by", "unknown"),
+                "intention_id": projection.intention.intention_id,
+                "reinforces": projection.intention.reinforces,
+                "shared_task_id": shared,
+            })
+            if shared:
+                # §1 resolution (b): unlink the pre-written orphan spec.
+                _unlink_orphaned_spec(payload.get("spec_path"), shared)
+                return shared
+            _coord_log.warning(
+                f"intention match for {task['id']} had no shared_task_id; "
+                f"falling back to queueing a fresh task"
+            )
+
+        # projected / sibling / registry disabled → queue the task normally.
+        if projection is not None:
+            task["intention_id"] = projection.intention.intention_id
+
         self._write_task(self.pending_dir, task)
 
         self._append_event({
@@ -191,6 +351,7 @@ class ClaudeQueue:
             "priority": task["priority"],
             "model": task.get("model"),
             "submitted_by": task.get("submitted_by", "unknown"),
+            "intention_id": task.get("intention_id"),
         })
 
         state = self._read_state()
@@ -290,6 +451,8 @@ class ClaudeQueue:
         self._write_task(self.completed_dir, task)
         active_path.unlink(missing_ok=True)
 
+        _manifest_intention_for_task(task)
+
         self._append_event({
             "event": "completed",
             "id": task_id,
@@ -297,6 +460,7 @@ class ClaudeQueue:
             "task_type": task.get("task_type", "unknown"),
             "duration_seconds": task.get("duration_seconds"),
             "output_path": output_path,
+            "intention_id": task.get("intention_id"),
         })
 
         state = self._read_state()
@@ -333,6 +497,8 @@ class ClaudeQueue:
         self._write_task(self.failed_dir, task)
         active_path.unlink(missing_ok=True)
 
+        _compost_intention_for_task(task, reason=f"task_failed: {error[:120]}")
+
         self._append_event({
             "event": "failed",
             "id": task_id,
@@ -340,6 +506,7 @@ class ClaudeQueue:
             "task_type": task.get("task_type", "unknown"),
             "duration_seconds": task.get("duration_seconds"),
             "error": error[:500],
+            "intention_id": task.get("intention_id"),
         })
 
         state = self._read_state()
@@ -354,6 +521,13 @@ class ClaudeQueue:
 
         task = self._read_task(pending_path)
         pending_path.unlink(missing_ok=True)
+
+        # Compost the intention so it doesn't linger in-flight forever
+        # (mirrors gpu.py's 2026-04-23 cancel-compost cascade fix).
+        if task:
+            _compost_intention_for_task(
+                task, reason=f"task_cancelled: {reason or 'no reason given'}"
+            )
 
         self._append_event({
             "event": "cancelled",
@@ -435,6 +609,32 @@ class ClaudeQueue:
             except OSError:
                 continue
         return removed
+
+
+# ---------------------------------------------------------------------------
+# Coordinator autoload (ops-layer v0 bridge).
+#
+# Unlike agents_core.gpu which uses entry-point discovery via the
+# `agents_core.gpu_coordinators` group, ClaudeQueue hard-codes an
+# intention_registry probe. Rationale: ops_layer_init (the existing
+# entry-point plugin) only registers with GPUQueue's slot, and editing
+# ops-layer's pyproject is out of scope for the 2026-04-24 integration.
+# When ops-layer (or another coordinator) publishes a ClaudeQueue-aware
+# entry point, migrate to entry-point discovery mirroring gpu.py.
+# ---------------------------------------------------------------------------
+
+def _autoload_coordinators() -> None:
+    try:
+        import intention_registry  # noqa: F401
+    except ImportError:
+        return
+    try:
+        register_coordinator(intention_registry)
+    except Exception as e:  # pragma: no cover — defensive
+        _coord_log.warning(f"failed to register intention_registry: {e}")
+
+
+_autoload_coordinators()
 
 
 def main():

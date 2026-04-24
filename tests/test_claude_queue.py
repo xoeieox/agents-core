@@ -14,6 +14,19 @@ from agents_core import claude_queue as cq_mod
 from agents_core.claude_queue import ClaudeQueue, Priority
 
 
+@pytest.fixture(autouse=True)
+def _no_coordinator_during_base_tests():
+    """The module-load autoload may bind intention_registry (if installed);
+    base ClaudeQueue tests assert queue plumbing in isolation, so we clear
+    the slot per-test and restore afterwards. Coordinator-wired behaviour
+    is covered in tests/test_claude_queue_coordinator.py.
+    """
+    prior = cq_mod.get_coordinator()
+    cq_mod.register_coordinator(None)
+    yield
+    cq_mod.register_coordinator(prior)
+
+
 @pytest.fixture
 def queue(tmp_path: Path) -> ClaudeQueue:
     return ClaudeQueue(queue_dir=tmp_path / "claude-queue")
@@ -198,26 +211,17 @@ def test_status_reports_depth_and_in_flight(queue):
 
 
 # ---------------------------------------------------------------------------
-# Anti-coupling regression — ClaudeQueue must NOT touch intention_registry
+# Slot independence — ClaudeQueue keeps its own coordinator slot, separate
+# from agents_core.gpu's. A coordinator registered only with gpu's slot must
+# not receive ClaudeQueue lifecycle events.
 # ---------------------------------------------------------------------------
 
-def test_claude_queue_does_not_import_intention_registry():
-    """Guard against accidental coupling drift.
-
-    Shaped-agent dedup is handled by pm/dispatched/<tid> mem keys +
-    _branch_belongs — deliberately not the intention registry. If someone
-    adds an `import intention_registry` to claude_queue.py, this test trips.
-    """
-    src = Path(cq_mod.__file__).read_text()
-    assert "intention_registry" not in src
-    assert "_project_intention_for_task" not in src
-    assert "register_coordinator" not in src
-
-
-def test_claude_queue_does_not_call_coordinator_hooks(queue, monkeypatch):
-    """Even if the agents_core.gpu coordinator is registered, ClaudeQueue
-    does not invoke it. Regression against drift — submit/complete/fail
-    should be fully silent w.r.t. intention projection.
+def test_claude_queue_slot_independent_from_gpu_slot(queue):
+    """Registering a coordinator ONLY on agents_core.gpu must not cause
+    ClaudeQueue to call it. Full coordinator-call coverage lives in
+    tests/test_claude_queue_coordinator.py — this is the anti-coupling
+    guard that used to forbid the integration entirely; it now asserts
+    the two coordinator slots are distinct.
     """
     calls: list[str] = []
 
@@ -233,8 +237,10 @@ def test_claude_queue_does_not_call_coordinator_hooks(queue, monkeypatch):
             calls.append("compost")
 
     from agents_core import gpu as gpu_mod
-    prior = gpu_mod.get_coordinator()
+    prior_gpu = gpu_mod.get_coordinator()
+    prior_cq = cq_mod.get_coordinator()
     gpu_mod.register_coordinator(_Spy())
+    cq_mod.register_coordinator(None)  # claude slot explicitly empty
     try:
         tid = queue.submit(_basic_task())
         queue.claim()
@@ -243,9 +249,10 @@ def test_claude_queue_does_not_call_coordinator_hooks(queue, monkeypatch):
         queue.claim()
         queue.fail(tid2, "x")
     finally:
-        gpu_mod.register_coordinator(prior)
+        gpu_mod.register_coordinator(prior_gpu)
+        cq_mod.register_coordinator(prior_cq)
 
-    assert calls == []  # zero coordinator traffic from ClaudeQueue
+    assert calls == []  # claude slot empty → no coordinator traffic
 
 
 # ---------------------------------------------------------------------------

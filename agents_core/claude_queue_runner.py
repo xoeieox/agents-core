@@ -54,6 +54,40 @@ log = logging.getLogger("claude-queue-runner")
 
 
 # ---------------------------------------------------------------------------
+# Ops telemetry — operational primitive extraction (Lapis Ops Layer parity).
+#
+# Ported from /srv/agents/scripts/gpu_queue_runner.py:64-96. Gated by
+# LAPIS_OPS_PRIMITIVES env var (default on); failures are swallowed because
+# missing weather data is acceptable at the aggregate. Called on the success
+# path only — match GPU's semantics.
+# ---------------------------------------------------------------------------
+
+def _extract_ops_primitives(task_id: str, task_type: str,
+                            result_text: str | None,
+                            output_path: str | None) -> None:
+    """Post-completion hook: tag the task output with operational primitives
+    and store to mem.db under weather/<date>/<task_id>."""
+    if os.environ.get("LAPIS_OPS_PRIMITIVES", "1") == "0":
+        return
+    try:
+        text = result_text or ""
+        if (not text or len(text) < 200) and output_path:
+            try:
+                text = Path(output_path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        if not text or len(text.strip()) < 80:
+            return  # nothing worth tagging
+        import ops_primitives
+        prims = ops_primitives.extract_and_store(task_id, task_type, text)
+        if prims:
+            types = ",".join(p.get("type", "?") for p in prims[:3])
+            log.info(f"ops-primitives [{task_type}] {task_id}: {types}")
+    except Exception as e:
+        log.warning(f"ops-primitives: skip for {task_id}: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Notification helpers
 #
 # These are local to the runner. `agents_core.notify` exports
@@ -211,6 +245,12 @@ async def _run_task(queue: ClaudeQueue, task: dict) -> None:
     Path(output_path).write_text(combined[-3000:] if combined else "(no output)")
     summary = combined.splitlines()[0][:200] if combined else ""
     queue.complete(task_id, output_path=output_path, result_summary=summary)
+    _extract_ops_primitives(
+        task_id,
+        task.get("task_type", "subprocess"),
+        combined,
+        output_path,
+    )
     notify_completion(task, output_path)
     log.info(f"done  {task_id} rc=0")
 
