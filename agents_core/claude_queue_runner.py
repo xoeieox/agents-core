@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""ClaudeQueue runner daemon — bounded-concurrency executor for shaped-agent
+`claude -p` subprocesses.
+
+Architecture differs from `gpu_queue_runner.py`:
+- asyncio event loop + `asyncio.Semaphore(CLAUDE_QUEUE_WORKERS)` for
+  bounded concurrency (Claude subprocesses are I/O-bound on the API).
+- The GPU runner uses threading + a single-worker claim loop because Qwen
+  inference is GPU-bound and can only run one task at a time.
+
+Config env vars:
+- CLAUDE_QUEUE_WORKERS: max concurrent subprocesses (default 2)
+- CLAUDE_QUEUE_ENABLED: "0" makes the daemon exit cleanly on next tick
+
+The runner is responsible for capturing `_runner.py`'s stdout/stderr and
+writing the output file under `/srv/lapis/claude-queue/completed/`. `_runner.py`
+prints the result and exits; the file-write lives here, not there, mirroring
+`/srv/agents/scripts/gpu_queue_runner.py:execute_subprocess_task`.
+"""
+
+import asyncio
+import logging
+import os
+import shutil
+import signal
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+from agents_core.claude_queue import CLAUDE_QUEUE_DIR, ClaudeQueue
+from agents_core.gpu import PACIFIC, Priority as QueuePriority  # noqa: F401
+from agents_core.notify import Priority as PushoverPriority, send_notification
+
+try:
+    # lapis-pm is a sibling package installed alongside agents-core in the
+    # Conductor deployment. Importing it keeps WORKTREE_ROOT as a single
+    # source of truth with lapis_pm/worktree.py. If lapis-pm is not
+    # installed (e.g. in agents-core CI), fall back to the documented
+    # default — the runner can still start and sweep nothing.
+    from lapis_pm.worktree import WORKTREE_ROOT
+except ImportError:
+    WORKTREE_ROOT = Path("/tmp/lapis-pm-worktrees")
+
+RUNNER_SCRIPT = Path("/srv/lapis/lapis-pm/lapis_pm/_runner.py")
+OUTPUT_DIR = CLAUDE_QUEUE_DIR / "completed"
+
+CLONE_ROOTS_GLOB = "/srv/git/*-working"
+
+POLL_INTERVAL_S = 2.0
+STARTUP_STALE_GRACE_S = 300
+
+log = logging.getLogger("claude-queue-runner")
+
+
+# ---------------------------------------------------------------------------
+# Notification helpers
+#
+# These are local to the runner. `agents_core.notify` exports
+# `send_notification()` + a `Priority` enum — no `notify_completion` /
+# `notify_failure` functions exist there. `gpu_queue_runner.py` follows the
+# same pattern: thin wrappers that format task context and call
+# send_notification().
+# ---------------------------------------------------------------------------
+
+def _fmt_task_label(task: dict) -> str:
+    desc = task.get("description") or ""
+    submitted_by = task.get("submitted_by", "unknown")
+    return desc or f"{task.get('task_type','?')} (by {submitted_by})"
+
+
+def notify_completion(task: dict, output_path: str) -> None:
+    if not task.get("notify"):
+        return
+    send_notification(
+        message=f"Claude task completed: {_fmt_task_label(task)}\nOutput: {output_path}",
+        title="claude-queue",
+        priority=PushoverPriority.NORMAL,
+    )
+
+
+def notify_failure(task: dict, result: str) -> None:
+    if not task.get("notify"):
+        return
+    summary = result.splitlines()[0][:300] if result else "(no output)"
+    send_notification(
+        message=f"Claude task FAILED: {_fmt_task_label(task)}\n{summary}",
+        title="claude-queue",
+        priority=PushoverPriority.HIGH,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Startup sweep
+# ---------------------------------------------------------------------------
+
+def startup_sweep(queue: ClaudeQueue) -> None:
+    """Crash recovery. Called once before the claim loop begins."""
+    now = datetime.now(PACIFIC)
+    for active_yaml in queue.active_dir.glob("*.yaml"):
+        task = queue._read_task(active_yaml)
+        if not task:
+            continue
+        started_at = task.get("started_at")
+        timeout = int(task.get("timeout_seconds", 300))
+        stale = False
+        if started_at:
+            try:
+                started_dt = datetime.fromisoformat(started_at)
+                age_s = (now - started_dt).total_seconds()
+                stale = age_s > (timeout + STARTUP_STALE_GRACE_S)
+            except ValueError:
+                stale = True
+        else:
+            stale = True
+        if stale:
+            log.warning(f"stale active task {task['id']} — moving to failed")
+            queue.fail(task["id"], error="runner_crash_recovery")
+
+    if WORKTREE_ROOT.exists():
+        active_ids = {p.stem for p in queue.active_dir.glob("*.yaml")}
+        for wt in WORKTREE_ROOT.iterdir():
+            if not wt.is_dir() or wt.name in active_ids:
+                continue
+            log.warning(f"orphaned worktree {wt} — removing")
+            for clone in Path("/srv/git").glob("*-working"):
+                subprocess.run(
+                    ["git", "-C", str(clone), "worktree", "remove",
+                     "--force", str(wt)],
+                    check=False, capture_output=True, timeout=30)
+            shutil.rmtree(wt, ignore_errors=True)
+
+    for clone in Path("/srv/git").glob("*-working"):
+        subprocess.run(
+            ["git", "-C", str(clone), "worktree", "prune"],
+            check=False, capture_output=True, timeout=30)
+
+
+# ---------------------------------------------------------------------------
+# Per-task execution
+# ---------------------------------------------------------------------------
+
+async def _run_task(queue: ClaudeQueue, task: dict) -> None:
+    """Spawn _runner.py, capture output, write output file, mark done.
+
+    This is the body of the daemon's per-worker coroutine. Errors are caught
+    at the top level; any unhandled exception drops the task in active/ for
+    the next startup sweep to clean up.
+    """
+    task_id = task["id"]
+    timeout = int(task.get("timeout_seconds", 300))
+    spec_path = (task.get("payload") or {}).get("spec_path")
+    output_path = str(OUTPUT_DIR / f"{task_id}-output.md")
+
+    if not spec_path:
+        msg = "ERROR: task payload missing spec_path"
+        Path(output_path).write_text(msg)
+        queue.fail(task_id, error=msg)
+        notify_failure(task, msg)
+        return
+
+    log.info(f"claim {task_id} model={task.get('model')} timeout={timeout}s")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(RUNNER_SCRIPT), spec_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as e:
+        msg = f"ERROR: failed to spawn _runner.py: {e}"
+        Path(output_path).write_text(msg)
+        queue.fail(task_id, error=msg)
+        notify_failure(task, msg)
+        return
+
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        stdout_b, stderr_b = await proc.communicate()
+        combined = (stdout_b + stderr_b).decode(errors="replace")
+        result = f"TIMEOUT: exceeded {timeout}s\n{combined[-3000:]}"
+        Path(output_path).write_text(result)
+        queue.fail(task_id, error=f"timeout after {timeout}s")
+        notify_failure(task, result)
+        return
+
+    combined = (stdout_b + stderr_b).decode(errors="replace").strip()
+    rc = proc.returncode or 0
+
+    if rc < 0:
+        result = f"INTERRUPTED by signal {-rc}:\n{combined[-3000:]}"
+        Path(output_path).write_text(result)
+        queue.fail(task_id, error=f"interrupted signal {-rc}")
+        notify_failure(task, result)
+        return
+
+    if rc != 0:
+        prefix = "ERROR: worktree_setup" if "worktree_setup" in combined else f"EXIT {rc}"
+        result = f"{prefix}:\n{combined[-3000:]}"
+        Path(output_path).write_text(result)
+        queue.fail(task_id, error=f"{prefix[:200]}")
+        notify_failure(task, result)
+        return
+
+    Path(output_path).write_text(combined[-3000:] if combined else "(no output)")
+    summary = combined.splitlines()[0][:200] if combined else ""
+    queue.complete(task_id, output_path=output_path, result_summary=summary)
+    notify_completion(task, output_path)
+    log.info(f"done  {task_id} rc=0")
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+class Daemon:
+    def __init__(self, workers: int):
+        self.queue = ClaudeQueue()
+        self.sem = asyncio.Semaphore(workers)
+        self.stop_claiming = asyncio.Event()
+        self.in_flight: set[asyncio.Task] = set()
+
+    async def _worker(self, task: dict):
+        async with self.sem:
+            try:
+                await _run_task(self.queue, task)
+            except Exception as e:
+                log.exception(f"unhandled error in task {task.get('id')}: {e}")
+
+    async def run(self):
+        startup_sweep(self.queue)
+        log.info("startup sweep complete, entering claim loop")
+        while not self.stop_claiming.is_set():
+            if os.environ.get("CLAUDE_QUEUE_ENABLED", "1") == "0":
+                log.info("CLAUDE_QUEUE_ENABLED=0 — exiting")
+                break
+
+            # Only claim when a worker slot is free. This avoids pulling
+            # tasks into active/ while all workers are busy (the task would
+            # sit under our id for the full duration of someone else's run).
+            if self.sem.locked():
+                await asyncio.sleep(POLL_INTERVAL_S)
+                continue
+
+            task = self.queue.claim()
+            if task is None:
+                await asyncio.sleep(POLL_INTERVAL_S)
+                continue
+
+            t = asyncio.create_task(self._worker(task))
+            self.in_flight.add(t)
+            t.add_done_callback(self.in_flight.discard)
+
+        if self.in_flight:
+            longest = max((int(self._task_timeout(t)) for t in self.in_flight),
+                          default=300)
+            log.info(f"draining {len(self.in_flight)} in-flight tasks "
+                     f"(grace {longest+60}s)")
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self.in_flight, return_exceptions=True),
+                    timeout=longest + 60,
+                )
+            except asyncio.TimeoutError:
+                log.warning("grace deadline exceeded; some tasks may be stranded")
+
+    def _task_timeout(self, _task: asyncio.Task) -> int:
+        return 600
+
+    def request_stop(self):
+        log.info("SIGTERM received; stopping claim loop")
+        self.stop_claiming.set()
+
+
+def _setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
+async def _amain():
+    workers = int(os.environ.get("CLAUDE_QUEUE_WORKERS", "2"))
+    daemon = Daemon(workers=workers)
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, daemon.request_stop)
+
+    log.info(f"claude-queue-runner starting workers={workers} "
+             f"queue_dir={daemon.queue.queue_dir}")
+    await daemon.run()
+    log.info("claude-queue-runner exited")
+
+
+def main():
+    _setup_logging()
+    asyncio.run(_amain())
+
+
+if __name__ == "__main__":
+    main()
