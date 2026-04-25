@@ -143,6 +143,17 @@ def get_pr(repo: str, pr_number: int) -> dict:
     return r.json()
 
 
+def get_branch(repo: str, branch: str) -> dict:
+    """Fetch branch info; raises httpx.HTTPStatusError (404) if the branch is deleted."""
+    r = httpx.get(
+        f"{API}/repos/{OWNER}/{repo}/branches/{branch}",
+        headers=_headers(),
+        timeout=TIMEOUT,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 def close_pr(repo: str, pr_number: int) -> dict:
     """Close a pull request without merging."""
     r = httpx.patch(
