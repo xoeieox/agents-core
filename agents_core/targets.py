@@ -209,6 +209,11 @@ class Target:
         return self.data.get("pm_authority", "advisory")
 
     @property
+    def pr_count(self) -> int:
+        """Number of PRs that must merge before auto-land fires. Default 1."""
+        return int(self.data.get("pr_count", 1))
+
+    @property
     def paused(self) -> bool:
         return bool(self.data.get("paused", False))
 
