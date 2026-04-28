@@ -171,6 +171,32 @@ def startup_sweep(queue: ClaudeQueue) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Runner failure classification
+# ---------------------------------------------------------------------------
+
+def _classify_runner_failure(combined: str, rc: int) -> tuple[str, str]:
+    """Return (prefix, error_for_queue_fail) for a non-zero _runner.py exit.
+
+    Contract source: lapis-pm's ``_runner.py`` (at
+    ``/srv/lapis/lapis-pm/lapis_pm/_runner.py``).  That module emits
+    ``ERROR: worktree_setup: <exception>`` as the *first token of a line*
+    when the worktree setup itself raises (see _runner.py:198).  All other
+    failure modes (call_claude_cli returning None, shape failures, unknown
+    return codes) do NOT emit that prefix.
+
+    Any future prefix added to _runner.py must be reflected here with an
+    explicit line-anchored check — do NOT revert to substring ``in combined``
+    matching, which was the source of the 2026-04-27 misclassification bug.
+    """
+    has_setup_err = any(
+        line.startswith("ERROR: worktree_setup")
+        for line in combined.splitlines()
+    )
+    prefix = "ERROR: worktree_setup" if has_setup_err else f"EXIT {rc}"
+    return prefix, prefix[:200]
+
+
+# ---------------------------------------------------------------------------
 # Per-task execution
 # ---------------------------------------------------------------------------
 
@@ -235,10 +261,10 @@ async def _run_task(queue: ClaudeQueue, task: dict) -> None:
         return
 
     if rc != 0:
-        prefix = "ERROR: worktree_setup" if "worktree_setup" in combined else f"EXIT {rc}"
+        prefix, error_str = _classify_runner_failure(combined, rc)
         result = f"{prefix}:\n{combined[-3000:]}"
         Path(output_path).write_text(result)
-        queue.fail(task_id, error=f"{prefix[:200]}")
+        queue.fail(task_id, error=error_str)
         notify_failure(task, result)
         return
 
