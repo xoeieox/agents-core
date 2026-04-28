@@ -24,6 +24,17 @@ read/write the cross-instance memory store.
   `Priority` enum (CRITICAL=0, HIGH=10, NORMAL=50, LOW=80, IDLE=99).
 - `agents_core.mem` — `MemoryStore` class over `/data/memory/mem.db` (SQLite + FTS5).
   Library only. The `mem` CLI stays in `/srv/agents/scripts/mem.py`.
+- `agents_core.shaper` — shaped-agent registry + dispatch. `class Shaper(registry_path)`
+  loads a per-consumer `registry.yaml`, routes to `ClaudeQueue` (Anthropic models)
+  or `GPUQueue` (local GPU), and writes a JSON spec for `shaped_runner`.
+  Exported: `Shaper`, `ShapedAgent`, `DispatchResult`.
+- `agents_core.shaped_runner` — subprocess runner for shaped agents. Invoked as
+  `python3 -m agents_core.shaped_runner <spec.json>`. Reads spec, calls
+  `call_claude_cli`, writes optional confabulation-detection meta sidecar, unlinks spec.
+- `agents_core.worktree` — per-task git worktree lifecycle. `WORKTREE_ROOT`,
+  `setup_worktree(task_id, repo_cwd, base_branch)`, `teardown_worktree(task_id, repo_cwd)`.
+  Enforces pip-isolation invariant (PYTHONUSERBASE + PIP_USER) so fixer worktrees
+  cannot mutate host-global Python state.
 
 ## What agents-core does NOT own
 
@@ -42,6 +53,28 @@ read/write the cross-instance memory store.
   a candidate for future inclusion in agents-core once a second consumer asks.
 - **Orchestration schedules, research-domain logic, anthro/TTRPG/psych miners,
   convergence analysis, dashboards.** All stay in `/srv/agents/` as consumers.
+
+## Shaper — promotion notes (2026-04-28)
+
+Promoted from `lapis_pm/shaper.py`, `lapis_pm/_runner.py`, `lapis_pm/worktree.py`
+as part of `agents-core-promote-shaper` (Phase 1 of a two-phase coordinated
+cutover; Phase 2 flips lapis-pm's imports and removes the originals).
+
+**Invariant resolved:** `agents_core.claude_queue_runner` previously imported
+`WORKTREE_ROOT` from `lapis_pm.worktree` (inverted dependency). It now imports
+from `agents_core.worktree` (same package). The runner invokes `shaped_runner`
+as `python3 -m agents_core.shaped_runner` (module-resolved, no hardcoded paths).
+
+**Emergency rollback env vars:**
+- `AGENTS_CORE_FORCE_GPU_QUEUE=1` — sends all dispatches to GPUQueue regardless
+  of model.
+- `LAPIS_PM_FORCE_GPU_QUEUE=1` — deprecated alias for one merge cycle; emits
+  `DeprecationWarning` to stderr on first use per Shaper instance. Slated for
+  removal in `agents-core-cleanup-deprecated-aliases`.
+
+**Consumers:** lapis-pm (Phase 2); ops-layer slice 2 (next consumer,
+`ops-layer-directives-autofix-v1`). Each consumer owns its `registry.yaml`.
+agents-core ships none.
 
 ## Deferred candidates
 
