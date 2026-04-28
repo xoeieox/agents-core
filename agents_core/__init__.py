@@ -9,10 +9,13 @@ Modules:
     gpu       — GPU task queue (GPUQueue, Priority)
     mem       — cross-instance memory store library (MemoryStore)
     retrieval — Synapse retrieval engine (Hit, retrieve)
+    shaper    — shaped-agent registry + dispatch (Shaper, ShapedAgent, DispatchResult)
+    worktree  — per-task git worktree lifecycle (WORKTREE_ROOT, setup_worktree, ...)
 """
 
 from agents_core.retrieval import Hit, retrieve
+from agents_core.shaper import DispatchResult, ShapedAgent, Shaper
 
 __version__ = "0.3.0"
 
-__all__ = ["Hit", "retrieve"]
+__all__ = ["Hit", "retrieve", "Shaper", "ShapedAgent", "DispatchResult"]

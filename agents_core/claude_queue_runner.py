@@ -12,8 +12,8 @@ Config env vars:
 - CLAUDE_QUEUE_WORKERS: max concurrent subprocesses (default 2)
 - CLAUDE_QUEUE_ENABLED: "0" makes the daemon exit cleanly on next tick
 
-The runner is responsible for capturing `_runner.py`'s stdout/stderr and
-writing the output file under `/srv/lapis/claude-queue/completed/`. `_runner.py`
+The runner is responsible for capturing `shaped_runner`'s stdout/stderr and
+writing the output file under `/srv/lapis/claude-queue/completed/`. `shaped_runner`
 prints the result and exits; the file-write lives here, not there, mirroring
 `/srv/agents/scripts/gpu_queue_runner.py:execute_subprocess_task`.
 """
@@ -32,17 +32,9 @@ from agents_core.claude_queue import CLAUDE_QUEUE_DIR, ClaudeQueue
 from agents_core.gpu import PACIFIC, Priority as QueuePriority  # noqa: F401
 from agents_core.notify import Priority as PushoverPriority, send_notification
 
-try:
-    # lapis-pm is a sibling package installed alongside agents-core in the
-    # Conductor deployment. Importing it keeps WORKTREE_ROOT as a single
-    # source of truth with lapis_pm/worktree.py. If lapis-pm is not
-    # installed (e.g. in agents-core CI), fall back to the documented
-    # default — the runner can still start and sweep nothing.
-    from lapis_pm.worktree import WORKTREE_ROOT
-except ImportError:
-    WORKTREE_ROOT = Path("/tmp/lapis-pm-worktrees")
+from agents_core.worktree import WORKTREE_ROOT
 
-RUNNER_SCRIPT = Path("/srv/lapis/lapis-pm/lapis_pm/_runner.py")
+RUNNER_SCRIPT_MODULE = "agents_core.shaped_runner"
 OUTPUT_DIR = CLAUDE_QUEUE_DIR / "completed"
 
 CLONE_ROOTS_GLOB = "/srv/git/*-working"
@@ -177,14 +169,13 @@ def startup_sweep(queue: ClaudeQueue) -> None:
 def _classify_runner_failure(combined: str, rc: int) -> tuple[str, str]:
     """Return (prefix, error_for_queue_fail) for a non-zero _runner.py exit.
 
-    Contract source: lapis-pm's ``_runner.py`` (at
-    ``/srv/lapis/lapis-pm/lapis_pm/_runner.py``).  That module emits
+    Contract source: ``agents_core.shaped_runner``.  That module emits
     ``ERROR: worktree_setup: <exception>`` as the *first token of a line*
-    when the worktree setup itself raises (see _runner.py:198).  All other
-    failure modes (call_claude_cli returning None, shape failures, unknown
-    return codes) do NOT emit that prefix.
+    when the worktree setup itself raises.  All other failure modes
+    (call_claude_cli returning None, shape failures, unknown return codes)
+    do NOT emit that prefix.
 
-    Any future prefix added to _runner.py must be reflected here with an
+    Any future prefix added to shaped_runner must be reflected here with an
     explicit line-anchored check — do NOT revert to substring ``in combined``
     matching, which was the source of the 2026-04-27 misclassification bug.
     """
@@ -223,12 +214,12 @@ async def _run_task(queue: ClaudeQueue, task: dict) -> None:
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, str(RUNNER_SCRIPT), spec_path,
+            sys.executable, "-m", RUNNER_SCRIPT_MODULE, spec_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
     except OSError as e:
-        msg = f"ERROR: failed to spawn _runner.py: {e}"
+        msg = f"ERROR: failed to spawn shaped_runner: {e}"
         Path(output_path).write_text(msg)
         queue.fail(task_id, error=msg)
         notify_failure(task, msg)
