@@ -137,6 +137,7 @@ def _atomic_write(path: Path, data: bytes) -> None:
 class _Subscriber:
     topic: str  # prefix filter; "*" matches all
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    loop: asyncio.AbstractEventLoop | None = None  # owning loop captured at register
 
 
 _subscribers: list[_Subscriber] = []
@@ -144,7 +145,7 @@ _subscribers_lock = asyncio.Lock()
 
 
 async def _register_subscriber(topic: str) -> _Subscriber:
-    sub = _Subscriber(topic=topic)
+    sub = _Subscriber(topic=topic, loop=asyncio.get_running_loop())
     async with _subscribers_lock:
         _subscribers.append(sub)
     return sub
@@ -158,24 +159,27 @@ async def _unregister_subscriber(sub: _Subscriber) -> None:
             pass
 
 
-async def _publish(event: WriteEvent) -> None:
-    """Deliver event to all matching subscribers (non-blocking put)."""
-    async with _subscribers_lock:
-        targets = list(_subscribers)
-    for sub in targets:
-        if sub.topic == "*" or event.record.path.startswith(sub.topic):
-            await sub.queue.put(event)
-
-
 def _publish_sync(event: WriteEvent) -> None:
-    """Synchronous wrapper: schedule _publish on the running loop if any."""
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_publish(event))
-    except RuntimeError:
-        # No running event loop (e.g. called from a plain thread / sync context).
-        # Best-effort: fire in a new event loop run.
-        asyncio.run(_publish(event))
+    """Deliver event to subscribers via each subscriber's owning loop.
+
+    Works from inside any event loop, a different loop, or a plain
+    sync/threaded caller.  Each subscriber's asyncio.Queue is only
+    mutated from its own loop's thread via ``call_soon_threadsafe``,
+    so cross-loop dispatch is safe.
+    """
+    # GIL-protected snapshot — we don't take the async lock from sync code.
+    targets = list(_subscribers)
+    for sub in targets:
+        if not (sub.topic == "*" or event.record.path.startswith(sub.topic)):
+            continue
+        target_loop = sub.loop
+        if target_loop is None or target_loop.is_closed():
+            continue
+        try:
+            target_loop.call_soon_threadsafe(sub.queue.put_nowait, event)
+        except RuntimeError:
+            # Loop closed mid-call; drop event (best-effort).
+            pass
 
 
 # ---------------------------------------------------------------------------
