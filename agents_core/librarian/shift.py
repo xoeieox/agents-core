@@ -111,60 +111,6 @@ def compute_shift(old_content: str, new_content: str) -> ShiftLevel:
 # Artifact-level shift (max across cited sources)
 # ---------------------------------------------------------------------------
 
-def compute_artifact_shift(
-    source_rows: list[dict],
-    read_source: Callable[[str], str | None],
-) -> ShiftLevel:
-    """Compute the maximum shift level across all sources cited by an artifact.
-
-    Parameters
-    ----------
-    source_rows:
-        Rows from ``synthesis_cache.get_source_rows(artifact_id)``.  Each row
-        has ``source_path``, ``source_content_hash``, ``latest_content_hash``.
-    read_source:
-        Callable that takes a ``source_path`` and returns current content as a
-        string, or ``None`` if the source no longer exists.
-
-    Returns
-    -------
-    ShiftLevel — the maximum shift across all cited sources.
-    """
-    if not source_rows:
-        return ShiftLevel.no_shift
-
-    max_shift = ShiftLevel.no_shift
-
-    for row in source_rows:
-        # Fast path: content hash hasn't changed
-        if row["source_content_hash"] == row["latest_content_hash"]:
-            continue
-
-        current_content = read_source(row["source_path"]) or ""
-        if not current_content:
-            level = ShiftLevel.source_broken
-        else:
-            # We don't have the old content directly; use the hash comparison.
-            # If latest_content_hash differs from source_content_hash, shift has occurred.
-            # We read the current file for structural comparison.
-            # Since we lack the original text, classify conservatively based on hash diff.
-            # If both hashes are known equal, no shift; otherwise at minimum word_line.
-            level = ShiftLevel.word_line
-            # Try to get a richer classification if current content is available:
-            # We assume the source file on disk IS the current content.
-            # Compare it structurally to estimate level from heading/FM structure.
-            old_headings = []  # We don't have old text, so only check source_broken
-            if not current_content.strip():
-                level = ShiftLevel.source_broken
-
-        if level > max_shift:
-            max_shift = level
-            if max_shift == ShiftLevel.source_broken:
-                break
-
-    return max_shift
-
-
 def compute_shift_from_rows(
     source_rows: list[dict],
     read_old: Callable[[str, str], str | None],

@@ -187,30 +187,39 @@ def _reset_signing_key() -> None:
     _signing_key = None
 
 
+def _read_key(key_path: Path) -> Ed25519PrivateKey:
+    pem_bytes = key_path.read_bytes()
+    key = serialization.load_pem_private_key(pem_bytes, password=None)
+    if not isinstance(key, Ed25519PrivateKey):
+        raise TypeError(f"Key at {key_path} is not Ed25519")
+    return key
+
+
 def _load_or_create_key(key_path: Path) -> Ed25519PrivateKey:
     if key_path.exists():
-        pem_bytes = key_path.read_bytes()
-        key = serialization.load_pem_private_key(pem_bytes, password=None)
-        if not isinstance(key, Ed25519PrivateKey):
-            raise TypeError(f"Key at {key_path} is not Ed25519")
-        return key
-    # Generate and persist a new key
-    key = Ed25519PrivateKey.generate()
+        return _read_key(key_path)
+
+    # Generate a candidate; persist with O_EXCL so a concurrent generator
+    # can't overwrite an existing key (and we'll discover their write).
+    new_key = Ed25519PrivateKey.generate()
     key_path.parent.mkdir(parents=True, exist_ok=True)
-    pem = key.private_bytes(
+    pem = new_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption(),
     )
-    # Write with mode 0o600 (owner-read/write only) to protect the private key.
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = os.open(str(key_path), flags, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        fd = os.open(str(key_path), flags, 0o600)
+    except FileExistsError:
+        # Lost the race — another process generated first. Load theirs.
+        return _read_key(key_path)
     try:
         os.write(fd, pem)
     finally:
         os.close(fd)
     log.info("librarian: generated new Ed25519 signing key at %s", key_path)
-    return key
+    return new_key
 
 
 def _sign_entry(entry_bytes: bytes) -> str:

@@ -670,6 +670,44 @@ def test_signing_key_file_mode_is_0o600():
     assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
 
 
+def test_signing_key_race_loads_existing_when_file_appears():
+    """If the key file appears between exists() check and O_EXCL create,
+    _load_or_create_key must load the existing key instead of overwriting."""
+    from agents_core import librarian
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+
+    key_path = Path(os.environ["LIBRARIAN_KEY_PATH"])
+    assert not key_path.exists()
+
+    # Pre-populate the key file with a known key, but make Path.exists()
+    # report False on the first call so _load_or_create_key takes the
+    # generation path and races into the O_EXCL FileExistsError.
+    pre_existing = Ed25519PrivateKey.generate()
+    pre_pem = pre_existing.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    fd = os.open(str(key_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(fd, pre_pem)
+    os.close(fd)
+
+    expected_pub = pre_existing.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+    with patch("pathlib.Path.exists", return_value=False):
+        loaded = librarian._load_or_create_key(key_path)
+
+    loaded_pub = loaded.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    assert loaded_pub == expected_pub, "race fallback did not load the existing key"
+
+
 # ---------------------------------------------------------------------------
 # Additional: startup_replay
 # ---------------------------------------------------------------------------
