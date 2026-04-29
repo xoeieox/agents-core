@@ -338,7 +338,7 @@ KNOWN_PROCESSES: list[ProcessSpec] = [
         name="roomrag-indexer",
         description="RoomRAG indexer server (scheduled at 22:45 + 08:00 PT)",
         detect=_detect_roomrag_indexer,
-        expected=False,  # scheduled, not always running — no schedule-awareness in v0
+        expected=False,  # cron-driven-process workaround: v0 expected flag has no schedule-awareness; pending v0.next process_class distinction (thread: process-health-continuous-vs-scheduled-classes)
     ),
 ]
 
