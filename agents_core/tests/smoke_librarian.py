@@ -626,6 +626,51 @@ def test_live_synthesis():
 
 
 # ---------------------------------------------------------------------------
+# Additional: zero-citation artifacts get verification: none
+# ---------------------------------------------------------------------------
+
+
+def test_zero_citation_verification_none():
+    """LLM returns no citations → artifact.verification == 'none' (not 'full')."""
+    from agents_core import librarian
+
+    chunk_path = "/srv/git/inertia-vault-working/Lapis/nocit.md"
+    chunk_content = "No citations expected here."
+    chunk = _make_chunk(chunk_path, chunk_content)
+
+    # LLM returns an answer with no citations field
+    mock_resp = _llm_response({"text": "answer without citations"}, citations=None)
+
+    scope = librarian.Scope(corpus=["vault-rag"])
+
+    with patch("agents_core.retrieval.retrieve", return_value=[chunk]), \
+         patch("httpx.post", return_value=mock_resp):
+        result = librarian.corroborate("zero citation claim", scope, freshness=0)
+
+    assert isinstance(result, librarian.SynthesisArtifact)
+    assert result.verification == "none"
+    assert result.citations == []
+
+
+# ---------------------------------------------------------------------------
+# Additional: Ed25519 key file permissions
+# ---------------------------------------------------------------------------
+
+
+def test_signing_key_file_mode_is_0o600():
+    """The generated Ed25519 private key file must be mode 0o600 (owner r/w only)."""
+    from agents_core import librarian
+
+    # Trigger key generation by calling any function that loads the key
+    _ = librarian.get_public_key_bytes()
+
+    key_path = Path(os.environ["LIBRARIAN_KEY_PATH"])
+    assert key_path.exists(), "key file was not created"
+    mode = key_path.stat().st_mode & 0o777
+    assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+
+
+# ---------------------------------------------------------------------------
 # Additional: startup_replay
 # ---------------------------------------------------------------------------
 

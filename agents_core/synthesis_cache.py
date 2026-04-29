@@ -141,9 +141,11 @@ def _atomic_write(path: Path, data: bytes) -> None:
         os.write(fd, data)
         os.fsync(fd)
         os.close(fd)
+        fd = -1  # sentinel: fd is now closed; guard against double-close in except
         os.rename(tmp_name, str(path))
     except BaseException:
-        os.close(fd)
+        if fd >= 0:
+            os.close(fd)
         try:
             os.unlink(tmp_name)
         except OSError:

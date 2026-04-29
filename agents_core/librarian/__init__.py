@@ -46,7 +46,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -57,7 +57,6 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from agents_core import retrieval, synthesis_cache
 from agents_core.librarian.shift import ShiftLevel, compute_shift_from_rows
-from agents_core.vault_writer import WriteEvent
 
 log = logging.getLogger(__name__)
 
@@ -103,7 +102,7 @@ class SynthesisArtifact:
     model_id: str
     corpus_snapshot: str
     synthesized_at: str
-    verification: str   # "full" | "partial"
+    verification: str   # "full" | "partial" | "none" (none = zero citations claimed)
     policy: str
 
     def to_dict(self) -> dict:
@@ -203,7 +202,13 @@ def _load_or_create_key(key_path: Path) -> Ed25519PrivateKey:
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption(),
     )
-    key_path.write_bytes(pem)
+    # Write with mode 0o600 (owner-read/write only) to protect the private key.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(str(key_path), flags, 0o600)
+    try:
+        os.write(fd, pem)
+    finally:
+        os.close(fd)
     log.info("librarian: generated new Ed25519 signing key at %s", key_path)
     return key
 
@@ -252,7 +257,6 @@ def get_public_key_bytes() -> bytes:
 
 _EXCLUDED_PATH_FRAGMENTS = ["/Personal/", "/Daily-Notes/private/"]
 _FM_RE = re.compile(r"^---\r?\n(.*?\r?\n)---\r?\n", re.DOTALL)
-_FM_FIELD_RE = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_-]*):\s*(.+)$", re.MULTILINE)
 
 
 def _extract_fm_bool(content: str, field: str) -> bool | None:
@@ -406,7 +410,12 @@ def _verify_citations(
 
         verified.append(cit)
 
-    status = "partial" if any_dropped else "full"
+    if not claimed_citations:
+        status = "none"
+    elif any_dropped:
+        status = "partial"
+    else:
+        status = "full"
     return verified, status
 
 
@@ -498,7 +507,7 @@ def _synthesize(
     # 6. Call LLM
     try:
         answer, model_id = _call_llm(claim, context_chunks, format)
-    except (httpx.HTTPError, httpx.TimeoutException, Exception) as exc:
+    except Exception as exc:
         log.warning("librarian: LLM call failed: %s", exc)
         # Return most-recent cached if any
         most_recent = _load_most_recent(claim, corpus, policy, format)
@@ -640,8 +649,8 @@ def corroborate(
                 if source_rows:
                     shift = compute_shift_from_rows(
                         source_rows,
-                        read_old=lambda p, h: None,  # old content not available at lookup; use row comparison
-                        read_new=lambda p: _read_corpus_file(p),
+                        read_old=_read_old_content,
+                        read_new=_read_corpus_file,
                     )
                     if shift == ShiftLevel.source_broken:
                         pass  # fall through to re-synthesis
@@ -660,6 +669,23 @@ def _read_corpus_file(path: str) -> str | None:
         return Path(path).read_text(encoding="utf-8")
     except OSError:
         return None
+
+
+def _read_old_content(path: str, content_hash: str) -> str | None:
+    """Return old content if the on-disk file still has the expected hash, else None.
+
+    v0 limitation: old content is only available when the file on disk still
+    matches the hash from when the artifact was created (i.e. it has not changed
+    since synthesis).  When the file has changed we cannot recover the original
+    text without a dedicated content store — compute_shift_from_rows then treats
+    the source as an opaque hash diff and falls back to word_line as the minimum
+    shift level.
+    """
+    content = _read_corpus_file(path)
+    if content is None:
+        return None
+    actual_hash = f"sha256:{hashlib.sha256(content.encode('utf-8')).hexdigest()}"
+    return content if actual_hash == content_hash else None
 
 
 def regenerate(artifact_id: str) -> SynthesisArtifact:
@@ -694,8 +720,8 @@ def regenerate(artifact_id: str) -> SynthesisArtifact:
     if source_rows:
         shift = compute_shift_from_rows(
             source_rows,
-            read_old=lambda p, h: None,
-            read_new=lambda p: _read_corpus_file(p),
+            read_old=_read_old_content,
+            read_new=_read_corpus_file,
         )
         if shift == ShiftLevel.no_shift:
             return SynthesisArtifact.from_dict(entry)
@@ -724,8 +750,8 @@ def degree_of_shift(artifact_id: str) -> ShiftLevel:
         return ShiftLevel.no_shift
     return compute_shift_from_rows(
         source_rows,
-        read_old=lambda p, h: None,
-        read_new=lambda p: _read_corpus_file(p),
+        read_old=_read_old_content,
+        read_new=_read_corpus_file,
     )
 
 

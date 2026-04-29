@@ -44,10 +44,6 @@ _HEADING_RE = re.compile(r"^#{1,6}\s", re.MULTILINE)
 _FM_RE = re.compile(r"^---\r?\n(.*?\r?\n)---\r?\n", re.DOTALL)
 
 
-def _headings(text: str) -> list[str]:
-    return _HEADING_RE.findall(text)
-
-
 def _heading_lines(text: str) -> list[str]:
     return [ln for ln in text.splitlines() if _HEADING_RE.match(ln)]
 
