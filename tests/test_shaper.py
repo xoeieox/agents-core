@@ -53,7 +53,7 @@ def dispatch_mocks(tmp_path, monkeypatch):
         "fixer": _minimal_agent_def("sonnet", capture_meta=True, notify=True),
         "reviewer": _minimal_agent_def("opus", capture_meta=False, notify=True),
         "scout": _minimal_agent_def("haiku"),
-        "qwen_agent": _minimal_agent_def("qwen3.5-35b-a3b"),
+        "qwen_agent": _minimal_agent_def("qwen3.6-35b-a3b"),
     })
     monkeypatch.setattr(shaper_mod, "SPEC_DIR", tmp_path / "shaped")
 

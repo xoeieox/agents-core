@@ -2,7 +2,7 @@
 """Shared LLM client — talks to llama-server and Claude CLI (Max subscription).
 
 Two backends:
-  - call_llm()         → local llama-server (qwen3.5-35b-a3b, GPU, free)
+  - call_llm()         → local llama-server (qwen3.6-35b-a3b, GPU, free)
   - call_claude_cli()  → claude -p subprocess (Haiku/Sonnet, Max subscription)
 
 All conductor/agent scripts should import from here.

@@ -42,7 +42,7 @@ def shaper_mocks(tmp_path, monkeypatch):
         "fixer": _agent_def("sonnet"),
         "reviewer": _agent_def("opus"),
         "haiku_agent": _agent_def("haiku"),
-        "qwen_agent": _agent_def("qwen3.5-35b-a3b"),
+        "qwen_agent": _agent_def("qwen3.6-35b-a3b"),
     })
     monkeypatch.setattr(shaper_mod, "SPEC_DIR", tmp_path / "shaped")
 
