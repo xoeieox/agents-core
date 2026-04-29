@@ -65,22 +65,17 @@ def test_inventory_returns_one_state_per_spec():
 
 def test_inventory_isolates_failing_probe():
     """A probe that raises must not prevent other probes from running."""
-    # Inject a probe that always raises into a local list
     bomb_spec = ProcessSpec(
         name="__test_bomb__",
         description="always raises",
         detect=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
         expected=False,
     )
+    # Pass an explicit list so we never mutate the module-level KNOWN_PROCESSES.
+    process_list = list(KNOWN_PROCESSES) + [bomb_spec]
+    states = inventory(process_list=process_list)
 
-    original = list(KNOWN_PROCESSES)
-    KNOWN_PROCESSES.append(bomb_spec)
-    try:
-        states = inventory()
-    finally:
-        KNOWN_PROCESSES.remove(bomb_spec)
-
-    assert len(states) == len(original) + 1
+    assert len(states) == len(process_list)
     bomb_state = next(s for s in states if s.name == "__test_bomb__")
     assert bomb_state.running is False
     assert "probe failed" in bomb_state.notes
@@ -155,7 +150,6 @@ def test_port_listening_unused_port():
 def test_port_listening_open_socket(tmp_path):
     """port_listening returns True for a port we open ourselves."""
     import socket
-    import threading
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

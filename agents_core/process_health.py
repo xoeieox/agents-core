@@ -48,6 +48,10 @@ class ProcessSpec:
     expected: bool = True
 
 
+# Tailscale-assigned IP for the StarHouse host. Update here if Tailscale reassigns.
+_STARHOUSE_TAILSCALE_IP = "203.0.113.12"
+
+
 # ---------------------------------------------------------------------------
 # Detect helpers — composable primitives
 # ---------------------------------------------------------------------------
@@ -106,7 +110,7 @@ def port_listening(port: int) -> bool:
     Tries the Tailscale-bound interface first, then localhost. Does not raise.
     """
     try:
-        for host in ("203.0.113.12", "127.0.0.1"):
+        for host in (_STARHOUSE_TAILSCALE_IP, "127.0.0.1"):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(0.5)
                 if s.connect_ex((host, port)) == 0:
@@ -135,6 +139,10 @@ def mem_key_fresh(
             return False, None
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
+            # Queries the memories table directly rather than through
+            # agents_core.mem.MemoryStore to keep probe isolation clean and
+            # avoid circular-import risk. Schema assumption: memories(updated_at TEXT
+            # ISO-8601). If MemoryStore's table shape changes, update this query.
             cur = con.execute(
                 "SELECT updated_at FROM memories WHERE key = ?", (key,)
             )
@@ -330,7 +338,7 @@ KNOWN_PROCESSES: list[ProcessSpec] = [
         name="roomrag-indexer",
         description="RoomRAG indexer server (scheduled at 22:45 + 08:00 PT)",
         detect=_detect_roomrag_indexer,
-        expected=True,
+        expected=False,  # scheduled, not always running — no schedule-awareness in v0
     ),
 ]
 
@@ -339,14 +347,21 @@ KNOWN_PROCESSES: list[ProcessSpec] = [
 # Inventory
 # ---------------------------------------------------------------------------
 
-def inventory() -> list[ProcessState]:
+def inventory(
+    process_list: list[ProcessSpec] | None = None,
+) -> list[ProcessState]:
     """Run all detect callables and return one ProcessState per ProcessSpec.
 
     Per-probe failures are caught and returned as running=False with a
     descriptive notes field. One probe raising never affects others.
+
+    Args:
+        process_list: Registry to use. Defaults to KNOWN_PROCESSES. Pass an
+            explicit list in tests to avoid mutating the module-level registry.
     """
+    specs = process_list if process_list is not None else KNOWN_PROCESSES
     results: list[ProcessState] = []
-    for spec in KNOWN_PROCESSES:
+    for spec in specs:
         try:
             state = spec.detect()
         except Exception as exc:
