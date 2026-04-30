@@ -37,6 +37,22 @@ def test_target_pm_fields(tmp_path):
     assert t.pm_repo is None
 
 
+def test_target_bind_pm_authority_levels(tmp_path):
+    """All three authority levels (advisory, auto, hold) must be accepted."""
+    import pytest
+    path = tmp_path / "auth.yaml"
+    path.write_text("id: auth\ntitle: Auth\n")
+
+    for level in ("advisory", "auto", "hold"):
+        t = Target(yaml.safe_load(path.read_text()), path)
+        t.bind_pm(repo="r", authority=level)
+        assert t.pm_authority == level
+
+    t = Target(yaml.safe_load(path.read_text()), path)
+    with pytest.raises(ValueError):
+        t.bind_pm(repo="r", authority="invalid")
+
+
 def test_target_store_create(tmp_path):
     store = TargetStore(targets_dir=tmp_path)
     target = store.create(
