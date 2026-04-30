@@ -235,8 +235,8 @@ class Target:
 
     def bind_pm(self, repo: str, authority: str = "advisory"):
         """Mark target as PM-managed. Save() must be called by caller."""
-        if authority not in ("advisory", "auto"):
-            raise ValueError("authority must be 'advisory' or 'auto'")
+        if authority not in ("advisory", "auto", "hold"):
+            raise ValueError("authority must be 'advisory', 'auto', or 'hold'")
         self.data["pm_bound"] = True
         self.data["pm_repo"] = repo
         self.data["pm_authority"] = authority
