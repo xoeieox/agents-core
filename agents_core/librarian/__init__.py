@@ -49,7 +49,10 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from agents_core.vault_writer import WriteRecord
 
 import httpx
 from cryptography.hazmat.primitives import serialization
@@ -830,85 +833,25 @@ def startup_replay(events_jsonl: Path | None = None) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Live-surface digest (PR 5 hook; implemented as a stub in PR 2)
+# Live-surface digest (PR 5 — implemented in agents_core.librarian.live_surface)
 # ---------------------------------------------------------------------------
 
-def render_live_surface(out_path: Path) -> None:
+def render_live_surface(out_path: "str | Path") -> "WriteRecord":
     """Render the weekly Live-Surface digest to *out_path*.
 
-    Invoked by cron on Saturday mornings (wired in PR 5).  Calls
-    ``corroborate()`` for Thread Weaver state + Follow-ups + recently-landed,
-    then writes the result as a markdown file with required frontmatter via
-    ``vault_writer``.
+    Delegates to ``agents_core.librarian.live_surface.render_live_surface``.
+    Full implementation there: corroborate() calls, idempotent timestamp
+    keyed by corpus hash, vault_writer write with ``agent_id="librarian"``.
 
     Frontmatter contract::
 
         type: live-surface
-        generated: <iso-timestamp>
+        generated: <iso-timestamp>  (stable when corpus unchanged)
         freshness: weekly
 
-    Idempotent: re-rendering with the same corpus snapshot produces
-    byte-identical output.
-
-    Parameters
-    ----------
-    out_path:
-        Destination path for the digest (e.g.
-        ``/srv/git/inertia-vault-working/Lapis/Live-Surface.md``).
+    Returns
+    -------
+    ``WriteRecord`` from ``vault_writer.write()``.
     """
-    from agents_core import vault_writer
-
-    # Synthesise thread-weaver + follow-ups state
-    thread_state = corroborate(
-        "thread-weaver-state",
-        Scope(corpus=["vault-rag", "mem"]),
-        freshness=0,
-        policy="auto-update",
-    )
-    follow_ups = corroborate(
-        "recent-follow-ups",
-        Scope(corpus=["mem", "vault-rag"]),
-        freshness=0,
-        policy="auto-update",
-    )
-
-    now_ts = datetime.now(tz=timezone.utc).isoformat()
-
-    thread_text = (
-        thread_state.answer.get("text", str(thread_state.answer))
-        if isinstance(thread_state, SynthesisArtifact)
-        else "(unavailable)"
-    )
-    follow_text = (
-        follow_ups.answer.get("text", str(follow_ups.answer))
-        if isinstance(follow_ups, SynthesisArtifact)
-        else "(unavailable)"
-    )
-
-    content = (
-        f"---\n"
-        f"type: live-surface\n"
-        f"generated: {now_ts}\n"
-        f"freshness: weekly\n"
-        f"---\n"
-        f"\n"
-        f"# Live Surface\n"
-        f"\n"
-        f"*Generated {now_ts}*\n"
-        f"\n"
-        f"## Threads in Motion\n"
-        f"\n"
-        f"{thread_text}\n"
-        f"\n"
-        f"## Follow-ups\n"
-        f"\n"
-        f"{follow_text}\n"
-    )
-
-    vault_writer.write(
-        out_path,
-        content,
-        agent_id="librarian",
-        intent="weekly live-surface digest",
-        stamp_frontmatter=False,  # frontmatter is already present above
-    )
+    from agents_core.librarian.live_surface import render_live_surface as _impl
+    return _impl(out_path)
