@@ -19,6 +19,10 @@ Invariants
   dual-layer visibility rules (per-directory allow-list + frontmatter
   ``citable:`` override) before grounding.  Filtered-out chunks never appear
   in synthesis answers or citations.
+- Operational projectors short-circuit LLM synthesis for registered claims.
+  See agents_core.librarian.projectors. Projector artifacts carry
+  ``verification: "authoritative"`` (no LLM hallucination surface) and
+  no citations (consumers know which sources fed the projector by spec).
 
 LLM endpoint
 ------------
@@ -105,7 +109,11 @@ class SynthesisArtifact:
     model_id: str
     corpus_snapshot: str
     synthesized_at: str
-    verification: str   # "full" | "partial" | "none" (none = zero citations claimed)
+    verification: str   # "full" | "partial" | "none" | "authoritative"
+                        # "full"          — all cited chunks verified
+                        # "partial"       — some citations dropped
+                        # "none"          — zero citations claimed by LLM
+                        # "authoritative" — projector artifact (no LLM, no citations)
     policy: str
 
     def to_dict(self) -> dict:
@@ -595,6 +603,114 @@ def _load_most_recent(
     return SynthesisArtifact.from_dict(entry)
 
 
+def _compute_projector_shift(new_answer: dict, prev_answer: dict | None) -> str | None:
+    """Classify the change between two projected answers.
+
+    Returns:
+        None         — no prior artifact (first call)
+        "no-shift"   — answer dict is byte-equal after canonical JSON
+        "word-line"  — only counter/timestamp fields differ
+                       (dispatched_total, dispatched_pending, generated_at)
+        "paragraph"  — same target_id set but other fields shifted
+        "section"    — set of target_ids changed (bind/unbind happened)
+    """
+    if prev_answer is None:
+        return None
+
+    new_json = synthesis_cache.canonical_json(new_answer)
+    prev_json = synthesis_cache.canonical_json(prev_answer)
+
+    if new_json == prev_json:
+        return "no-shift"
+
+    new_targets = new_answer.get("targets", [])
+    prev_targets = prev_answer.get("targets", [])
+
+    new_ids = {t.get("target_id") for t in new_targets}
+    prev_ids = {t.get("target_id") for t in prev_targets}
+
+    if new_ids != prev_ids:
+        return "section"
+
+    _COUNTER_FIELDS = {"dispatched_total", "dispatched_pending", "generated_at"}
+    prev_map = {t.get("target_id"): t for t in prev_targets}
+
+    for nt in new_targets:
+        tid = nt.get("target_id")
+        pt = prev_map.get(tid)
+        if pt is None:
+            return "section"
+        for k, v in nt.items():
+            if k not in _COUNTER_FIELDS and v != pt.get(k):
+                return "paragraph"
+
+    return "word-line"
+
+
+def _project_and_cache(
+    claim: str,
+    corpus: list[str],
+    policy: str,
+    format: dict | None,
+    projector,
+    freshness: int,
+) -> SynthesisArtifact:
+    """Run a projector, sign + cache the result, return the artifact."""
+    scope_dict = {"corpus": corpus}
+
+    # Compute artifact_id before running projector (needed for prev entry lookup)
+    artifact_id = synthesis_cache.compute_artifact_id(claim, corpus, policy, format)
+
+    # Load previous cached answer BEFORE overwriting, for shift computation
+    prev_entry = synthesis_cache.get(artifact_id)
+    prev_answer = prev_entry.get("answer") if prev_entry else None
+
+    # Run projector (exceptions propagate — loud failure beats silent LLM substitution)
+    answer = projector(scope_dict, freshness, policy)
+
+    # Degree-of-shift for the freshness gauge
+    projector_shift = _compute_projector_shift(answer, prev_answer)
+
+    now_ts = datetime.now(tz=timezone.utc).isoformat()
+    format_schema_hash = synthesis_cache.compute_format_schema_hash(format)
+    scope_identity = {
+        "corpus": sorted(corpus),
+        "policy": policy,
+        "format_schema_hash": format_schema_hash,
+    }
+    request_metadata = {
+        "freshness_at_request": freshness,
+        "format_schema": format or {},
+        "projector": True,       # disambiguates projector artifacts in cache rows
+        "projector_shift": projector_shift,
+    }
+    entry_dict = {
+        "schema_version": "1",
+        "artifact_id": artifact_id,
+        "claim": claim,
+        "scope_identity": scope_identity,
+        "request_metadata": request_metadata,
+        "answer": answer,
+        "citations": [],
+        "librarian_id": _LIBRARIAN_ID,
+        "model_id": "projector:" + claim,
+        "corpus_snapshot": "projector",
+        "synthesized_at": now_ts,
+        "verification": "authoritative",
+        "policy": policy,
+    }
+
+    entry_bytes = synthesis_cache.canonical_json(entry_dict).encode("utf-8")
+    try:
+        sig_hex = _sign_entry(entry_bytes)
+    except Exception as exc:
+        log.error("librarian: projector signing failed: %s — writing unsigned entry", exc)
+        sig_hex = ""
+
+    synthesis_cache.put(entry_dict, sig_hex)
+    return SynthesisArtifact.from_dict(entry_dict)
+
+
 def _is_within_freshness(entry: dict, freshness: int) -> bool:
     """Return True if entry is still within its freshness budget."""
     if freshness <= 0:
@@ -671,7 +787,16 @@ def corroborate(
                 else:
                     return SynthesisArtifact.from_dict(entry)
 
-    # Cache miss, stale, or source_broken — synthesise
+    # Operational projector path (registered claims short-circuit LLM synthesis)
+    from agents_core.librarian.projectors import lookup as _projector_lookup
+    projector = _projector_lookup(claim)
+    if projector is not None:
+        # Cache lookup already happened above; if we reach here the cache was
+        # absent or stale. Run projector, sign, cache, return.
+        return _project_and_cache(claim, corpus, policy, format, projector,
+                                  freshness=freshness)
+
+    # Cache miss, stale, or source_broken — synthesise (existing path)
     return _synthesize(claim, corpus, policy, freshness, format)
 
 
