@@ -129,14 +129,38 @@ def _artifact_wire(art: SynthesisArtifact) -> dict[str, Any]:
         "answer": art.answer,
         "citations": art.citations,
         "synthesized_at": art.synthesized_at,
-        "degree_of_shift": _shift_for(art.artifact_id),
+        "degree_of_shift": _shift_for(art.artifact_id, art.model_id, art.answer),
         "verification": art.verification,
         "policy": art.policy,
     }
 
 
-def _shift_for(artifact_id: str) -> str | None:
+def _projector_shift(artifact_id: str, current_answer: dict) -> str | None:
+    """Return degree-of-shift for a projector artifact from its cached metadata.
+
+    The shift is computed in ``_project_and_cache`` (before overwriting the
+    prior entry) and stored in ``request_metadata["projector_shift"]``.
+
+    Levels:
+        None         — no prior artifact (first call)
+        "no-shift"   — answer byte-equal to prior
+        "word-line"  — only counter/timestamp fields differ
+        "paragraph"  — same target_ids, other fields shifted
+        "section"    — target_id set changed (bind/unbind)
+    """
+    try:
+        entry = synthesis_cache.get(artifact_id)
+    except Exception:
+        return None
+    if entry is None:
+        return None
+    return entry.get("request_metadata", {}).get("projector_shift")
+
+
+def _shift_for(artifact_id: str, model_id: str = "", answer: dict | None = None) -> str | None:
     """Compute degree-of-shift for a cached artifact, or None if unknown."""
+    if model_id.startswith("projector:"):
+        return _projector_shift(artifact_id, answer or {})
     try:
         rows = synthesis_cache.get_source_rows(artifact_id)
     except Exception:

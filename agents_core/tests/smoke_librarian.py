@@ -794,6 +794,64 @@ def test_trigger_request_round_trip():
 
 
 # ---------------------------------------------------------------------------
+# Test 11: Projector end-to-end
+# ---------------------------------------------------------------------------
+
+
+def test_projector_end_to_end(tmp_path):
+    """corroborate('current-targets-state') returns a non-empty targets list
+    when one bound fixture target exists, with no LLM call made.
+
+    Verifies producer/consumer parity: answer.targets is a list, each item
+    has the 12 frozen fields, verification == 'authoritative'.
+    """
+    from agents_core import librarian
+    from agents_core.librarian.projectors import REGISTRY
+
+    targets_dir = tmp_path / "room_targets"
+    targets_dir.mkdir()
+    (targets_dir / "fixture-target.yaml").write_text(
+        "id: fixture-target\n"
+        "pm_bound: true\n"
+        "title: Fixture Target\n"
+        "pm_repo: agents-core\n"
+        "pm_authority: auto\n"
+        "tags: [test]\n"
+        "urgency: medium\n"
+        "category: core\n",
+        encoding="utf-8",
+    )
+
+    FROZEN_KEYS = {
+        "target_id", "title", "pm_repo", "pm_authority", "paused", "cursor",
+        "dispatched_total", "dispatched_pending", "outstanding_brief_id",
+        "tags", "urgency", "category",
+    }
+
+    with patch("agents_core.librarian.projectors.targets.TARGETS_DIR", targets_dir), \
+         patch("agents_core.librarian.projectors.targets._mem_get", return_value=None), \
+         patch("agents_core.librarian._call_llm", side_effect=RuntimeError("no LLM")), \
+         patch("agents_core.retrieval.retrieve", return_value=[]):
+        result = librarian.corroborate(
+            "current-targets-state",
+            librarian.Scope(corpus=[]),
+            freshness=0,
+        )
+
+    assert isinstance(result, librarian.SynthesisArtifact)
+    assert result.verification == "authoritative"
+    assert isinstance(result.answer, dict)
+    targets = result.answer.get("targets", [])
+    assert len(targets) >= 1, "expected at least one target from fixture"
+    for t in targets:
+        assert FROZEN_KEYS.issubset(set(t.keys())), (
+            f"target {t.get('target_id')} missing keys: "
+            f"{FROZEN_KEYS - set(t.keys())}"
+        )
+    assert targets[0]["target_id"] == "fixture-target"
+
+
+# ---------------------------------------------------------------------------
 # Standalone runner
 # ---------------------------------------------------------------------------
 
