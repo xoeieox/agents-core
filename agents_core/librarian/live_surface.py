@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from agents_core.vault_writer import WriteRecord
 
 _TS_STORE_DEFAULT = "/data/synthesis-cache/live-surface-ts.json"
+_TS_STORE_MAX_ENTRIES = 100  # ~2 years of weekly renders; prune oldest on overflow
 
 
 def _ts_store_path() -> Path:
@@ -54,7 +55,13 @@ def _load_ts_store() -> dict:
 def _save_ts_store(store: dict) -> None:
     p = _ts_store_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(store, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    # Cap to most recent entries — values are ISO timestamps, lexicographic sort is correct.
+    if len(store) > _TS_STORE_MAX_ENTRIES:
+        store = dict(sorted(store.items(), key=lambda kv: kv[1])[-_TS_STORE_MAX_ENTRIES:])
+    data = json.dumps(store, ensure_ascii=False, sort_keys=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(data, encoding="utf-8")
+    tmp.rename(p)
 
 
 def _render_key(

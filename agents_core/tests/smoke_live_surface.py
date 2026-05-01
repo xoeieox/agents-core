@@ -212,6 +212,8 @@ def test_idempotent_rerender_byte_identical(tmp_path):
 
 def test_different_corpus_snapshot_produces_different_timestamp(tmp_path):
     """Different corpus snapshots on the second render produce a different generated timestamp."""
+    from unittest.mock import MagicMock
+    import agents_core.librarian.live_surface as ls_mod
     from agents_core.librarian.live_surface import render_live_surface
 
     out_path = tmp_path / "Live-Surface.md"
@@ -222,21 +224,40 @@ def test_different_corpus_snapshot_produces_different_timestamp(tmp_path):
         contents.append(content)
         return fake_record
 
-    with patch("agents_core.vault_writer.write", side_effect=_capture_write):
-        # First render
+    # Mock datetime.now in live_surface to return deterministic, distinct values.
+    ts_sequence = iter(["2026-01-01T00:00:00+00:00", "2026-06-15T12:00:00+00:00"])
+
+    class _FakeDatetime:
+        @staticmethod
+        def now(tz=None):
+            class _Dt:
+                def isoformat(self_inner):
+                    return next(ts_sequence)
+            return _Dt()
+
+    with patch("agents_core.vault_writer.write", side_effect=_capture_write), \
+         patch("agents_core.librarian.live_surface.datetime", _FakeDatetime):
+        # First render with v1 corpus
         with patch("agents_core.librarian.corroborate", side_effect=[
             _make_artifact(corpus_snapshot="sha256:v1thread"),
             _make_artifact(corpus_snapshot="sha256:v1follow"),
         ]):
             render_live_surface(out_path)
 
-        # Second render with different corpus snapshots — different render key
-        # Sleep 0 is not enough; we rely on the fact that the clock MAY advance.
-        # To be deterministic: just verify the render key differs → it will
-        # store a new timestamp, so the generated fields may differ.
-        # We just check the first render completed without error.
+        # Second render with v2 corpus — different render key → new datetime.now() call
+        with patch("agents_core.librarian.corroborate", side_effect=[
+            _make_artifact(corpus_snapshot="sha256:v2thread"),
+            _make_artifact(corpus_snapshot="sha256:v2follow"),
+        ]):
+            render_live_surface(out_path)
 
-    assert len(contents) >= 1
+    assert len(contents) == 2, "vault_writer.write should be called once per render"
+    fm1 = _extract_frontmatter(contents[0])
+    fm2 = _extract_frontmatter(contents[1])
+    assert fm1["generated"] != fm2["generated"], (
+        f"Different corpus snapshots must produce different generated timestamps.\n"
+        f"First:  {fm1['generated']!r}\nSecond: {fm2['generated']!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -332,9 +353,13 @@ def test_degraded_librarian_renders_unavailable_text(tmp_path):
 
 
 def test_cli_render_live_surface_subcommand(tmp_path):
-    """python3 -m agents_core.librarian render-live-surface --out <path> exits 0."""
-    from agents_core.librarian import __main__ as cli
-    from agents_core.librarian.live_surface import render_live_surface as _real
+    """librarian_cli.py render-live-surface --out <path> exits 0."""
+    import importlib.util
+
+    cli_script = Path("/srv/agents/scripts/librarian_cli.py")
+    spec = importlib.util.spec_from_file_location("librarian_cli", cli_script)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
 
     out_path = tmp_path / "cli-test.md"
     fake_record = _make_write_record(str(out_path))
