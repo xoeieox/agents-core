@@ -235,6 +235,14 @@ def main():
             )
     finally:
         if worktree_path is not None:
+            verdict_src = worktree_path / ".lapis-pm-verdict.json"
+            if verdict_src.exists():
+                try:
+                    spec_id = _spec_id_from_path(spec_path)
+                    verdict_dest = spec_path.parent / f"{spec_id}-verdict.json"
+                    verdict_dest.write_text(verdict_src.read_text())
+                except OSError as e:
+                    print(f"WARN: verdict sidecar copy failed: {e}", file=sys.stderr)
             try:
                 from agents_core.worktree import teardown_worktree
                 teardown_worktree(spec["task_id"], base_cwd)
