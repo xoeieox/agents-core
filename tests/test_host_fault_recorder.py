@@ -422,6 +422,85 @@ def test_notify_burst_after_cooldown_sends_again(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# notify_burst — mem.db emission and message format
+# ---------------------------------------------------------------------------
+
+
+class _FakeMemoryStore:
+    """Minimal MemoryStore stand-in that records set() calls."""
+    def __init__(self):
+        self.calls: list[tuple[str, str, list]] = []
+
+    def set(self, key: str, value: str, tags=None):
+        self.calls.append((key, value, tags or []))
+
+    def close(self):
+        pass
+
+
+def _patch_notify(monkeypatch):
+    """Patch send_notification + MemoryStore; return (sent_msgs, store_instance)."""
+    sent: list[str] = []
+    store = _FakeMemoryStore()
+
+    monkeypatch.setattr("agents_core.host_fault_recorder.send_notification",
+                        lambda msg, **kw: sent.append(msg) or True)
+    monkeypatch.setattr("agents_core.host_fault_recorder.MemoryStore",
+                        lambda: store)
+    return sent, store
+
+
+def test_notify_burst_emits_mem_db_entry(monkeypatch):
+    """notify_burst writes incident key to mem.db with correct prefix and tags."""
+    sent, store = _patch_notify(monkeypatch)
+
+    import agents_core.host_fault_recorder as hfr
+    hfr._LAST_PUSHOVER_TS = 0.0
+
+    notify_burst(BurstLevel.NORMAL, [_make_event()], Path("/tmp/fake-snap.json"))
+    time.sleep(0.2)
+
+    assert len(store.calls) == 1, f"Expected 1 mem.db set call, got {store.calls}"
+    key, value, tags = store.calls[0]
+    assert key.startswith("incident/host-fault-burst-"), (
+        f"mem key should start with 'incident/host-fault-burst-', got: {key!r}"
+    )
+    assert "host-fault" in tags, f"Expected 'host-fault' tag, got: {tags}"
+    assert "starhouse" in tags, f"Expected 'starhouse' tag, got: {tags}"
+
+
+def test_notify_burst_message_format_normal(monkeypatch):
+    """NORMAL burst Pushover message contains '(NORMAL)' and 'fault-report --burst'."""
+    sent, store = _patch_notify(monkeypatch)
+
+    import agents_core.host_fault_recorder as hfr
+    hfr._LAST_PUSHOVER_TS = 0.0
+
+    notify_burst(BurstLevel.NORMAL, [_make_event()], Path("/tmp/snap.json"))
+    time.sleep(0.2)
+
+    assert len(sent) == 1
+    assert "(NORMAL)" in sent[0], f"Expected '(NORMAL)' in message: {sent[0]!r}"
+    assert "fault-report --burst" in sent[0], f"Expected CLI hint in message: {sent[0]!r}"
+
+
+def test_notify_burst_message_format_high(monkeypatch):
+    """HIGH burst Pushover message contains '(HIGH)' and drop_caches first-aid hint."""
+    sent, store = _patch_notify(monkeypatch)
+
+    import agents_core.host_fault_recorder as hfr
+    hfr._LAST_PUSHOVER_TS = 0.0
+
+    notify_burst(BurstLevel.HIGH, [_make_event() for _ in range(10)],
+                 Path("/tmp/snap.json"))
+    time.sleep(0.2)
+
+    assert len(sent) == 1
+    assert "(HIGH)" in sent[0], f"Expected '(HIGH)' in message: {sent[0]!r}"
+    assert "drop_caches" in sent[0], f"Expected drop_caches hint in message: {sent[0]!r}"
+
+
+# ---------------------------------------------------------------------------
 # Smoke test: import + parse on fixture
 # ---------------------------------------------------------------------------
 
