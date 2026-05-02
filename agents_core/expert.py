@@ -9,10 +9,8 @@ spec: expert-substrate-v0
 """
 from __future__ import annotations
 
-import argparse
 import json
 import re
-import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,7 +26,6 @@ from agents_core.expert_layout import (  # noqa: F401 — re-exported for consum
     post_mortems_root,
     seeds_root,
 )
-from agents_core.gpu import _now_pacific
 from agents_core.llm import call_claude_cli
 
 # ---------------------------------------------------------------------------
@@ -46,6 +43,8 @@ RECORD_KINDS = frozenset({
     "open_question",
     "decision_made",
 })
+
+_VALID_CONFIDENCES = frozenset({"low", "medium", "high"})
 
 _TEMPLATE_PATH = Path(__file__).parent / "templates" / "expert_post_mortem.txt"
 
@@ -82,8 +81,8 @@ class ExpertDispatchResult:
 # ---------------------------------------------------------------------------
 
 def _generate_task_id(expert_id: str) -> str:
-    """Generate expert_<YYYYMMDD>_<HHMMSS>_<usec>_<expert-id>."""
-    now = _now_pacific()
+    """Generate expert_<YYYYMMDD>_<HHMMSS>_<usec>_<expert-id> (UTC)."""
+    now = datetime.now(timezone.utc)
     ts = now.strftime("%Y%m%d_%H%M%S")
     usec = now.strftime("%f")[:4]
     return f"expert_{ts}_{usec}_{expert_id}"
@@ -119,9 +118,9 @@ def _compose_system_prompt(
         parts.append("\n## What you have learned from past dispatches\n")
         pm_dir = experts_root / expert_id / "post-mortems"
         if pm_dir.exists():
-            # Skip .yaml.failed files — they have no records
+            # glob "*.yaml*" to also catch ".yaml.failed"; filter keeps only plain ".yaml"
             pm_files = [
-                f for f in sorted(pm_dir.glob("*.yaml"))
+                f for f in sorted(pm_dir.glob("*.yaml*"))
                 if not f.name.endswith(".yaml.failed")
             ]
             if pm_files:
@@ -203,20 +202,21 @@ def _run_post_mortem(
     pm_yaml_path = pm_dir / f"{task_id}.yaml"
     pm_failed_path = pm_dir / f"{task_id}.yaml.failed"
 
-    dispatch_block: dict = {
-        "dispatch": {
-            "task_id": task_id,
-            "expert_id": expert_id,
-            "intent": intent,
-            "dispatched_by": dispatched_by,
-            "dispatched_at": dispatched_at,
-            "duration_seconds": duration_seconds,
-            "outcome": dispatch_outcome,
-            "layers_loaded": layers_loaded,
-            "notepad_path": f"dispatches/{task_id}/notepad.md",
-            "output_path": f"dispatches/{task_id}/output.md",
-        }
+    dispatch_info: dict = {
+        "task_id": task_id,
+        "expert_id": expert_id,
+        "intent": intent,
+        "dispatched_by": dispatched_by,
+        "dispatched_at": dispatched_at,
+        "duration_seconds": duration_seconds,
+        "outcome": dispatch_outcome,
+        "layers_loaded": layers_loaded,
+        "notepad_path": f"dispatches/{task_id}/notepad.md",
     }
+    # output_path only included when the file actually exists (omitted on abandoned)
+    if output_path.exists() and output_path.stat().st_size > 0:
+        dispatch_info["output_path"] = f"dispatches/{task_id}/output.md"
+    dispatch_block: dict = {"dispatch": dispatch_info}
 
     # Short-circuit: if nothing was written, skip LLM call
     if notepad_content == "(no notepad)" and output_content == "(no output)":
@@ -272,6 +272,18 @@ def _run_post_mortem(
                 )
             if not record.get("essence", "").strip():
                 raise ValueError(f"Record with kind {kind!r} has empty 'essence'")
+            if not record.get("context", "").strip():
+                raise ValueError(f"Record with kind {kind!r} has empty 'context'")
+            confidence = record.get("confidence")
+            if confidence not in _VALID_CONFIDENCES:
+                raise ValueError(
+                    f"Record with kind {kind!r} has invalid confidence {confidence!r};"
+                    f" must be one of {sorted(_VALID_CONFIDENCES)}"
+                )
+            if not isinstance(record.get("domain_tags"), list):
+                raise ValueError(
+                    f"Record with kind {kind!r} has missing or non-list 'domain_tags'"
+                )
 
         full_data = {**dispatch_block, "records": records}
         pm_yaml_path.write_text(
@@ -467,115 +479,3 @@ def dispatch_expert(
         post_mortem_path=pm_path,
         error=error,
     )
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def _cli_dispatch(args: argparse.Namespace) -> int:
-    layers = tuple(l.strip() for l in args.layers.split(",") if l.strip())
-    inp = ExpertDispatchInput(
-        expert_id=args.expert_id,
-        intent=args.intent,
-        layers=layers,
-        model=args.model,
-        requested_by=args.requested_by,
-        timeout_s=args.timeout_s,
-    )
-    try:
-        result = dispatch_expert(inp)
-    except ValueError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
-    print(f"task_id: {result.task_id}")
-    print(f"outcome: {result.outcome}")
-    print(f"post_mortem: {result.post_mortem_path}")
-    if result.error:
-        print(f"error: {result.error}")
-    return 0 if result.outcome == "completed" else 1
-
-
-def _cli_smoke(args: argparse.Namespace) -> int:
-    """Smoke test: real dispatch against test-stub persona in a tmpdir overlay."""
-    import shutil
-    import tempfile
-
-    stub_fixture = Path(__file__).parent.parent / "tests" / "fixtures" / "experts" / "test-stub"
-    if not stub_fixture.exists():
-        print(f"ERROR: test-stub fixture not found at {stub_fixture}", file=sys.stderr)
-        return 1
-
-    with tempfile.TemporaryDirectory(prefix="expert-smoke-") as tmp:
-        tmp_path = Path(tmp)
-        experts_root = tmp_path / "experts"
-        queue_root = tmp_path / "queue"
-
-        # Copy stub persona into tmpdir experts root
-        stub_dir = experts_root / "test-stub"
-        stub_dir.mkdir(parents=True)
-        shutil.copy(stub_fixture / "persona.md", stub_dir / "persona.md")
-
-        print("Running smoke dispatch against test-stub Expert (persona only)...")
-        inp = ExpertDispatchInput(
-            expert_id="test-stub",
-            intent="What is the result of 2 + 2? Write your answer to output.md.",
-            layers=("persona",),
-            model="haiku",
-            requested_by="expert-smoke-test",
-            timeout_s=120,
-        )
-        result = dispatch_expert(inp, _experts_root=experts_root, _queue_dir=queue_root)
-
-        print(f"task_id: {result.task_id}")
-        print(f"outcome: {result.outcome}")
-        print(f"post_mortem_path: {result.post_mortem_path}")
-        if result.output_path and result.output_path.exists():
-            print(f"output.md: {result.output_path.read_text()[:200]}")
-        pm_content = result.post_mortem_path.read_text()
-        print(f"post_mortem YAML:\n{pm_content}")
-
-        if result.outcome not in ("completed", "abandoned", "post_mortem_failed"):
-            print(f"SMOKE FAILED: unknown outcome {result.outcome!r}", file=sys.stderr)
-            return 1
-
-        # Validate post-mortem is parseable YAML with expected structure
-        pm_data = yaml.safe_load(pm_content)
-        if "dispatch" not in pm_data:
-            print("SMOKE FAILED: post-mortem missing 'dispatch' key", file=sys.stderr)
-            return 1
-
-        print("SMOKE PASSED")
-        return 0
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="python -m agents_core.expert",
-        description="Expert dispatch substrate CLI",
-    )
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    # dispatch sub-command
-    dp = sub.add_parser("dispatch", help="Dispatch an Expert")
-    dp.add_argument("--expert-id", required=True)
-    dp.add_argument("--intent", required=True)
-    dp.add_argument("--layers", default="persona",
-                    help="Comma-separated: persona,corpus,memory")
-    dp.add_argument("--model", default="sonnet")
-    dp.add_argument("--timeout-s", type=int, default=600, dest="timeout_s")
-    dp.add_argument("--requested-by", default="cli", dest="requested_by")
-
-    # smoke sub-command
-    sk = sub.add_parser("smoke", help="Smoke test against test-stub Expert")
-    sk.add_argument("--stub", action="store_true", default=True)
-
-    args = parser.parse_args()
-    if args.cmd == "dispatch":
-        sys.exit(_cli_dispatch(args))
-    elif args.cmd == "smoke":
-        sys.exit(_cli_smoke(args))
-
-
-if __name__ == "__main__":
-    main()
