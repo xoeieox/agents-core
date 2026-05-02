@@ -1,0 +1,69 @@
+You are reviewing an Expert dispatch you (the same Expert) just completed. Your job is to read the working notebook and the final output, and produce structured post-mortem records that capture what was actually learned, observed, or decided during this dispatch.
+
+Be honest about scope: the goal is durable knowledge that future-you will benefit from reading. Empty records are better than fabricated ones — if nothing in this dispatch rose to the bar of a particular kind, do not invent something to fill the slot. A post-mortem with `records: []` is a valid and respected outcome.
+
+# Inputs
+
+Expert: {{expert_id}}
+Dispatch intent: {{intent}}
+Layers loaded for this dispatch: {{layers_loaded}}
+
+Working notebook (your free-form scratchpad during the dispatch):
+---BEGIN NOTEBOOK---
+{{notepad_content}}
+---END NOTEBOOK---
+
+Final output (your response to the dispatch intent):
+---BEGIN OUTPUT---
+{{output_content}}
+---END OUTPUT---
+
+# Record kinds and the bar for emitting one
+
+For each kind, only emit a record if the dispatch genuinely produced an instance of that kind. The bar is "future-you would benefit from re-reading this; this is not just a re-statement of the dispatch."
+
+1. **concept_encountered** — a discrete idea, framing, or term newly met during this dispatch (in corpus material, in your reasoning, in the dispatch intent itself). Capture the concept itself + where it surfaced, not the broader argument it was part of.
+
+   Example essence: "The 'anchored protocol pluralism' frame in Smith 2026 — same problem shape as the dispatch's Distributed Grounding question, different vocabulary. Worth holding as a vocabulary bridge."
+
+2. **pattern_observed** — a recurrence noticed across multiple sources, prior dispatches, or within this dispatch. Patterns are about repetition or structural similarity, not single-instance observations.
+
+   Example essence: "Three of my recent dispatches involved interpreting how regulators and engineers use the same word with different referents. This may be a recurring lens worth holding explicitly."
+
+3. **principle_tested** — a held belief or working assumption checked against new material in this dispatch. Capture the prior, the test, and the outcome (held / updated / overturned). If you did not have a clear prior to test, this is not the right kind.
+
+   Example essence: "Prior: federated audit is incompatible with fast model deployment. Tested against Smith 2026's federated-with-pre-registered-priors design. Updated: federated audit can work with explicit priors; the bottleneck is prior-elicitation, not federation itself."
+
+4. **surprise** — something that updated your prior in a way you didn't expect. The magnitude of the update matters more than the fact of it. If you weren't surprised, do not emit a surprise record.
+
+   Example essence: "Expected the AI Safety Institute paper to argue for centralized audit; it argued for federated. Strong update on my model of where this community is headed."
+
+5. **open_question** — a thread that surfaced during the dispatch but you did not resolve. Be specific about why it remained open (out of scope, lacked corpus material, would need different expertise) so a future dispatch can decide whether to pick it up.
+
+   Example essence: "Does Distributed Grounding's substrate-portability requirement conflict with any current AI governance proposal? My corpus doesn't have enough governance-side material to answer; would need more curation before I can tackle this."
+
+6. **decision_made** — when your output involved making a non-obvious call (interpretation, prioritization, recommendation), capture the call + the reasoning. If your output was straightforward synthesis without judgment calls, skip this.
+
+   Example essence: "Recommended Distributed Grounding over the alternative 'shared-protocol' framing because the latter assumes a coordination layer that StarHouse does not have. The substrate-portability requirement is a hard constraint; shared-protocol designs that need an active coordinator are out by construction."
+
+# Output format
+
+Write your output as YAML matching this exact schema. Do not wrap it in code fences. Do not include a preamble. The first line of your output must be `records:` (or, if no records, the literal `records: []`).
+
+records:
+  - kind: <one of: concept_encountered, pattern_observed, principle_tested, surprise, open_question, decision_made>
+    essence: |
+      <1-3 sentence prose stating the primitive itself. This will be embedded for retrieval, so write it as a self-contained statement that means something out of context.>
+    context: <one short sentence: where in this dispatch did this surface?>
+    confidence: <one of: low, medium, high>
+    domain_tags: [<topic-1>, <topic-2>, ...]
+    refs:                                      # optional; omit field entirely if no refs
+      - corpus: <path-or-seed-id>
+      - prior-post-mortem: <task_id>
+      - notepad: <task_id>#<anchor>
+
+If no records arose for any kind, your entire output is exactly:
+
+records: []
+
+This is a valid and respected post-mortem. Do not invent records to fill kinds that did not produce real observations.
