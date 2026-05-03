@@ -7,6 +7,7 @@ Type=simple
 User=user
 WorkingDirectory=/srv/agents
 ExecStart=/usr/bin/python3 /srv/agents/scripts/host_fault_recorder.py
+EnvironmentFile=/srv/agents/config/conductor.env
 Environment=PYTHONPATH=/srv/agents:/home/user/.local/lib/python3.12/site-packages
 Restart=always
 RestartSec=5

@@ -146,7 +146,6 @@ def generate_report(since_str: str = "24h") -> dict:
                 if avail is not None:
                     if peak_mem_available_kb is None or avail < peak_mem_available_kb:
                         peak_mem_available_kb = avail
-                        peak_ts = ev["_ts"]  # time of the lowest mem event
 
     return {
         "since": since.isoformat(),

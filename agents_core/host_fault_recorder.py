@@ -198,21 +198,6 @@ def parse_fault_line(line: str) -> FaultEvent | None:
                     faulting_offset=offset,
                     cpu=_extract_cpu(line),
                 )
-        elif m:
-            module, offset = _extract_module_offset(line)
-            return FaultEvent(
-                captured_at_utc=now,
-                journal_line=line,
-                fault_kind="trap",
-                comm=m.group("comm"),
-                pid=int(m.group("pid")),
-                ip=m.group("ip"),
-                sp=m.group("sp"),
-                error_code=m.group("error"),
-                faulting_module=module,
-                faulting_offset=offset,
-                cpu=_extract_cpu(line),
-            )
 
     # --- Segfault ---
     if "segfault at" in line:
@@ -489,16 +474,16 @@ class BurstDetector:
         self.window_seconds = window_seconds
         self.normal_threshold = normal_threshold
         self.high_threshold = high_threshold
-        # Store timestamps as floats (epoch seconds)
-        self._window: deque[float] = deque()
+        # Store FaultEvent objects so callers can retrieve them for Pushover messages
+        self._window: deque[FaultEvent] = deque()
 
     def add(self, event: FaultEvent) -> BurstLevel:
         """Add an event and return the current burst level."""
         now_ts = event.captured_at_utc.timestamp()
-        self._window.append(now_ts)
+        self._window.append(event)
         # Trim expired entries
         cutoff = now_ts - self.window_seconds
-        while self._window and self._window[0] < cutoff:
+        while self._window and self._window[0].captured_at_utc.timestamp() < cutoff:
             self._window.popleft()
 
         count = len(self._window)
@@ -507,6 +492,10 @@ class BurstDetector:
         if count >= self.normal_threshold:
             return BurstLevel.NORMAL
         return BurstLevel.NONE
+
+    @property
+    def recent_events(self) -> list[FaultEvent]:
+        return list(self._window)
 
     @property
     def recent_events_count(self) -> int:
@@ -663,7 +652,7 @@ def run() -> None:
             try:
                 level = burst.add(event)
                 if level != BurstLevel.NONE and snap_path is not None:
-                    notify_burst(level, [], snap_path)
+                    notify_burst(level, burst.recent_events, snap_path)
             except Exception as exc:
                 logger.error("burst detection failed (non-fatal): %s", exc)
 
