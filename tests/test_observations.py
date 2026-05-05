@@ -203,7 +203,7 @@ def test_filter_substring(corpus):
     assert "MATCH" in res[0]["content"]
 
 
-def test_filter_substring_context(corpus, tmp_path, monkeypatch):
+def test_filter_substring_context(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
     record("agent", "friction", "unique-ctx-xyz", "no match here", now=_ts())
     res = search(substring="unique-ctx-xyz")
