@@ -125,8 +125,9 @@ def search(
     substring: str | None = None,
     limit: int | None = None,
 ) -> list[dict]:
-    """Read across observation files matching filters. Streams JSONL files;
-    does not load everything into memory. Returns entries sorted by timestamp ascending."""
+    """Read across observation files matching filters. Iterates JSONL files line by line
+    (files are not slurped whole), but accumulates all matching entries in memory before
+    returning. Returns entries sorted by timestamp ascending."""
     obs_root = root()
     if not obs_root.exists():
         return []
