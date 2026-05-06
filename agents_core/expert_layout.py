@@ -10,15 +10,20 @@ Layout:
     │   └── <seed-id>.yaml
     ├── post-mortems/            ← layer 3 (written by dispatch_expert)
     │   └── <task_id>.yaml
-    └── dispatches/              ← layer 4 (written during dispatch)
-        └── <task_id>/
-            ├── intent.yaml
-            ├── notepad.md
-            └── output.md
+    ├── dispatches/              ← layer 4 (written during dispatch)
+    │   └── <task_id>/
+    │       ├── intent.yaml
+    │       ├── notepad.md
+    │       └── output.md
+    └── corpora/<mode>/          ← layer 5 (assembled by corpus builders)
+        └── <source-kind>/
+            └── <stable-id>.md
 """
 from pathlib import Path
 
 EXPERTS_ROOT = Path("/srv/lapis/experts")
+
+_VALID_CORPUS_MODES = frozenset({"build", "adversary"})
 
 
 def expert_root(expert_id: str) -> Path:
@@ -39,3 +44,15 @@ def post_mortems_root(expert_id: str) -> Path:
 def dispatches_root(expert_id: str, task_id: str) -> Path:
     """Return /srv/lapis/experts/<expert-id>/dispatches/<task_id>/."""
     return expert_root(expert_id) / "dispatches" / task_id
+
+
+def corpus_root(expert_id: str, mode: str = "build") -> Path:
+    """Return /srv/lapis/experts/<expert-id>/corpora/<mode>/.
+
+    Raises ValueError for unknown mode. Valid modes: 'build', 'adversary'.
+    """
+    if mode not in _VALID_CORPUS_MODES:
+        raise ValueError(
+            f"corpus_root: unknown mode {mode!r}; valid modes are {sorted(_VALID_CORPUS_MODES)}"
+        )
+    return expert_root(expert_id) / "corpora" / mode
