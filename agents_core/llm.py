@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Shared LLM client — talks to llama-server and Claude CLI (Max subscription).
 
-Two backends:
+Backends:
   - call_llm()         → local llama-server (qwen3.6-35b-a3b, GPU, free)
+  - call_operator()    → multi-operator routing (qwen / sonnet / opus / haiku)
   - call_claude_cli()  → claude -p subprocess (Haiku/Sonnet, Max subscription)
 
 All conductor/agent scripts should import from here.
@@ -23,13 +24,22 @@ LLAMACPP_URL = f"http://{TAILSCALE_IP}:8081"
 PACIFIC = ZoneInfo("America/Los_Angeles")
 
 
-def call_llm(prompt: str, system: str = None, timeout: int = 600,
-             json_mode: bool = False, temperature: float = 0.7,
-             log=None, bundle_ids: list[str] = None) -> str | None:
-    """Send a completion request to llama-server via /v1/chat/completions.
+# ---------------------------------------------------------------------------
+# Multi-operator routing
+# ---------------------------------------------------------------------------
 
-    Drop-in replacement for ollama_client.call_ollama() and
-    ollama_utils.call_ollama().
+_OPERATOR_DEFAULTS: dict[str, str] = {
+    "qwen":   "qwen3.6-35b-a3b",
+    "sonnet": "claude-sonnet-4-6",
+    "opus":   "claude-opus-4-7",
+    "haiku":  "claude-haiku-4-5-20251001",
+}
+
+
+def _call_qwen_backend(prompt: str, system: str = None, timeout: int = 600,
+                       json_mode: bool = False, temperature: float = 0.7,
+                       log=None, bundle_ids: list[str] = None) -> str | None:
+    """Send a completion request to the local llama-server (Qwen endpoint).
 
     Context selection priority:
     1. Explicit system= override (task-specific prompts)
@@ -90,6 +100,94 @@ def call_llm(prompt: str, system: str = None, timeout: int = 600,
             if log:
                 log(f"LLM call error: {e}")
             return None
+
+
+def call_operator(operator_class: str, prompt: str, model: str = None,
+                  **kwargs) -> str | None:
+    """Route a completion request to the appropriate backend operator.
+
+    operator_class ∈ {"qwen", "sonnet", "opus", "haiku"}.
+    Raises ValueError for unknown classes.
+
+    Default models:
+        qwen   → "qwen3.6-35b-a3b"
+        sonnet → "claude-sonnet-4-6"
+        opus   → "claude-opus-4-7"
+        haiku  → "claude-haiku-4-5-20251001"
+
+    qwen routes via the local llama-server (same path as call_llm()).
+
+    sonnet / opus / haiku route via ClaudeQueue dispatch metadata only (v0).
+    No direct Anthropic-API calls — kill-switched per decision/no-anthropic-api-direct.
+
+    v0 gap: ClaudeQueue does not yet expose a synchronous-call surface.
+    Anthropic-family calls submit the task (returning the task_id in the
+    exception message) then raise NotImplementedError. The gap is named in
+    the PR description; the future bind is agents-core-claude-queue-sync-surface-v0.
+    """
+    if operator_class not in _OPERATOR_DEFAULTS:
+        raise ValueError(
+            f"Unknown operator_class {operator_class!r}. "
+            f"Must be one of: {sorted(_OPERATOR_DEFAULTS)}"
+        )
+
+    if operator_class == "qwen":
+        return _call_qwen_backend(prompt=prompt, **kwargs)
+
+    # Anthropic-family: route via ClaudeQueue dispatch metadata only (v0).
+    # No direct Anthropic-API code path (decision/no-anthropic-api-direct).
+    resolved_model = model or _OPERATOR_DEFAULTS[operator_class]
+    from agents_core.claude_queue import ClaudeQueue
+    q = ClaudeQueue()
+    task_id = q.submit({
+        "task_type": "llm_call",
+        "model": resolved_model,
+        "submitted_by": "call_operator",
+        "description": f"call_operator/{operator_class}",
+        "payload": {
+            "operator_class": operator_class,
+            "prompt": prompt,
+            "_ignore_intention_registry": True,
+        },
+    })
+    # GAP (v0): ClaudeQueue exposes no synchronous-call surface.
+    # The task is queued; result retrieval requires polling
+    # claude_queue/completed/. Future bind: agents-core-claude-queue-sync-surface-v0.
+    raise NotImplementedError(
+        f"Anthropic-family call (operator_class={operator_class!r}, "
+        f"model={resolved_model!r}) submitted to ClaudeQueue as "
+        f"task_id={task_id!r}. Synchronous result surface not yet "
+        f"implemented — see PR description for the named gap."
+    )
+
+
+def call_llm(prompt: str, system: str = None, timeout: int = 600,
+             json_mode: bool = False, temperature: float = 0.7,
+             log=None, bundle_ids: list[str] = None) -> str | None:
+    """Send a completion request to llama-server via /v1/chat/completions.
+
+    Drop-in replacement for ollama_client.call_ollama() and
+    ollama_utils.call_ollama().
+
+    Thin wrapper around call_operator(operator_class="qwen", ...).
+
+    Context selection priority:
+    1. Explicit system= override (task-specific prompts)
+    2. Explicit bundle_ids= (chub bundles by ID)
+    3. Default: inertia-ecosystem bundle
+
+    Returns the response text, or None on failure.
+    """
+    return call_operator(
+        operator_class="qwen",
+        prompt=prompt,
+        system=system,
+        timeout=timeout,
+        json_mode=json_mode,
+        temperature=temperature,
+        log=log,
+        bundle_ids=bundle_ids,
+    )
 
 
 def call_llm_streaming(prompt: str, system: str = None, timeout: int = 600,
