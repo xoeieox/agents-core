@@ -16,6 +16,9 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest"]
 
+[project.scripts]
+narrative-emit = "agents_core.narrative.emit:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["agents_core*"]
