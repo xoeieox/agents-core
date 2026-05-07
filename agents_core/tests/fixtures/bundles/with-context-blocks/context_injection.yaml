@@ -1,0 +1,22 @@
+blocks:
+  - id: conventions
+    source: mem.search
+    params:
+      key_prefix: review/convention/
+    max_chars: 2000
+    truncation: tail
+    freshness: per_task
+    cache_scope: process
+    on_empty: placeholder:No repo-specific conventions found
+
+  - id: agent_observations
+    source: agent_observations
+    params:
+      agent_id: test-agent
+      tags: [test-tag]
+      limit: 10
+    max_chars: 1500
+    truncation: tail
+    freshness: per_task
+    cache_scope: host
+    on_empty: omit
