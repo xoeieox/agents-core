@@ -189,14 +189,16 @@ def _classify_runner_failure(combined: str, rc: int) -> tuple[str, str]:
 
 # ---------------------------------------------------------------------------
 # Per-task execution
+# Step A: verbatim body extracted into _run_shaped_task; _run_task delegates.
+# Step B (next commit): _run_task gains task_type dispatch + council handler.
 # ---------------------------------------------------------------------------
 
-async def _run_task(queue: ClaudeQueue, task: dict) -> None:
+async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
     """Spawn _runner.py, capture output, write output file, mark done.
 
-    This is the body of the daemon's per-worker coroutine. Errors are caught
-    at the top level; any unhandled exception drops the task in active/ for
-    the next startup sweep to clean up.
+    Body of the shaped-agent execution path.  Errors are caught at the top
+    level; any unhandled exception drops the task in active/ for the next
+    startup sweep to clean up.
     """
     task_id = task["id"]
     timeout = int(task.get("timeout_seconds", 300))
@@ -270,6 +272,11 @@ async def _run_task(queue: ClaudeQueue, task: dict) -> None:
     )
     notify_completion(task, output_path)
     log.info(f"done  {task_id} rc=0")
+
+
+async def _run_task(queue: ClaudeQueue, task: dict) -> None:
+    """Route to shaped handler (Step A: single route; Step B adds dispatch)."""
+    return await _run_shaped_task(queue, task)
 
 
 # ---------------------------------------------------------------------------
