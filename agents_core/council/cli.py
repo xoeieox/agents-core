@@ -46,10 +46,8 @@ import random
 import re
 import subprocess
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import yaml
 
@@ -677,7 +675,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     task = {
         "task_type": "council.run",
         "description": description,
-        "priority": 5,
+        "priority": 50,  # Priority.NORMAL
         "model": "sonnet",
         "notify": bool(notify),
         "timeout_seconds": timeout_seconds,

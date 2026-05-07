@@ -71,12 +71,19 @@ log = logging.getLogger("claude-queue-runner")
 
 
 # ---------------------------------------------------------------------------
-# Ops telemetry
+# Ops telemetry — operational primitive extraction (Lapis Ops Layer parity).
+#
+# Ported from /srv/agents/scripts/gpu_queue_runner.py:64-96. Gated by
+# LAPIS_OPS_PRIMITIVES env var (default on); failures are swallowed because
+# missing weather data is acceptable at the aggregate. Called on the success
+# path only — match GPU's semantics.
 # ---------------------------------------------------------------------------
 
 def _extract_ops_primitives(task_id: str, task_type: str,
                             result_text: str | None,
                             output_path: str | None) -> None:
+    """Post-completion hook: tag the task output with operational primitives
+    and store to mem.db under weather/<date>/<task_id>."""
     if os.environ.get("LAPIS_OPS_PRIMITIVES", "1") == "0":
         return
     try:
@@ -87,7 +94,7 @@ def _extract_ops_primitives(task_id: str, task_type: str,
             except OSError:
                 pass
         if not text or len(text.strip()) < 80:
-            return
+            return  # nothing worth tagging
         import ops_primitives
         prims = ops_primitives.extract_and_store(task_id, task_type, text)
         if prims:
@@ -99,6 +106,12 @@ def _extract_ops_primitives(task_id: str, task_type: str,
 
 # ---------------------------------------------------------------------------
 # Notification helpers
+#
+# These are local to the runner. `agents_core.notify` exports
+# `send_notification()` + a `Priority` enum — no `notify_completion` /
+# `notify_failure` functions exist there. `gpu_queue_runner.py` follows the
+# same pattern: thin wrappers that format task context and call
+# send_notification().
 # ---------------------------------------------------------------------------
 
 def _fmt_task_label(task: dict) -> str:
@@ -229,6 +242,18 @@ def startup_sweep(queue: ClaudeQueue) -> None:
 # ---------------------------------------------------------------------------
 
 def _classify_runner_failure(combined: str, rc: int) -> tuple[str, str]:
+    """Return (prefix, error_for_queue_fail) for a non-zero _runner.py exit.
+
+    Contract source: ``agents_core.shaped_runner``.  That module emits
+    ``ERROR: worktree_setup: <exception>`` as the *first token of a line*
+    when the worktree setup itself raises.  All other failure modes
+    (call_claude_cli returning None, shape failures, unknown return codes)
+    do NOT emit that prefix.
+
+    Any future prefix added to shaped_runner must be reflected here with an
+    explicit line-anchored check — do NOT revert to substring ``in combined``
+    matching, which was the source of the 2026-04-27 misclassification bug.
+    """
     has_setup_err = any(
         line.startswith("ERROR: worktree_setup")
         for line in combined.splitlines()
