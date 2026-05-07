@@ -818,7 +818,7 @@ def _parse_synthesis(text: str) -> dict:
         text,
         re.IGNORECASE | re.DOTALL,
     )
-    confidence_m = re.search(r"CONFIDENCE:\s*(\w[\w\-]*)", text, re.IGNORECASE)
+    confidence_m = re.search(r"CONFIDENCE:\s*(\w+)", text, re.IGNORECASE)
 
     questions_raw = (questions_m.group(1).strip() if questions_m else "").strip()
     if questions_raw.lower() in {"none", "none.", "n/a", "-", ""}:
