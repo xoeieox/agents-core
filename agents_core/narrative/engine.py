@@ -280,10 +280,6 @@ def emit_draft(
     while time.monotonic() < deadline:
         if output_file.exists() and output_file.stat().st_size > 0:
             break
-        if not spec_path.exists():
-            # spec deleted by runner — brief grace then check once more
-            time.sleep(min(2.0, _poll_interval))
-            break
         time.sleep(_poll_interval)
 
     if not (output_file.exists() and output_file.stat().st_size > 0):
