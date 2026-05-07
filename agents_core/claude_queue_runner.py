@@ -64,7 +64,7 @@ _COUNCIL_LOG_DIR = Path("/srv/lapis/council/logs")
 _COUNCIL_ORPHAN_AGE_SECS = int(os.environ.get("COUNCIL_ORPHAN_AGE_SECS", "3600"))
 
 # Terminal status sets per mode.
-_DELIBERATION_TERMINAL = frozenset({"resolved", "open", "diverged"})
+_DELIBERATION_TERMINAL = frozenset({"resolved", "open", "laid-down"})
 _SCENE_TERMINAL = frozenset({"closed"})
 
 log = logging.getLogger("claude-queue-runner")

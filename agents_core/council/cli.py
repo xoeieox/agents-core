@@ -23,6 +23,8 @@ run:
 Environment:
     COUNCIL_ENGINE_STUB=1  — skip LLM calls, write fixture turn/synthesis,
                              for smoke / CI use.
+    COUNCIL_STUB_POSITIONS — comma-separated positions for stub mode
+                             (e.g. "agree,stand-aside"). Default: "agree,agree".
 
 Modes:
   deliberation (default) — 2 entities, alternating turns, synthesis turn
@@ -165,7 +167,20 @@ def gather_mem_context(decision: str, max_hits: int = 6) -> dict:
                 continue
             seen_keys.add(key)
             hits.append({"key": key, "matched_on": term})
-    return {"terms": tokens[:3], "hits": hits[:max_hits]}
+
+    context: dict = {"terms": tokens[:3], "hits": hits[:max_hits]}
+
+    # NEW v0.next: surface prior cohesion findings for voice selection context.
+    # find_related returns [] when cache dir is missing (first-deploy safe).
+    try:
+        from agents_core.council import cache as _cache
+        context["cohesion_findings"] = _cache.find_related(
+            decision_text=decision, limit=3
+        )
+    except Exception:
+        context["cohesion_findings"] = []
+
+    return context
 
 
 def _extract_search_terms(decision: str) -> list[str]:
@@ -221,6 +236,24 @@ def select_entities(
     mem_preview = (
         "\n".join(f"- {h['key']}" for h in context.get("hits", []))
         or "(no direct mem hits)"
+    )
+
+    # NEW v0.next: render prior cohesion findings section between MEM CONTEXT and ROSTER.
+    findings = context.get("cohesion_findings", [])
+    if findings:
+        finding_lines = []
+        for f in findings:
+            kv = f.get("kernel_version", "?")
+            stale = f.get("stale", False)
+            landing = f.get("synthesis", {}).get("landing", "") or ""
+            prefix = f"[stale, kernel {kv}]" if stale else f"[prior finding {kv}]"
+            truncated = (landing[:300] + "\u2026") if len(landing) > 300 else landing
+            finding_lines.append(f"{prefix} {truncated}")
+        findings_text = "\n".join(finding_lines)
+    else:
+        findings_text = "(none)"
+    findings_section = (
+        f"RELATED PRIOR COHESION FINDINGS:\n{findings_text}\n--- END PRIOR FINDINGS ---"
     )
 
     remaining = n - 1 if pinned else n
@@ -283,6 +316,8 @@ def select_entities(
 
 RELATED MEM CONTEXT (from prior decisions/fixes/architecture):
 {mem_preview}
+
+{findings_section}
 
 ROSTER (character_id, source_pool, and a brief cue):
 {roster_text}
@@ -353,8 +388,223 @@ def _extract_json(text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Deliberation runtime
+# Deliberation runtime — v0.next helpers
 # ---------------------------------------------------------------------------
+
+
+def _render_transcript(turns: list[dict]) -> str:
+    """Render deliberation_turn entries as transcript text for cast prompts.
+
+    Filters to turns where type == "deliberation_turn" (whitelist per M6 in v3->v4).
+    Both _render_transcript and turns_used derivation use this whitelist — they are
+    coupled by design; changing one requires changing the other.
+
+    Returns "(no turns recorded)" for empty filtered list (per M7 in v2->v3).
+    """
+    filtered = [t for t in turns if t.get("type") == "deliberation_turn"]
+    if not filtered:
+        return "(no turns recorded)"
+    return "\n\n".join(
+        f"[{t.get('speaker', 'unknown')}] {t.get('content', '')}"
+        for t in filtered
+    )
+
+
+def _aggregate_positions(positions: list[dict], turns_used: int, turns_cap: int) -> dict:
+    """Compute confidence + derived views from per-voice position list.
+
+    Returns {"confidence": str, "stood_aside": list[dict], "blocks": list[dict]}.
+
+    Aggregator table (per §Scope):
+      all agree               -> converged
+      agree + stand-aside     -> converged-with-reservation
+      any block, turns remain -> partial
+      any block, turns at cap -> laid-down
+    """
+    stood_aside = [
+        {"voice": p["voice"], "reason": p.get("reason", "")}
+        for p in positions
+        if p.get("position") == "stand-aside"
+    ]
+    blocks = [
+        {"voice": p["voice"], "basis": p.get("basis", "")}
+        for p in positions
+        if p.get("position") == "block"
+    ]
+
+    if blocks:
+        confidence = "laid-down" if turns_used >= turns_cap else "partial"
+    elif stood_aside:
+        confidence = "converged-with-reservation"
+    else:
+        confidence = "converged"
+
+    return {"confidence": confidence, "stood_aside": stood_aside, "blocks": blocks}
+
+
+def _extract_invariants_implicated(synthesis_text: str, positions: list[dict]) -> list[str]:
+    """Extract kernel invariant ids from synthesis text and position bases.
+
+    Three matched forms (per §Scope — regex shapes enumerated):
+      kernel.invariant.N  — ascii ref (e.g. kernel.invariant.4)
+      Invariant N         — prose ref, case-insensitive
+      invariant (N)       — paren-form, case-insensitive
+
+    Returns sorted unique list of ids as strings, e.g. ["4", "8"].
+    May return [] — expected for many runs. Empty result does NOT affect actionable.
+    """
+    patterns = [
+        r"kernel\.invariant\.([1-8])\b",
+        r"(?i)Invariant\s+([1-8])\b",
+        r"(?i)invariant\s+\(([1-8])\)",
+    ]
+    found: set[int] = set()
+    texts = [synthesis_text]
+    for p in positions:
+        basis = p.get("basis") or ""
+        texts.append(str(basis))
+    combined = " ".join(texts)
+    for pattern in patterns:
+        for m in re.finditer(pattern, combined):
+            found.add(int(m.group(1)))
+    return [str(n) for n in sorted(found)]
+
+
+def _cast_positions(run: dict, entities, adapter) -> list[dict]:
+    """Cast per-voice positions on the synthesis. Returns list of position dicts.
+
+    Handles both stub (COUNCIL_ENGINE_STUB=1) and real paths:
+
+    Stub path: returns fixture positions from COUNCIL_STUB_POSITIONS env var.
+      Default "agree,agree". Auto-fills reason/basis for stand-aside/block per
+      stub safety contract (L11 in v1->v2). No LLM calls.
+
+    Real path: calls entity.act(cast_prompt, ctx) for each character voice,
+      parses JSON response, validates per Invariants 4-5.
+
+    Narrator entities (role=="narrator") are excluded — they don't vote.
+    entities parameter is ignored in stub mode (env-var fast-path).
+    """
+    character_sels = [
+        sel for sel in run.get("selected_entities", [])
+        if sel.get("role") != ROLE_NARRATOR
+    ]
+
+    if os.environ.get("COUNCIL_ENGINE_STUB") == "1":
+        stub_env = os.environ.get("COUNCIL_STUB_POSITIONS", "agree,agree")
+        raw_positions = [p.strip() for p in stub_env.split(",")]
+        result = []
+        for i, sel in enumerate(character_sels):
+            pos = raw_positions[i] if i < len(raw_positions) else "agree"
+            if pos == "stand-aside":
+                entry: dict = {
+                    "voice": sel["id"],
+                    "position": "stand-aside",
+                    "reason": "[stub] stand-aside reason",
+                    "basis": None,
+                }
+            elif pos == "block":
+                entry = {
+                    "voice": sel["id"],
+                    "position": "block",
+                    "reason": "[stub] block reason",
+                    "basis": "kernel.invariant.1",
+                }
+            else:
+                entry = {
+                    "voice": sel["id"],
+                    "position": "agree",
+                    "reason": "",
+                    "basis": None,
+                }
+            result.append(entry)
+        return result
+
+    # Real path: build cast prompt per voice, call entity.act, parse+validate.
+    synthesis = run.get("synthesis", {})
+    synth_landing = synthesis.get("landing", "")
+    synth_questions = synthesis.get("open_questions", [])
+    transcript = _render_transcript(run.get("turns", []))
+    questions_text = (
+        "\n".join(f"- {q}" for q in synth_questions) if synth_questions else "(none)"
+    )
+
+    try:
+        from lapis_engine import RunContext  # type: ignore
+    except ImportError:
+        RunContext = None  # type: ignore
+
+    result = []
+    for i, sel in enumerate(character_sels):
+        entity = entities[i] if entities and i < len(entities) else None
+        if entity is None:
+            raise RuntimeError(
+                f"entity is None for {sel['id']!r} in non-stub _cast_positions"
+            )
+
+        other_ids = [s["id"] for j, s in enumerate(character_sels) if j != i]
+        other_str = ", ".join(other_ids) if other_ids else "the other participant"
+
+        cast_prompt = (
+            f"You have just deliberated alongside {other_str}. "
+            "Here is the full exchange:\n\n"
+            "--- TRANSCRIPT ---\n"
+            f"{transcript}\n"
+            "--- END TRANSCRIPT ---\n\n"
+            "The synthesis of the deliberation reads:\n\n"
+            f"{synth_landing}\n\n"
+            "Open questions surfaced:\n"
+            f"{questions_text}\n\n"
+            'Cast your position on this synthesis using the consensus-process taxonomy:\n\n'
+            '- "agree" \u2014 you accept the synthesis as it stands.\n'
+            '- "stand-aside" \u2014 you don\'t endorse the synthesis but you let the group '
+            'proceed; provide a 1-2 sentence reason explaining what you\'d register as '
+            'concern. You may cite a kernel invariant (e.g. "kernel.invariant.4") in your '
+            'basis when the concern names a specific invariant.\n'
+            '- "block" \u2014 you have a firm conviction the synthesis does not serve the '
+            'whole; provide a basis (a kernel invariant id like "kernel.invariant.4" or '
+            "evidence reference).\n\n"
+            "Respond with ONLY a JSON object:\n"
+            "{\n"
+            '  "position": "agree" | "stand-aside" | "block",\n'
+            '  "reason": "<your reason, 1-2 sentences; required for stand-aside; '
+            'recommended for block; optional for agree>",\n'
+            '  "basis": "<kernel invariant id or evidence reference; required for block; '
+            'allowed for stand-aside; null for agree>"\n'
+            "}"
+        )
+
+        ctx = RunContext() if RunContext is not None else None
+        raw = entity.act(cast_prompt, ctx)
+
+        data = _extract_json(raw)
+        position = data.get("position", "")
+        reason = data.get("reason") or ""
+        basis = data.get("basis")
+
+        if position not in ("agree", "stand-aside", "block"):
+            raise RuntimeError(
+                f"_cast_positions: unknown position {position!r} from {sel['id']!r}"
+            )
+        if position == "stand-aside" and len(reason) < 5:
+            raise RuntimeError(
+                f"_cast_positions: stand-aside requires non-empty reason (\u22655 chars) "
+                f"from {sel['id']!r}; got {reason!r}"
+            )
+        if position == "block" and (not basis or len(str(basis)) < 5):
+            raise RuntimeError(
+                f"_cast_positions: block requires non-null basis (\u22655 chars) "
+                f"from {sel['id']!r}; got {basis!r}"
+            )
+
+        result.append({
+            "voice": sel["id"],
+            "position": position,
+            "reason": reason,
+            "basis": basis,
+        })
+
+    return result
 
 
 def run_deliberation(run_id: str) -> None:
@@ -368,9 +618,13 @@ def run_deliberation(run_id: str) -> None:
     runner's notify_completion/notify_failure handle it.
 
     COUNCIL_ENGINE_STUB=1: skip LLM calls entirely, write fixture turn/synthesis.
+    COUNCIL_STUB_POSITIONS: comma-separated positions for stub cast (default: agree,agree).
     """
+    from agents_core.council import cache as _cache
+
     run = load_run(run_id)
     mode = run.get("mode", DEFAULT_MODE)
+    kernel_version = _cache.read_kernel_version()
 
     if os.environ.get("COUNCIL_ENGINE_STUB") == "1":
         first_id = (run["selected_entities"][0]["id"]
@@ -379,37 +633,45 @@ def run_deliberation(run_id: str) -> None:
             {
                 "step": 1,
                 "speaker": first_id,
-                "type": "dialogue",
+                "type": "deliberation_turn",  # was "dialogue" — H1 fix per v3->v4
                 "content": "[STUB] turn output",
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
             }
         )
         if mode == "scene":
             run["status"] = "closed"
-        else:
-            synth_content = (
-                "LANDING: stub-landing\n"
-                "OPEN QUESTIONS: -\n"
-                "CONFIDENCE: converged"
-            )
-            run["turns"].append(
-                {
-                    "step": 2,
-                    "speaker": "synthesis",
-                    "type": "synthesis",
-                    "content": synth_content,
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                }
-            )
-            run["synthesis"] = _parse_synthesis(synth_content)
-            run["status"] = _status_from_synthesis(run["synthesis"])
+            run["completed_at"] = datetime.now().isoformat(timespec="seconds")
+            save_run(run)
+            return
+        # Deliberation stub: write synthesis turn, parse synthesis, then shared tail.
+        synth_content = (
+            "LANDING: stub-landing\n"
+            "OPEN QUESTIONS: -\n"
+            "CONFIDENCE: converged"
+        )
+        run["turns"].append(
+            {
+                "step": 2,
+                "speaker": "synthesis",
+                "type": "synthesis",
+                "content": synth_content,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        run["synthesis"] = _parse_synthesis(synth_content)
+        # Common deliberation tail — MUST run in stub mode too (H2 fix per v3->v4).
+        # entities=None is safe: _cast_positions uses env-var fast-path in stub mode.
+        _apply_position_cast_tail(
+            run, entities=None, adapter=None,
+            kernel_version=kernel_version, cache=_cache,
+        )
         run["completed_at"] = datetime.now().isoformat(timespec="seconds")
         save_run(run)
         return
 
     # Late imports: keep lapis-engine load function-local so importing
     # agents_core.council doesn't force-load lapis-engine at queue startup.
-    from lapis_engine import (
+    from lapis_engine import (  # type: ignore
         ClaudeAdapter,
         DeliberationDirector,
         Engine,
@@ -417,7 +679,7 @@ def run_deliberation(run_id: str) -> None:
         SceneDirector,
         StepData,
     )
-    from archetypes.engine.character_entity import CharacterEntity
+    from archetypes.engine.character_entity import CharacterEntity  # type: ignore
     from agents_core.council.narrator_entity import NarratorEntity
 
     try:
@@ -454,7 +716,11 @@ def run_deliberation(run_id: str) -> None:
         else:
             synth_content = run["turns"][-1]["content"] if run["turns"] else ""
             run["synthesis"] = _parse_synthesis(synth_content)
-            run["status"] = _status_from_synthesis(run["synthesis"])
+            # Common deliberation tail — runs in real mode.
+            _apply_position_cast_tail(
+                run, entities=entities, adapter=adapter,
+                kernel_version=kernel_version, cache=_cache,
+            )
         run["completed_at"] = datetime.now().isoformat(timespec="seconds")
         save_run(run)
     except Exception as e:
@@ -463,6 +729,57 @@ def run_deliberation(run_id: str) -> None:
         run["completed_at"] = datetime.now().isoformat(timespec="seconds")
         save_run(run)
         raise
+
+
+def _apply_position_cast_tail(
+    run: dict, entities, adapter, kernel_version: str, cache
+) -> None:
+    """Shared deliberation tail: cast positions, aggregate, update synthesis, write cache.
+
+    Runs in BOTH stub and real branches of run_deliberation (H2 fix per v3->v4).
+    Mutates run["synthesis"] in-place with all v0.next keys.
+    Aggregator output overrides parsed confidence (Invariant 11).
+    Sets run["status"] from the updated synthesis.
+    """
+    positions = _cast_positions(run, entities, adapter)
+
+    # turns_used: whitelist filter "deliberation_turn" only (per H3 in v2->v3 and M6).
+    # Coupled to _render_transcript whitelist — both must stay in sync.
+    turns_used = len([
+        t for t in run.get("turns", [])
+        if t.get("type") == "deliberation_turn"
+    ])
+    agg = _aggregate_positions(
+        positions, turns_used, turns_cap=int(run.get("turns_cap", 8))
+    )
+
+    synthesis = run["synthesis"]
+
+    inv_text = (
+        synthesis.get("landing", "") + " " +
+        " ".join(synthesis.get("open_questions", []))
+    )
+    synthesis["invariants_implicated"] = _extract_invariants_implicated(inv_text, positions)
+
+    synthesis["evidence"] = [
+        {"voice": p["voice"], "claim": p.get("reason", ""), "basis": p.get("basis")}
+        for p in positions
+        if p.get("reason") or p.get("basis")
+    ]
+
+    synthesis["positions"] = positions
+    synthesis["stood_aside"] = agg["stood_aside"]
+    synthesis["blocks"] = agg["blocks"]
+
+    # Aggregator override of confidence — Invariant 11.
+    synthesis["confidence"] = agg["confidence"]
+    synthesis["actionable"] = agg["confidence"] in ("converged", "converged-with-reservation")
+    synthesis["output_class"] = "cohesion-finding" if synthesis["actionable"] else "none"
+
+    run["status"] = _status_from_synthesis(synthesis)
+
+    if synthesis["output_class"] == "cohesion-finding":
+        cache.write_finding(run, kernel_version)
 
 
 def _build_entity(sel: dict, adapter, CharacterEntity, NarratorEntity):
@@ -521,11 +838,22 @@ def _parse_synthesis(text: str) -> dict:
 
 
 def _status_from_synthesis(synthesis: dict) -> str:
+    """Map synthesis confidence to run status.
+
+    v0.next extended mapping (per H1 in v1->v2 and §Scope pseudocode):
+      converged                  -> resolved
+      converged-with-reservation -> resolved
+      laid-down                  -> laid-down
+      diverged                   -> open  (backward-compat for pre-v0.next run YAMLs)
+      partial / <anything else>  -> open
+    """
     conf = synthesis.get("confidence", "partial")
-    if conf == "converged":
+    if conf in ("converged", "converged-with-reservation"):
         return "resolved"
-    if conf == "diverged":
-        return "diverged"
+    if conf == "laid-down":
+        return "laid-down"
+    if conf == "diverged":  # backward-compat for pre-v0.next run YAMLs — Invariant 10
+        return "open"
     return "open"
 
 

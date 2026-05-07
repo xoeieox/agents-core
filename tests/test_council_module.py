@@ -40,11 +40,15 @@ def test_run_deliberation_writes_turns_and_synthesis(tmp_path, monkeypatch):
     run_yaml = council_dir / f"{run_id}.yaml"
     run_yaml.write_text(yaml.safe_dump(run, sort_keys=False, allow_unicode=True))
     from agents_core.council import cli as council_cli
+    from agents_core.council import cache
     monkeypatch.setattr(council_cli, "COUNCIL_DIR", council_dir)
+    # pin cache dir to tmp_path so position-cast tail doesn't leak fixture
+    # files to /srv/lapis/council/cache/cohesion/ (same L2 fix as the neighboring test)
+    monkeypatch.setattr(cache, "CACHE_DIR", tmp_path / "cache")
     council_cli.run_deliberation(run_id)
     result = yaml.safe_load(run_yaml.read_text())
     assert len(result["turns"]) >= 1
-    assert result["status"] in {"resolved", "open", "diverged"}
+    assert result["status"] in {"resolved", "open", "laid-down"}
     assert "synthesis" in result
     assert result["synthesis"]["confidence"] == "converged"
 
@@ -103,7 +107,11 @@ def test_run_deliberation_does_not_call_send_notification(tmp_path, monkeypatch)
     run_yaml = council_dir / f"{run_id}.yaml"
     run_yaml.write_text(yaml.safe_dump(run, sort_keys=False, allow_unicode=True))
     from agents_core.council import cli as council_cli
+    from agents_core.council import cache
     monkeypatch.setattr(council_cli, "COUNCIL_DIR", council_dir)
+    # L2 (v4->v4.1): pin cache dir to tmp_path so position-cast tail doesn't
+    # leak fixture files to /srv/lapis/council/cache/cohesion/.
+    monkeypatch.setattr(cache, "CACHE_DIR", tmp_path / "cache")
     call_log: list = []
     import agents_core.notify as notify_mod
     monkeypatch.setattr(notify_mod, "send_notification", lambda *a, **kw: call_log.append((a, kw)))
@@ -150,7 +158,7 @@ def test_status_mapping():
     from agents_core.council.cli import _status_from_synthesis
     assert _status_from_synthesis({"confidence": "converged"}) == "resolved"
     assert _status_from_synthesis({"confidence": "partial"}) == "open"
-    assert _status_from_synthesis({"confidence": "diverged"}) == "diverged"
+    assert _status_from_synthesis({"confidence": "diverged"}) == "open"
     assert _status_from_synthesis({}) == "open"
 
 
