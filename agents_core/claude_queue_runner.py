@@ -42,6 +42,31 @@ CLONE_ROOTS_GLOB = "/srv/git/*-working"
 POLL_INTERVAL_S = 2.0
 STARTUP_STALE_GRACE_S = 300
 
+# Council concurrency control — module-level, NOT on Daemon (see docstring).
+# asyncio.Semaphore is safe to create at module level in Python 3.10+.
+_COUNCIL_SEM = asyncio.Semaphore(1)
+"""Hard cap: at most one council subprocess at a time.
+
+NOT placed on Daemon because the existing dispatch pattern is
+  Daemon._worker → module-level _run_task(queue, task)
+with no Daemon handle threaded through.  Putting it on Daemon would require
+reworking every call site.
+
+Acquisition order in Daemon._worker is load-bearing: _COUNCIL_SEM is
+acquired BEFORE self.sem.  Reversed order causes the second queued council
+task to idle-hold a worker slot while waiting — dropping fixer/reviewer
+throughput to zero.  With the outer-first ordering, the second council task
+blocks without holding a worker slot.
+"""
+
+_COUNCIL_DIR = Path("/srv/lapis/council")
+_COUNCIL_LOG_DIR = Path("/srv/lapis/council/logs")
+_COUNCIL_ORPHAN_AGE_SECS = int(os.environ.get("COUNCIL_ORPHAN_AGE_SECS", "3600"))
+
+# Terminal status sets per mode.
+_DELIBERATION_TERMINAL = frozenset({"resolved", "open", "diverged"})
+_SCENE_TERMINAL = frozenset({"closed"})
+
 log = logging.getLogger("claude-queue-runner")
 
 
@@ -161,6 +186,56 @@ def startup_sweep(queue: ClaudeQueue) -> None:
             ["git", "-C", str(clone), "worktree", "prune"],
             check=False, capture_output=True, timeout=30)
 
+    # Council orphan recovery: mark deliberating runs that have no
+    # corresponding queue task and are older than _COUNCIL_ORPHAN_AGE_SECS.
+    import yaml as _yaml
+    if _COUNCIL_DIR.exists():
+        queued_ids: set[str] = set()
+        for subdir_name in ("pending", "active", "completed", "failed"):
+            subdir = queue.queue_dir / subdir_name
+            if subdir.exists():
+                for f in subdir.glob("*.yaml"):
+                    queued_ids.add(f.stem)
+        cancelled_dir = queue.queue_dir / "cancelled"
+        if cancelled_dir.exists():
+            for f in cancelled_dir.glob("*.yaml"):
+                queued_ids.add(f.stem)
+
+        sweep_now = datetime.now()  # naive — matches council YAML created_at
+        for run_yaml in _COUNCIL_DIR.glob("*.yaml"):
+            try:
+                run_data = _yaml.safe_load(run_yaml.read_text())
+            except Exception:
+                continue
+            if not isinstance(run_data, dict):
+                continue
+            if run_data.get("status") != "deliberating":
+                continue
+            created_at = run_data.get("created_at")
+            if created_at:
+                try:
+                    created_dt = datetime.fromisoformat(created_at)
+                    age_s = (sweep_now - created_dt).total_seconds()
+                    if age_s <= _COUNCIL_ORPHAN_AGE_SECS:
+                        continue
+                except ValueError:
+                    pass
+            run_id = run_data.get("run_id") or run_yaml.stem
+            if run_id in queued_ids:
+                continue
+            log.warning(f"orphan council run {run_id} — marking failed (crash recovery)")
+            run_data["status"] = "failed"
+            run_data["error"] = "runner_crash_recovery"
+            run_data["completed_at"] = sweep_now.isoformat(timespec="seconds")
+            try:
+                run_yaml.write_text(
+                    _yaml.safe_dump(
+                        run_data, sort_keys=False, width=100, allow_unicode=True
+                    )
+                )
+            except Exception as exc:
+                log.warning(f"council orphan recovery: could not write {run_yaml}: {exc}")
+
 
 # ---------------------------------------------------------------------------
 # Runner failure classification
@@ -191,12 +266,10 @@ def _classify_runner_failure(combined: str, rc: int) -> tuple[str, str]:
 # Per-task execution
 # ---------------------------------------------------------------------------
 
-async def _run_task(queue: ClaudeQueue, task: dict) -> None:
+async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
     """Spawn _runner.py, capture output, write output file, mark done.
 
-    This is the body of the daemon's per-worker coroutine. Errors are caught
-    at the top level; any unhandled exception drops the task in active/ for
-    the next startup sweep to clean up.
+    Body of the shaped-agent execution path (Step A extraction).
     """
     task_id = task["id"]
     timeout = int(task.get("timeout_seconds", 300))
@@ -273,6 +346,126 @@ async def _run_task(queue: ClaudeQueue, task: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Council task handler
+# ---------------------------------------------------------------------------
+
+async def _run_council_task(queue: ClaudeQueue, task: dict) -> None:
+    """Spawn `python -m agents_core.council run <run_id>`, read terminal status,
+    mark queue complete/failed.
+
+    Output path = run YAML (what dashboard reads).
+    Does NOT call _extract_ops_primitives.
+    notify_completion / notify_failure gated on task["notify"].
+    """
+    task_id = task["id"]
+    timeout = int(task.get("timeout_seconds", 1200))
+    payload = task.get("payload") or {}
+    mode = payload.get("mode", "")
+
+    if mode not in ("deliberation", "scene"):
+        msg = f"council.run: invalid payload.mode={mode!r}"
+        queue.fail(task_id, error=msg)
+        notify_failure(task, msg)
+        return
+
+    run_yaml_path = _COUNCIL_DIR / f"{task_id}.yaml"
+    log_file = _COUNCIL_LOG_DIR / f"{task_id}.log"
+    _COUNCIL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    log.info(f"council claim {task_id} mode={mode} timeout={timeout}s")
+
+    try:
+        with open(log_file, "ab") as log_fh:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "agents_core.council", "run", task_id,
+                stdout=log_fh,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+    except OSError as e:
+        msg = f"ERROR: failed to spawn council subprocess: {e}"
+        queue.fail(task_id, error=msg)
+        notify_failure(task, msg)
+        return
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        msg = f"timeout after {timeout}s"
+        queue.fail(task_id, error=msg)
+        notify_failure(task, msg)
+        return
+
+    rc = proc.returncode
+
+    if rc is not None and rc < 0:
+        msg = f"interrupted signal {-rc}"
+        queue.fail(task_id, error=msg)
+        notify_failure(task, msg)
+        return
+
+    if rc != 0:
+        msg = f"EXIT {rc}: subprocess failed before terminal status"
+        queue.fail(task_id, error=msg)
+        notify_failure(task, msg)
+        return
+
+    try:
+        import yaml as _yaml
+        run_data = _yaml.safe_load(run_yaml_path.read_text())
+        status = (run_data or {}).get("status", "")
+    except Exception as e:
+        msg = f"could not read run YAML after subprocess exit: {e}"
+        queue.fail(task_id, error=msg)
+        notify_failure(task, msg)
+        return
+
+    terminal_set = (
+        _DELIBERATION_TERMINAL if mode == "deliberation" else _SCENE_TERMINAL
+    )
+
+    if status == "failed":
+        error_detail = (run_data or {}).get("error", "run_deliberation raised")
+        queue.fail(task_id, error=error_detail)
+        notify_failure(task, error_detail)
+        return
+
+    if status not in terminal_set:
+        msg = "runtime_did_not_set_terminal_status"
+        queue.fail(task_id, error=msg)
+        notify_failure(task, msg)
+        return
+
+    output_path = str(run_yaml_path)
+    queue.complete(
+        task_id, output_path=output_path,
+        result_summary=f"council {mode} {status}",
+    )
+    notify_completion(task, output_path)
+    log.info(f"council done {task_id} status={status}")
+
+
+# ---------------------------------------------------------------------------
+# Task dispatch (Step B)
+# ---------------------------------------------------------------------------
+
+async def _run_task(queue: ClaudeQueue, task: dict) -> None:
+    """Dispatch to the correct handler based on task_type.
+
+    Dispatch happens BEFORE any field validation so council tasks never
+    reach the spec_path check in _run_shaped_task.
+    """
+    tt = task.get("task_type", "subprocess")
+    if tt == "council.run":
+        return await _run_council_task(queue, task)
+    return await _run_shaped_task(queue, task)
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -284,11 +477,24 @@ class Daemon:
         self.in_flight: set[asyncio.Task] = set()
 
     async def _worker(self, task: dict):
-        async with self.sem:
-            try:
-                await _run_task(self.queue, task)
-            except Exception as e:
-                log.exception(f"unhandled error in task {task.get('id')}: {e}")
+        if task.get("task_type") == "council.run":
+            # _COUNCIL_SEM acquired BEFORE self.sem — order is load-bearing.
+            async with _COUNCIL_SEM:
+                async with self.sem:
+                    try:
+                        await _run_task(self.queue, task)
+                    except Exception as e:
+                        log.exception(
+                            f"unhandled error in task {task.get('id')}: {e}"
+                        )
+        else:
+            async with self.sem:
+                try:
+                    await _run_task(self.queue, task)
+                except Exception as e:
+                    log.exception(
+                        f"unhandled error in task {task.get('id')}: {e}"
+                    )
 
     async def run(self):
         startup_sweep(self.queue)
@@ -298,9 +504,6 @@ class Daemon:
                 log.info("CLAUDE_QUEUE_ENABLED=0 — exiting")
                 break
 
-            # Only claim when a worker slot is free. This avoids pulling
-            # tasks into active/ while all workers are busy (the task would
-            # sit under our id for the full duration of someone else's run).
             if self.sem.locked():
                 await asyncio.sleep(POLL_INTERVAL_S)
                 continue
