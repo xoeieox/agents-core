@@ -18,11 +18,10 @@ Live ClaudeQueue calls are NOT exercised here (mocked throughout).
 from __future__ import annotations
 
 import hashlib
-import io
 import sys
 from datetime import date
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import yaml

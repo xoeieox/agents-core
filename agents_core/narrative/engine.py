@@ -98,13 +98,8 @@ def _resolve_sources(profile: AudienceProfile) -> tuple[list[SourceRef], dict[st
     refs.append(SourceRef(path="Lapis/Constitution-Kernel.md", sha256=_sha256(body)))
     bodies["Lapis/Constitution-Kernel.md"] = body
 
-    # b. Chub bundle — check for empty at call site (loud failure invariant)
+    # b. Chub bundle — _load_chub() raises RuntimeError on empty return
     chub_body = _load_chub()
-    if not chub_body:
-        raise RuntimeError(
-            "chub bundle 'conductor/lapis-ecosystem' returned empty content; "
-            "verify chub CLI installed and bundle present"
-        )
     chub_key = "<chub:conductor/lapis-ecosystem>"
     refs.append(SourceRef(path=chub_key, sha256=_sha256(chub_body)))
     bodies[chub_key] = chub_body
