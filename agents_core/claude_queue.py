@@ -387,10 +387,10 @@ class ClaudeQueue:
             return None
 
         def sort_key(t):
-            return (
-                t.get("priority", Priority.NORMAL),
-                t.get("submitted_at", ""),
-            )
+            p = t.get("priority", Priority.NORMAL)
+            if not isinstance(p, int):
+                p = Priority.NORMAL
+            return (p, t.get("submitted_at", ""))
 
         tasks.sort(key=sort_key)
 
