@@ -132,6 +132,15 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         )
 
     if operator_class == "qwen":
+        if model is not None and model != _OPERATOR_DEFAULTS["qwen"]:
+            raise ValueError(
+                f"call_operator(operator_class='qwen', model={model!r}): "
+                "the local llama.cpp backend serves a single fixed model "
+                f"({_OPERATOR_DEFAULTS['qwen']!r}); model swaps are an "
+                "infrastructure operation (stop / swap weights / restart), "
+                "not a per-call parameter. Either pass model=None to use the "
+                "default, or do the model swap out-of-band first."
+            )
         return _call_qwen_backend(prompt=prompt, **kwargs)
 
     # Anthropic-family: route via ClaudeQueue dispatch metadata only (v0).
@@ -147,7 +156,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         "payload": {
             "operator_class": operator_class,
             "prompt": prompt,
-            "_ignore_intention_registry": True,
+            "_ignore_intention_registry": True,  # bypass: ClaudeQueue dispatch skips intention-registry lookup; task is fire-and-forget at v0 (no intention to register)
         },
     })
     # GAP (v0): ClaudeQueue exposes no synchronous-call surface.
