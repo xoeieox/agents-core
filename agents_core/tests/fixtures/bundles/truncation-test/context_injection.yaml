@@ -4,7 +4,7 @@ blocks:
     source: mem.search
     params:
       key_prefix: trunc/a/
-    max_chars: 50
+    max_chars: 500
     truncation: tail
     freshness: per_task
     cache_scope: process
@@ -14,7 +14,7 @@ blocks:
     source: mem.search
     params:
       key_prefix: trunc/b/
-    max_chars: 50
+    max_chars: 500
     truncation: tail
     freshness: per_task
     cache_scope: process
@@ -24,7 +24,7 @@ blocks:
     source: mem.search
     params:
       key_prefix: trunc/c/
-    max_chars: 50
+    max_chars: 500
     truncation: tail
     freshness: per_task
     cache_scope: process

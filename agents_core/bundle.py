@@ -1,10 +1,10 @@
-"""Agent bundle loader — load, resolve, render, and invoke agent bundle directories.
+"""Agent bundle loader - load, resolve, render, and invoke agent bundle directories.
 
 Public surface:
-    Bundle            — parsed bundle (cheap; holds raw component data)
-    InvocationResult  — result of a full invoke() round-trip
-    load(path)        — read manifest + component files from disk
-    invoke(path, ...) — end-to-end: load → resolve context → render → call_operator → record
+    Bundle            - parsed bundle (cheap; holds raw component data)
+    InvocationResult  - result of a full invoke() round-trip
+    load(path)        - read manifest + component files from disk
+    invoke(path, ...) - end-to-end: load → resolve context → render → call_operator → record
 
 Consumers:
     from agents_core.bundle import load, invoke
@@ -14,9 +14,9 @@ v0 invariants:
     - No retry_strategy enforcement (parsed, exposed, not consumed)
     - No eval_criteria enforcement (parsed, exposed, not consumed)
     - No caching (cache_scope parsed but ignored)
-    - Strict undefined in Jinja2 — missing variables raise at render, not silently empty
+    - Strict undefined in Jinja2 - missing variables raise at render, not silently empty
     - Anthropic-family operator_class raises NotImplementedError (gap: agents-core-claude-queue-sync-surface-v0)
-    - No backward-compat shim for harness_id — loader reads agent_id only
+    - No backward-compat shim for harness_id - loader reads agent_id only
 """
 from __future__ import annotations
 
@@ -180,8 +180,15 @@ def _parse_yaml_component(raw: str, bundle_path: Path, filename: str) -> dict:
         result = yaml.safe_load(raw)
     except yaml.YAMLError as exc:
         raise ValueError(f"Failed to parse YAML component {file_path}: {exc}") from exc
-    # Empty YAML files are valid (e.g. empty tool list) — return empty dict
-    return result if isinstance(result, dict) else {}
+    # Empty YAML files are valid (e.g. empty tool list) - return empty dict
+    if result is None:
+        return {}
+    if not isinstance(result, dict):
+        raise ValueError(
+            f"Expected YAML mapping in {file_path}, got {type(result).__name__} - "
+            f"component files must be top-level mappings, not lists or scalars"
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -204,11 +211,11 @@ def invoke(
         default agents_core.mem and agents_core.observations modules.
     operator_kwargs: forwarded verbatim to call_operator() (timeout, json_mode, temperature, etc.).
 
-    Raises NotImplementedError if operator_class is in {"sonnet","opus","haiku"} — those route
+    Raises NotImplementedError if operator_class is in {"sonnet","opus","haiku"} - those route
         via ClaudeQueue and have no synchronous result surface yet (named gap:
         agents-core-claude-queue-sync-surface-v0). Caller catches if appropriate.
     """
-    # Resolve backends at the top — pass them down, never re-import inside helpers
+    # Resolve backends at the top - pass them down, never re-import inside helpers
     if backends is None:
         backends = {}
 
@@ -224,7 +231,7 @@ def invoke(
         if reserved in operator_kwargs:
             raise ValueError(
                 f"operator_kwargs contains reserved key {reserved!r}; "
-                f"the loader supplies this argument — remove it from operator_kwargs"
+                f"the loader supplies this argument - remove it from operator_kwargs"
             )
 
     bundle = load(bundle_path)
@@ -233,7 +240,7 @@ def invoke(
     if bundle.operator_class in ("sonnet", "opus", "haiku"):
         raise NotImplementedError(
             f"Anthropic-family operator_class={bundle.operator_class!r} is not yet supported "
-            f"synchronously — gap: agents-core-claude-queue-sync-surface-v0"
+            f"synchronously - gap: agents-core-claude-queue-sync-surface-v0"
         )
 
     # Resolve context blocks
