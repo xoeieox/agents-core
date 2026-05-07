@@ -1,0 +1,8 @@
+schema_version: 1
+agent_id: test-truncation
+operator_class: qwen
+task: test
+components:
+  system_prompt: system_prompt.md.j2
+  context_injection: context_injection.yaml
+  tool_allowlist: tool_allowlist.yaml

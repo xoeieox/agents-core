@@ -165,6 +165,30 @@ class MemoryStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
+    def list_by_prefix(self, prefix: str, limit: int = 50) -> list[dict]:
+        """Return entries whose key starts with `prefix`, ordered by key ascending.
+
+        Empty prefix raises ValueError (use list_all() for unfiltered listing).
+        Escapes SQL-LIKE wildcards in prefix so callers with literal dots, slashes,
+        underscores, or percent signs get exact prefix semantics.
+        Returns the same dict shape as list_all() / search() / get().
+        """
+        if not prefix:
+            raise ValueError(
+                "list_by_prefix() requires a non-empty prefix; "
+                "use list_all() for unfiltered listing"
+            )
+
+        # Escape SQL-LIKE special chars before appending %
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"{escaped}%"
+
+        rows = self._conn.execute(
+            "SELECT * FROM memories WHERE key LIKE ? ESCAPE '\\' ORDER BY key LIMIT ?",
+            (pattern, limit),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
     def delete(self, key: str) -> bool:
         """Delete a memory by key. Returns True if deleted."""
         cursor = self._conn.execute(

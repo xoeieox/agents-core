@@ -1,0 +1,10 @@
+tools:
+  - name: forgejo.get_pr_diff
+    kind: read
+    purpose: Retrieve the unified diff for a pull request under review
+  - name: forgejo.get_pr_metadata
+    kind: read
+    purpose: Retrieve PR title, description, author, and base/head branch metadata
+  - name: mem.search
+    kind: read
+    purpose: Search the memory substrate by full-text query

@@ -11,6 +11,7 @@ dependencies = [
     "httpx",
     "requests",
     "pyyaml",
+    "jinja2",
 ]
 
 [project.optional-dependencies]

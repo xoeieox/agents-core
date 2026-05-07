@@ -1,0 +1,31 @@
+total_budget_chars: 600
+blocks:
+  - id: block_a
+    source: mem.search
+    params:
+      key_prefix: trunc/a/
+    max_chars: 500
+    truncation: tail
+    freshness: per_task
+    cache_scope: process
+    on_empty: placeholder:empty-a
+
+  - id: block_b
+    source: mem.search
+    params:
+      key_prefix: trunc/b/
+    max_chars: 500
+    truncation: tail
+    freshness: per_task
+    cache_scope: process
+    on_empty: placeholder:empty-b
+
+  - id: block_c
+    source: mem.search
+    params:
+      key_prefix: trunc/c/
+    max_chars: 500
+    truncation: tail
+    freshness: per_task
+    cache_scope: process
+    on_empty: placeholder:empty-c
