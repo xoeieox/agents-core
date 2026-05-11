@@ -8,27 +8,9 @@ Covers:
 """
 from __future__ import annotations
 
-import textwrap
 from pathlib import Path
 
-import pytest
-
-from agents_core.claude_queue_runner import _classify_runner_failure
-
-
-# ---------------------------------------------------------------------------
-# Helper to produce the success-path write (extracted inline logic)
-# ---------------------------------------------------------------------------
-
-def _write_success(path: Path, combined: str) -> None:
-    """Mirrors the success-path write at claude_queue_runner.py:335-338."""
-    path.write_text(combined if combined else "(no output)")
-
-
-def _write_failure(path: Path, combined: str, rc: int) -> None:
-    """Mirrors the rc!=0 failure-path write at claude_queue_runner.py:328-330."""
-    prefix, _ = _classify_runner_failure(combined, rc)
-    path.write_text(f"{prefix}:\n{combined[-3000:]}")
+from agents_core.claude_queue_runner import _classify_runner_failure, _write_success_output
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +24,7 @@ def test_large_success_preserves_head(tmp_path):
     assert len(combined) > 3000
 
     out = tmp_path / "output.md"
-    _write_success(out, combined)
+    _write_success_output(out, combined)
 
     content = out.read_text()
     assert sentinel in content
@@ -55,7 +37,7 @@ def test_small_success_unchanged(tmp_path):
     assert len(combined) < 3000
 
     out = tmp_path / "output.md"
-    _write_success(out, combined)
+    _write_success_output(out, combined)
 
     assert out.read_text() == combined
 
@@ -67,7 +49,8 @@ def test_failure_tail_preserved(tmp_path):
     assert len(combined) > 3000
 
     out = tmp_path / "output.md"
-    _write_failure(out, combined, rc=1)
+    prefix, _ = _classify_runner_failure(combined, rc=1)
+    out.write_text(f"{prefix}:\n{combined[-3000:]}")
 
     content = out.read_text()
     # Must start with the EXIT prefix line
