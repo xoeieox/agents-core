@@ -97,6 +97,13 @@ def setup_worktree(task_id: str, repo_cwd: str, base_branch: str = "main") -> Wo
         check=True, capture_output=True, timeout=60,
     )
 
+    # Pin commit author to conductor so shaped-agent commits attribute correctly.
+    for key, val in [("user.name", "conductor"), ("user.email", "conductor@agents.invalid")]:
+        subprocess.run(
+            ["git", "-C", str(path), "config", key, val],
+            check=True, capture_output=True, timeout=10,
+        )
+
     src_claude = Path(repo_cwd) / ".claude"
     dst_claude = path / ".claude"
     if src_claude.exists() and not dst_claude.exists():
