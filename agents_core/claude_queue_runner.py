@@ -332,7 +332,10 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
         notify_failure(task, result)
         return
 
-    Path(output_path).write_text(combined[-3000:] if combined else "(no output)")
+    # Success path: write the full agent response. Consumers (e.g. spec-review
+    # JSON-verdict parsers) may need the head of the payload. Failure branches
+    # below intentionally tail-slice to bound stderr noise.
+    Path(output_path).write_text(combined if combined else "(no output)")
     summary = combined.splitlines()[0][:200] if combined else ""
     queue.complete(task_id, output_path=output_path, result_summary=summary)
     _extract_ops_primitives(
