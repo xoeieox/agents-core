@@ -152,7 +152,7 @@ def record(
 
 def _backfill_v0_defaults(entry: dict) -> dict:
     """Apply v0.1 read-time defaults to v0 entries that lack new fields.
-    Does NOT modify the dict in place — returns the same dict with keys added."""
+    Modifies the dict in place and returns it."""
     if "obs_id" not in entry:
         entry["obs_id"] = compute_obs_id(
             entry.get("agent_id", ""),
@@ -331,6 +331,10 @@ def lineage(
     Each entry in forward/backward has _lineage_depth added (int, distance from root).
     Direction filter empties the unwanted list. Cycles broken by visited-set on obs_id.
     """
+    if direction not in ("forward", "backward", "both"):
+        raise ValueError(
+            f"direction must be 'forward', 'backward', or 'both', got {direction!r}"
+        )
     all_entries = search()
 
     # Build index: obs_id -> entry (last-seen wins per Invariant 4)
@@ -393,7 +397,8 @@ def lineage(
                     backward.append(entry_copy)
                     queue_b.append((parent_id, depth + 1))
 
-    return {"root": root_entry, "forward": forward, "backward": backward}
+    root_copy = dict(root_entry) if root_entry is not None else None
+    return {"root": root_copy, "forward": forward, "backward": backward}
 
 
 def cite(
@@ -449,6 +454,11 @@ def _cli_record(args: list[str]) -> None:
     if ns.extra_json:
         extra = json.loads(ns.extra_json)
 
+    # Generate now upfront so we can compute obs_id without a post-write search scan.
+    now = datetime.now(timezone.utc)
+    ts_iso = now.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    obs_id_out = compute_obs_id(ns.agent_id, ts_iso, ns.observation_type, ns.content)
+
     path = record(
         agent_id=ns.agent_id,
         observation_type=ns.observation_type,
@@ -461,17 +471,8 @@ def _cli_record(args: list[str]) -> None:
         informed_by=ns.informed_by if ns.informed_by else None,
         signal_strength=ns.signal_strength,
         extra=extra,
+        now=now,
     )
-
-    # Read back the entry to get the obs_id for tab-separated output
-    entries = search(agent_id=ns.agent_id, substring=ns.content)
-    obs_id_out = ""
-    for e in reversed(entries):
-        if (e.get("observation_type") == ns.observation_type
-                and e.get("content") == ns.content
-                and e.get("context") == ns.context):
-            obs_id_out = e.get("obs_id", "")
-            break
 
     print(f"{path}\t{obs_id_out}")
 
