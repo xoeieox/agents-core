@@ -5,8 +5,12 @@ Override root via AGENT_OBSERVATIONS_ROOT env var (primarily for tests).
 
 Entry schema (each JSONL line):
     {
+        obs_id (v0.1, stable hash of agent_id+timestamp+type+content),
         agent_id, session_id, timestamp (ISO8601 UTC), observation_type,
-        context, content, target_id, tags, intervention_shape, extra
+        context, content, target_id, tags, intervention_shape,
+        informed_by (v0.1, list[str] of cited obs_ids, default []),
+        signal_strength (v0.1, "high" | "normal", default "normal"),
+        extra
     }
 
 observation_type: friction | decision | lesson | anomaly | intervention
@@ -18,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,12 +37,25 @@ VALID_INTERVENTION_SHAPES = frozenset({
     "question", "pointer", "counter-example", "frame-shift", "constraint", "why-trace"
 })
 
+VALID_SIGNAL_STRENGTHS = frozenset({"high", "normal"})
+DEFAULT_SIGNAL_STRENGTH = "normal"
+
 
 def root() -> Path:
     """Return the resolved observations root, honoring AGENT_OBSERVATIONS_ROOT env override.
     Default: /srv/lapis/agent-observations/"""
     override = os.environ.get("AGENT_OBSERVATIONS_ROOT")
     return Path(override) if override else DEFAULT_ROOT
+
+
+def compute_obs_id(agent_id: str, timestamp_iso: str,
+                   observation_type: str, content: str) -> str:
+    """Stable, content-derived identifier. 16 hex chars from SHA-256.
+    Same inputs always produce the same obs_id, across invocations
+    and across processes."""
+    import hashlib
+    key = f"{agent_id}|{timestamp_iso}|{observation_type}|{content}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
 def record(
@@ -50,6 +68,8 @@ def record(
     target_id: str | None = None,
     tags: list[str] | None = None,
     intervention_shape: str | None = None,
+    informed_by: list[str] | None = None,
+    signal_strength: str = DEFAULT_SIGNAL_STRENGTH,
     extra: dict | None = None,
     now: datetime | None = None,
 ) -> Path:
@@ -77,6 +97,18 @@ def record(
                 f"got observation_type={observation_type!r}"
             )
 
+    if signal_strength not in VALID_SIGNAL_STRENGTHS:
+        raise ValueError(
+            f"signal_strength must be one of {sorted(VALID_SIGNAL_STRENGTHS)}, "
+            f"got {signal_strength!r}"
+        )
+
+    if informed_by is not None:
+        if not isinstance(informed_by, list) or not all(
+            isinstance(x, str) for x in informed_by
+        ):
+            raise TypeError("informed_by must be a list of strings")
+
     ts = now if now is not None else datetime.now(timezone.utc)
     if ts.tzinfo is None:
         raise ValueError("now must be timezone-aware")
@@ -85,7 +117,10 @@ def record(
     ts_iso = ts_utc.strftime("%Y-%m-%dT%H:%M:%S+00:00")
     date_str = ts_utc.strftime("%Y-%m-%d")
 
+    obs_id = compute_obs_id(agent_id, ts_iso, observation_type, content)
+
     entry: dict = {
+        "obs_id": obs_id,
         "agent_id": agent_id,
         "session_id": session_id,
         "timestamp": ts_iso,
@@ -95,6 +130,8 @@ def record(
         "target_id": target_id,
         "tags": list(tags) if tags else [],
         "intervention_shape": intervention_shape,
+        "informed_by": list(informed_by) if informed_by else [],
+        "signal_strength": signal_strength,
         "extra": extra,
     }
 
@@ -113,6 +150,23 @@ def record(
     return path
 
 
+def _backfill_v0_defaults(entry: dict) -> dict:
+    """Apply v0.1 read-time defaults to v0 entries that lack new fields.
+    Does NOT modify the dict in place — returns the same dict with keys added."""
+    if "obs_id" not in entry:
+        entry["obs_id"] = compute_obs_id(
+            entry.get("agent_id", ""),
+            entry.get("timestamp", ""),
+            entry.get("observation_type", ""),
+            entry.get("content", ""),
+        )
+    if "informed_by" not in entry:
+        entry["informed_by"] = []
+    if "signal_strength" not in entry:
+        entry["signal_strength"] = DEFAULT_SIGNAL_STRENGTH
+    return entry
+
+
 def search(
     *,
     agent_id: str | None = None,
@@ -123,6 +177,8 @@ def search(
     since: datetime | None = None,
     until: datetime | None = None,
     substring: str | None = None,
+    min_signal_strength: str | None = None,
+    informed_by: str | None = None,
     limit: int | None = None,
 ) -> list[dict]:
     """Read across observation files matching filters. Iterates JSONL files line by line
@@ -179,6 +235,9 @@ def search(
                         if not isinstance(entry, dict):
                             continue
 
+                        # Backfill v0 entries with v0.1 defaults at read time
+                        _backfill_v0_defaults(entry)
+
                         # Filter: observation_type
                         if (observation_type is not None
                                 and entry.get("observation_type") != observation_type):
@@ -232,6 +291,17 @@ def search(
                                     and substring_lower not in context_lower):
                                 continue
 
+                        # Filter: min_signal_strength
+                        if min_signal_strength == "high":
+                            if entry.get("signal_strength") != "high":
+                                continue
+                        # "normal" is a no-op (everything passes); None disables filter
+
+                        # Filter: informed_by (entry must cite the given obs_id)
+                        if informed_by is not None:
+                            if informed_by not in (entry.get("informed_by") or []):
+                                continue
+
                         results.append(entry)
             except OSError:
                 continue
@@ -244,8 +314,116 @@ def search(
     return results
 
 
+def lineage(
+    obs_id: str,
+    *,
+    direction: str = "both",
+    max_depth: int = 10,
+) -> dict:
+    """Return the citation graph rooted at obs_id.
+
+    Returns: {
+      "root": <entry or None if obs_id not found>,
+      "forward": [<entry>, ...],   # entries that (transitively) cite obs_id
+      "backward": [<entry>, ...],  # entries (transitively) in obs_id's informed_by chain
+    }
+
+    Each entry in forward/backward has _lineage_depth added (int, distance from root).
+    Direction filter empties the unwanted list. Cycles broken by visited-set on obs_id.
+    """
+    all_entries = search()
+
+    # Build index: obs_id -> entry (last-seen wins per Invariant 4)
+    by_id: dict[str, dict] = {}
+    for e in all_entries:
+        eid = e.get("obs_id")
+        if eid:
+            by_id[eid] = e
+
+    # Build reverse-citation index: obs_id -> list of obs_ids that cite it
+    cited_by: dict[str, list[str]] = {}
+    for e in all_entries:
+        eid = e.get("obs_id")
+        if not eid:
+            continue
+        for parent_id in (e.get("informed_by") or []):
+            cited_by.setdefault(parent_id, []).append(eid)
+
+    root_entry = by_id.get(obs_id)
+
+    forward: list[dict] = []
+    backward: list[dict] = []
+
+    if direction in ("forward", "both"):
+        visited: set[str] = {obs_id}
+        queue: deque[tuple[str, int]] = deque([(obs_id, 0)])
+        while queue:
+            current_id, depth = queue.popleft()
+            if depth >= max_depth:
+                continue
+            for child_id in cited_by.get(current_id, []):
+                if child_id in visited:
+                    continue
+                visited.add(child_id)
+                child_entry = by_id.get(child_id)
+                if child_entry is not None:
+                    entry_copy = dict(child_entry)
+                    entry_copy["_lineage_depth"] = depth + 1
+                    forward.append(entry_copy)
+                    queue.append((child_id, depth + 1))
+
+    if direction in ("backward", "both"):
+        visited_b: set[str] = {obs_id}
+        queue_b: deque[tuple[str, int]] = deque([(obs_id, 0)])
+        while queue_b:
+            current_id, depth = queue_b.popleft()
+            if depth >= max_depth:
+                continue
+            current_entry = by_id.get(current_id)
+            if current_entry is None:
+                continue
+            for parent_id in (current_entry.get("informed_by") or []):
+                if parent_id in visited_b:
+                    continue
+                visited_b.add(parent_id)
+                parent_entry = by_id.get(parent_id)
+                if parent_entry is not None:
+                    entry_copy = dict(parent_entry)
+                    entry_copy["_lineage_depth"] = depth + 1
+                    backward.append(entry_copy)
+                    queue_b.append((parent_id, depth + 1))
+
+    return {"root": root_entry, "forward": forward, "backward": backward}
+
+
+def cite(
+    informed_by: list[str],
+    *,
+    agent_id: str,
+    observation_type: str,
+    context: str,
+    content: str,
+    signal_strength: str = DEFAULT_SIGNAL_STRENGTH,
+    **record_kwargs,
+) -> Path:
+    """Record an observation that cites prior observations.
+
+    Equivalent to record(..., informed_by=informed_by, signal_strength=...) — exists
+    purely for readability at the call site: cite([obs1, obs2], agent_id=..., ...).
+    """
+    return record(
+        agent_id=agent_id,
+        observation_type=observation_type,
+        context=context,
+        content=content,
+        informed_by=informed_by,
+        signal_strength=signal_strength,
+        **record_kwargs,
+    )
+
+
 # ---------------------------------------------------------------------------
-# CLI entry-point  (python -m agents_core.observations [record|search] ...)
+# CLI entry-point  (python -m agents_core.observations [record|search|lineage] ...)
 # ---------------------------------------------------------------------------
 
 def _cli_record(args: list[str]) -> None:
@@ -260,6 +438,11 @@ def _cli_record(args: list[str]) -> None:
     parser.add_argument("--tag", dest="tags", action="append", default=[])
     parser.add_argument("--intervention-shape")
     parser.add_argument("--extra-json")
+    parser.add_argument("--informed-by", dest="informed_by", action="append", default=[])
+    parser.add_argument(
+        "--signal-strength", dest="signal_strength",
+        choices=["high", "normal"], default="normal",
+    )
     ns = parser.parse_args(args)
 
     extra: dict | None = None
@@ -275,9 +458,22 @@ def _cli_record(args: list[str]) -> None:
         target_id=ns.target_id,
         tags=ns.tags or None,
         intervention_shape=ns.intervention_shape,
+        informed_by=ns.informed_by if ns.informed_by else None,
+        signal_strength=ns.signal_strength,
         extra=extra,
     )
-    print(str(path))
+
+    # Read back the entry to get the obs_id for tab-separated output
+    entries = search(agent_id=ns.agent_id, substring=ns.content)
+    obs_id_out = ""
+    for e in reversed(entries):
+        if (e.get("observation_type") == ns.observation_type
+                and e.get("content") == ns.content
+                and e.get("context") == ns.context):
+            obs_id_out = e.get("obs_id", "")
+            break
+
+    print(f"{path}\t{obs_id_out}")
 
 
 def _cli_search(args: list[str]) -> None:
@@ -293,6 +489,11 @@ def _cli_search(args: list[str]) -> None:
     parser.add_argument("--substring")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--format", dest="fmt", choices=["json", "text"], default="text")
+    parser.add_argument(
+        "--min-signal-strength", dest="min_signal_strength",
+        choices=["high", "normal"], default=None,
+    )
+    parser.add_argument("--informed-by", dest="informed_by", default=None)
     ns = parser.parse_args(args)
 
     tags_any = [t.strip() for t in ns.tags_any.split(",")] if ns.tags_any else None
@@ -309,6 +510,8 @@ def _cli_search(args: list[str]) -> None:
         since=since,
         until=until,
         substring=ns.substring,
+        min_signal_strength=ns.min_signal_strength,
+        informed_by=ns.informed_by,
         limit=ns.limit,
     )
 
@@ -322,17 +525,69 @@ def _cli_search(args: list[str]) -> None:
             otype = entry.get("observation_type", "?")
             content = entry.get("content", "")
             context = entry.get("context", "")
-            print(f"{ts} [{aid}:{otype}] {content}")
+            obs_id = entry.get("obs_id", "????????????????")
+            print(f"{obs_id} {ts} [{aid}:{otype}] {content}")
             if context:
                 print(f"  context: {context}")
+
+
+def _cli_lineage(args: list[str]) -> None:
+    import argparse
+    parser = argparse.ArgumentParser(prog="observations lineage")
+    parser.add_argument("obs_id")
+    parser.add_argument(
+        "--direction", choices=["both", "forward", "backward"], default="both"
+    )
+    parser.add_argument("--max-depth", type=int, default=10)
+    parser.add_argument("--format", dest="fmt", choices=["json", "text"], default="text")
+    ns = parser.parse_args(args)
+
+    result = lineage(ns.obs_id, direction=ns.direction, max_depth=ns.max_depth)
+
+    if ns.fmt == "json":
+        print(json.dumps(result, ensure_ascii=False, default=str))
+    else:
+        root_entry = result["root"]
+        if root_entry is None:
+            print(f"<missing: {ns.obs_id}>")
+        else:
+            obs_id = root_entry.get("obs_id", "?")
+            ts = root_entry.get("timestamp", "?")
+            otype = root_entry.get("observation_type", "?")
+            content = root_entry.get("content", "")
+            print(f"root: {obs_id} {ts} [{otype}] {content}")
+
+        if result["forward"]:
+            print("forward citations (entries that cite root):")
+            for e in result["forward"]:
+                depth = e.get("_lineage_depth", "?")
+                obs_id = e.get("obs_id", "?")
+                ts = e.get("timestamp", "?")
+                otype = e.get("observation_type", "?")
+                content = e.get("content", "")
+                indent = "  " + "↳ " * depth
+                print(f"{indent}{obs_id} {ts} [{otype}] {content}")
+
+        if result["backward"]:
+            print("backward citations (entries root was informed by):")
+            for e in result["backward"]:
+                depth = e.get("_lineage_depth", "?")
+                obs_id = e.get("obs_id", "?")
+                ts = e.get("timestamp", "?")
+                otype = e.get("observation_type", "?")
+                content = e.get("content", "")
+                indent = "  " + "↰ " * depth
+                print(f"{indent}{obs_id} {ts} [{otype}] {content}")
 
 
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) < 2 or sys.argv[1] not in ("record", "search"):
-        print("usage: python -m agents_core.observations [record|search] ...",
-              file=sys.stderr)
+    if len(sys.argv) < 2 or sys.argv[1] not in ("record", "search", "lineage"):
+        print(
+            "usage: python -m agents_core.observations [record|search|lineage] ...",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     subcommand = sys.argv[1]
@@ -340,5 +595,7 @@ if __name__ == "__main__":
 
     if subcommand == "record":
         _cli_record(rest)
-    else:
+    elif subcommand == "search":
         _cli_search(rest)
+    else:
+        _cli_lineage(rest)
