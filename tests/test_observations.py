@@ -10,7 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from agents_core.observations import record, search, root, VALID_OBSERVATION_TYPES, VALID_INTERVENTION_SHAPES
+from agents_core.observations import (
+    record, search, root, lineage, cite, compute_obs_id,
+    VALID_OBSERVATION_TYPES, VALID_INTERVENTION_SHAPES,
+    VALID_SIGNAL_STRENGTHS, DEFAULT_SIGNAL_STRENGTH,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -397,3 +401,400 @@ def test_search_malformed_lines_skipped(tmp_path, monkeypatch):
     # Malformed line is skipped; good entry is returned
     assert len(entries) == 1
     assert entries[0]["content"] == "good"
+
+
+# ---------------------------------------------------------------------------
+# v0.1 — obs_id
+# ---------------------------------------------------------------------------
+
+def test_obs_id_stable_across_invocations(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    ts = _ts()
+    record("agent-a", "lesson", "ctx", "same content", now=ts)
+    record("agent-a", "lesson", "ctx", "same content", now=ts)
+    entries = search()
+    assert len(entries) == 2
+    assert entries[0]["obs_id"] == entries[1]["obs_id"]
+
+
+def test_obs_id_unique_per_distinct_content(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    ts = _ts()
+    record("agent-a", "lesson", "ctx", "content-X", now=ts)
+    record("agent-a", "lesson", "ctx", "content-Y", now=ts)
+    entries = search()
+    assert entries[0]["obs_id"] != entries[1]["obs_id"]
+
+
+def test_v0_entries_get_obs_id_on_read(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    agent_dir = tmp_path / "v0-agent"
+    agent_dir.mkdir()
+    v0_entry = {
+        "agent_id": "v0-agent",
+        "session_id": None,
+        "timestamp": "2026-05-05T12:00:00+00:00",
+        "observation_type": "lesson",
+        "context": "ctx",
+        "content": "v0 content",
+        "target_id": None,
+        "tags": [],
+        "intervention_shape": None,
+        "extra": None,
+    }
+    (agent_dir / "2026-05-05.jsonl").write_text(
+        json.dumps(v0_entry) + "\n", encoding="utf-8"
+    )
+    # Disk has no obs_id
+    raw = json.loads((agent_dir / "2026-05-05.jsonl").read_text())
+    assert "obs_id" not in raw
+
+    entries = search()
+    assert len(entries) == 1
+    assert "obs_id" in entries[0]
+    assert len(entries[0]["obs_id"]) == 16
+
+    # Disk still has no obs_id (not rewritten)
+    raw2 = json.loads((agent_dir / "2026-05-05.jsonl").read_text())
+    assert "obs_id" not in raw2
+
+
+# ---------------------------------------------------------------------------
+# v0.1 — informed_by / cite
+# ---------------------------------------------------------------------------
+
+def test_informed_by_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    path_a = record("agent-a", "lesson", "ctx", "observation A", now=_ts(0))
+    entries_a = search(agent_id="agent-a", substring="observation A")
+    obs_id_a = entries_a[0]["obs_id"]
+
+    cite([obs_id_a], agent_id="agent-a", observation_type="decision",
+         context="ctx", content="based on A", now=_ts(1))
+
+    entries_b = search(agent_id="agent-a", observation_type="decision")
+    assert len(entries_b) == 1
+    assert entries_b[0]["informed_by"] == [obs_id_a]
+
+
+# ---------------------------------------------------------------------------
+# v0.1 — search new filters
+# ---------------------------------------------------------------------------
+
+def test_search_min_signal_strength(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    record("agent-a", "lesson", "ctx", "high entry", signal_strength="high", now=_ts(0))
+    record("agent-a", "lesson", "ctx", "normal entry", signal_strength="normal", now=_ts(1))
+
+    highs = search(min_signal_strength="high")
+    assert len(highs) == 1
+    assert highs[0]["content"] == "high entry"
+
+    all_entries = search(min_signal_strength="normal")
+    assert len(all_entries) == 2
+
+    no_filter = search()
+    assert len(no_filter) == 2
+
+
+def test_search_informed_by(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    record("agent-a", "lesson", "ctx", "entry A", now=_ts(0))
+    obs_id_a = search(agent_id="agent-a", substring="entry A")[0]["obs_id"]
+
+    cite([obs_id_a], agent_id="agent-a", observation_type="decision",
+         context="ctx", content="B cites A", now=_ts(1))
+    cite([obs_id_a], agent_id="agent-a", observation_type="decision",
+         context="ctx", content="C cites A", now=_ts(2))
+    record("agent-a", "lesson", "ctx", "entry D unrelated", now=_ts(3))
+
+    results = search(informed_by=obs_id_a)
+    assert len(results) == 2
+    contents = {e["content"] for e in results}
+    assert contents == {"B cites A", "C cites A"}
+
+
+# ---------------------------------------------------------------------------
+# v0.1 — lineage
+# ---------------------------------------------------------------------------
+
+def test_lineage_forward(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    record("agent-a", "lesson", "ctx", "A", now=_ts(0))
+    obs_a = search(agent_id="agent-a", substring="A")[0]["obs_id"]
+
+    cite([obs_a], agent_id="agent-a", observation_type="decision",
+         context="ctx", content="B", now=_ts(1))
+    obs_b = search(agent_id="agent-a", substring="B",
+                   observation_type="decision")[0]["obs_id"]
+
+    cite([obs_b], agent_id="agent-a", observation_type="decision",
+         context="ctx", content="C", now=_ts(2))
+
+    result = lineage(obs_a, direction="forward")
+    assert result["root"]["obs_id"] == obs_a
+    forward_contents = {e["content"] for e in result["forward"]}
+    assert "B" in forward_contents
+    assert "C" in forward_contents
+    assert result["backward"] == []
+
+    depths = {e["content"]: e["_lineage_depth"] for e in result["forward"]}
+    assert depths["B"] == 1
+    assert depths["C"] == 2
+
+
+def test_lineage_backward(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    record("agent-a", "lesson", "ctx", "A", now=_ts(0))
+    obs_a = search(agent_id="agent-a", observation_type="lesson")[0]["obs_id"]
+
+    cite([obs_a], agent_id="agent-a", observation_type="decision",
+         context="ctx", content="B", now=_ts(1))
+
+    cite_entries = search(agent_id="agent-a", observation_type="decision")
+    obs_b = cite_entries[0]["obs_id"]
+
+    cite([obs_b], agent_id="agent-a", observation_type="decision",
+         context="ctx", content="C", now=_ts(2))
+
+    all_decisions = search(agent_id="agent-a", observation_type="decision")
+    obs_c = all_decisions[1]["obs_id"]  # sorted by timestamp; C is second
+
+    result = lineage(obs_c, direction="backward")
+    assert result["root"]["obs_id"] == obs_c
+    backward_contents = {e["content"] for e in result["backward"]}
+    assert "B" in backward_contents
+    assert "A" in backward_contents
+    assert result["forward"] == []
+
+    depths = {e["content"]: e["_lineage_depth"] for e in result["backward"]}
+    assert depths["B"] == 1
+    assert depths["A"] == 2
+
+
+def test_lineage_both(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    record("agent-a", "lesson", "ctx", "A", now=_ts(0))
+    obs_a = search(agent_id="agent-a", substring="A")[0]["obs_id"]
+
+    cite([obs_a], agent_id="agent-a", observation_type="decision",
+         context="ctx", content="B", now=_ts(1))
+    obs_b = search(agent_id="agent-a", observation_type="decision",
+                   substring="B")[0]["obs_id"]
+
+    cite([obs_b], agent_id="agent-a", observation_type="decision",
+         context="ctx", content="C", now=_ts(2))
+
+    result = lineage(obs_b, direction="both")
+    forward_contents = {e["content"] for e in result["forward"]}
+    backward_contents = {e["content"] for e in result["backward"]}
+    assert "C" in forward_contents
+    assert "A" in backward_contents
+
+
+def test_lineage_cycle_safe(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    # Write entries first to get obs_ids, then write cycle entries manually
+    agent_dir = tmp_path / "cycle-agent"
+    agent_dir.mkdir()
+
+    # Compute obs_ids for the cycle entries
+    ts_a = "2026-05-05T12:00:00+00:00"
+    ts_b = "2026-05-05T12:00:01+00:00"
+    obs_id_a = compute_obs_id("cycle-agent", ts_a, "lesson", "A cycle")
+    obs_id_b = compute_obs_id("cycle-agent", ts_b, "lesson", "B cycle")
+
+    entry_a = {
+        "obs_id": obs_id_a,
+        "agent_id": "cycle-agent",
+        "session_id": None,
+        "timestamp": ts_a,
+        "observation_type": "lesson",
+        "context": "ctx",
+        "content": "A cycle",
+        "target_id": None,
+        "tags": [],
+        "intervention_shape": None,
+        "informed_by": [obs_id_b],  # A cites B
+        "signal_strength": "normal",
+        "extra": None,
+    }
+    entry_b = {
+        "obs_id": obs_id_b,
+        "agent_id": "cycle-agent",
+        "session_id": None,
+        "timestamp": ts_b,
+        "observation_type": "lesson",
+        "context": "ctx",
+        "content": "B cycle",
+        "target_id": None,
+        "tags": [],
+        "intervention_shape": None,
+        "informed_by": [obs_id_a],  # B cites A
+        "signal_strength": "normal",
+        "extra": None,
+    }
+    (agent_dir / "2026-05-05.jsonl").write_text(
+        json.dumps(entry_a) + "\n" + json.dumps(entry_b) + "\n",
+        encoding="utf-8",
+    )
+
+    # Must not raise or loop infinitely
+    result = lineage(obs_id_a)
+    assert result["root"] is not None
+
+
+def test_lineage_max_depth(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    # Build a 5-deep chain
+    prev_id = None
+    ids = []
+    for i in range(5):
+        ib = [prev_id] if prev_id else []
+        record("agent-a", "lesson", "ctx", f"depth-{i}",
+               informed_by=ib or None, now=_ts(i))
+        e = search(agent_id="agent-a", substring=f"depth-{i}")[0]
+        prev_id = e["obs_id"]
+        ids.append(prev_id)
+
+    root_id = ids[0]
+    result = lineage(root_id, direction="forward", max_depth=2)
+    # Only entries at depth 1 and 2 should appear
+    depths = [e["_lineage_depth"] for e in result["forward"]]
+    assert all(d <= 2 for d in depths)
+    assert max(depths) <= 2
+
+
+def test_lineage_missing_obs_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    result = lineage("nonexistent0000")
+    assert result == {"root": None, "forward": [], "backward": []}
+
+
+# ---------------------------------------------------------------------------
+# v0.1 — signal_strength default on v0 entries
+# ---------------------------------------------------------------------------
+
+def test_signal_strength_default_normal_on_v0_entries(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    agent_dir = tmp_path / "v0-signal-agent"
+    agent_dir.mkdir()
+    v0_entry = {
+        "agent_id": "v0-signal-agent",
+        "session_id": None,
+        "timestamp": "2026-05-05T12:00:00+00:00",
+        "observation_type": "lesson",
+        "context": "ctx",
+        "content": "v0 no signal",
+        "target_id": None,
+        "tags": [],
+        "intervention_shape": None,
+        "extra": None,
+    }
+    (agent_dir / "2026-05-05.jsonl").write_text(
+        json.dumps(v0_entry) + "\n", encoding="utf-8"
+    )
+    entries = search()
+    assert len(entries) == 1
+    assert entries[0]["signal_strength"] == "normal"
+    assert entries[0]["informed_by"] == []
+
+
+# ---------------------------------------------------------------------------
+# v0.1 — CLI parity for new flags
+# ---------------------------------------------------------------------------
+
+def test_cli_record_with_informed_by_and_signal_strength(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    env = {"AGENT_OBSERVATIONS_ROOT": str(tmp_path)}
+
+    # First record to get an obs_id
+    r1 = subprocess.run(
+        [
+            sys.executable, "-m", "agents_core.observations", "record",
+            "--agent-id", "cli-v01",
+            "--type", "lesson",
+            "--context", "cli ctx",
+            "--content", "first observation",
+            "--signal-strength", "high",
+        ],
+        capture_output=True, text=True, env={**__import__("os").environ, **env},
+    )
+    assert r1.returncode == 0, r1.stderr
+    # Output is path<TAB>obs_id
+    parts = r1.stdout.strip().split("\t")
+    assert len(parts) == 2
+    obs_id_first = parts[1]
+    assert len(obs_id_first) == 16
+
+    # Second record citing the first
+    r2 = subprocess.run(
+        [
+            sys.executable, "-m", "agents_core.observations", "record",
+            "--agent-id", "cli-v01",
+            "--type", "decision",
+            "--context", "cli ctx",
+            "--content", "second cites first",
+            "--informed-by", obs_id_first,
+        ],
+        capture_output=True, text=True, env={**__import__("os").environ, **env},
+    )
+    assert r2.returncode == 0, r2.stderr
+    parts2 = r2.stdout.strip().split("\t")
+    assert len(parts2) == 2
+
+    entries = search(agent_id="cli-v01")
+    first = next(e for e in entries if e["observation_type"] == "lesson")
+    second = next(e for e in entries if e["observation_type"] == "decision")
+
+    assert first["signal_strength"] == "high"
+    assert second["informed_by"] == [obs_id_first]
+
+
+def test_cli_lineage_subcommand(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    env = {"AGENT_OBSERVATIONS_ROOT": str(tmp_path)}
+
+    # Build A <- B chain via CLI
+    r1 = subprocess.run(
+        [
+            sys.executable, "-m", "agents_core.observations", "record",
+            "--agent-id", "lineage-cli",
+            "--type", "lesson",
+            "--context", "ctx",
+            "--content", "root entry",
+        ],
+        capture_output=True, text=True, env={**__import__("os").environ, **env},
+    )
+    assert r1.returncode == 0, r1.stderr
+    obs_id_root = r1.stdout.strip().split("\t")[1]
+
+    r2 = subprocess.run(
+        [
+            sys.executable, "-m", "agents_core.observations", "record",
+            "--agent-id", "lineage-cli",
+            "--type", "decision",
+            "--context", "ctx",
+            "--content", "child cites root",
+            "--informed-by", obs_id_root,
+        ],
+        capture_output=True, text=True, env={**__import__("os").environ, **env},
+    )
+    assert r2.returncode == 0, r2.stderr
+
+    # Run lineage subcommand in JSON mode
+    r3 = subprocess.run(
+        [
+            sys.executable, "-m", "agents_core.observations", "lineage",
+            obs_id_root,
+            "--direction", "forward",
+            "--format", "json",
+        ],
+        capture_output=True, text=True, env={**__import__("os").environ, **env},
+    )
+    assert r3.returncode == 0, r3.stderr
+    data = json.loads(r3.stdout)
+    assert data["root"]["obs_id"] == obs_id_root
+    assert len(data["forward"]) == 1
+    assert data["forward"][0]["content"] == "child cites root"
+    assert data["forward"][0]["_lineage_depth"] == 1
