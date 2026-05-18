@@ -574,7 +574,14 @@ def _cast_positions(run: dict, entities, adapter) -> list[dict]:
             "}"
         )
 
-        ctx = RunContext() if RunContext is not None else None
+        ctx = (
+            RunContext(
+                step=len(run.get("turns", [])),
+                entity_ids=[s["id"] for s in character_sels],
+            )
+            if RunContext is not None
+            else None
+        )
         raw = entity.act(cast_prompt, ctx)
 
         data = _extract_json(raw)
