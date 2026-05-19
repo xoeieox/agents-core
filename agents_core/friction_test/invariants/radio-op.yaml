@@ -1,0 +1,61 @@
+target: radio-op
+invariants:
+  - id: i01_consult_log_row_per_judgment
+    description: "Every ingest that reached the Qwen judge appends exactly one row to consult-log JSONL"
+    dimension: row_count_delta
+    expected: 1
+    tolerance: 0
+    proposed_by: Erah
+    provisional: false
+    check: agents_core.friction_test.invariants_impl.radio_op.i01_consult_log_row_per_judgment
+    qwen_check: null
+
+  - id: i02_authority_tier_host_determined
+    description: "Surfaced fragments' authority_tier matches map_authority_tier over their ID prefix; no Qwen-overridden values"
+    dimension: tier_override_count
+    expected: 0
+    tolerance: 0
+    proposed_by: Erah
+    provisional: false
+    check: agents_core.friction_test.invariants_impl.radio_op.i02_authority_tier_host_determined
+    qwen_check: null
+
+  - id: i03_should_surface_default_false
+    description: "Empty, whitespace, or single-stopword segments surface zero fragments"
+    dimension: surfaced_count
+    expected: 0
+    tolerance: 0
+    proposed_by: Erah
+    provisional: false
+    check: agents_core.friction_test.invariants_impl.radio_op.i03_should_surface_default_false
+    qwen_check: null
+
+  - id: i04_harvest_marker_iff_explicit_gesture
+    description: "Harvest-queue marker file appears iff the scenario contains an explicit harvest gesture"
+    dimension: marker_xor_gesture
+    expected: 0
+    tolerance: 0
+    proposed_by: Erah
+    provisional: false
+    check: agents_core.friction_test.invariants_impl.radio_op.i04_harvest_marker_iff_explicit_gesture
+    qwen_check: null
+
+  - id: i05_synapse_degradation_handled
+    description: "Synapse 5xx upstream produces structured fallback with methodology.retrieve_pass=degraded, not unhandled exception"
+    dimension: degradation_handled
+    expected: 1
+    tolerance: 0
+    proposed_by: Erah
+    provisional: false
+    check: agents_core.friction_test.invariants_impl.radio_op.i05_synapse_degradation_handled
+    qwen_check: null
+
+  - id: i06_label_isolation
+    description: "Every session started by friction-tester carries a label of the form friction-test-<scenario_id>"
+    dimension: foreign_label_count
+    expected: 0
+    tolerance: 0
+    proposed_by: Erah
+    provisional: false
+    check: agents_core.friction_test.invariants_impl.radio_op.i06_label_isolation
+    qwen_check: null

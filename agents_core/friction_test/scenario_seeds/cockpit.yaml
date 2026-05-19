@@ -1,0 +1,94 @@
+target: cockpit
+families:
+  - id: get_status_happy
+    kind: happy
+    inputs:
+      method: GET
+      path: /api/status
+    expected_class: "status_200"
+    notes: "GET /api/status happy path; expect 200 with basic status body"
+
+  - id: get_thread_weaver_no_threads
+    kind: happy
+    inputs:
+      method: GET
+      path: /api/thread-weaver
+    expected_class: "empty_list_or_200"
+    notes: "GET /api/thread-weaver with no threads; expect 200 with empty or minimal body"
+
+  - id: post_thread_comment_empty_body
+    kind: obvious_break
+    inputs:
+      method: POST
+      path: /api/thread/test-friction-tid/comment
+      body: {}
+      tid: test-friction-tid
+    expected_class: "4xx_or_structured_error"
+    notes: "POST comment with empty body; expect structured error, not 500"
+
+  - id: post_directive_unknown_tid
+    kind: obvious_break
+    inputs:
+      method: POST
+      path: /api/thread/unknown-tid-friction-99999/directive
+      body:
+        action: "test directive from friction tester"
+        author: "friction-tester-v0"
+      tid: unknown-tid-friction-99999
+      unknown_tid: true
+    expected_class: "4xx_structured_error"
+    notes: "POST directive for unknown tid; c03: expect 4xx with structured error body, not 500"
+
+  - id: get_room_state_mid_tick
+    kind: happy
+    inputs:
+      method: GET
+      path: /api/room-state
+    expected_class: "200_or_current_state"
+    notes: "GET /api/room-state; concurrency probe — may be mid-tick; expect 200 and valid body"
+
+  - id: post_heading_malformed_json
+    kind: obvious_break
+    inputs:
+      method: POST
+      path: /api/heading
+      body: null
+    expected_class: "4xx_validation_error"
+    notes: "POST /api/heading with null body (malformed); expect 4xx structured validation error"
+
+  - id: get_gpu_queue
+    kind: happy
+    inputs:
+      method: GET
+      path: /api/gpu-queue
+    expected_class: "200_queue_state"
+    notes: "GET /api/gpu-queue; expect 200 with queue state (may be empty or paused)"
+
+  - id: get_documents_path_traversal
+    kind: obvious_break
+    inputs:
+      method: GET
+      path: /api/documents/targets/../../etc/passwd
+    expected_class: "4xx_no_path_leak"
+    notes: "GET with path traversal '..' in filename; c04: expect 4xx with no absolute path in body"
+
+  - id: post_directive_happy
+    kind: happy
+    inputs:
+      method: POST
+      path: /api/thread/test-friction-directive/directive
+      body:
+        action: "friction-test directive — verify commentstore write"
+        author: "friction-tester-v0"
+      tid: test-friction-directive
+      settle_s: 3
+    expected_class: "directive_persisted"
+    notes: "POST directive to a test tid; expect c02a row in commentstore and c02b latency within bounds"
+
+  - id: get_cockpit_workday_provenance
+    kind: happy
+    inputs:
+      method: GET
+      path: /cockpit/api/workday
+    expected_class: "200_with_provenance"
+    notes: "GET /cockpit/api/workday; c01: expect top-level provenance field with agent_id, signature, mode"

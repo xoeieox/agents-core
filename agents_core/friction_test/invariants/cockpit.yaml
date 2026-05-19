@@ -1,0 +1,51 @@
+target: cockpit
+invariants:
+  - id: c01_cockpit_provenance_present
+    description: "GET /cockpit/api/workday, /cockpit/api/substrate, /cockpit/api/needs-call each return a top-level provenance field with at least agent_id, signature, mode"
+    dimension: routes_missing_provenance
+    expected: 0
+    tolerance: 0
+    proposed_by: Erah
+    provisional: false
+    check: agents_core.friction_test.invariants_impl.cockpit.c01_cockpit_provenance_present
+    qwen_check: null
+
+  - id: c02a_directive_writes_to_commentstore
+    description: "POST /api/thread/{tid}/directive results in a new line appended to /srv/lapis/targets/comments/<tid>.jsonl tagged human:directive"
+    dimension: row_count_delta
+    expected: 1
+    tolerance: 0
+    proposed_by: Erah
+    provisional: false
+    check: agents_core.friction_test.invariants_impl.cockpit.c02a_directive_writes_to_commentstore
+    qwen_check: null
+
+  - id: c02b_directive_write_latency
+    description: "POST directive CommentStore append completes within 200ms of HTTP response"
+    dimension: latency_ms
+    expected: 200
+    tolerance: 50
+    proposed_by: Erah
+    provisional: true
+    check: agents_core.friction_test.invariants_impl.cockpit.c02b_directive_write_latency
+    qwen_check: null
+
+  - id: c03_unknown_tid_returns_4xx
+    description: "Directive or comment to unknown tid returns 4xx with structured error body, not 500"
+    dimension: http_status_class_distance
+    expected: 0
+    tolerance: 0
+    proposed_by: Erah
+    provisional: false
+    check: agents_core.friction_test.invariants_impl.cockpit.c03_unknown_tid_returns_4xx
+    qwen_check: null
+
+  - id: c04_path_traversal_rejected
+    description: "GET /api/documents/{doc_type}/{filename} with '..' in filename returns 4xx with no absolute path leaked in error body"
+    dimension: leak_count
+    expected: 0
+    tolerance: 0
+    proposed_by: Erah
+    provisional: false
+    check: agents_core.friction_test.invariants_impl.cockpit.c04_path_traversal_rejected
+    qwen_check: null

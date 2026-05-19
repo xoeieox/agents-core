@@ -1,0 +1,109 @@
+target: radio-op
+families:
+  - id: empty_segment
+    kind: obvious_break
+    inputs:
+      segments:
+        - segment: ""
+          ts: "{ingest_ts}"
+      harvest: false
+    expected_class: "no_surface"
+    notes: "should_surface=false; no consult-log row; no panel event"
+
+  - id: single_word_segment
+    kind: obvious_break
+    inputs:
+      segments:
+        - segment: "hello"
+          ts: "{ingest_ts}"
+      harvest: false
+    expected_class: "possible_surface"
+    notes: "single word — may or may not trigger judgment depending on threshold"
+
+  - id: long_segment
+    kind: happy
+    inputs:
+      segments:
+        - segment: "This is a detailed message about the current state of the project. We need to decide on the architecture for the new data pipeline. The options are: a streaming approach using Kafka, a batch approach using Spark, or a hybrid model. Each has trade-offs in terms of latency, cost, and complexity. I think we should go with the streaming approach because real-time data is critical for the radio operator workflow and latency matters for the end user experience in the cockpit dashboard."
+          ts: "{ingest_ts}"
+      harvest: false
+    expected_class: "surface_with_fragments"
+    notes: ">200 word segment; judge should fire and surface relevant fragments"
+
+  - id: repeat_segment_within_session
+    kind: obvious_break
+    n_scenarios: 2
+    inputs:
+      segments:
+        - segment: "The memory substrate needs to be updated with the latest decisions."
+          ts: "{ingest_ts}"
+        - segment: "The memory substrate needs to be updated with the latest decisions."
+          ts: "{ingest_ts}"
+      harvest: false
+    expected_class: "both_judged_independently"
+    notes: "identical segments in same session; each should get a consult-log row independently"
+
+  - id: race_two_segments
+    kind: obvious_break
+    n_scenarios: 2
+    inputs:
+      segments:
+        - segment: "First message about project status and timeline."
+          ts: "{ingest_ts}"
+        - segment: "Second message about resource allocation and priorities."
+          ts: "{ingest_ts}"
+          delay_ms: 50
+      harvest: false
+    expected_class: "both_judged_independently"
+    notes: "two ingests within 50ms; both should be judged independently"
+
+  - id: ingest_synapse_down
+    kind: obvious_break
+    inputs:
+      segments:
+        - segment: "Status update on the project: we need to surface recent decisions about the architecture."
+          ts: "{ingest_ts}"
+      harvest: false
+      synapse_down: true
+    expected_class: "degraded_gracefully"
+    notes: "Synapse /serve returns 503; expect structured fallback methodology.retrieve_pass=degraded"
+
+  - id: all_whitespace_segment
+    kind: obvious_break
+    inputs:
+      segments:
+        - segment: "   \t\n   "
+          ts: "{ingest_ts}"
+      harvest: false
+    expected_class: "no_surface"
+    notes: "all-whitespace segment; no consult-log row; no surface"
+
+  - id: explicit_harvest_gesture
+    kind: happy
+    inputs:
+      segments:
+        - segment: "Today we discussed the roadmap and made several decisions about the next quarter priorities."
+          ts: "{ingest_ts}"
+      harvest: true
+    expected_class: "harvest_marker_created"
+    notes: "explicit POST /talk_it_out/session/harvest; harvest-queue marker should appear"
+
+  - id: authority_tier_high_fragment
+    kind: happy
+    inputs:
+      segments:
+        - segment: "I want to review our mem:decision/ entries about the vault writer protocol and authority tier mapping."
+          ts: "{ingest_ts}"
+      harvest: false
+    expected_class: "high_tier_fragments_surfaced"
+    notes: "crafted to trigger authority-tier-high mem fragment (mem:decision/* prefix)"
+
+  - id: stopword_only_segment
+    kind: obvious_break
+    inputs:
+      segments:
+        - segment: "the and or"
+          ts: "{ingest_ts}"
+      harvest: false
+    expected_class: "no_surface"
+    notes: "stopword-only segment; should_surface=false per i03"
