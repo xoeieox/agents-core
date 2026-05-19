@@ -178,12 +178,20 @@ class RadioOpDriver:
             consult_path = CONSULT_LOG_DIR / f"{session_id}.jsonl"
             lines_before = _read_jsonl_lines(consult_path)
 
-            # 2. SSE stream — open in streaming mode, collect briefly
-            sse_events = _collect_sse(
-                self._client, f"{self._base}/talk_it_out/stream/{session_id}"
-            )
+            # 2. Open SSE stream in background thread BEFORE ingests so events
+            #    emitted during ingest processing are captured.
+            sse_url = f"{self._base}/talk_it_out/stream/{session_id}"
+            sse_result: list[list[dict[str, Any]]] = [[]]
 
-            # 3. ingest segments
+            def _sse_worker() -> None:
+                sse_result[0] = _collect_sse(
+                    self._client, sse_url  # type: ignore[arg-type]
+                )
+
+            sse_thread = threading.Thread(target=_sse_worker, daemon=True)
+            sse_thread.start()
+
+            # 3. ingest segments (SSE collection window is now open)
             segments = s.inputs.get("segments", [])
             for seg_spec in segments:
                 segment_text = seg_spec.get("segment", "")
@@ -207,6 +215,10 @@ class RadioOpDriver:
                 ))
                 if r.status_code >= 500:
                     errors.append({"stage": "ingest", "status": r.status_code, "body": body})
+
+            # Close SSE collection (waits for the 2s timeout inside _collect_sse)
+            sse_thread.join(timeout=5.0)
+            sse_events = sse_result[0]
 
             # 4. optional harvest gesture
             if s.inputs.get("harvest", False):

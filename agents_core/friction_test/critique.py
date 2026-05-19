@@ -243,17 +243,26 @@ def _run_qwen_check(
     obs: Observation,
     observed: Any,
     qwen_endpoint: str,
-) -> str:
-    """Run a Qwen check prompt for an invariant; returns justification string."""
+) -> tuple[str, float | None]:
+    """Run a Qwen check prompt for an invariant.
+
+    Returns (justification, distance_estimate).
+    distance_estimate is None when Qwen did not return a parseable numeric estimate.
+    Returns ("qwen_check unreachable: ...", None) on network failure.
+    """
     if not inv.qwen_check:
-        return ""
+        return "", None
     prompt = (
         f"{inv.qwen_check}\n\n"
         f"Scenario: {json.dumps(scenario.to_dict())}\n"
         f"Observation summary: http_calls={len(obs.http_calls)}, "
         f"log_appends={len(obs.log_appends)}, errors={len(obs.errors)}\n"
-        f"Expected: {inv.expected}\nObserved: {observed}\nDistance: "
-        f"(distance computed programmatically)"
+        f"Expected: {inv.expected}\nObserved: {observed}\n\n"
+        "Respond with a JSON object with exactly these keys:\n"
+        "  verdict: \"held\" | \"dissonant\"\n"
+        "  distance_estimate: <non-negative number, 0 if held>\n"
+        "  justification: <one or two sentence explanation>\n"
+        "Return only the JSON object, no markdown fences."
     )
     try:
         resp = httpx.post(
@@ -267,9 +276,32 @@ def _run_qwen_check(
             timeout=20.0,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        parsed = _extract_json_object(raw)
+        if parsed is not None:
+            justification = str(parsed.get("justification", raw))
+            try:
+                distance_estimate = float(parsed["distance_estimate"])
+            except (KeyError, TypeError, ValueError):
+                distance_estimate = None
+            return justification, distance_estimate
+        # Fallback: treat full text as justification, no distance
+        return raw, None
     except Exception as exc:
-        return f"qwen_check unreachable: {exc}"
+        return f"qwen_check unreachable: {exc}", None
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Extract the first JSON object from text."""
+    import re
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        result = json.loads(match.group(0))
+        return result if isinstance(result, dict) else None
+    except Exception:
+        return None
 
 
 def critique(
@@ -315,7 +347,9 @@ def critique(
                     continue
             elif inv.qwen_check:
                 # Qwen-only invariant (inferred); run qwen_check
-                qwen_justification = _run_qwen_check(inv, scenario, obs, observed, qwen_endpoint)
+                qwen_justification, qwen_distance = _run_qwen_check(
+                    inv, scenario, obs, observed, qwen_endpoint
+                )
                 if "unreachable" in qwen_justification:
                     results.append(InvariantResult(
                         scenario_id=scenario.scenario_id,
@@ -333,9 +367,10 @@ def critique(
                         evidence_refs=[],
                     ))
                     continue
-                # For qwen-only, treat as held (qwen provided justification)
+                # Use Qwen's distance_estimate if provided; fall back to 0.0 only
+                # when Qwen explicitly said "held" or gave no numeric estimate.
                 observed = "qwen_evaluated"
-                distance = 0.0
+                distance = qwen_distance if qwen_distance is not None else 0.0
                 status, classification = _classify(inv, observed, distance)
                 results.append(InvariantResult(
                     scenario_id=scenario.scenario_id,
@@ -397,7 +432,7 @@ def critique(
 
             # Optional Qwen secondary pass for qwen_check
             if inv.qwen_check and status != "inapplicable":
-                extra = _run_qwen_check(inv, scenario, obs, observed, qwen_endpoint)
+                extra, _ = _run_qwen_check(inv, scenario, obs, observed, qwen_endpoint)
                 if extra:
                     justification = f"{justification} Qwen: {extra}"
 

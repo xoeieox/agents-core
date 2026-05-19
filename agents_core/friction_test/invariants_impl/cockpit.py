@@ -81,7 +81,8 @@ def c02b_directive_write_latency(
     """POST directive CommentStore append completes within 200ms of HTTP response.
 
     This is a provisional invariant (200ms is a guess).
-    Returns (latency_ms, max(0, latency_ms - (expected + tolerance))).
+    Returns (latency_ms, max(0, latency_ms - expected)).
+    The critique layer applies tolerance; the check function must not.
     Returns (None, 0.0) if no directive call was made.
     """
     # Find POST directive call latency
@@ -99,17 +100,14 @@ def c02b_directive_write_latency(
         if la.get("file", "").endswith(".jsonl") and "/comments/" in la.get("file", ""):
             write_latency = la.get("write_latency_ms")
             if write_latency is not None:
-                # expected=200, tolerance=50; distance = max(0, latency - (expected+tolerance))
                 expected = 200
-                tolerance = 50
-                distance = max(0.0, float(write_latency) - (expected + tolerance))
+                distance = max(0.0, float(write_latency) - expected)
                 return float(write_latency), distance
 
     # Fall back to HTTP call latency
     latency = directive_calls[0].get("latency_ms", 0)
     expected = 200
-    tolerance = 50
-    distance = max(0.0, float(latency) - (expected + tolerance))
+    distance = max(0.0, float(latency) - expected)
     return float(latency), distance
 
 
