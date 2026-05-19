@@ -90,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: harness error — {exc}", file=sys.stderr)
             return 1
         print(f"WARNING: harness error — {exc}", file=sys.stderr)
-        return 1
+        return 0
 
     # Check for harness errors in report
     harness_errors = sum(1 for o in report.observations if o.harness_error)
