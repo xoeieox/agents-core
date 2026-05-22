@@ -12,13 +12,16 @@ dependencies = [
     "requests",
     "pyyaml",
     "jinja2",
+    "fastapi",
+    "uvicorn[standard]",
 ]
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "respx", "pytest-asyncio", "httpx"]
 
 [project.scripts]
 narrative-emit = "agents_core.narrative.emit:main"
+mem-server = "agents_core.mem_server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -15,6 +15,8 @@ locally; every Python process on the box gets `import agents_core.*` without
 | `agents_core.comments` | `Comment`, `CommentStore` — per-target comment log |
 | `agents_core.gpu` | `GPUQueue`, `Priority` — GPU task queue at `/srv/lapis/gpu-queue/` |
 | `agents_core.mem` | `MemoryStore` — SQLite + FTS5 cross-instance memory library |
+| `agents_core.mem_server` | FastAPI HTTP service wrapping `MemoryStore` (port 8403) |
+| `agents_core.mem_client` | `MemClient` — HTTP client for `mem-server` |
 | `agents_core.observations` | `record`, `search`, `root` — append-only per-agent observation substrate |
 
 The `mem` CLI stays at `/srv/agents/scripts/mem.py` (imports `MemoryStore` from
@@ -215,6 +217,27 @@ Forward pointer: additional sources (e.g. `forgejo.get_file`, `vault.search`) ar
 ### First real consumer
 
 `code-reviewer-bundle-wire-v0` wires `bundle.invoke()` into `code_reviewer/review.py`, replacing the hardcoded Python-format system prompt, and renames `harness_id` → `agent_id` in the three existing bundle manifests.
+
+## HTTP service mode
+
+`mem-server` wraps `mem.db` over HTTP so any Tailscale-connected host can read
+and write Memory state without SSH-proxying.
+
+```bash
+# Start server (reads MEM_DB_PATH, MEM_BIND_HOST, MEM_BIND_PORT from env)
+mem-server
+
+# Smoke-test
+curl http://127.0.0.1:8403/healthz
+
+# Client side — set MEM_SERVER to route CLI through HTTP
+export MEM_SERVER=http://203.0.113.12:8403
+```
+
+Full deployment guide (systemd, launchd, Tailscale bind, SSH-proxy deprecation):
+[`docs/deploying-mem-server.md`](docs/deploying-mem-server.md)
+
+Port: **8403** (Lapis web-services 84xx range).
 
 ## Scope
 
