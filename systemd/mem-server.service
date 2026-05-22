@@ -1,0 +1,12 @@
+[Unit]
+Description=mem HTTP service (port 8403)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mem-server
+Restart=on-failure
+EnvironmentFile=-%h/.config/mem/server.env
+
+[Install]
+WantedBy=default.target

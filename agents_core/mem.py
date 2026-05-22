@@ -18,13 +18,14 @@ import json
 import os
 import re
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 # --- Configuration ---
 
 DB_DIR = Path("/data/memory")
-DB_PATH = DB_DIR / "mem.db"
+DB_PATH = Path(os.environ.get("MEM_DB_PATH", DB_DIR / "mem.db"))
 HOSTNAME = os.uname().nodename
 IS_STARHOUSE = HOSTNAME == "starhouse"
 STARHOUSE_SSH = "user@203.0.113.12"
@@ -75,11 +76,16 @@ class MemoryStore:
     def __init__(self, db_path: Path = DB_PATH):
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path))
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(SCHEMA)
+        # Serializes concurrent access from FastAPI threadpool. check_same_thread=False
+        # removes the ownership guard but does not make the connection object safe for
+        # simultaneous calls from different threads — this lock does. RLock because
+        # stats() calls all_tags() internally.
+        self._lock = threading.RLock()
 
     def close(self):
         self._conn.close()
@@ -91,29 +97,31 @@ class MemoryStore:
         tag_str = ",".join(sorted(tags)) if tags else ""
         source = source or HOSTNAME
 
-        existing = self._conn.execute(
-            "SELECT 1 FROM memories WHERE key = ?", (key,)
-        ).fetchone()
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT 1 FROM memories WHERE key = ?", (key,)
+            ).fetchone()
 
-        if existing:
-            self._conn.execute(
-                "UPDATE memories SET content=?, tags=?, source=?, updated_at=? WHERE key=?",
-                (content, tag_str, source, now, key),
-            )
-        else:
-            self._conn.execute(
-                "INSERT INTO memories (key, content, tags, source, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (key, content, tag_str, source, now, now),
-            )
-        self._conn.commit()
+            if existing:
+                self._conn.execute(
+                    "UPDATE memories SET content=?, tags=?, source=?, updated_at=? WHERE key=?",
+                    (content, tag_str, source, now, key),
+                )
+            else:
+                self._conn.execute(
+                    "INSERT INTO memories (key, content, tags, source, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (key, content, tag_str, source, now, now),
+                )
+            self._conn.commit()
         return not existing
 
     def get(self, key: str) -> dict | None:
         """Exact key lookup."""
-        row = self._conn.execute(
-            "SELECT * FROM memories WHERE key = ?", (key,)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM memories WHERE key = ?", (key,)
+            ).fetchone()
         return self._row_to_dict(row) if row else None
 
     def search(self, query: str, tag: str = "", limit: int = 20) -> list[dict]:
@@ -133,7 +141,8 @@ class MemoryStore:
         sql += "ORDER BY rank LIMIT ?"
         params.append(limit)
 
-        rows = self._conn.execute(sql, params).fetchall()
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
     def list_all(self, tag: str = "", tags: list[str] | None = None,
@@ -162,7 +171,8 @@ class MemoryStore:
         sql += "ORDER BY updated_at DESC LIMIT ?"
         params.append(limit)
 
-        rows = self._conn.execute(sql, params).fetchall()
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
     def list_by_prefix(self, prefix: str, limit: int = 50) -> list[dict]:
@@ -183,25 +193,28 @@ class MemoryStore:
         escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = f"{escaped}%"
 
-        rows = self._conn.execute(
-            "SELECT * FROM memories WHERE key LIKE ? ESCAPE '\\' ORDER BY key LIMIT ?",
-            (pattern, limit),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM memories WHERE key LIKE ? ESCAPE '\\' ORDER BY key LIMIT ?",
+                (pattern, limit),
+            ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
     def delete(self, key: str) -> bool:
         """Delete a memory by key. Returns True if deleted."""
-        cursor = self._conn.execute(
-            "DELETE FROM memories WHERE key = ?", (key,)
-        )
-        self._conn.commit()
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM memories WHERE key = ?", (key,)
+            )
+            self._conn.commit()
         return cursor.rowcount > 0
 
     def all_tags(self) -> list[tuple[str, int]]:
         """Return all unique tags with counts, sorted by count desc."""
-        rows = self._conn.execute(
-            "SELECT tags FROM memories WHERE tags != ''"
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT tags FROM memories WHERE tags != ''"
+            ).fetchall()
 
         tag_counts: dict[str, int] = {}
         for row in rows:
@@ -214,9 +227,10 @@ class MemoryStore:
 
     def stats(self) -> dict:
         """Return store statistics."""
-        count = self._conn.execute(
-            "SELECT COUNT(*) as n FROM memories"
-        ).fetchone()["n"]
+        with self._lock:
+            count = self._conn.execute(
+                "SELECT COUNT(*) as n FROM memories"
+            ).fetchone()["n"]
         tags = self.all_tags()
         size_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
 
@@ -231,9 +245,10 @@ class MemoryStore:
 
     def dump(self, fmt: str = "md") -> str:
         """Export all memories."""
-        rows = self._conn.execute(
-            "SELECT * FROM memories ORDER BY key"
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM memories ORDER BY key"
+            ).fetchall()
         memories = [self._row_to_dict(row) for row in rows]
 
         if fmt == "json":
@@ -250,7 +265,8 @@ class MemoryStore:
 
     def checkpoint_wal(self):
         """Force WAL checkpoint for clean sync copy."""
-        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        with self._lock:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     @staticmethod
     def _row_to_dict(row: sqlite3.Row) -> dict:
