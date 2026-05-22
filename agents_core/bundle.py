@@ -55,7 +55,11 @@ class Bundle:
 
 @dataclass(frozen=True)
 class InvocationResult:
-    response: str | None           # operator response text, or None on operator failure
+    response: str | None           # operator response text, or None when operator returned empty content.
+                                   # May propagate agents_core.llm.OperatorUnreachableError if the
+                                   # operator backend is unreachable after retries. response=None means
+                                   # the operator returned empty content (semantic empty response); use
+                                   # the exception to distinguish backend outages.
     rendered_prompt: str           # the fully-rendered system prompt that was sent
     agent_id: str
     operator_class: str
@@ -210,6 +214,9 @@ def invoke(
         default agents_core.mem and agents_core.observations modules.
     operator_kwargs: forwarded verbatim to call_operator() (timeout, json_mode, temperature, etc.).
 
+    May propagate agents_core.llm.OperatorUnreachableError if the operator backend is
+    unreachable after retries. InvocationResult.response=None means the operator returned
+    empty content (semantic empty response); use the exception to distinguish backend outages.
     """
     # Resolve backends at the top - pass them down, never re-import inside helpers
     if backends is None:
