@@ -140,17 +140,94 @@ def test_call_llm_legacy_behavior_byte_identical():
     assert payload["messages"][1] == {"role": "user", "content": "legacy prompt"}
 
 
-def test_call_llm_returns_none_on_connection_error():
-    """call_llm() returns None after exhausting retries (legacy behavior)."""
+def test_call_llm_raises_on_unreachable_after_retries():
+    """call_llm() raises OperatorUnreachableError after exhausting retries on ConnectionError."""
     import requests as req
+    from agents_core.llm import call_llm, OperatorUnreachableError, LLAMACPP_URL
 
-    with patch("agents_core.llm.requests.post",
-               side_effect=req.exceptions.ConnectionError("down")), \
+    conn_err = req.exceptions.ConnectionError("down")
+
+    with patch("agents_core.llm.requests.post", side_effect=conn_err), \
          patch("agents_core.llm.time.sleep"):
-        from agents_core.llm import call_llm
-        result = call_llm(prompt="will fail", system="s")
+        with pytest.raises(OperatorUnreachableError) as exc_info:
+            call_llm(prompt="will fail", system="s")
+
+    exc = exc_info.value
+    assert exc.url == LLAMACPP_URL
+    assert exc.last_error is conn_err
+
+
+def test_call_llm_raises_on_http_error_after_retries():
+    """call_llm() raises OperatorUnreachableError after exhausting retries on HTTPError."""
+    import requests as req
+    from agents_core.llm import call_llm, OperatorUnreachableError, LLAMACPP_URL
+
+    http_err = req.exceptions.HTTPError("503")
+
+    with patch("agents_core.llm.requests.post", side_effect=http_err), \
+         patch("agents_core.llm.time.sleep"):
+        with pytest.raises(OperatorUnreachableError) as exc_info:
+            call_llm(prompt="will fail", system="s")
+
+    exc = exc_info.value
+    assert exc.url == LLAMACPP_URL
+    assert exc.last_error is http_err
+
+
+def test_call_llm_returns_none_on_empty_content():
+    """call_llm() returns None (not exception) when operator returns empty content."""
+    from agents_core.llm import call_llm
+
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {
+        "choices": [{"message": {"content": "", "reasoning_content": None}}]
+    }
+
+    with patch("agents_core.llm.requests.post", return_value=resp):
+        result = call_llm(prompt="empty reply", system="s")
 
     assert result is None
+
+
+def test_call_llm_retries_then_succeeds():
+    """call_llm() retries on ConnectionError and returns content on eventual success."""
+    import requests as req
+    from agents_core.llm import call_llm
+
+    success_resp = _make_llama_response("recovered")
+    conn_err = req.exceptions.ConnectionError("transient")
+
+    with patch("agents_core.llm.requests.post",
+               side_effect=[conn_err, conn_err, success_resp]), \
+         patch("agents_core.llm.time.sleep"):
+        result = call_llm(prompt="retry me", system="s")
+
+    assert result == "recovered"
+
+
+def test_call_llm_returns_none_on_generic_exception():
+    """call_llm() returns None (not exception) for non-Connection/HTTP exceptions."""
+    from agents_core.llm import call_llm
+
+    with patch("agents_core.llm.requests.post", side_effect=ValueError("unexpected")):
+        result = call_llm(prompt="generic error", system="s")
+
+    assert result is None
+
+
+def test_operator_unreachable_error_carries_diagnostic():
+    """OperatorUnreachableError exposes .url and .last_error; str() includes both."""
+    from agents_core.llm import OperatorUnreachableError
+
+    cause = ValueError("boom")
+    exc = OperatorUnreachableError("http://x:1234", cause)
+
+    assert exc.url == "http://x:1234"
+    assert exc.last_error is cause
+    msg = str(exc)
+    assert "http://x:1234" in msg
+    assert "boom" in msg
 
 
 def test_call_llm_delegates_to_call_operator():

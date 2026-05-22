@@ -24,6 +24,21 @@ LLAMACPP_URL = f"http://{TAILSCALE_IP}:8081"
 PACIFIC = ZoneInfo("America/Los_Angeles")
 
 
+class OperatorUnreachableError(Exception):
+    """Raised when an operator backend cannot be reached after exhausting retries.
+
+    Distinguishes "server down / network failure" from "model returned empty content."
+    Carries the backend URL and the last underlying error for diagnostic context.
+    Empty operator responses (content stripped to "") still return None from call_llm;
+    this exception fires only when the HTTP layer itself fails repeatedly.
+    """
+
+    def __init__(self, url: str, last_error: Exception):
+        self.url = url
+        self.last_error = last_error
+        super().__init__(f"Operator unreachable at {url} after retries: {last_error}")
+
+
 # ---------------------------------------------------------------------------
 # Multi-operator routing
 # ---------------------------------------------------------------------------
@@ -95,7 +110,7 @@ def _call_qwen_backend(prompt: str, system: str = None, timeout: int = 600,
             else:
                 if log:
                     log(f"LLM call failed after {max_retries} attempts: {e}")
-                return None
+                raise OperatorUnreachableError(LLAMACPP_URL, e)
         except Exception as e:
             if log:
                 log(f"LLM call error: {e}")
@@ -188,7 +203,9 @@ def call_llm(prompt: str, system: str = None, timeout: int = 600,
     2. Explicit bundle_ids= (chub bundles by ID)
     3. Default: inertia-ecosystem bundle
 
-    Returns the response text, or None on failure.
+    Returns the response text, or None if the operator returned empty content.
+    May raise OperatorUnreachableError if the operator backend is unreachable
+    after retries.
     """
     return call_operator(
         operator_class="qwen",
