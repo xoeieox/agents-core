@@ -2,7 +2,7 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
-from agents_core.llm import call_operator, _OPERATOR_DEFAULTS
+from agents_core.llm import call_operator, OPERATOR_DEFAULTS
 
 
 # ---------------------------------------------------------------------------
@@ -17,7 +17,7 @@ def test_call_operator_qwen_default_model_works():
         mock_qwen.assert_called_once_with(prompt="hi")
 
     with patch("agents_core.llm._call_qwen_backend", return_value="ok") as mock_qwen:
-        result = call_operator("qwen", prompt="hi", model=_OPERATOR_DEFAULTS["qwen"])
+        result = call_operator("qwen", prompt="hi", model=OPERATOR_DEFAULTS["qwen"])
         assert result == "ok"
         mock_qwen.assert_called_once_with(prompt="hi")
 
@@ -32,7 +32,7 @@ def test_call_operator_qwen_non_default_model_raises():
         call_operator("qwen", prompt="hi", model="qwen-other-7b")
     assert "infrastructure operation" in str(exc_info.value)
     assert "qwen-other-7b" in str(exc_info.value)
-    assert _OPERATOR_DEFAULTS["qwen"] in str(exc_info.value)
+    assert OPERATOR_DEFAULTS["qwen"] in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -40,17 +40,11 @@ def test_call_operator_qwen_non_default_model_raises():
 # ---------------------------------------------------------------------------
 
 def test_call_operator_sonnet_model_override_passes_through():
-    """A non-default model on sonnet is not rejected; it routes to ClaudeQueue."""
-    mock_queue = MagicMock()
-    mock_queue.submit.return_value = "task-123"
+    """A non-default model on sonnet is not rejected; it propagates into the task dict."""
+    with patch("agents_core.claude_queue_sync.submit_and_wait", return_value="ok") as mock_saw:
+        result = call_operator("sonnet", prompt="hi", model="claude-sonnet-4-5")
 
-    with patch("agents_core.claude_queue.ClaudeQueue", return_value=mock_queue):
-        with pytest.raises(NotImplementedError) as exc_info:
-            call_operator("sonnet", prompt="hi", model="claude-sonnet-4-5")
-
-    # Confirm it reached ClaudeQueue (not rejected before)
-    mock_queue.submit.assert_called_once()
-    submitted = mock_queue.submit.call_args[0][0]
-    assert submitted["model"] == "claude-sonnet-4-5"
-    # Confirm the NotImplementedError is the v0 gap, not a model-guard error
-    assert "task_id" in str(exc_info.value) or "submitted to ClaudeQueue" in str(exc_info.value)
+    assert result == "ok"
+    mock_saw.assert_called_once()
+    task_dict = mock_saw.call_args[0][0]
+    assert task_dict["model"] == "claude-sonnet-4-5"

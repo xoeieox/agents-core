@@ -462,6 +462,86 @@ async def _run_council_task(queue: ClaudeQueue, task: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# llm_call handler
+# ---------------------------------------------------------------------------
+
+_CLI_MODEL_MAP: dict[str, str] = {
+    "haiku": "haiku",
+    "sonnet": "sonnet",
+    "opus": "opus",
+}
+
+_ALLOWED_OPERATOR_CLASSES = frozenset(_CLI_MODEL_MAP)
+
+
+async def _run_llm_call_task(queue: ClaudeQueue, task: dict) -> None:
+    """Handle task_type=llm_call — call claude -p via call_claude_cli.
+
+    payload.operator_class ∈ {"sonnet","opus","haiku"} (required).
+    payload.prompt (required, non-empty str).
+    payload.system (optional str, default "").
+    payload.json_mode (optional bool, default False).
+
+    Rejects qwen (has its own sync path) and any unknown operator_class.
+    Does NOT call _extract_ops_primitives — llm_call returns raw model text.
+    """
+    from agents_core.llm import call_claude_cli
+
+    task_id = task["id"]
+    payload = task.get("payload") or {}
+    output_path = str(OUTPUT_DIR / f"{task_id}-output.md")
+
+    operator_class = payload.get("operator_class")
+
+    if operator_class == "qwen":
+        msg = "operator_class='qwen' is not routable through llm_call — qwen has its own sync path via call_llm()"
+        queue.fail(task_id, error=msg)
+        notify_failure(task, msg)
+        return
+
+    if operator_class not in _ALLOWED_OPERATOR_CLASSES:
+        msg = f"llm_call: unknown operator_class={operator_class!r}; must be one of {sorted(_ALLOWED_OPERATOR_CLASSES)}"
+        queue.fail(task_id, error=msg)
+        notify_failure(task, msg)
+        return
+
+    prompt = payload.get("prompt")
+    if not prompt:
+        msg = "payload.prompt is empty or missing"
+        queue.fail(task_id, error=msg)
+        notify_failure(task, msg)
+        return
+
+    system = payload.get("system", "")
+    json_mode = bool(payload.get("json_mode", False))
+    cli_model = _CLI_MODEL_MAP[operator_class]
+    timeout = int(task.get("timeout_seconds", 300))
+
+    log.info(f"llm_call claim {task_id} operator={operator_class} model={cli_model} timeout={timeout}s")
+
+    text = await asyncio.to_thread(
+        call_claude_cli,
+        prompt,
+        system=system,
+        model=cli_model,
+        timeout=timeout,
+        json_mode=json_mode,
+    )
+
+    if text is None:
+        msg = "call_claude_cli returned None (subprocess failure or empty response)"
+        queue.fail(task_id, error=msg)
+        notify_failure(task, msg)
+        return
+
+    Path(output_path).write_text(text)
+    summary = text.splitlines()[0][:200] if text else ""
+    queue.complete(task_id, output_path=output_path, result_summary=summary)
+    notify_completion(task, output_path)
+    log.info(f"llm_call done {task_id} chars={len(text)}")
+
+
+# ---------------------------------------------------------------------------
 # Task dispatch (Step B)
 # ---------------------------------------------------------------------------
 
@@ -474,6 +554,8 @@ async def _run_task(queue: ClaudeQueue, task: dict) -> None:
     tt = task.get("task_type", "subprocess")
     if tt == "council.run":
         return await _run_council_task(queue, task)
+    if tt == "llm_call":
+        return await _run_llm_call_task(queue, task)
     return await _run_shaped_task(queue, task)
 
 

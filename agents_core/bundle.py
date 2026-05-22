@@ -15,7 +15,6 @@ v0 invariants:
     - No eval_criteria enforcement (parsed, exposed, not consumed)
     - No caching (cache_scope parsed but ignored)
     - Strict undefined in Jinja2 - missing variables raise at render, not silently empty
-    - Anthropic-family operator_class raises NotImplementedError (gap: agents-core-claude-queue-sync-surface-v0)
     - No backward-compat shim for harness_id - loader reads agent_id only
 """
 from __future__ import annotations
@@ -211,9 +210,6 @@ def invoke(
         default agents_core.mem and agents_core.observations modules.
     operator_kwargs: forwarded verbatim to call_operator() (timeout, json_mode, temperature, etc.).
 
-    Raises NotImplementedError if operator_class is in {"sonnet","opus","haiku"} - those route
-        via ClaudeQueue and have no synchronous result surface yet (named gap:
-        agents-core-claude-queue-sync-surface-v0). Caller catches if appropriate.
     """
     # Resolve backends at the top - pass them down, never re-import inside helpers
     if backends is None:
@@ -235,13 +231,6 @@ def invoke(
             )
 
     bundle = load(bundle_path)
-
-    # Raise NotImplementedError for Anthropic-family operators (v0 gap)
-    if bundle.operator_class in ("sonnet", "opus", "haiku"):
-        raise NotImplementedError(
-            f"Anthropic-family operator_class={bundle.operator_class!r} is not yet supported "
-            f"synchronously - gap: agents-core-claude-queue-sync-surface-v0"
-        )
 
     # Resolve context blocks
     mem_backend_resolved, context_blocks = _resolve_context_blocks(

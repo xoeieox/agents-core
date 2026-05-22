@@ -56,8 +56,8 @@ def test_call_operator_qwen_dispatches_to_existing_endpoint():
 
 def test_call_operator_qwen_uses_default_model_constant():
     """The qwen default model string is the expected production value."""
-    from agents_core.llm import _OPERATOR_DEFAULTS
-    assert _OPERATOR_DEFAULTS["qwen"] == "qwen3.6-35b-a3b"
+    from agents_core.llm import OPERATOR_DEFAULTS
+    assert OPERATOR_DEFAULTS["qwen"] == "qwen3.6-35b-a3b"
 
 
 # ---------------------------------------------------------------------------
@@ -71,30 +71,21 @@ def test_call_operator_qwen_uses_default_model_constant():
 ])
 def test_call_operator_anthropic_dispatches_to_claude_queue(
         operator_class, expected_model):
-    """Anthropic-family classes submit to ClaudeQueue with the right model.
+    """Anthropic-family classes route via submit_and_wait and return the response string."""
+    with patch("agents_core.claude_queue_sync.submit_and_wait", return_value="y") as mock_saw:
+        from agents_core import llm as llm_mod
+        result = llm_mod.call_operator(operator_class, prompt="x")
 
-    v0 gap: the function raises NotImplementedError after submit (no sync surface).
-    The test verifies both the dispatch and the gap signal.
-    """
-    mock_queue = MagicMock()
-    mock_queue.submit.return_value = f"claude_fake_{operator_class}_id"
-
-    with patch("agents_core.claude_queue.ClaudeQueue", return_value=mock_queue) as mock_cls:
-        with pytest.raises(NotImplementedError) as exc_info:
-            from agents_core import llm as llm_mod
-            llm_mod.call_operator(operator_class, prompt="test prompt")
-
-    mock_queue.submit.assert_called_once()
-    submitted = mock_queue.submit.call_args[0][0]
-    assert submitted["model"] == expected_model
-    assert submitted["task_type"] == "llm_call"
-    assert submitted["payload"]["operator_class"] == operator_class
-    assert submitted["payload"]["prompt"] == "test prompt"
-
-    # Gap signal: exception message names the task_id
-    err_msg = str(exc_info.value)
-    assert operator_class in err_msg
-    assert f"claude_fake_{operator_class}_id" in err_msg
+    assert result == "y"
+    mock_saw.assert_called_once()
+    task_dict = mock_saw.call_args[0][0]
+    assert task_dict["task_type"] == "llm_call"
+    assert task_dict["model"] == expected_model
+    assert task_dict["payload"]["operator_class"] == operator_class
+    assert task_dict["payload"]["prompt"] == "x"
+    assert task_dict["payload"]["system"] == ""
+    assert task_dict["payload"]["json_mode"] is False
+    assert task_dict["payload"]["_ignore_intention_registry"] is True
 
 
 def test_call_operator_sonnet_dispatches_to_claude_queue():
@@ -117,11 +108,11 @@ def test_call_operator_unknown_class_raises():
 
 def test_call_operator_unknown_class_names_valid_options():
     """ValueError message lists the valid operator classes."""
-    from agents_core.llm import call_operator, _OPERATOR_DEFAULTS
+    from agents_core.llm import call_operator, OPERATOR_DEFAULTS
     with pytest.raises(ValueError) as exc_info:
         call_operator("unknown-op", prompt="x")
     err = str(exc_info.value)
-    for valid in _OPERATOR_DEFAULTS:
+    for valid in OPERATOR_DEFAULTS:
         assert valid in err
 
 

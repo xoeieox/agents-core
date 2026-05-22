@@ -17,7 +17,7 @@ All 22 test cases from the spec:
   14. Template rendering: retry_state None evaluates falsy; renders empty
   15. Tool allowlist rendering — three-tool list
   16. invoke() qwen path end-to-end (mocked call_operator)
-  17. invoke() Anthropic path raises NotImplementedError
+  17. invoke() Anthropic path routes via submit_and_wait
   18. invoke() backend injection — real modules NOT imported
   19. invoke() record_observation=False
   20. invoke() observation write failure → WARN logged, result still returned
@@ -675,22 +675,35 @@ def test_invoke_qwen_end_to_end(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 17. invoke() Anthropic path raises NotImplementedError
+# 17. invoke() Anthropic path routes via submit_and_wait and returns response
 # ---------------------------------------------------------------------------
 
-def test_invoke_anthropic_raises_not_implemented(tmp_path):
-    """bundle with operator_class: sonnet propagates NotImplementedError with gap name."""
+def test_invoke_sonnet_routes_via_submit_and_wait(tmp_path):
+    """bundle with operator_class: sonnet calls submit_and_wait and returns the response."""
     from agents_core.bundle import invoke
 
     bundle_dir = _make_bundle(
         tmp_path,
-        {"schema_version": 1, "agent_id": "test", "operator_class": "sonnet", "task": "test"},
+        {"schema_version": 1, "agent_id": "test-sonnet", "operator_class": "sonnet", "task": "test"},
     )
 
-    with pytest.raises(NotImplementedError) as exc_info:
-        invoke(bundle_dir, task_intent="hello")
+    fake_obs = MagicMock()
+    fake_obs.record.return_value = tmp_path / "obs.json"
 
-    assert "agents-core-claude-queue-sync-surface-v0" in str(exc_info.value)
+    with patch("agents_core.claude_queue_sync.submit_and_wait", return_value="ok") as mock_saw:
+        result = invoke(
+            bundle_dir,
+            task_intent="hello",
+            backends={"observations": fake_obs},
+        )
+
+    assert result.response == "ok"
+    assert result.operator_class == "sonnet"
+    mock_saw.assert_called_once()
+    # Observation recorded with operator:sonnet tag
+    fake_obs.record.assert_called_once()
+    record_kwargs = fake_obs.record.call_args.kwargs
+    assert "operator:sonnet" in record_kwargs["tags"]
 
 
 # ---------------------------------------------------------------------------

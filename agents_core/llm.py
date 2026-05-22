@@ -28,7 +28,7 @@ PACIFIC = ZoneInfo("America/Los_Angeles")
 # Multi-operator routing
 # ---------------------------------------------------------------------------
 
-_OPERATOR_DEFAULTS: dict[str, str] = {
+OPERATOR_DEFAULTS: dict[str, str] = {
     "qwen":   "qwen3.6-35b-a3b",
     "sonnet": "claude-sonnet-4-6",
     "opus":   "claude-opus-4-7",
@@ -117,56 +117,59 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
 
     qwen routes via the local llama-server (same path as call_llm()).
 
-    sonnet / opus / haiku route via ClaudeQueue dispatch metadata only (v0).
-    No direct Anthropic-API calls — kill-switched per decision/no-anthropic-api-direct.
+    sonnet / opus / haiku route via ClaudeQueue → `claude -p` (Max subscription
+    path). The task is submitted to ClaudeQueue with task_type="llm_call";
+    `submit_and_wait` blocks the caller's thread until the daemon's
+    `_run_llm_call_task` handler completes the task and writes the output file.
+    No direct Anthropic-API calls — kill-switched per
+    decision/no-anthropic-api-direct.
 
-    v0 gap: ClaudeQueue does not yet expose a synchronous-call surface.
-    Anthropic-family calls submit the task (returning the task_id in the
-    exception message) then raise NotImplementedError. The gap is named in
-    the PR description; the future bind is agents-core-claude-queue-sync-surface-v0.
+    Return contract:
+      - str on success (the model's response text, identical to call_llm()'s).
+      - Raises RuntimeError if the queued task fails (subprocess error, missing
+        output_path, queue.fail()'d).
+      - Raises TimeoutError if the wall-clock budget elapses (default
+        timeout + 30s queue overhead).
     """
-    if operator_class not in _OPERATOR_DEFAULTS:
+    if operator_class not in OPERATOR_DEFAULTS:
         raise ValueError(
             f"Unknown operator_class {operator_class!r}. "
-            f"Must be one of: {sorted(_OPERATOR_DEFAULTS)}"
+            f"Must be one of: {sorted(OPERATOR_DEFAULTS)}"
         )
 
     if operator_class == "qwen":
-        if model is not None and model != _OPERATOR_DEFAULTS["qwen"]:
+        if model is not None and model != OPERATOR_DEFAULTS["qwen"]:
             raise ValueError(
                 f"call_operator(operator_class='qwen', model={model!r}): "
                 "the local llama.cpp backend serves a single fixed model "
-                f"({_OPERATOR_DEFAULTS['qwen']!r}); model swaps are an "
+                f"({OPERATOR_DEFAULTS['qwen']!r}); model swaps are an "
                 "infrastructure operation (stop / swap weights / restart), "
                 "not a per-call parameter. Either pass model=None to use the "
                 "default, or do the model swap out-of-band first."
             )
         return _call_qwen_backend(prompt=prompt, **kwargs)
 
-    # Anthropic-family: route via ClaudeQueue dispatch metadata only (v0).
+    # Anthropic-family: route via ClaudeQueue → call_claude_cli.
     # No direct Anthropic-API code path (decision/no-anthropic-api-direct).
-    resolved_model = model or _OPERATOR_DEFAULTS[operator_class]
-    from agents_core.claude_queue import ClaudeQueue
-    q = ClaudeQueue()
-    task_id = q.submit({
-        "task_type": "llm_call",
-        "model": resolved_model,
-        "submitted_by": "call_operator",
-        "description": f"call_operator/{operator_class}",
-        "payload": {
-            "operator_class": operator_class,
-            "prompt": prompt,
-            "_ignore_intention_registry": True,  # bypass: ClaudeQueue dispatch skips intention-registry lookup; task is fire-and-forget at v0 (no intention to register)
+    resolved_model = model or OPERATOR_DEFAULTS[operator_class]
+    from agents_core.claude_queue_sync import submit_and_wait
+    timeout = int(kwargs.get("timeout", 300))
+    return submit_and_wait(
+        {
+            "task_type": "llm_call",
+            "model": resolved_model,
+            "submitted_by": "call_operator",
+            "description": f"call_operator/{operator_class}",
+            "timeout_seconds": timeout,
+            "payload": {
+                "operator_class": operator_class,
+                "prompt": prompt,
+                "system": kwargs.get("system", ""),
+                "json_mode": kwargs.get("json_mode", False),
+                "_ignore_intention_registry": True,
+            },
         },
-    })
-    # GAP (v0): ClaudeQueue exposes no synchronous-call surface.
-    # The task is queued; result retrieval requires polling
-    # claude_queue/completed/. Future bind: agents-core-claude-queue-sync-surface-v0.
-    raise NotImplementedError(
-        f"Anthropic-family call (operator_class={operator_class!r}, "
-        f"model={resolved_model!r}) submitted to ClaudeQueue as "
-        f"task_id={task_id!r}. Synchronous result surface not yet "
-        f"implemented — see PR description for the named gap."
+        timeout_s=timeout + 30,  # wrapper budget = task timeout + queue overhead
     )
 
 
