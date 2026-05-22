@@ -190,9 +190,9 @@ result = invoke(
 | Class | Backend | Notes |
 |-------|---------|-------|
 | `qwen` | Local llama-server (synchronous) | Production path |
-| `sonnet` | ClaudeQueue | v0 gap — raises `NotImplementedError`; see `agents-core-claude-queue-sync-surface-v0` |
-| `opus` | ClaudeQueue | Same gap |
-| `haiku` | ClaudeQueue | Same gap |
+| `sonnet` | ClaudeQueue → `claude -p` | Synchronous via `submit_and_wait`; production path |
+| `opus` | ClaudeQueue → `claude -p` | Synchronous via `submit_and_wait`; production path |
+| `haiku` | ClaudeQueue → `claude -p` | Synchronous via `submit_and_wait`; production path |
 
 ### Supported context-injection sources
 
