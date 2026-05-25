@@ -25,9 +25,8 @@ When latch_state != PROBE the guard stops downgrading. The caller must record
 a final latch-state entry to the chassis.
 """
 
-import dataclasses
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal
 
@@ -106,11 +105,11 @@ class RecencyGuard:
 
         created_at_str = record["created_at"]
         created_at = datetime.fromisoformat(created_at_str)
-        # Strip timezone info if present so arithmetic works with utcnow()
-        if created_at.tzinfo is not None:
-            created_at = created_at.replace(tzinfo=None)
+        # Ensure tz-aware for comparison with now(timezone.utc)
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
         artifact_age_days = (
-            datetime.utcnow() - created_at
+            datetime.now(timezone.utc) - created_at
         ).total_seconds() / 86400
 
         current_latch = self.latch_state
