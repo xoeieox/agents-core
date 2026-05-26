@@ -343,7 +343,7 @@ Respond with ONLY a JSON object:
         prompt=prompt,
         system=system_msg,
         model="sonnet",
-        timeout=120,
+        timeout=300,
         json_mode=True,
         log=log,
     )
