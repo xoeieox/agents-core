@@ -17,6 +17,8 @@ locally; every Python process on the box gets `import agents_core.*` without
 | `agents_core.mem` | `MemoryStore` — SQLite + FTS5 cross-instance memory library |
 | `agents_core.mem_server` | FastAPI HTTP service wrapping `MemoryStore` (port 8403) |
 | `agents_core.mem_client` | `MemClient` — HTTP client for `mem-server` |
+| `agents_core.gpu_server` | FastAPI HTTP service wrapping `GPUQueue` (port 8405) |
+| `agents_core.gpu_client` | `GPUClient` — HTTP client for `gpu-queue-server` |
 | `agents_core.observations` | `record`, `search`, `root` — append-only per-agent observation substrate |
 
 The `mem` CLI stays at `/srv/agents/scripts/mem.py` (imports `MemoryStore` from
@@ -238,6 +240,29 @@ Full deployment guide (systemd, launchd, Tailscale bind, SSH-proxy deprecation):
 [`docs/deploying-mem-server.md`](docs/deploying-mem-server.md)
 
 Port: **8403** (Lapis web-services 84xx range).
+
+## GPU queue HTTP service mode
+
+`gpu-queue-server` wraps `GPUQueue` over HTTP so any Tailscale-connected host
+can submit, claim, and complete GPU tasks without sharing the filesystem at
+`/srv/lapis/gpu-queue`. This is the cross-node handoff enabling BRIX-side
+orchestration to submit GPU jobs while StarHouse's runner consumes them.
+
+```bash
+# Start server (reads GPU_QUEUE_DIR, GPU_QUEUE_BIND_HOST, GPU_QUEUE_BIND_PORT from env)
+gpu-queue-server
+
+# Smoke-test
+curl http://127.0.0.1:8405/healthz
+
+# Client side — set GPU_QUEUE_SERVER to route through HTTP
+export GPU_QUEUE_SERVER=http://203.0.113.10:8405
+```
+
+Full deployment guide (systemd, Tailscale bind, BRIX-as-canonical-host note):
+[`docs/deploying-gpu-queue-server.md`](docs/deploying-gpu-queue-server.md)
+
+Port: **8405** (Lapis web-services 84xx range).
 
 ## Scope
 

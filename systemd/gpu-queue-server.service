@@ -1,0 +1,12 @@
+[Unit]
+Description=gpu-queue HTTP service (port 8405)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gpu-queue-server
+Restart=on-failure
+EnvironmentFile=-%h/.config/gpu-queue/server.env
+
+[Install]
+WantedBy=default.target
