@@ -25,7 +25,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal
 
-from agents_core.mem import MemoryStore
+from agents_core.mem import HOSTNAME, IS_MASTER, MEM_MASTER_URL, MemoryStore
 from agents_core.notify import Priority, send_notification
 
 logger = logging.getLogger(__name__)
@@ -547,7 +547,11 @@ def _do_notify_burst(level: BurstLevel, recent_events: list[FaultEvent],
     except Exception as exc:
         logger.warning("Pushover send failed (non-fatal): %s", exc)
 
-    # Emit mem.db incident entry
+    # Emit incident entry to the mem MASTER. host-fault-recorder records the LOCAL
+    # host's faults but the substrate is BRIX-canonical, so off-master hosts (e.g.
+    # StarHouse) must POST to the BRIX mem-server rather than write a divergent
+    # local sqlite. On the master itself, write locally (avoids HTTP-to-self and a
+    # mem-server-up dependency). Tag with the actual host so incidents are attributable.
     ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
     mem_key = f"incident/host-fault-burst-{ts_str}"
     summary = (
@@ -556,11 +560,19 @@ def _do_notify_burst(level: BurstLevel, recent_events: list[FaultEvent],
         f"Latest snapshot: {latest_snapshot}."
     )
     try:
-        store = MemoryStore()
-        store.set(mem_key, summary, tags=["host-fault", "starhouse"])
-        store.close()
+        if IS_MASTER:
+            store = MemoryStore()
+            store.set(mem_key, summary, tags=["host-fault", HOSTNAME])
+            store.close()
+        else:
+            # MemClient.set takes tags as a comma-separated string.
+            from agents_core.mem_client import MemClient
+
+            base_url = os.environ.get("MEM_SERVER") or MEM_MASTER_URL
+            with MemClient(base_url=base_url) as client:
+                client.set(mem_key, summary, tags=f"host-fault,{HOSTNAME}")
     except Exception as exc:
-        logger.warning("mem.db emit failed (non-fatal): %s", exc)
+        logger.warning("mem incident emit failed (non-fatal): %s", exc)
 
 
 def notify_burst(

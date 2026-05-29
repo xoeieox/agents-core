@@ -466,7 +466,9 @@ def test_notify_burst_emits_mem_db_entry(monkeypatch):
         f"mem key should start with 'incident/host-fault-burst-', got: {key!r}"
     )
     assert "host-fault" in tags, f"Expected 'host-fault' tag, got: {tags}"
-    assert "starhouse" in tags, f"Expected 'starhouse' tag, got: {tags}"
+    # Incidents are tagged with the actual host they occurred on (was hardcoded
+    # "starhouse"; now host-attributed since the recorder may run on any host).
+    assert hfr.HOSTNAME in tags, f"Expected host tag {hfr.HOSTNAME!r}, got: {tags}"
 
 
 def test_notify_burst_message_format_normal(monkeypatch):
@@ -510,3 +512,63 @@ def test_smoke_import_and_parse():
     result = host_fault_recorder.parse_fault_line(GP_FAULT_LINE)
     assert result is not None
     assert result.fault_kind == "general_protection_fault"
+
+
+# ---------------------------------------------------------------------------
+# Incident emit routes to the mem MASTER (substrate cutover)
+# ---------------------------------------------------------------------------
+
+def test_incident_emit_off_master_posts_to_brix(monkeypatch):
+    """Off-master (e.g. StarHouse): incident POSTs to the mem master via MemClient,
+    NOT a divergent local sqlite. Tags are passed as a comma-separated string."""
+    import agents_core.host_fault_recorder as hfr
+    import agents_core.mem_client as mem_client_mod
+
+    monkeypatch.setattr("agents_core.host_fault_recorder.send_notification", lambda *a, **k: True)
+    monkeypatch.setattr(hfr, "IS_MASTER", False)
+    # MemoryStore must NOT be used off-master.
+    monkeypatch.setattr(hfr, "MemoryStore", lambda *a, **k: (_ for _ in ()).throw(AssertionError("local write off-master")))
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, base_url=None, **kw):
+            calls.append(("init", base_url))
+        def set(self, key, content, tags="", source=""):
+            calls.append(("set", key, tags))
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(mem_client_mod, "MemClient", FakeClient)
+
+    hfr._do_notify_burst(BurstLevel.NORMAL, [_make_event()], Path("/tmp/snap.json"))
+
+    set_calls = [c for c in calls if c[0] == "set"]
+    assert len(set_calls) == 1
+    _, key, tags = set_calls[0]
+    assert key.startswith("incident/host-fault-burst-")
+    assert tags == f"host-fault,{hfr.HOSTNAME}"  # string form, host-attributed
+    # MemClient was pointed at the master URL.
+    assert any(c[0] == "init" and c[1] for c in calls)
+
+
+def test_incident_emit_on_master_writes_local(monkeypatch):
+    """On the master itself: write locally via MemoryStore (no HTTP-to-self)."""
+    import agents_core.host_fault_recorder as hfr
+
+    monkeypatch.setattr("agents_core.host_fault_recorder.send_notification", lambda *a, **k: True)
+    monkeypatch.setattr(hfr, "IS_MASTER", True)
+
+    store_calls = []
+    fake_store = MagicMock()
+    fake_store.set = lambda key, content, tags=None: store_calls.append((key, tags))
+    monkeypatch.setattr(hfr, "MemoryStore", lambda *a, **k: fake_store)
+
+    hfr._do_notify_burst(BurstLevel.NORMAL, [_make_event()], Path("/tmp/snap.json"))
+
+    assert len(store_calls) == 1
+    key, tags = store_calls[0]
+    assert key.startswith("incident/host-fault-burst-")
+    assert tags == ["host-fault", hfr.HOSTNAME]  # list form for the local store
