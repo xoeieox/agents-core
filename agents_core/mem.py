@@ -34,7 +34,6 @@ HOSTNAME = os.uname().nodename
 # "starhouse" via the former IS_STARHOUSE; promoted to "brix" 2026-05-29 (substrate
 # cutover step B). `IS_STARHOUSE` kept as a back-compat alias for any external ref.
 MEM_MASTER_HOST = "brix"
-MEM_MASTER_URL = "http://203.0.113.10:8404"  # BRIX Tailscale IP; change with MEM_MASTER_HOST
 IS_MASTER = HOSTNAME == MEM_MASTER_HOST
 IS_STARHOUSE = IS_MASTER  # back-compat alias (no in-tree consumers as of 2026-05-29)
 STARHOUSE_SSH = "user@203.0.113.12"
