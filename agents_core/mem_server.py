@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -29,6 +29,29 @@ from agents_core.mem import MemoryStore
 
 def _error(code: str, message: str) -> dict:
     return {"error": {"code": code, "message": message}}
+
+
+@runtime_checkable
+class DepositRecorder(Protocol):
+    """Attribution-log sink injected at boot (zephyr provides the impl).
+
+    agents-core declares this interface and NEVER imports zephyr; the wiring is
+    config-driven via MEM_DEPOSIT_RECORDER=<module>:<callable> (dynamic import in
+    main()). Keeps the dependency arrow agents-core -> (interface) <- zephyr, per
+    the substrate deposit endpoint spec (HIGH-2 layering)."""
+
+    def already_recorded(self, manifest_hash: str) -> bool: ...
+
+    def record(self, provenance: dict, *, store_kind: str, key: str | None) -> bool: ...
+
+
+def _normalize_tags(tags_raw: Any) -> list[str] | None:
+    """Accept tags as a comma-separated string or a list; normalize for set()."""
+    if isinstance(tags_raw, str) and tags_raw:
+        return [t.strip() for t in tags_raw.split(",") if t.strip()]
+    if isinstance(tags_raw, list):
+        return [str(t).strip() for t in tags_raw if str(t).strip()]
+    return None
 
 
 def _row_response(row: dict) -> dict:
@@ -53,7 +76,7 @@ def _search_row_response(row: dict) -> dict:
 # App factory
 # ---------------------------------------------------------------------------
 
-def create_app(db_path: Path) -> FastAPI:
+def create_app(db_path: Path, deposit_recorder: "DepositRecorder | None" = None) -> FastAPI:
     app = FastAPI(title="mem-server", version="0")
     store = MemoryStore(db_path)
 
@@ -98,6 +121,7 @@ def create_app(db_path: Path) -> FastAPI:
                 "in_sync": in_sync,
                 "divergence": mem_count - fts_count,
             },
+            "deposit": {"configured": deposit_recorder is not None},
         }
 
     # ------------------------------------------------------------------
@@ -137,13 +161,7 @@ def create_app(db_path: Path) -> FastAPI:
         tags_raw = request_data.get("tags", "")
         source = request_data.get("source", "")
 
-        # tags arrives as a comma-separated string; split for MemoryStore.set()
-        if isinstance(tags_raw, str) and tags_raw:
-            tags_list = [t.strip() for t in tags_raw.split(",") if t.strip()]
-        elif isinstance(tags_raw, list):
-            tags_list = [str(t).strip() for t in tags_raw if str(t).strip()]
-        else:
-            tags_list = None
+        tags_list = _normalize_tags(tags_raw)
 
         store.set(key, content, tags=tags_list, source=source)
         row = store.get(key)
@@ -215,12 +233,95 @@ def create_app(db_path: Path) -> FastAPI:
         store.checkpoint_wal()
         return {"ok": True}
 
+    # ------------------------------------------------------------------
+    # Deposit (Zephyr work-record envelope) - rides LapisToolReturn
+    # ------------------------------------------------------------------
+
+    @app.post("/v0/deposit")
+    def deposit(envelope: dict[str, Any]):
+        """Accept a LapisToolReturn deposit: persist payload to the mem store and
+        append its provenance to the (injected) attribution log. Idempotent on
+        provenance.manifest_hash (HIGH-1 construct-once / retry-identical-bytes)."""
+        if deposit_recorder is None:
+            raise HTTPException(
+                status_code=503,
+                detail=_error(
+                    "deposit_unconfigured",
+                    "No attribution recorder injected (set MEM_DEPOSIT_RECORDER)",
+                ),
+            )
+        # Validate the envelope via the canonical dataclass (lazy import keeps boot
+        # free of a hard archetypes_core dependency).
+        try:
+            from archetypes_core.provenance import LapisToolReturn
+
+            ltr = LapisToolReturn.from_dict(envelope)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=_error("bad_envelope", f"Invalid LapisToolReturn: {e}"),
+            )
+
+        prov = ltr.provenance
+        mh = prov.manifest_hash
+        if not mh:
+            raise HTTPException(
+                status_code=400,
+                detail=_error("bad_envelope", "provenance.manifest_hash is required"),
+            )
+
+        payload = ltr.payload
+        if not isinstance(payload, dict) or "key" not in payload:
+            raise HTTPException(
+                status_code=400,
+                detail=_error(
+                    "bad_payload", "mem deposit payload must be {key, value, tags?}"
+                ),
+            )
+        key = payload["key"]
+
+        # Dedup on manifest_hash. mem set() is an idempotent upsert, but we honor
+        # the duplicate contract so append-style sinks (weaver) share this shape.
+        if deposit_recorder.already_recorded(mh):
+            return {"status": "duplicate", "key": key, "manifest_hash": mh}
+
+        value = payload.get("value", payload.get("content", ""))
+        tags_list = _normalize_tags(payload.get("tags"))
+        store.set(key, value, tags=tags_list, source=prov.agent_id or "")
+        deposit_recorder.record(prov.to_dict(), store_kind="mem", key=key)
+        return {"status": "accepted", "key": key, "manifest_hash": mh}
+
     return app
 
 
 # ---------------------------------------------------------------------------
 # Console-script entry point
 # ---------------------------------------------------------------------------
+
+def _load_deposit_recorder() -> "DepositRecorder | None":
+    """Load the attribution recorder from MEM_DEPOSIT_RECORDER=<module>:<callable>.
+
+    Dynamic import (no static zephyr dependency). ANY failure is swallowed with a
+    warning and returns None so the server still boots and serves every existing
+    route; only /v0/deposit degrades to 503. This protects the live master."""
+    import logging
+
+    log = logging.getLogger("mem-server")
+    spec = os.environ.get("MEM_DEPOSIT_RECORDER", "").strip()
+    if not spec:
+        return None
+    try:
+        import importlib
+
+        mod_name, _, attr = spec.partition(":")
+        factory = getattr(importlib.import_module(mod_name), attr)
+        recorder = factory()
+        log.info("deposit recorder loaded: %s", spec)
+        return recorder
+    except Exception as e:  # noqa: BLE001 - boot must never fail over this
+        log.warning("deposit recorder load FAILED (%s): %s; /v0/deposit will 503", spec, e)
+        return None
+
 
 def main():
     import uvicorn
@@ -230,7 +331,7 @@ def main():
     port = int(os.environ.get("MEM_BIND_PORT", "8403"))
     log_level = os.environ.get("MEM_LOG_LEVEL", "info")
 
-    app = create_app(db_path)
+    app = create_app(db_path, deposit_recorder=_load_deposit_recorder())
     uvicorn.run(app, host=host, port=port, log_level=log_level)
 
 
