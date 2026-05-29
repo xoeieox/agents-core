@@ -1,7 +1,11 @@
 # Deploying mem-server
 
-`mem-server` exposes `mem.db` over HTTP on port 8403. Any Tailscale-connected
+`mem-server` exposes `mem.db` over HTTP on port 8404. Any Tailscale-connected
 host can read and write Memory state through a network-addressable endpoint.
+
+**Topology (as of 2026-05-29):** BRIX (`203.0.113.10:8404`) is the read-write
+master. StarHouse and MacBook are read-only mirrors. The master is set by the
+`MEM_MASTER_HOST = "brix"` constant in `agents_core/mem.py` — not an env toggle.
 
 ## Environment variables
 
@@ -11,7 +15,7 @@ host can read and write Memory state through a network-addressable endpoint.
 |---|---|---|
 | `MEM_DB_PATH` | `/data/memory/mem.db` | SQLite DB file location |
 | `MEM_BIND_HOST` | `127.0.0.1` | uvicorn bind host |
-| `MEM_BIND_PORT` | `8403` | uvicorn bind port |
+| `MEM_BIND_PORT` | `8404` | uvicorn bind port |
 | `MEM_BEARER_TOKEN` | (unset) | Optional shared bearer token; omit to disable auth |
 | `MEM_LOG_LEVEL` | `info` | uvicorn log level |
 
@@ -34,8 +38,8 @@ cp systemd/mem-server.service ~/.config/systemd/user/
 mkdir -p ~/.config/mem
 cat > ~/.config/mem/server.env <<EOF
 MEM_DB_PATH=/data/memory/mem.db
-MEM_BIND_HOST=203.0.113.12
-MEM_BIND_PORT=8403
+MEM_BIND_HOST=203.0.113.10  # BRIX — read-write master
+MEM_BIND_PORT=8404
 MEM_LOG_LEVEL=info
 # MEM_BEARER_TOKEN=changeme
 EOF
@@ -54,10 +58,9 @@ journalctl --user -u mem-server -f
 Production deployments bind to the host's Tailscale IP rather than `127.0.0.1`:
 
 ```
-MEM_BIND_HOST=203.0.113.12   # StarHouse
+MEM_BIND_HOST=203.0.113.10   # BRIX (read-write master, 2026-05-29+)
+# MEM_BIND_HOST=203.0.113.12  # StarHouse — read-only mirror; do not promote
 ```
-
-After BRIX assembly (2026-05-29), update to the BRIX Tailscale IP.
 
 ## macOS - launchd / nohup pattern
 
@@ -65,7 +68,7 @@ After BRIX assembly (2026-05-29), update to the BRIX Tailscale IP.
 # nohup background pattern
 export MEM_DB_PATH=$HOME/data/memory/mem.db
 export MEM_BIND_HOST=127.0.0.1
-export MEM_BIND_PORT=8403
+export MEM_BIND_PORT=8404
 nohup mem-server > /tmp/mem-server.log 2>&1 &
 echo $! > /tmp/mem-server.pid
 ```
@@ -90,7 +93,7 @@ For a persistent launchd plist, create `~/Library/LaunchAgents/com.lapis.mem-ser
         <key>MEM_BIND_HOST</key>
         <string>127.0.0.1</string>
         <key>MEM_BIND_PORT</key>
-        <string>8403</string>
+        <string>8404</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -111,23 +114,28 @@ launchctl load ~/Library/LaunchAgents/com.lapis.mem-server.plist
 ## Smoke test
 
 ```bash
-curl http://127.0.0.1:8403/healthz
+# Local
+curl http://127.0.0.1:8404/healthz
+# Remote (BRIX master)
+curl http://203.0.113.10:8404/healthz
 # expected: {"status":"ok","db_path":"...","row_counts":{"memories":N,...}}
 
 # With bearer token:
-curl -H "Authorization: Bearer <token>" http://127.0.0.1:8403/healthz
+curl -H "Authorization: Bearer <token>" http://203.0.113.10:8404/healthz
 ```
 
-## SSH-proxy deprecation
+## Client configuration
 
-The current CLI shim at `/srv/agents/scripts/mem.py` contains `_remote_write()`
-which proxies write commands from non-StarHouse hosts to StarHouse via SSH. Once
-`mem-server` is running in production:
+All non-BRIX hosts point `MEM_SERVER` at the BRIX master:
 
-1. Set `MEM_SERVER=http://<starhouse-tailscale-ip>:8403` on MacBook (and other
-   non-StarHouse hosts).
-2. The companion CLI-shim edit (`conductor-mem-cli-http-route-v0`) replaces the
-   SSH branch with an `httpx`-based `MemClient` call.
-3. Remove `_remote_write()` after ≥7 days of HTTP service in production.
+```
+MEM_SERVER=http://203.0.113.10:8404
+```
 
-The SSH proxy is NOT removed in this PR - removal is gated on the companion edit.
+This is set in `~/.bashrc` and `~/.claude/settings.json` on both StarHouse and
+MacBook. The `/usr/local/bin/mem` wrapper on StarHouse defaults to BRIX; rollback
+shim is baked in. `mem stats` reports `mode: read-only (master is brix)` on
+non-BRIX hosts and `mode: read-write` on BRIX.
+
+The old SSH-proxy (`_remote_write()`) in `mem.py` is superseded by the HTTP
+client path and can be removed once the HTTP service has been stable for ≥7 days.
