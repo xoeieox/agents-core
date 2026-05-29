@@ -37,6 +37,10 @@ MEM_MASTER_HOST = "brix"
 IS_MASTER = HOSTNAME == MEM_MASTER_HOST
 IS_STARHOUSE = IS_MASTER  # back-compat alias (no in-tree consumers as of 2026-05-29)
 STARHOUSE_SSH = "user@203.0.113.12"
+# HTTP base URL of the mem master's mem-server. Off-master writers (e.g.
+# host-fault-recorder on StarHouse) POST here via MemClient instead of writing a
+# divergent local sqlite. Env-overridable; default is the BRIX tailscale address.
+MEM_MASTER_URL = os.environ.get("MEM_MASTER_URL", "http://203.0.113.10:8404")
 
 
 # --- Database Schema ---
