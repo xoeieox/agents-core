@@ -27,7 +27,15 @@ from pathlib import Path
 DB_DIR = Path("/data/memory")
 DB_PATH = Path(os.environ.get("MEM_DB_PATH", DB_DIR / "mem.db"))
 HOSTNAME = os.uname().nodename
-IS_STARHOUSE = HOSTNAME == "starhouse"
+# Master (read-write) host for the mem substrate. Single deliberate value, NOT an
+# env toggle — so the designation cannot drift per-host into a dual-master
+# split-brain (the failure the BRIX-canonical cutover exists to escape). Flipping
+# the master is a reviewed code change, deployed old-master-first. Was implicitly
+# "starhouse" via the former IS_STARHOUSE; promoted to "brix" 2026-05-29 (substrate
+# cutover step B). `IS_STARHOUSE` kept as a back-compat alias for any external ref.
+MEM_MASTER_HOST = "brix"
+IS_MASTER = HOSTNAME == MEM_MASTER_HOST
+IS_STARHOUSE = IS_MASTER  # back-compat alias (no in-tree consumers as of 2026-05-29)
 STARHOUSE_SSH = "user@203.0.113.12"
 
 
@@ -240,7 +248,7 @@ class MemoryStore:
             "db_size_bytes": size_bytes,
             "db_path": str(self.db_path),
             "hostname": HOSTNAME,
-            "mode": "read-write" if IS_STARHOUSE else "read-only (writes proxy to StarHouse)",
+            "mode": "read-write" if IS_MASTER else f"read-only (master is {MEM_MASTER_HOST})",
         }
 
     def dump(self, fmt: str = "md") -> str:
