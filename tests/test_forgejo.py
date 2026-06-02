@@ -7,7 +7,15 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agents_core import forgejo
+
+
+@pytest.fixture(autouse=True)
+def _isolate_provenance_ledger(tmp_path, monkeypatch):
+    """Keep mutating-op provenance out of the real audit ledger during tests."""
+    monkeypatch.setattr(forgejo, "PROVENANCE_LOG", str(tmp_path / "forgejo-ops.jsonl"))
 
 
 def _mock_response(status_code=200, json_data=None):
