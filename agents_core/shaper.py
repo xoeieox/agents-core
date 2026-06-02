@@ -64,6 +64,40 @@ def _slugify(text: str, max_len: int = 32) -> str:
     return (s or "task")[:max_len]
 
 
+def _record_dispatch_slot(
+    *,
+    slot_id: str,
+    project_id: str,
+    agent_type: str,
+    task_id: str,
+    vars_: dict | None,
+    user_prompt: str,
+) -> None:
+    """Open a project-slot on the BRIX blackboard for a shaped dispatch.
+
+    Best-effort: never raises. Slot-store unavailability (off-master, server down,
+    not-yet-deployed) must not block a dispatch — the dispatch is the real work; the
+    slot is coordination metadata. The project is the target; the slot is this unit of
+    work; the contributor-of-record is the dispatched agent (keyed by task_id).
+    """
+    try:
+        from agents_core.slots import SlotStore
+
+        horizon = {
+            "project_summary": (vars_ or {}).get("spec_summary") or "",
+            "immediate_goal": (user_prompt or "").strip()[:280],
+            "adjacent_slots": [],
+        }
+        SlotStore().create_slot(
+            project_id=project_id,
+            contributor={"type": agent_type, "id": task_id},
+            horizon=horizon,
+            slot_id=slot_id,
+        )
+    except Exception as exc:  # never block dispatch
+        print(f"[slots:dispatch-open-failed] {slot_id}: {exc}", file=sys.stderr)
+
+
 @dataclass
 class ShapedAgent:
     name: str
@@ -217,6 +251,11 @@ class Shaper:
 
         spec_id = uuid.uuid4().hex[:12]
         spec_path = SPEC_DIR / f"{target_id}-{agent.name}-{spec_id}.json"
+        # The slot_id IS the spec_id: stable, unique per dispatch, already carried on
+        # DispatchResult and recorded by lapis-pm, so the contributor-of-record that
+        # completes the slot later keys off the same id. Hand it to the runner too so
+        # mid-run checkpoints (Reality Snap) can target this slot.
+        spec["slot_id"] = spec_id
 
         cmd = f"python3 -m {RUNNER_MODULE} {shlex.quote(str(spec_path))}"
 
@@ -278,6 +317,19 @@ class Shaper:
                 "payload": {"command": cmd},
             })
             output_path = f"/srv/lapis/gpu-queue/completed/{task_id}-output.md"
+
+        # Open a project-slot on the blackboard for this dispatch. Best-effort:
+        # slot-store trouble must never block a real dispatch (mirrors
+        # router_portfolio's emit discipline). slot_id == spec_id; contributor-of-
+        # record == task_id, which is what lapis-pm matches on at completion.
+        _record_dispatch_slot(
+            slot_id=spec_id,
+            project_id=target_id,
+            agent_type=agent.name,
+            task_id=task_id,
+            vars_=vars_,
+            user_prompt=user_prompt,
+        )
 
         return DispatchResult(
             task_id=task_id,

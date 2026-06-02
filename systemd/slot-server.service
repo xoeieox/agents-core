@@ -1,0 +1,21 @@
+[Unit]
+Description=slot HTTP service — project-slot blackboard / actor-read API (Layer 5, port 8405)
+After=network.target
+# Don't let a tight crash-loop trip the start limit and wedge the service.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# python -m form (not the console script) so it runs without a pip reinstall on the
+# PEP-668 BRIX system interpreter. agents_core resolves from PYTHONPATH=/srv/agents.
+ExecStart=/usr/bin/env python3 -m agents_core.slot_server
+Environment=PYTHONPATH=/srv/agents
+Restart=on-failure
+RestartSec=5
+# Production env sets SLOTS_BIND_HOST=0.0.0.0 + SLOTS_BEARER_TOKEN so off-master
+# contributors (shaped runners on StarHouse) can self-report against the BRIX master
+# over Tailscale. Default (no env file) binds 127.0.0.1:8405 — BRIX-local only.
+EnvironmentFile=-%h/.config/slots/server.env
+
+[Install]
+WantedBy=default.target

@@ -23,6 +23,7 @@ test = ["pytest", "respx", "pytest-asyncio", "httpx"]
 narrative-emit = "agents_core.narrative.emit:main"
 mem-server = "agents_core.mem_server:main"
 gpu-queue-server = "agents_core.gpu_server:main"
+slot-server = "agents_core.slot_server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
