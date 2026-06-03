@@ -233,6 +233,20 @@ def create_app(db_path: Path) -> FastAPI:
             raise HTTPException(status_code=404, detail=_error("not_found", slot_id))
         return store.get(slot_id)
 
+    @app.post("/v0/slots/{slot_id}/ratify")
+    def facets_ratify(slot_id: str, body: dict[str, Any]):
+        """Facets ratification write (blackboard bootstrap step 4) — the three-voice
+        consult verdict for an escalated slot lands in the separate facets_* namespace,
+        never touching contributor-of-record or weaver fields. Body: {"verdict": {...},
+        "by": "facets"}."""
+        try:
+            store.facets_ratify(slot_id, body["verdict"], by=body.get("by", "facets"))
+        except SlotNotFoundError:
+            raise HTTPException(status_code=404, detail=_error("not_found", slot_id))
+        except KeyError as e:
+            raise HTTPException(status_code=400, detail=_error("bad_request", f"missing field {e}"))
+        return store.get(slot_id)
+
     # ------------------------------------------------------------------
     # Maintenance
     # ------------------------------------------------------------------

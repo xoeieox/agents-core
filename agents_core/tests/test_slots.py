@@ -16,6 +16,7 @@ Covers:
 from __future__ import annotations
 
 import multiprocessing
+import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from agents_core.slots import (
+    SCHEMA,
     OffMasterWriteError,
     SlotNotFoundError,
     SlotOwnershipError,
@@ -113,6 +115,76 @@ def test_observer_writes_separate_namespace(store: SlotStore):
     assert slot["status"] == "in-progress"        # contributor-of-record unchanged
     assert slot["weaver_status"] == "stuck"       # observer signal recorded separately
     assert slot["weaver_last_update"]
+
+
+# --- Facets ratification namespace (blackboard step 4) ---------------------
+
+def test_facets_ratify_separate_namespace(store: SlotStore):
+    sid = store.create_slot("proj-A", CONTRIB)
+    store.escalate(sid, to="facets", reason="authority undeclared", by="agent-1")
+    verdict = {"deliberation_id": "d1", "council_status": "resolved",
+               "council_landing": "proceed with changes", "confidence": "medium"}
+    store.facets_ratify(sid, verdict, by="facets")
+    slot = store.get(sid)
+    # Facets verdict lands in its own namespace; status stays escalated (clearing the
+    # escalation is the contributor-of-record's owner-guarded call, not Facets').
+    assert slot["status"] == "escalated"
+    assert slot["facets_verdict"]["council_status"] == "resolved"
+    assert slot["facets_verdict"]["council_landing"] == "proceed with changes"
+    assert slot["facets_verdict"]["by"] == "facets"
+    assert slot["facets_verdict"]["ratified_at"]
+    assert slot["facets_last_update"]
+    # contributor + weaver namespaces untouched
+    assert slot["weaver_status"] is None
+
+def test_facets_ratify_missing_slot_raises(store: SlotStore):
+    with pytest.raises(SlotNotFoundError):
+        store.facets_ratify("nope", {"council_status": "resolved"})
+
+def test_migration_idempotent_on_reopen(tmp_path: Path):
+    # Opening an existing DB twice must not fail on ADD COLUMN (idempotent _migrate).
+    db = tmp_path / "slots.db"
+    s1 = SlotStore(db_path=db)
+    sid = s1.create_slot("proj-A", CONTRIB)
+    s1.close()
+    s2 = SlotStore(db_path=db)          # re-open: _migrate runs again, must be a no-op
+    assert s2.get(sid)["slot_id"] == sid
+    s2.close()
+
+
+def test_migration_adds_facets_columns_to_legacy_db(tmp_path: Path):
+    """The real upgrade path: a pre-existing #52-shaped slots table (no facets_*
+    columns) must be upgraded by _migrate's ADD COLUMN on open. A fresh CREATE TABLE
+    already has the columns, so only a legacy DB exercises the migration itself."""
+    db = tmp_path / "legacy.db"
+    # A #52-era schema = the current SCHEMA with the facets_* lines removed.
+    legacy_schema = "\n".join(
+        ln for ln in SCHEMA.splitlines() if "facets" not in ln.lower()
+    )
+    assert "facets" not in legacy_schema.lower()  # guard: the fixture is truly #52-shaped
+    conn = sqlite3.connect(db)
+    conn.executescript(legacy_schema)
+    # A row written under the #52 schema, before the facets columns existed.
+    conn.execute(
+        "INSERT INTO slots (slot_id, project_id, status, last_update, created_at) "
+        "VALUES ('s1', 'proj-A', 'escalated', ?, ?)",
+        ("2026-06-01T00:00:00+00:00", "2026-06-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(slots)").fetchall()}
+    conn.close()
+    assert "facets_verdict" not in cols  # confirm the ADD COLUMN path is actually untrodden
+
+    # Opening via SlotStore runs _migrate -> the facets_* columns are added in place.
+    store = SlotStore(db_path=db)
+    migrated = {r[1] for r in store._conn.execute("PRAGMA table_info(slots)").fetchall()}
+    assert {"facets_verdict", "facets_last_update"} <= migrated
+    # The pre-existing row reads back with facets_verdict None-guarded (never ratified).
+    assert store.get("s1")["facets_verdict"] is None
+    # And ratification now works against the upgraded legacy table.
+    store.facets_ratify("s1", {"council_status": "resolved"})
+    assert store.get("s1")["facets_verdict"]["council_status"] == "resolved"
+    store.close()
 
 
 # --- checkpoints / domain_touch / escalate ---------------------------------
