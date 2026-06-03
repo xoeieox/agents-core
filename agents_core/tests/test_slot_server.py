@@ -224,6 +224,17 @@ class TestPrincipalBinding:
         assert r.status_code == 200
         assert r.json()["weaver_status"] == "stuck"
 
+    def test_ratify_not_principal_bound(self, client, slot_id):
+        """Facets ratification writes (like the Weaver's) are a distinct-actor
+        observer namespace — not subject to contributor-of-record principal binding."""
+        r = client.post(
+            f"/v0/slots/{slot_id}/ratify",
+            json={"verdict": {"council_status": "resolved"}, "by": "facets"},
+            headers=_auth("mysecret"),
+        )
+        assert r.status_code == 200
+        assert r.json()["facets_verdict"]["council_status"] == "resolved"
+
 
 # ---------------------------------------------------------------------------
 # CRUD / input validation
@@ -329,6 +340,29 @@ class TestCRUD:
     def test_observer_update_404(self, client):
         r = client.post("/v0/slots/nope/observer", json={"weaver_status": "stuck"})
         assert r.status_code == 404
+
+    def test_ratify_via_http(self, client, sid):
+        r = client.post(
+            f"/v0/slots/{sid}/ratify",
+            json={"verdict": {"council_status": "resolved", "council_landing": "proceed"},
+                  "by": "facets"},
+        )
+        assert r.status_code == 200
+        d = r.json()
+        # Verdict lands in the facets_* namespace; status is untouched (still dispatched).
+        assert d["facets_verdict"]["council_status"] == "resolved"
+        assert d["facets_verdict"]["by"] == "facets"
+        assert d["status"] == "dispatched"
+
+    def test_ratify_missing_slot_404(self, client):
+        r = client.post("/v0/slots/nope/ratify", json={"verdict": {"council_status": "resolved"}})
+        assert r.status_code == 404
+        assert r.json()["detail"]["error"]["code"] == "not_found"
+
+    def test_ratify_missing_verdict_400(self, client, sid):
+        r = client.post(f"/v0/slots/{sid}/ratify", json={"by": "facets"})
+        assert r.status_code == 400
+        assert r.json()["detail"]["error"]["code"] == "bad_request"
 
     def test_list_slots(self, client, sid):
         r = client.get("/v0/slots")

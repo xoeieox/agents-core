@@ -357,6 +357,7 @@ class SlotStore:
         ``verdict`` is the consult outcome, e.g. ``{"deliberation_id", "council_status",
         "recommendation", "confidence", ...}``. Raises SlotNotFoundError.
         """
+        self._check_writable()
         now = _now()
         payload = dict(verdict)
         payload.setdefault("ratified_at", now)
