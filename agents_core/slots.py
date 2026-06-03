@@ -94,6 +94,13 @@ CREATE TABLE IF NOT EXISTS slots (
     -- signals never collide (design doc: "observers write to separate fields").
     weaver_status      TEXT,
     weaver_last_update TEXT,
+    -- ratification (Facets-derived) fields: the opinion-authority namespace
+    -- (blackboard bootstrap step 4). Facets reads an escalated slot, runs the
+    -- three-voice persona consult, and writes its ratification verdict HERE —
+    -- never to contributor or weaver columns. Same separate-namespace discipline:
+    -- the store records the verdict, the contributor decides whether to act on it.
+    facets_verdict      TEXT,
+    facets_last_update  TEXT,
     created_at         TEXT NOT NULL
 );
 
@@ -103,7 +110,15 @@ CREATE INDEX IF NOT EXISTS slots_contrib ON slots(contributor_id);
 """
 
 # JSON-encoded columns, parsed back to objects on read.
-_JSON_FIELDS = ("domain_touch", "horizon", "checkpoints", "escalation")
+_JSON_FIELDS = ("domain_touch", "horizon", "checkpoints", "escalation", "facets_verdict")
+
+# Observer-namespace columns added after the initial gate-5 schema. CREATE TABLE
+# IF NOT EXISTS won't add columns to a pre-existing table, so they are applied as
+# idempotent ADD COLUMN migrations against live DBs (see SlotStore._migrate).
+_ADDED_COLUMNS = (
+    ("facets_verdict", "TEXT"),
+    ("facets_last_update", "TEXT"),
+)
 
 
 class SlotOwnershipError(PermissionError):
@@ -139,9 +154,22 @@ class SlotStore:
         # covers a separate shaper writer + slot-server concurrently on-disk.
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         # Serializes concurrent access from the FastAPI threadpool. RLock because
         # escalate() reuses update_status() internally.
         self._lock = threading.RLock()
+
+    def _migrate(self):
+        """Apply idempotent ADD COLUMN migrations for columns introduced after the
+        initial gate-5 schema. Safe to run on every open: ALTER TABLE ADD COLUMN
+        on an already-present column is a no-op here because we check pragma first."""
+        existing = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(slots)").fetchall()
+        }
+        for name, decl in _ADDED_COLUMNS:
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE slots ADD COLUMN {name} {decl}")
+        self._conn.commit()
 
     def close(self):
         self._conn.close()
@@ -311,6 +339,36 @@ class SlotStore:
             self._conn.execute(
                 "UPDATE slots SET weaver_status=?, weaver_last_update=? WHERE slot_id=?",
                 (weaver_status, now, slot_id),
+            )
+            self._conn.commit()
+        return True
+
+    def facets_ratify(self, slot_id: str, verdict: dict, *, by: str = "facets") -> bool:
+        """Write a Facets ratification verdict (blackboard bootstrap step 4).
+
+        Facets is the opinion-authority observer: it reads a slot escalated ``to:
+        facets``, runs the three-voice persona consult, and records its verdict in
+        the separate ``facets_*`` namespace — like the Weaver's ``observer_update``,
+        it NEVER writes contributor-of-record or weaver fields. The store records
+        the verdict; the contributor-of-record decides whether to act on it. This
+        write does not change ``status`` — clearing the escalation (escalated ->
+        in-progress/landed/abandoned) stays the contributor's owner-guarded call.
+
+        ``verdict`` is the consult outcome, e.g. ``{"deliberation_id", "council_status",
+        "recommendation", "confidence", ...}``. Raises SlotNotFoundError.
+        """
+        now = _now()
+        payload = dict(verdict)
+        payload.setdefault("ratified_at", now)
+        payload.setdefault("by", by)
+        with self._lock:
+            if not self._conn.execute(
+                "SELECT 1 FROM slots WHERE slot_id=?", (slot_id,)
+            ).fetchone():
+                raise SlotNotFoundError(slot_id)
+            self._conn.execute(
+                "UPDATE slots SET facets_verdict=?, facets_last_update=? WHERE slot_id=?",
+                (json.dumps(payload, sort_keys=True), now, slot_id),
             )
             self._conn.commit()
         return True

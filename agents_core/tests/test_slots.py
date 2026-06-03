@@ -115,6 +115,41 @@ def test_observer_writes_separate_namespace(store: SlotStore):
     assert slot["weaver_last_update"]
 
 
+# --- Facets ratification namespace (blackboard step 4) ---------------------
+
+def test_facets_ratify_separate_namespace(store: SlotStore):
+    sid = store.create_slot("proj-A", CONTRIB)
+    store.escalate(sid, to="facets", reason="authority undeclared", by="agent-1")
+    verdict = {"deliberation_id": "d1", "council_status": "resolved",
+               "council_landing": "proceed with changes", "confidence": "medium"}
+    store.facets_ratify(sid, verdict, by="facets")
+    slot = store.get(sid)
+    # Facets verdict lands in its own namespace; status stays escalated (clearing the
+    # escalation is the contributor-of-record's owner-guarded call, not Facets').
+    assert slot["status"] == "escalated"
+    assert slot["facets_verdict"]["council_status"] == "resolved"
+    assert slot["facets_verdict"]["council_landing"] == "proceed with changes"
+    assert slot["facets_verdict"]["by"] == "facets"
+    assert slot["facets_verdict"]["ratified_at"]
+    assert slot["facets_last_update"]
+    # contributor + weaver namespaces untouched
+    assert slot["weaver_status"] is None
+
+def test_facets_ratify_missing_slot_raises(store: SlotStore):
+    with pytest.raises(SlotNotFoundError):
+        store.facets_ratify("nope", {"council_status": "resolved"})
+
+def test_migration_idempotent_on_reopen(tmp_path: Path):
+    # Opening an existing DB twice must not fail on ADD COLUMN (idempotent _migrate).
+    db = tmp_path / "slots.db"
+    s1 = SlotStore(db_path=db)
+    sid = s1.create_slot("proj-A", CONTRIB)
+    s1.close()
+    s2 = SlotStore(db_path=db)          # re-open: _migrate runs again, must be a no-op
+    assert s2.get(sid)["slot_id"] == sid
+    s2.close()
+
+
 # --- checkpoints / domain_touch / escalate ---------------------------------
 
 def test_append_checkpoint(store: SlotStore):
