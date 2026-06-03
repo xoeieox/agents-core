@@ -13,8 +13,18 @@ Environment variables (server side):
   SLOTS_DB_PATH      — SQLite DB file (default /data/slots/slots.db)
   SLOTS_BIND_HOST    — uvicorn bind host (default 127.0.0.1)
   SLOTS_BIND_PORT    — uvicorn bind port (default 8405)
-  SLOTS_BEARER_TOKEN — optional shared bearer token; omit to disable auth
   SLOTS_LOG_LEVEL    — uvicorn log level (default info)
+
+  SLOTS_BEARER_TOKEN — auth token in one of two forms:
+    - "secret"                  legacy shared mode: any authenticated caller may write
+                                as any contributor (weaker ownership; backward-compat).
+    - "contributor_id:secret"   per-principal mode: only writes where body["by"] ==
+                                contributor_id are permitted. Recommended for production.
+    Omit SLOTS_BEARER_TOKEN only when the server is bound to 127.0.0.1 (loopback).
+    Binding to a non-loopback host without a token is refused at startup (fail-closed).
+
+Auth implementation:
+  Bearer comparison uses hmac.compare_digest (constant-time) to prevent timing attacks.
 
 Agent-operable, NOT agent-as-destination: every write carries a contributor-of-record
 (`by`), the single-writer guard rejects impostor writes, and the blackboard feeds the
@@ -23,7 +33,10 @@ human-readable Composer surface (post-GravityWell). Reads are advisory discovery
 
 from __future__ import annotations
 
+import hmac
+import ipaddress
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -52,18 +65,55 @@ def create_app(db_path: Path) -> FastAPI:
     app = FastAPI(title="slot-server", version="0")
     store = SlotStore(db_path)
 
-    _token = os.environ.get("SLOTS_BEARER_TOKEN", "")
+    _raw_token = os.environ.get("SLOTS_BEARER_TOKEN", "")
+    # Per-principal mode: "contributor_id:secret" — the part before the first colon
+    # is the authorized writer; writes where body["by"] != contributor_id are rejected.
+    # Legacy shared mode: no colon — any authenticated caller may write as any principal.
+    if ":" in _raw_token:
+        _colon = _raw_token.index(":")
+        _token_principal: str | None = _raw_token[:_colon]
+        _token_secret: str = _raw_token[_colon + 1:]
+    else:
+        _token_principal = None
+        _token_secret = _raw_token
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
-        if _token:
+        # Propagate the authenticated principal to write endpoints. None means no
+        # per-principal binding (loopback or legacy shared-token mode).
+        request.state.principal = _token_principal
+        if _token_secret:
             auth = request.headers.get("Authorization", "")
-            if not auth.startswith("Bearer ") or auth[len("Bearer "):] != _token:
+            if not auth.startswith("Bearer "):
+                return JSONResponse(
+                    status_code=401,
+                    content=_error("unauthorized", "Missing or invalid bearer token"),
+                )
+            presented = auth[len("Bearer "):]
+            # Constant-time comparison — prevents timing-oracle token enumeration.
+            if not hmac.compare_digest(
+                presented.encode("utf-8"), _token_secret.encode("utf-8")
+            ):
                 return JSONResponse(
                     status_code=401,
                     content=_error("unauthorized", "Missing or invalid bearer token"),
                 )
         return await call_next(request)
+
+    def _check_by_principal(by: str) -> None:
+        """Reject writes where the caller's authenticated principal doesn't match `by`.
+
+        No-op in legacy shared-token mode (_token_principal is None) and when the
+        server is bound to loopback without a token (trusted local callers).
+        """
+        if _token_principal and by != _token_principal:
+            raise HTTPException(
+                status_code=403,
+                detail=_error(
+                    "not_authorized",
+                    f"token not authorized to write as '{by}'",
+                ),
+            )
 
     # ------------------------------------------------------------------
     # Health
@@ -128,6 +178,10 @@ def create_app(db_path: Path) -> FastAPI:
 
     @app.post("/v0/slots", status_code=201)
     def create_slot(body: dict[str, Any]):
+        # Principal binding: the contributor.id must match the authenticated principal.
+        by = (body.get("contributor") or {}).get("id")
+        if by is not None:
+            _check_by_principal(by)
         try:
             sid = store.create_slot(
                 project_id=body["project_id"],
@@ -146,28 +200,33 @@ def create_app(db_path: Path) -> FastAPI:
     @app.post("/v0/slots/{slot_id}/status")
     def update_status(slot_id: str, body: dict[str, Any]):
         return _guarded(lambda: store.update_status(
-            slot_id, body["status"], by=body["by"]), slot_id)
+            slot_id, body["status"], by=body["by"]), slot_id,
+            by=body.get("by"))
 
     @app.post("/v0/slots/{slot_id}/checkpoint")
     def append_checkpoint(slot_id: str, body: dict[str, Any]):
         return _guarded(lambda: store.append_checkpoint(
-            slot_id, body.get("kind", "self-report"), body.get("note", ""), by=body["by"]), slot_id)
+            slot_id, body.get("kind", "self-report"), body.get("note", ""), by=body["by"]), slot_id,
+            by=body.get("by"))
 
     @app.post("/v0/slots/{slot_id}/domain")
     def set_domain(slot_id: str, body: dict[str, Any]):
         return _guarded(lambda: store.set_domain_touch(
             slot_id, files=body.get("files"), mem_keys=body.get("mem_keys"),
-            scopes=body.get("scopes"), by=body["by"]), slot_id)
+            scopes=body.get("scopes"), by=body["by"]), slot_id,
+            by=body.get("by"))
 
     @app.post("/v0/slots/{slot_id}/escalate")
     def escalate(slot_id: str, body: dict[str, Any]):
         return _guarded(lambda: store.escalate(
-            slot_id, to=body.get("to", "facets"), reason=body.get("reason", ""), by=body["by"]), slot_id)
+            slot_id, to=body.get("to", "facets"), reason=body.get("reason", ""), by=body["by"]), slot_id,
+            by=body.get("by"))
 
     @app.post("/v0/slots/{slot_id}/observer")
     def observer_update(slot_id: str, body: dict[str, Any]):
         """Observer (Weaver-derived) corroboration write — lands in the separate
-        weaver_* namespace, never touches contributor-of-record fields."""
+        weaver_* namespace, never touches contributor-of-record fields.
+        Observer writes are not principal-bound (Weaver is a distinct actor)."""
         try:
             store.observer_update(slot_id, body["weaver_status"], by=body.get("by", "weaver"))
         except SlotNotFoundError:
@@ -191,7 +250,11 @@ def create_app(db_path: Path) -> FastAPI:
     # Shared write-guard error mapping
     # ------------------------------------------------------------------
 
-    def _guarded(fn, slot_id: str):
+    def _guarded(fn, slot_id: str, *, by: str | None = None):
+        # Principal binding check fires before the store layer so a spoofed `by`
+        # gets 403 (not_authorized) rather than 403 (not_owner) from SlotStore.
+        if by is not None:
+            _check_by_principal(by)
         try:
             fn()
         except SlotNotFoundError:
@@ -218,6 +281,26 @@ def main():
     host = os.environ.get("SLOTS_BIND_HOST", "127.0.0.1")
     port = int(os.environ.get("SLOTS_BIND_PORT", "8405"))
     log_level = os.environ.get("SLOTS_LOG_LEVEL", "info")
+    token = os.environ.get("SLOTS_BEARER_TOKEN", "")
+
+    # Fail-closed: refuse to start if no bearer token and not loopback-bound.
+    # Loopback-only binding (127.0.0.1 / ::1) is safe without a token because
+    # only local processes can reach it. Any Tailscale or routable bind without
+    # a token exposes an unauthenticated write surface — refuse, don't warn.
+    if not token:
+        try:
+            addr = ipaddress.ip_address(host)
+            if not addr.is_loopback:
+                print(
+                    f"FATAL: SLOTS_BEARER_TOKEN is unset but SLOTS_BIND_HOST={host!r} "
+                    f"is non-loopback. Set SLOTS_BEARER_TOKEN or bind to 127.0.0.1.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        except ValueError:
+            # Host is a hostname string, not a bare IP — can't check loopback
+            # status at startup. The operator is responsible for token config.
+            pass
 
     app = create_app(db_path)
     uvicorn.run(app, host=host, port=port, log_level=log_level)

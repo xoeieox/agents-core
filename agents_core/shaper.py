@@ -255,6 +255,10 @@ class Shaper:
         # DispatchResult and recorded by lapis-pm, so the contributor-of-record that
         # completes the slot later keys off the same id. Hand it to the runner too so
         # mid-run checkpoints (Reality Snap) can target this slot.
+        # slot_id is set here so the runner spec is self-contained regardless of
+        # whether _record_dispatch_slot (best-effort, below) succeeds. The slot
+        # may not exist in the blackboard if the store is unavailable, but the
+        # runner can still carry the id for mid-run checkpoints.
         spec["slot_id"] = spec_id
 
         cmd = f"python3 -m {RUNNER_MODULE} {shlex.quote(str(spec_path))}"

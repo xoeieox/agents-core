@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sqlite3
 import threading
 import uuid
@@ -42,7 +43,8 @@ from pathlib import Path
 
 DB_DIR = Path("/data/slots")
 DB_PATH = Path(os.environ.get("SLOTS_DB_PATH", DB_DIR / "slots.db"))
-HOSTNAME = os.uname().nodename
+# socket.gethostname() is cross-platform; os.uname() is Unix-only.
+HOSTNAME = socket.gethostname()
 # Master (read-write) host for the slot substrate. Single deliberate value, NOT an env
 # toggle — mirrors mem.py's MEM_MASTER_HOST so the designation cannot drift per-host into
 # a dual-master split-brain. The blackboard is the single source of truth; BRIX owns it.
@@ -113,6 +115,14 @@ class SlotNotFoundError(KeyError):
     """Raised when a write targets a slot_id that does not exist."""
 
 
+class OffMasterWriteError(RuntimeError):
+    """Raised when a non-master node attempts a local mutating write to SlotStore.
+
+    Off-master writers must POST to SLOTS_MASTER_URL instead of writing a
+    divergent local sqlite — the docstring contract enforced loudly.
+    """
+
+
 class SlotStore:
     """SQLite-backed project-slot blackboard. Thread-safe; one connection + lock."""
 
@@ -123,6 +133,11 @@ class SlotStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        # Let cross-process writers wait up to 5 s for a WAL write lock instead
+        # of raising OperationalError("database is locked") immediately. The
+        # in-process RLock below serializes threads within one process; this
+        # covers a separate shaper writer + slot-server concurrently on-disk.
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
         # Serializes concurrent access from the FastAPI threadpool. RLock because
         # escalate() reuses update_status() internally.
@@ -149,6 +164,7 @@ class SlotStore:
         ``horizon`` is the vision-propagation field (``project_summary``,
         ``immediate_goal``, ``adjacent_slots``). Returns the slot_id.
         """
+        self._check_writable()
         self._validate_status(status)
         sid = slot_id or uuid.uuid4().hex[:12]
         now = _now()
@@ -185,6 +201,7 @@ class SlotStore:
 
         Returns True. Raises SlotNotFoundError / SlotOwnershipError / ValueError.
         """
+        self._check_writable()
         self._validate_status(status)
         now = _now()
         with self._lock:
@@ -202,6 +219,7 @@ class SlotStore:
         ``kind`` is one of reality-snap | self-report | external-event (free string).
         Only the contributor-of-record may write.
         """
+        self._check_writable()
         now = _now()
         entry = {"at": now, "kind": kind, "note": note}
         with self._lock:
@@ -227,6 +245,7 @@ class SlotStore:
         """Publish what files / mem-keys / scopes this slot is touching — the field
         that makes cross-slot proximity detection possible. Contributor-of-record only.
         """
+        self._check_writable()
         now = _now()
         dt = {
             "files": sorted(set(files or [])),
@@ -244,6 +263,7 @@ class SlotStore:
 
     def update_horizon(self, slot_id: str, *, by: str, **fields) -> bool:
         """Merge fields into the slot's horizon (e.g. adjacent_slots). Owner only."""
+        self._check_writable()
         now = _now()
         with self._lock:
             row = self._require_owner(slot_id, by)
@@ -261,6 +281,7 @@ class SlotStore:
 
         ``to`` is facets | flame | none. Contributor-of-record only.
         """
+        self._check_writable()
         now = _now()
         with self._lock:
             self._require_owner(slot_id, by)
@@ -280,6 +301,7 @@ class SlotStore:
         diverges from the contributor's ``status``, the divergence is itself a percept
         (surfaced to Facets later); this store records both, it does not resolve them.
         """
+        self._check_writable()
         now = _now()
         with self._lock:
             if not self._conn.execute(
@@ -392,6 +414,7 @@ class SlotStore:
 
         Blackboards accumulate cruft fast — cleanup discipline matters. Returns counts.
         """
+        self._check_writable()
         now = now or datetime.now(timezone.utc)
         parked_cut = (now - timedelta(days=PARKED_AGE_DAYS)).isoformat()
         abandoned_cut = (now - timedelta(days=ABANDONED_AGE_DAYS)).isoformat()
@@ -409,10 +432,24 @@ class SlotStore:
 
     def checkpoint_wal(self):
         """Force WAL checkpoint for a clean sync copy."""
+        self._check_writable()
         with self._lock:
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     # -- internal -----------------------------------------------------------
+
+    def _check_writable(self) -> None:
+        """Refuse mutating writes on non-master nodes.
+
+        Off-master nodes must not create a divergent local sqlite — they must
+        POST to SLOTS_MASTER_URL instead. Fail loud so the error is not silent.
+        """
+        if not IS_MASTER:
+            raise OffMasterWriteError(
+                f"off-master write refused: this node is {HOSTNAME!r}, "
+                f"the canonical store is on {SLOTS_MASTER_HOST!r}. "
+                f"POST to {SLOTS_MASTER_URL!r} instead of writing a local sqlite."
+            )
 
     def _require_owner(self, slot_id: str, by: str) -> sqlite3.Row:
         """Fetch a slot's row, asserting ``by`` is the contributor-of-record.

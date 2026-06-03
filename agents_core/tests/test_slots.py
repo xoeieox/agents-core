@@ -9,11 +9,13 @@ Covers:
   - expiration age-out (parked 30d, abandoned 7d)
   - status validation
   - JSON round-trip on read
-  - concurrent writes under WAL don't corrupt or lose updates
+  - concurrent writes under WAL don't corrupt or lose updates (in-process)
+  - cross-process WAL + busy_timeout: two processes write concurrently without lock errors
 """
 
 from __future__ import annotations
 
+import multiprocessing
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from agents_core.slots import (
+    OffMasterWriteError,
     SlotNotFoundError,
     SlotOwnershipError,
     SlotStore,
@@ -244,3 +247,89 @@ def test_concurrent_checkpoints_no_loss(store: SlotStore):
     cps = store.get(sid)["checkpoints"]
     assert len(cps) == n  # no lost updates under the lock
     assert {c["note"] for c in cps} == {f"note-{i}" for i in range(n)}
+
+
+# --- cross-process lock safety (D4: busy_timeout + WAL) -------------------
+
+def _cross_proc_create_slots(db_path: str, prefix: str, n: int, result_queue) -> None:
+    """Subprocess target: create n slots and report success count.
+
+    create_slot is a pure INSERT (no read-modify-write), so two processes can
+    race on it safely under WAL + busy_timeout without logical corruption.
+    """
+    try:
+        store = SlotStore(db_path=db_path)
+        for i in range(n):
+            store.create_slot(
+                f"{prefix}-proj-{i}",
+                {"type": "fixer", "id": "agent-1"},
+            )
+        store.close()
+        result_queue.put(n)
+    except Exception as exc:
+        result_queue.put(exc)
+
+
+def test_cross_process_busy_timeout(tmp_path: Path):
+    """Two separate processes INSERT slots concurrently.
+
+    Without PRAGMA busy_timeout, the second writer raises OperationalError
+    ("database is locked") immediately when the WAL write lock is held. With
+    busy_timeout=5000 both processes complete without raising. Verifies D4.
+    """
+    db_path = str(tmp_path / "slots.db")
+    # Initialize DB schema in-process before forking.
+    store = SlotStore(db_path=db_path)
+    store.close()
+
+    n_per_proc = 20
+    ctx = multiprocessing.get_context("fork")
+    q: multiprocessing.Queue = ctx.Queue()
+    p1 = ctx.Process(target=_cross_proc_create_slots, args=(db_path, "proc1", n_per_proc, q))
+    p2 = ctx.Process(target=_cross_proc_create_slots, args=(db_path, "proc2", n_per_proc, q))
+    p1.start()
+    p2.start()
+    p1.join(timeout=30)
+    p2.join(timeout=30)
+
+    assert p1.exitcode == 0, f"process 1 exited {p1.exitcode}"
+    assert p2.exitcode == 0, f"process 2 exited {p2.exitcode}"
+
+    results = [q.get_nowait() for _ in range(2)]
+    for r in results:
+        if isinstance(r, Exception):
+            raise r
+    assert sum(results) == n_per_proc * 2
+
+    # Verify all slots were committed — no silent loss under concurrent INSERTs.
+    store2 = SlotStore(db_path=db_path)
+    total = store2.stats()["total_slots"]
+    store2.close()
+    assert total == n_per_proc * 2
+
+
+# --- off-master write guard (D1) ------------------------------------------
+
+def test_off_master_write_raises(tmp_path: Path, monkeypatch):
+    """A SlotStore on a non-master host must refuse mutating writes."""
+    monkeypatch.setattr("agents_core.slots.IS_MASTER", False)
+    store = SlotStore(db_path=tmp_path / "off-master.db")
+    with pytest.raises(OffMasterWriteError):
+        store.create_slot("p", {"type": "fixer", "id": "a"})
+    store.close()
+
+
+def test_off_master_reads_still_work(tmp_path: Path, monkeypatch):
+    """Reads (get, query, adjacent, stats) must work regardless of IS_MASTER."""
+    # Seed on master first, then flip IS_MASTER.
+    db = tmp_path / "slots.db"
+    store = SlotStore(db_path=db)
+    sid = store.create_slot("p", {"type": "fixer", "id": "a"})
+    store.close()
+
+    monkeypatch.setattr("agents_core.slots.IS_MASTER", False)
+    store2 = SlotStore(db_path=db)
+    assert store2.get(sid) is not None
+    assert store2.query() != []
+    assert store2.stats()["total_slots"] == 1
+    store2.close()
