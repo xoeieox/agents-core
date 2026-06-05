@@ -24,6 +24,7 @@ Invariants
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import sys
@@ -36,6 +37,8 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_CORPUS = "vault-rag"
 _DEFAULT_TOP_K = 8
+# corpus_snapshot value produced by _compute_corpus_snapshot([]) — sha256(b"")
+_EMPTY_CORPUS_SNAPSHOT = f"sha256:{hashlib.sha256(b'').hexdigest()}"
 
 # ---------------------------------------------------------------------------
 # D2 — Stakes heuristic
@@ -183,7 +186,6 @@ def _format_hits_human(hits: list, fell_back: bool, orig_corpus: list[str]) -> s
 
 def _format_artifact_human(artifact, fell_back: bool, orig_corpus: list[str]) -> str:
     """Format a SynthesisArtifact for human consumption."""
-    from agents_core.librarian import SynthesisArtifact
     lines: list[str] = []
     if fell_back:
         lines.append(
@@ -250,8 +252,10 @@ def run(
     stakes_resolved: str
     stakes_reason: str
 
-    if stakes == "low" or (stakes == "auto" and not dry_run):
+    if stakes == "low" or stakes == "auto":
         # Retrieve now for either: (a) low stakes output, or (b) auto routing signal.
+        # Retrieval is not an LLM call — it must also run during --dry-run so the
+        # auto heuristic sees real hit data instead of always routing high on [].
         hits, fell_back = _retrieve_with_fallback(
             question, retrieval_scopes, top_k, orig_corpus=corpus
         )
@@ -320,6 +324,9 @@ def run(
 
     if stakes == "auto":
         print(f"[auto → high: {stakes_reason.split(': ', 1)[-1]}]")
+        # Pre-flight fell_back was a routing signal only; corroborate() does its
+        # own retrieval, so don't carry the banner into the high-stakes output.
+        fell_back = False
 
     try:
         result = corroborate(
@@ -347,10 +354,11 @@ def run(
             print("Nothing found.")
         return 2
 
-    # Check for empty retrieval in the artifact — trigger fallback and re-corroborate.
-    if isinstance(result, SynthesisArtifact) and not result.citations:
-        # Heuristic: if we got a "none" verification and the question seems non-trivial,
-        # check whether a full-corpus retry could do better.
+    # Check for zero retrieval hits in the artifact via corpus_snapshot.
+    # Using corpus_snapshot (not result.citations) because citations=[] can also mean
+    # the LLM cited paths that failed two-stage verification — that's not a retrieval
+    # miss, just a verification failure, and re-corroborating would be wasteful/wrong.
+    if isinstance(result, SynthesisArtifact) and result.corpus_snapshot == _EMPTY_CORPUS_SNAPSHOT:
         if sorted(retrieval_scopes) != sorted(full_retrieval_scopes):
             log.info("keeper-query: empty-result fallback to full corpus")
             fell_back = True

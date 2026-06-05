@@ -230,39 +230,26 @@ def test_auto_routes_synthesis_to_high(capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_empty_result_fallback_fires(capsys):
-    """Scoped query returning zero hits triggers a full-corpus fallback."""
+def test_at_full_corpus_no_results_shows_not_found(capsys):
+    """When already querying full corpus and retrieval returns nothing, exit 0 and report clean empty."""
     from agents_core import keeper_query
 
-    path = "/vault/fallback.md"
-    content = "Full corpus fallback content."
-    fallback_hit = _make_hit(path, content)
-
-    call_count = {"n": 0}
-
-    def _mock_retrieve(query, scopes, **kwargs):
-        call_count["n"] += 1
-        # First call (scoped): return nothing
-        if call_count["n"] == 1:
-            return []
-        # Second call (fallback): return a hit
-        return [fallback_hit]
-
-    with patch("agents_core.retrieval.retrieve", side_effect=_mock_retrieve), \
+    with patch("agents_core.retrieval.retrieve", return_value=[]), \
          patch("httpx.post") as mock_post:
 
         code = keeper_query.run(
             "obscure topic",
             stakes="low",
-            corpus=["vault-rag"],  # same as full, but tests the path
+            corpus=["vault-rag"],  # already the full corpus — fallback cannot fire
             top_k=8,
         )
 
     assert code == 0
+    assert mock_post.call_count == 0
     out = capsys.readouterr().out
-    # The fallback message need not appear when scopes are identical (already full corpus)
-    # but the result should contain the fallback hit.
-    assert "fallback.md" in out or "Full corpus" in out or "fallback" in out.lower() or "No results" in out
+    assert "No results" in out
+    # The fallback banner must NOT appear — already at full corpus, nothing to fall back to
+    assert "fell back" not in out
 
 
 def test_empty_result_fallback_message_shown(capsys):
