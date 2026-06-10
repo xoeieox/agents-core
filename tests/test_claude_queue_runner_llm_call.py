@@ -213,3 +213,29 @@ def test_llm_call_opus_maps_to_cli_model(tmp_path):
     cli_mock.assert_called_once()
     kwargs = cli_mock.call_args.kwargs
     assert kwargs["model"] == "opus"
+
+
+# ---------------------------------------------------------------------------
+# 8. operator_class="gravitywell" is rejected with a clear sync-path error
+# ---------------------------------------------------------------------------
+
+def test_llm_call_gravitywell_rejected(tmp_path):
+    from agents_core.claude_queue_runner import _run_task
+
+    q = _make_queue(tmp_path)
+    task = _make_task(q, operator_class="gravitywell")
+    task_id = task["id"]
+
+    cli_mock = MagicMock()
+
+    with patch("agents_core.claude_queue_runner.OUTPUT_DIR", tmp_path / "out"), \
+         patch("agents_core.llm.call_claude_cli", cli_mock):
+        (tmp_path / "out").mkdir(parents=True, exist_ok=True)
+        _run(_run_task(q, task))
+
+    failed_yaml = q.failed_dir / f"{task_id}.yaml"
+    assert failed_yaml.exists()
+    data = yaml.safe_load(failed_yaml.read_text())
+    assert "gravitywell" in data["error"].lower()
+    assert "sync" in data["error"].lower() or "path" in data["error"].lower()
+    cli_mock.assert_not_called()

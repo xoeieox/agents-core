@@ -499,6 +499,12 @@ async def _run_llm_call_task(queue: ClaudeQueue, task: dict) -> None:
         notify_failure(task, msg)
         return
 
+    if operator_class == "gravitywell":
+        msg = "operator_class='gravitywell' is not routable through llm_call — gravitywell has its own sync path via call_operator()"
+        queue.fail(task_id, error=msg)
+        notify_failure(task, msg)
+        return
+
     if operator_class not in _ALLOWED_OPERATOR_CLASSES:
         msg = f"llm_call: unknown operator_class={operator_class!r}; must be one of {sorted(_ALLOWED_OPERATOR_CLASSES)}"
         queue.fail(task_id, error=msg)

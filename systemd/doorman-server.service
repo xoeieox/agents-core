@@ -1,0 +1,20 @@
+[Unit]
+Description=doorman HTTP service — GravityWell power/lease lifecycle (port 8407, BRIX-local)
+After=network.target
+# Don't let a tight crash-loop trip the start limit and wedge the service.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# python -m form (not the console script) so it runs without a pip reinstall on the
+# PEP-668 BRIX system interpreter. agents_core resolves from PYTHONPATH=/srv/agents.
+ExecStart=/usr/bin/env python3 -m agents_core.doorman_server
+Environment=PYTHONPATH=/srv/agents
+Restart=on-failure
+RestartSec=5
+# Production env sets GW_URL, GW_WAKE_DEADLINE_SEC, DOORMAN_BEARER_TOKEN etc.
+# Default (no env file) binds 127.0.0.1:8407 with GW at http://203.0.113.11:8081.
+EnvironmentFile=-%h/.config/doorman/server.env
+
+[Install]
+WantedBy=default.target

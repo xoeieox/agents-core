@@ -10,9 +10,12 @@ All conductor/agent scripts should import from here.
 """
 
 import json
+import os
 import re
 import subprocess
 import time
+import uuid
+import warnings
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -22,6 +25,8 @@ import requests
 TAILSCALE_IP = "203.0.113.12"
 LLAMACPP_URL = f"http://{TAILSCALE_IP}:8081"
 PACIFIC = ZoneInfo("America/Los_Angeles")
+
+GW_URL = os.environ.get("GW_URL", "http://203.0.113.11:8081")
 
 
 class OperatorUnreachableError(Exception):
@@ -44,10 +49,11 @@ class OperatorUnreachableError(Exception):
 # ---------------------------------------------------------------------------
 
 OPERATOR_DEFAULTS: dict[str, str] = {
-    "qwen":   "qwen3.6-35b-a3b",
-    "sonnet": "claude-sonnet-4-6",
-    "opus":   "claude-opus-4-7",
-    "haiku":  "claude-haiku-4-5-20251001",
+    "qwen":        "qwen3.6-35b-a3b",
+    "sonnet":      "claude-sonnet-4-6",
+    "opus":        "claude-opus-4-7",
+    "haiku":       "claude-haiku-4-5-20251001",
+    "gravitywell": "gravitywell-122b",
 }
 
 
@@ -117,6 +123,112 @@ def _call_qwen_backend(prompt: str, system: str = None, timeout: int = 600,
             return None
 
 
+def _call_gravitywell_backend(
+    prompt: str,
+    system: str = None,
+    timeout: int = 600,
+    json_mode: bool = False,
+    temperature: float = 0.7,
+    log=None,
+    think: bool = False,
+) -> str | None:
+    """Send a completion request to the GravityWell llama.cpp endpoint.
+
+    GW is a Qwen3.5-122B reasoning model. By default think=False injects
+    chat_template_kwargs={"enable_thinking": false} to suppress the think-trace
+    and keep responses clean (~2-4s). Callers may pass think=True for quality-mode
+    reasoning with a large max_tokens.
+
+    GW_URL coupling: reads the same GW_URL env var as doorman_server. Both must
+    be kept in sync (see doorman-server.env and operator environment docs).
+
+    Does NOT accept bundle_ids — GW gets system verbatim, no chub-bundle injection.
+    """
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    payload = {
+        "messages": messages,
+        "temperature": temperature,
+        "cache_prompt": True,
+        "chat_template_kwargs": {"enable_thinking": think},
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(
+                f"{GW_URL}/v1/chat/completions",
+                json=payload, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            msg = data["choices"][0]["message"]
+            text = msg.get("content") or msg.get("reasoning_content") or ""
+            return text if text.strip() else None
+        except (requests.exceptions.HTTPError,
+                requests.exceptions.ConnectionError) as e:
+            if attempt < max_retries - 1:
+                backoff = 10 * (2 ** attempt)
+                if log:
+                    log(f"GW call failed (attempt {attempt + 1}/{max_retries}): {e}")
+                time.sleep(backoff)
+            else:
+                if log:
+                    log(f"GW call failed after {max_retries} attempts: {e}")
+                raise OperatorUnreachableError(GW_URL, e)
+        except Exception as e:
+            if log:
+                log(f"GW call error: {e}")
+            return None
+
+
+def _apply_wake_fail(
+    on_wake_fail: str | None,
+    operator_class: str,
+    prompt: str,
+    **kwargs,
+) -> str | None:
+    """Apply the declared on_wake_fail policy when GW cannot be woken.
+
+    Policies:
+      "haiku" / "sonnet" / "opus" — re-dispatch to that operator class (paid fallback;
+          logs loudly before spending tokens per claude-p-api-pricing-june11).
+      "skip" / None — return None (batch/optional surfaces; no paid spend).
+      "error" — raise OperatorUnreachableError so the caller decides.
+
+    If the fallback call_operator() itself raises, the exception propagates unchanged.
+    """
+    policy = on_wake_fail or "skip"
+
+    if policy in ("haiku", "sonnet", "opus"):
+        warnings.warn(
+            f"[gravitywell] wake_failed — falling back to {policy} "
+            f"(paid Claude spend per claude-p-api-pricing-june11). "
+            f"operator_class={operator_class!r}",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        # Remove gravitywell-specific kwargs that the fallback operator doesn't accept
+        fallback_kwargs = {
+            k: v for k, v in kwargs.items()
+            if k not in ("think", "on_wake_fail")
+        }
+        return call_operator(policy, prompt, **fallback_kwargs)
+
+    if policy == "error":
+        raise OperatorUnreachableError(
+            GW_URL,
+            Exception(f"GW wake_failed and on_wake_fail='error' for {operator_class!r}"),
+        )
+
+    # "skip" or None
+    return None
+
+
 def call_operator(operator_class: str, prompt: str, model: str = None,
                   **kwargs) -> str | None:
     """Route a completion request to the appropriate backend operator.
@@ -163,6 +275,49 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                 "default, or do the model swap out-of-band first."
             )
         return _call_qwen_backend(prompt=prompt, **kwargs)
+
+    if operator_class == "gravitywell":
+        if model is not None and model != OPERATOR_DEFAULTS["gravitywell"]:
+            raise ValueError(
+                f"call_operator(operator_class='gravitywell', model={model!r}): "
+                "the GravityWell endpoint serves a single fixed model "
+                f"({OPERATOR_DEFAULTS['gravitywell']!r}); model swaps are an "
+                "infrastructure operation (gw-serve), "
+                "not a per-call parameter. Either pass model=None to use the "
+                "default, or do the model swap out-of-band first."
+            )
+        # Extract GW-specific kwargs; discard bundle_ids and other qwen-specific keys
+        gw_kwargs = {
+            k: kwargs[k] for k in (
+                "system", "timeout", "json_mode", "temperature", "log"
+            ) if k in kwargs
+        }
+        think = kwargs.get("think", False)
+        on_wake_fail = kwargs.get("on_wake_fail", "skip")
+        timeout = int(kwargs.get("timeout", 300))
+        work_id = f"op-gravitywell-{uuid.uuid4().hex}"
+
+        # kwargs forwarded to _apply_wake_fail must not include on_wake_fail
+        # (it's a positional arg there) or gravitywell-internal keys.
+        wake_fail_kwargs = {
+            k: v for k, v in kwargs.items()
+            if k not in ("on_wake_fail", "think", "bundle_ids")
+        }
+
+        from agents_core.doorman_client import DoormanClient, DoormanUnreachable
+        client = DoormanClient()
+        try:
+            res = client.acquire(
+                "gravitywell", work_id, ttl_sec=timeout + 60, reason="call_operator"
+            )
+            if res.get("status") != "serving":
+                return _apply_wake_fail(on_wake_fail, operator_class, prompt, **wake_fail_kwargs)
+            try:
+                return _call_gravitywell_backend(prompt=prompt, think=think, **gw_kwargs)
+            finally:
+                client.release("gravitywell", work_id)
+        except DoormanUnreachable:
+            return _apply_wake_fail(on_wake_fail, operator_class, prompt, **wake_fail_kwargs)
 
     # Anthropic-family: route via ClaudeQueue → call_claude_cli.
     # No direct Anthropic-API code path (decision/no-anthropic-api-direct).

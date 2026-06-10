@@ -30,7 +30,7 @@ from agents_core.llm import call_operator  # module-level import enables patch("
 
 logger = logging.getLogger(__name__)
 
-_VALID_OPERATOR_CLASSES = frozenset({"qwen", "sonnet", "opus", "haiku"})
+_VALID_OPERATOR_CLASSES = frozenset({"qwen", "sonnet", "opus", "haiku", "gravitywell"})
 _RESERVED_OPERATOR_KWARGS = frozenset({"operator_class", "prompt", "system", "model", "bundle_ids"})
 
 
