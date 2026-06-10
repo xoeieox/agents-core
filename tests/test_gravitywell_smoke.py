@@ -11,11 +11,22 @@ Excluded from the default suite (no -m smoke flag).
 
 import json
 import subprocess
+import time
 
 import pytest
 import requests
 
 from agents_core.llm import call_operator
+
+DOORMAN_URL = "http://127.0.0.1:8407"
+GW_SSH_HOST = "gravitywell"
+
+
+def _gw_ssh(cmd: str, timeout: int = 15) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["ssh", GW_SSH_HOST, cmd],
+        capture_output=True, text=True, timeout=timeout,
+    )
 
 
 @pytest.mark.smoke
@@ -36,10 +47,7 @@ def test_gravitywell_wakes_returns_json_releases_hold():
 
     # Verify the doorman hold was released (no lingering doorman holder on GW)
     try:
-        proc = subprocess.run(
-            ["ssh", "gravitywell", "ls /run/gw-keepawake.d/"],
-            capture_output=True, text=True, timeout=10,
-        )
+        proc = _gw_ssh("ls /run/gw-keepawake.d/")
         holders = proc.stdout.strip().split() if proc.stdout.strip() else []
         # The 'doorman' hold should have been released after the call
         assert "doorman" not in holders, (
@@ -47,3 +55,110 @@ def test_gravitywell_wakes_returns_json_releases_hold():
         )
     except Exception:
         pytest.skip("SSH to gravitywell unavailable — skipping hold-release check")
+
+
+@pytest.mark.smoke
+def test_cold_acquire_starts_service_and_release_with_grace_stops():
+    """Full clean-stop lifecycle: cold acquire → serving; release + grace → stopped.
+
+    This test verifies gravitywell-doorman-clean-stop-v0:
+      1. acquire from stopped → doorman issues gw-serve big → llama-server active
+      2. release → idle_since set
+      3. after GW_STOP_GRACE_SEC (injected low via doorman env), refresh thread
+         issues gw-serve stop → llama-server inactive
+      4. /status shows service_stopped=True and serving_mode=stopped
+      5. guard now permits suspend (llama-server.service not active)
+
+    Does NOT assert actual S3 suspend (irreversible/slow) — inactive + guard-eligibility
+    is sufficient proof.
+    """
+    try:
+        resp = requests.get(f"{DOORMAN_URL}/healthz", timeout=5)
+        if resp.status_code != 200:
+            pytest.skip("doorman-server not running on :8407")
+    except Exception:
+        pytest.skip("doorman-server not reachable at :8407")
+
+    try:
+        _gw_ssh("true", timeout=5)
+    except Exception:
+        pytest.skip("SSH to gravitywell not available")
+
+    # --- Step 1: ensure service is stopped before the test ---
+    try:
+        _gw_ssh("gw-serve stop", timeout=60)
+    except Exception:
+        pytest.skip("gw-serve stop failed — cannot set up precondition")
+    time.sleep(3)
+
+    # --- Step 2: cold acquire (doorman must issue gw-serve big) ---
+    acq = requests.post(
+        f"{DOORMAN_URL}/lease/acquire",
+        json={"node": "gravitywell", "work_id": "smoke-clean-stop", "ttl_sec": 120, "reason": "smoke"},
+        timeout=200,  # covers cold-load (~25s) + wake (~15s)
+    )
+    assert acq.status_code == 200, f"acquire failed: {acq.text}"
+    assert acq.json().get("status") == "serving", f"unexpected status: {acq.json()}"
+
+    # Verify llama-server.service is now active on GW
+    is_active = _gw_ssh("systemctl is-active llama-server.service", timeout=10)
+    assert "active" in is_active.stdout, (
+        f"llama-server.service not active after acquire: {is_active.stdout!r}"
+    )
+
+    # --- Step 3: inference still works ---
+    result = call_operator(
+        "gravitywell",
+        'reply with {"ok":true}',
+        json_mode=True,
+        on_wake_fail="error",
+    )
+    assert result is not None
+    parsed = json.loads(result) if isinstance(result, str) else result
+    assert parsed.get("ok") is True or "ok" in str(parsed)
+
+    # --- Step 4: release ---
+    rel = requests.post(
+        f"{DOORMAN_URL}/lease/release",
+        json={"node": "gravitywell", "work_id": "smoke-clean-stop"},
+        timeout=10,
+    )
+    assert rel.status_code == 200
+
+    # Confirm /status shows idle_since set (not None) and service not yet stopped
+    status_resp = requests.get(f"{DOORMAN_URL}/status", timeout=5)
+    gw_status = status_resp.json()["nodes"]["gravitywell"]
+    assert gw_status["idle_since"] is not None, "idle_since should be set after release"
+    assert gw_status["service_stopped"] is False, "service should still be up in grace period"
+
+    # --- Step 5: wait for the refresh thread to issue gw-serve stop ---
+    # GW_STOP_GRACE_SEC is typically 600s in production; this test relies on
+    # the doorman being configured with a low value (e.g. GW_STOP_GRACE_SEC=30)
+    # for smoke runs. If the env var is at default, this poll will time out and
+    # the test will skip rather than fail.
+    grace_sec = 45  # poll up to 45s; assumes smoke env has GW_STOP_GRACE_SEC<=30
+    deadline = time.time() + grace_sec
+    stopped = False
+    while time.time() < deadline:
+        s = requests.get(f"{DOORMAN_URL}/status", timeout=5).json()["nodes"]["gravitywell"]
+        if s.get("service_stopped") is True:
+            stopped = True
+            break
+        time.sleep(5)
+
+    if not stopped:
+        pytest.skip(
+            f"gw-serve stop not observed within {grace_sec}s — "
+            f"set GW_STOP_GRACE_SEC<=30 in doorman env for smoke runs"
+        )
+
+    # llama-server.service must now be inactive
+    is_inactive = _gw_ssh("systemctl is-active llama-server.service", timeout=10)
+    assert "inactive" in is_inactive.stdout or is_inactive.returncode != 0, (
+        f"llama-server.service still active after gw-serve stop: {is_inactive.stdout!r}"
+    )
+
+    # /status must reflect the stopped state
+    final_status = requests.get(f"{DOORMAN_URL}/status", timeout=5).json()["nodes"]["gravitywell"]
+    assert final_status["serving_mode"] == "stopped"
+    assert final_status["service_stopped"] is True

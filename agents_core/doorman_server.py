@@ -12,6 +12,8 @@ Environment variables:
   DOORMAN_BIND_HOST      — uvicorn bind host (default 127.0.0.1)
   DOORMAN_BIND_PORT      — uvicorn bind port (default 8407)
   DOORMAN_BEARER_TOKEN   — optional shared bearer token
+  DOORMAN_IDLE_LOG       — path for structured idle-lifecycle JSONL log
+                           (default /var/log/doorman-idle.jsonl)
   GW_URL                 — GravityWell base URL (default http://203.0.113.11:8081)
                            NOTE: must match the GW_URL configured for agents_core.llm
                            (the operator reads the same env var for inference POSTs).
@@ -19,17 +21,30 @@ Environment variables:
                            cold 77GB model load backstop — typical warm wake is ~10s)
   GW_HOLD_TTL_SEC        — keepawake hold TTL in seconds (default 120)
   GW_HOLD_REFRESH_SEC    — refresh interval for the keepawake hold (default 45)
+  GW_STOP_GRACE_SEC      — seconds after last-release before the refresh thread
+                           issues gw-serve stop (default 600; machine-economics
+                           boundary that amortizes the ~25s cold-load against burst
+                           gaps — not a human-rhythm value)
 
-Safety properties:
-  - Doorman crash → GW frees itself: hold TTL lapses within ~2min, GW idle-suspends.
-  - Leaked client lease → GC: stale leases (acquired_at + ttl_sec < now) are auto-
-    released by the background refresh loop — a crashed operator cannot pin GW forever.
-  - SSH-refresh failure → logged loudly, last_error set, retried on next tick; does NOT
-    crash the thread and does NOT drop live leases.
+Safety properties (gravitywell-doorman-clean-stop-v0):
+  - Doorman crash → GW stays POWERED, not suspended. The host-side guard
+    (gw-idle-suspend.sh) blocks suspend while llama-server.service is active.
+    A crashed doorman leaves the service running, so the guard keeps GW powered
+    (safe, but no power saving). The doorman is a power-saving optimizer layered
+    on the guard's safety floor — if the doorman never stops the service, the
+    node degrades to "always powered," not to "unsafe suspend."
+  - The doorman never causes an unsafe suspend: it can only *enable* suspend by
+    first issuing gw-serve stop. A stop failure leaves GW powered (guard holds).
+  - Leaked client lease → GC: stale leases (acquired_at + ttl_sec < now) are
+    auto-released by the background refresh loop — a crashed operator cannot pin
+    GW forever.
+  - SSH-refresh failure → logged loudly, last_error set, retried on next tick;
+    does NOT crash the thread and does NOT drop live leases.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
@@ -47,12 +62,40 @@ GW_URL_DEFAULT = "http://203.0.113.11:8081"
 GW_WAKE_DEADLINE_SEC = int(os.environ.get("GW_WAKE_DEADLINE_SEC", "180"))
 GW_HOLD_TTL_SEC = int(os.environ.get("GW_HOLD_TTL_SEC", "120"))
 GW_HOLD_REFRESH_SEC = int(os.environ.get("GW_HOLD_REFRESH_SEC", "45"))
+# Machine-economics boundary: amortizes the ~25s cold-load against burst gaps.
+# Calibrate from /var/log/doorman-idle.jsonl observations — never auto-tuned.
+GW_STOP_GRACE_SEC = int(os.environ.get("GW_STOP_GRACE_SEC", "600"))
 
 HOLD_NAME = "doorman"
+DOORMAN_IDLE_LOG = os.environ.get("DOORMAN_IDLE_LOG", "/var/log/doorman-idle.jsonl")
 
 
 def _error(code: str, message: str) -> dict:
     return {"error": {"code": code, "message": message}}
+
+
+def _write_idle_log(
+    node: str, event: str, lease_count: int, idle_secs: float | None = None
+) -> None:
+    """Append one structured entry to the idle-lifecycle observation log.
+
+    Best-effort: a write failure must never crash the caller or block the stop.
+    This is an observation substrate for human calibration — not operational
+    alerting and not consumed internally for auto-tuning.
+    """
+    entry: dict[str, Any] = {
+        "ts": time.time(),
+        "node": node,
+        "event": event,
+        "lease_count": lease_count,
+    }
+    if idle_secs is not None:
+        entry["idle_secs"] = round(idle_secs, 2)
+    try:
+        with open(DOORMAN_IDLE_LOG, "a") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except Exception as exc:
+        log.warning(f"idle log write failed ({DOORMAN_IDLE_LOG}): {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -68,13 +111,17 @@ class _NodeState:
     - background refresh-thread reads and SSH hold re-issues
     """
 
-    def __init__(self, gw_url: str):
+    def __init__(self, gw_url: str, node_name: str = "gravitywell"):
         self.lock = threading.Lock()
         self.gw_url = gw_url
+        self.node_name = node_name
         # keyed by work_id → {acquired_at: float, ttl_sec: int, reason: str}
         self.leases: dict[str, dict] = {}
         self.last_wake_at: float | None = None
         self.last_error: str | None = None
+        # Service-lifecycle fields (gravitywell-doorman-clean-stop-v0)
+        self.idle_since: float | None = None   # set when last lease released
+        self.service_stopped: bool = False     # True after gw-serve stop confirmed
 
     # ------------------------------------------------------------------
     # Health poll (lock-free — read-only HTTP, safe to call outside lock)
@@ -92,17 +139,25 @@ class _NodeState:
     # ------------------------------------------------------------------
 
     def ensure_serving(self) -> bool:
-        """Wake GW if needed and wait until it serves. Returns True on success.
+        """Wake GW if needed, start the serving unit, and wait until it serves.
 
-        Called under self.lock — serializes concurrent wake attempts so only
-        one wake-gravitywell subprocess runs at a time.
+        Returns True on success. Called under self.lock — serializes concurrent
+        wake attempts so only one wake-gravitywell subprocess runs at a time.
+
+        Flow (gravitywell-doorman-clean-stop-v0):
+          1. Fast-path: _is_serving() → return True (service already up).
+          2. wake-gravitywell: idempotent host-wake (no-op if already up).
+          3. gw-serve big: start llama-server.service if stopped (idempotent).
+          4. Poll /health until serving or GW_WAKE_DEADLINE_SEC (covers ~25s
+             cold-load after gw-serve big).
         """
-        # Fast path: already awake
+        # Fast path: already awake and serving
         if self._is_serving():
             self.last_error = None
+            self.service_stopped = False
             return True
 
-        log.info("GW not serving — running wake-gravitywell")
+        log.info(f"[{self.node_name}] GW not serving — running wake-gravitywell")
         try:
             proc = subprocess.run(
                 ["wake-gravitywell", "doorman-acquire"],
@@ -110,30 +165,51 @@ class _NodeState:
             )
             if proc.returncode != 0:
                 err = f"wake-gravitywell failed rc={proc.returncode}: {proc.stderr[:300]}"
-                log.error(err)
+                log.error(f"[{self.node_name}] {err}")
                 self.last_error = err
                 return False
         except Exception as e:
             err = f"wake-gravitywell subprocess error: {e}"
-            log.error(err)
+            log.error(f"[{self.node_name}] {err}")
             self.last_error = err
             return False
 
-        # Poll /health until serving or deadline
+        # Ensure the serving unit is up (idempotent — fast no-op if already active)
+        log.info(f"[{self.node_name}] running gw-serve big to ensure llama-server.service is up")
+        try:
+            proc = subprocess.run(
+                ["ssh", "gravitywell", "gw-serve big"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if proc.returncode != 0:
+                err = (
+                    f"gw-serve big failed rc={proc.returncode}: {proc.stderr[:300]}"
+                )
+                log.error(f"[{self.node_name}] {err}")
+                self.last_error = err
+                return False
+        except Exception as e:
+            err = f"gw-serve big subprocess error: {e}"
+            log.error(f"[{self.node_name}] {err}")
+            self.last_error = err
+            return False
+
+        # Poll /health until serving or deadline (covers ~25s cold-load)
         deadline = time.time() + GW_WAKE_DEADLINE_SEC
         poll_interval = 3.0
         while time.time() < deadline:
             if self._is_serving():
                 elapsed = GW_WAKE_DEADLINE_SEC - (deadline - time.time())
-                log.info(f"GW serving after ~{elapsed:.0f}s")
+                log.info(f"[{self.node_name}] GW serving after ~{elapsed:.0f}s")
                 self.last_wake_at = time.time()
                 self.last_error = None
+                self.service_stopped = False
                 self._place_hold()
                 return True
             time.sleep(poll_interval)
 
         err = f"GW did not serve within {GW_WAKE_DEADLINE_SEC}s after wake"
-        log.error(err)
+        log.error(f"[{self.node_name}] {err}")
         self.last_error = err
         return False
 
@@ -149,7 +225,7 @@ class _NodeState:
                 capture_output=True, text=True, timeout=15,
             )
         except Exception as e:
-            log.warning(f"gw-keepawake hold failed: {e}")
+            log.warning(f"[{self.node_name}] gw-keepawake hold failed: {e}")
 
     def _release_hold(self) -> None:
         try:
@@ -158,7 +234,7 @@ class _NodeState:
                 capture_output=True, text=True, timeout=15,
             )
         except Exception as e:
-            log.warning(f"gw-keepawake release failed: {e}")
+            log.warning(f"[{self.node_name}] gw-keepawake release failed: {e}")
 
     # ------------------------------------------------------------------
     # Lease operations — must be called under lock
@@ -172,12 +248,18 @@ class _NodeState:
             if now > info["acquired_at"] + info["ttl_sec"]
         ]
         for wid in expired:
-            log.info(f"GC stale lease work_id={wid}")
+            log.info(f"[{self.node_name}] GC stale lease work_id={wid}")
             del self.leases[wid]
         return expired
 
     def acquire_lease(self, work_id: str, ttl_sec: int, reason: str) -> bool:
         """Try to ensure GW is serving, then register the lease. Returns True on success."""
+        # Clear idle tracking: an arriving lease means the node is no longer idle
+        was_idle = self.idle_since is not None
+        self.idle_since = None
+        if was_idle:
+            _write_idle_log(self.node_name, "resumed", len(self.leases))
+
         # ensure_serving serializes concurrent wakes under the same lock
         ok = self.ensure_serving()
         if not ok:
@@ -191,11 +273,13 @@ class _NodeState:
         return True
 
     def release_lease(self, work_id: str) -> None:
-        """Drop a lease. If it was the last, release the keepawake hold."""
+        """Drop a lease. If it was the last, record idle_since and release the hold."""
         self.leases.pop(work_id, None)
         self._gc_stale()
         if not self.leases:
+            self.idle_since = time.time()
             self._release_hold()
+            _write_idle_log(self.node_name, "idle_start", 0)
 
     # ------------------------------------------------------------------
     # Status snapshot (for /status endpoint)
@@ -204,8 +288,19 @@ class _NodeState:
     def status_snapshot(self) -> dict:
         with self.lock:
             self._gc_stale()
+            serving = self._is_serving(timeout=2.0)
+            # Derive serving_mode without an extra ssh gw-serve status round-trip
+            if serving:
+                serving_mode = "big"
+            elif self.service_stopped:
+                serving_mode = "stopped"
+            else:
+                serving_mode = "unknown"
             return {
-                "serving": self._is_serving(timeout=2.0),
+                "serving": serving,
+                "serving_mode": serving_mode,
+                "service_stopped": self.service_stopped,
+                "idle_since": self.idle_since,
                 "lease_count": len(self.leases),
                 "leases": [
                     {"work_id": wid, **info}
@@ -221,7 +316,7 @@ class _NodeState:
 # ---------------------------------------------------------------------------
 
 def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
-    """Start the keepawake refresh + stale-lease GC background thread."""
+    """Start the keepawake refresh + stale-lease GC + deferred stop background thread."""
 
     def _loop():
         backoff = 0.0
@@ -232,8 +327,76 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                 with state.lock:
                     state._gc_stale()
                     if not state.leases:
-                        continue
-                    # Re-issue the keepawake hold to refresh its TTL
+                        # No active leases: check if deferred service stop is due
+                        if (
+                            state.idle_since is not None
+                            and not state.service_stopped
+                        ):
+                            idle_elapsed = time.time() - state.idle_since
+                            if idle_elapsed >= GW_STOP_GRACE_SEC:
+                                log.warning(
+                                    f"[{node_name}] idle {idle_elapsed:.0f}s >= grace "
+                                    f"{GW_STOP_GRACE_SEC}s — issuing gw-serve stop. "
+                                    f"Safety: guard blocks suspend while service active; "
+                                    f"doorman stop enables suspend, never forces it."
+                                )
+                                try:
+                                    stop_proc = subprocess.run(
+                                        ["ssh", "gravitywell", "gw-serve stop"],
+                                        capture_output=True, text=True, timeout=60,
+                                    )
+                                    if stop_proc.returncode == 0:
+                                        state.service_stopped = True
+                                        state.idle_since = None
+                                        log.warning(
+                                            f"[{node_name}] gw-serve stop succeeded — "
+                                            f"llama-server.service stopped, host now "
+                                            f"suspend-eligible via guard"
+                                        )
+                                        _write_idle_log(
+                                            node_name, "stopped", 0,
+                                            idle_secs=idle_elapsed,
+                                        )
+                                    else:
+                                        # rc != 0: idempotency guard — check if already down
+                                        if not state._is_serving():
+                                            # Already stopped — treat as success
+                                            state.service_stopped = True
+                                            state.idle_since = None
+                                            log.warning(
+                                                f"[{node_name}] gw-serve stop "
+                                                f"rc={stop_proc.returncode} but service "
+                                                f"already down — treating as success"
+                                            )
+                                            _write_idle_log(
+                                                node_name, "stopped", 0,
+                                                idle_secs=idle_elapsed,
+                                            )
+                                        else:
+                                            # Real failure: still serving
+                                            err = (
+                                                f"gw-serve stop failed "
+                                                f"rc={stop_proc.returncode}: "
+                                                f"{stop_proc.stderr[:200]}"
+                                            )
+                                            log.error(f"[{node_name}] {err}")
+                                            state.last_error = err
+                                            backoff = min(
+                                                backoff + 15, GW_HOLD_REFRESH_SEC
+                                            )
+                                            _write_idle_log(
+                                                node_name, "stop_failed", 0,
+                                                idle_secs=idle_elapsed,
+                                            )
+                                except Exception as exc:
+                                    err = f"gw-serve stop exception: {exc}"
+                                    log.error(f"[{node_name}] {err}")
+                                    state.last_error = err
+                                    backoff = min(backoff + 15, GW_HOLD_REFRESH_SEC)
+                                    _write_idle_log(node_name, "stop_failed", 0)
+                        continue  # no hold refresh needed for idle node
+
+                    # Leases are active: re-issue the keepawake hold to refresh its TTL
                     try:
                         proc = subprocess.run(
                             ["ssh", "gravitywell",
@@ -267,7 +430,7 @@ def create_app(gw_url: str | None = None) -> FastAPI:
     _gw_url = gw_url or os.environ.get("GW_URL", GW_URL_DEFAULT)
 
     nodes: dict[str, _NodeState] = {
-        "gravitywell": _NodeState(_gw_url),
+        "gravitywell": _NodeState(_gw_url, node_name="gravitywell"),
     }
 
     # Start background refresh thread
