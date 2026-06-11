@@ -220,3 +220,44 @@ def test_gravitywell_release_called_on_backend_error():
     assert mock_client.release.call_count == 1
     release_args = mock_client.release.call_args[0]
     assert release_args[0] == "gravitywell"
+
+
+# ---------------------------------------------------------------------------
+# gravitywell: Edit 4 — OperatorUnreachableError caught and routed to wake_fail
+# ---------------------------------------------------------------------------
+
+def test_gravitywell_operator_unreachable_fallback_skip():
+    """When GW is serving then HTTP exhausts retries (OperatorUnreachableError),
+    on_wake_fail='skip' returns None (no crash)."""
+    mock_client = _gw_mock_client(status="serving")
+    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_client), \
+         patch("agents_core.llm._call_gravitywell_backend",
+               side_effect=OperatorUnreachableError("http://gw", Exception("retries exhausted"))):
+        result = call_operator("gravitywell", prompt="test", on_wake_fail="skip")
+
+    assert result is None
+    # Verify the finally-block release was called
+    assert mock_client.release.call_count == 1
+
+
+def test_gravitywell_operator_unreachable_fallback_sonnet():
+    """When GW is serving then HTTP exhausts retries (OperatorUnreachableError),
+    on_wake_fail='sonnet' falls back to paid Sonnet (never raises)."""
+    mock_client = _gw_mock_client(status="serving")
+    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_client), \
+         patch("agents_core.llm._call_gravitywell_backend",
+               side_effect=OperatorUnreachableError("http://gw", Exception("retries exhausted"))), \
+         patch("agents_core.claude_queue_sync.submit_and_wait",
+               return_value="sonnet-fallback") as mock_saw, \
+         warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        result = call_operator("gravitywell", prompt="test", on_wake_fail="sonnet")
+
+    assert result == "sonnet-fallback"
+    # Verify fallback was invoked
+    assert mock_saw.call_count >= 1
+    # Verify loud warning was emitted
+    assert any("sonnet" in str(warning.message).lower() or "paid" in str(warning.message).lower()
+               for warning in w)
+    # Verify release was called
+    assert mock_client.release.call_count == 1
