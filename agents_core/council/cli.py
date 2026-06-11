@@ -358,14 +358,76 @@ Respond with ONLY a JSON object:
             f"Selection returned {len(selected) if isinstance(selected, list) else '?'} "
             f"entities, expected {n}. Raw: {raw[:300]}"
         )
+
+    # Build resolution map from roster: normalize fuzzy ids to canonical
+    _canonical_ids = {r["character_id"] for r in roster}
+    _resolution = {}
+    for cid in _canonical_ids:
+        _resolution[cid] = cid
+        parts = cid.split("-")
+        for i in range(1, len(parts)):
+            suffix = "-".join(parts[i:])
+            if suffix not in _resolution:
+                _resolution[suffix] = cid
+
+    active_data = data
+    resolved = []
+    unresolved = []
+
+    # Step 2: fuzzy-resolve before raising
     for sid in selected:
-        if not isinstance(sid, str) or not find_card_path(sid):
-            raise RuntimeError(f"Selected unknown character_id: {sid!r}")
-    if len(set(selected)) != len(selected):
-        raise RuntimeError(
-            f"Selection returned duplicate entities: {selected}"
+        if not isinstance(sid, str):
+            unresolved.append(sid)
+            continue
+        if find_card_path(sid):
+            resolved.append(sid)
+            continue
+        if sid in _resolution and find_card_path(_resolution[sid]):
+            resolved.append(_resolution[sid])
+            continue
+        unresolved.append(sid)
+
+    # Step 3: retry-once if any ids are still unresolvable
+    if unresolved:
+        retry_note = (
+            f"The following id(s) you returned are NOT in the roster and cannot be "
+            f"resolved: {unresolved!r}. Choose ONLY from the character_ids listed in "
+            f"the ROSTER. Return the same JSON shape."
         )
-    return {"selected": selected, "reasoning": data.get("reasoning", "")}
+        retry_prompt = prompt + f"\n\n--- CORRECTION NEEDED ---\n{retry_note}"
+        raw2 = call_claude_cli(
+            prompt=retry_prompt,
+            system=system_msg,
+            model="sonnet",
+            timeout=300,
+            json_mode=True,
+            log=log,
+        )
+        data2 = _extract_json(raw2 or "")
+        active_data = data2
+        selected2 = data2.get("selected") or []
+        resolved = []
+        for sid in selected2:
+            if isinstance(sid, str) and find_card_path(sid):
+                resolved.append(sid)
+            elif isinstance(sid, str) and sid in _resolution and find_card_path(_resolution[sid]):
+                resolved.append(_resolution[sid])
+            else:
+                raise RuntimeError(
+                    f"Selected unknown character_id after retry: {sid!r} "
+                    f"(original unresolvable: {unresolved!r})"
+                )
+        if len(resolved) != n:
+            raise RuntimeError(
+                f"Retry returned {len(resolved)} entities, expected {n}: {resolved!r}"
+            )
+
+    # Step 4: duplicate check and return
+    if len(set(resolved)) != len(resolved):
+        raise RuntimeError(
+            f"Selection returned duplicate entities: {resolved}"
+        )
+    return {"selected": resolved, "reasoning": active_data.get("reasoning", "")}
 
 
 def _extract_json(text: str) -> dict:
