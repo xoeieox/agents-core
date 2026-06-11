@@ -372,3 +372,159 @@ def test_find_card_path_unknown_returns_none():
     if not CARDS_ROOT.exists():
         pytest.skip("archetypal-intelligence cards dir not present")
     assert find_card_path("obviously-not-a-real-character") is None
+
+
+def test_select_entities_resolves_fuzzy_montaigne_alias(monkeypatch):
+    """Curator returns montaigne-canonical which resolves to michel-de-montaigne-canonical."""
+    from agents_core.council.cli import select_entities
+
+    roster = [
+        {
+            "character_id": "michel-de-montaigne-canonical",
+            "character_name": "Michel de Montaigne",
+            "pool": "historical",
+            "cultural_context": "Renaissance philosopher.",
+            "path": "/path/to/montaigne.yaml",
+        },
+        {
+            "character_id": "ada-lovelace-canonical",
+            "character_name": "Ada Lovelace",
+            "pool": "historical",
+            "cultural_context": "Mathematician.",
+            "path": "/path/to/ada.yaml",
+        },
+    ]
+
+    context = {"hits": []}
+
+    call_count = [0]
+    def mock_call_claude_cli(**kwargs):
+        call_count[0] += 1
+        return '{"selected": ["montaigne-canonical", "ada-lovelace-canonical"], "reasoning": "test"}'
+
+    def mock_find_card_path(cid):
+        # Exact match for canonical ids
+        if cid == "michel-de-montaigne-canonical":
+            return True
+        if cid == "ada-lovelace-canonical":
+            return True
+        return None
+
+    monkeypatch.setattr("agents_core.council.cli.call_claude_cli", mock_call_claude_cli)
+    monkeypatch.setattr("agents_core.council.cli.find_card_path", mock_find_card_path)
+
+    result = select_entities(
+        decision="Test decision",
+        roster=roster,
+        context=context,
+        n=2,
+    )
+
+    # Should resolve montaigne-canonical to the canonical form without retry
+    assert result["selected"] == ["michel-de-montaigne-canonical", "ada-lovelace-canonical"]
+    assert call_count[0] == 1
+
+
+def test_select_entities_retries_once_on_unresolvable_then_raises(monkeypatch):
+    """Unresolvable id triggers exactly one retry, then raises."""
+    from agents_core.council.cli import select_entities
+
+    roster = [
+        {
+            "character_id": "ada-lovelace-canonical",
+            "character_name": "Ada Lovelace",
+            "pool": "historical",
+            "cultural_context": "Mathematician.",
+            "path": "/path/to/ada.yaml",
+        },
+        {
+            "character_id": "benjamin-franklin-canonical",
+            "character_name": "Benjamin Franklin",
+            "pool": "historical",
+            "cultural_context": "Polymath.",
+            "path": "/path/to/ben.yaml",
+        },
+    ]
+
+    context = {"hits": []}
+
+    call_count = [0]
+    def mock_call_claude_cli(**kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            # First call returns an unresolvable id
+            return '{"selected": ["totally-unknown-id", "ada-lovelace-canonical"], "reasoning": "test"}'
+        else:
+            # Retry still returns unresolvable (curator fails to correct)
+            return '{"selected": ["also-unknown-id", "ada-lovelace-canonical"], "reasoning": "test"}'
+
+    def mock_find_card_path(cid):
+        if cid == "ada-lovelace-canonical":
+            return True
+        if cid == "benjamin-franklin-canonical":
+            return True
+        return None
+
+    monkeypatch.setattr("agents_core.council.cli.call_claude_cli", mock_call_claude_cli)
+    monkeypatch.setattr("agents_core.council.cli.find_card_path", mock_find_card_path)
+
+    with pytest.raises(RuntimeError, match="Selected unknown character_id after retry"):
+        select_entities(
+            decision="Test decision",
+            roster=roster,
+            context=context,
+            n=2,
+        )
+
+    # Should have called LLM twice: initial + one retry
+    assert call_count[0] == 2
+
+
+def test_select_entities_exact_match_unchanged(monkeypatch):
+    """Valid exact-match ids pass through unchanged."""
+    from agents_core.council.cli import select_entities
+
+    roster = [
+        {
+            "character_id": "ada-lovelace-canonical",
+            "character_name": "Ada Lovelace",
+            "pool": "historical",
+            "cultural_context": "Mathematician.",
+            "path": "/path/to/ada.yaml",
+        },
+        {
+            "character_id": "benjamin-franklin-canonical",
+            "character_name": "Benjamin Franklin",
+            "pool": "historical",
+            "cultural_context": "Polymath.",
+            "path": "/path/to/ben.yaml",
+        },
+    ]
+
+    context = {"hits": []}
+
+    call_count = [0]
+    def mock_call_claude_cli(**kwargs):
+        call_count[0] += 1
+        return '{"selected": ["ada-lovelace-canonical", "benjamin-franklin-canonical"], "reasoning": "exact match test"}'
+
+    def mock_find_card_path(cid):
+        if cid == "ada-lovelace-canonical":
+            return True
+        if cid == "benjamin-franklin-canonical":
+            return True
+        return None
+
+    monkeypatch.setattr("agents_core.council.cli.call_claude_cli", mock_call_claude_cli)
+    monkeypatch.setattr("agents_core.council.cli.find_card_path", mock_find_card_path)
+
+    result = select_entities(
+        decision="Test decision",
+        roster=roster,
+        context=context,
+        n=2,
+    )
+
+    # Should return without retry since all ids are exact matches
+    assert result["selected"] == ["ada-lovelace-canonical", "benjamin-franklin-canonical"]
+    assert call_count[0] == 1  # No retry needed
