@@ -54,6 +54,7 @@ from pathlib import Path
 import yaml
 
 from agents_core.llm import call_claude_cli  # noqa: E402
+from agents_core.council.gravitywell_adapter import GravityWellAdapter
 
 COUNCIL_DIR = Path("/srv/lapis/council")
 CARDS_ROOT = Path(
@@ -810,6 +811,8 @@ def _build_director(mode: str, prompt: str, turns: int,
 def _build_adapter(voicing: str, ClaudeAdapter, LlamaAdapter):
     if voicing == "local":
         return LlamaAdapter(temperature=0.8, max_tokens=900)
+    if voicing == "gravitywell":
+        return GravityWellAdapter(temperature=0.8)
     if voicing in ("haiku", "sonnet", "opus"):
         return ClaudeAdapter(model=voicing, timeout=300)
     raise ValueError(f"Unknown voicing: {voicing!r}")
@@ -1092,7 +1095,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--n", type=int, default=None)
     sp.add_argument("--turns", type=int, default=DEFAULT_TURNS)
     sp.add_argument(
-        "--voicing", choices=["local", "haiku", "sonnet", "opus"],
+        "--voicing", choices=["local", "gravitywell", "haiku", "sonnet", "opus"],
         default=DEFAULT_VOICING,
     )
     sp.add_argument("--with", dest="with_entity", default=None)

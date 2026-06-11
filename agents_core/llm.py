@@ -316,7 +316,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                 return _call_gravitywell_backend(prompt=prompt, think=think, **gw_kwargs)
             finally:
                 client.release("gravitywell", work_id)
-        except DoormanUnreachable:
+        except (DoormanUnreachable, OperatorUnreachableError):
             return _apply_wake_fail(on_wake_fail, operator_class, prompt, **wake_fail_kwargs)
 
     # Anthropic-family: route via ClaudeQueue → call_claude_cli.
