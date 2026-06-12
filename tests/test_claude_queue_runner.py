@@ -193,12 +193,8 @@ def test_spawn_freeze_guard_block_reason_read_failure_open(monkeypatch):
 
 def test_spawn_freeze_guard_block_reason_threshold_override(monkeypatch):
     """AC#5: Env-var thresholds override defaults."""
-    monkeypatch.setenv("CLAUDE_QUEUE_MIN_RAM_GB", "5.0")
-    monkeypatch.setenv("CLAUDE_QUEUE_MIN_SWAP_FREE_GB", "2.0")
-
-    # Re-read the constants from the module.
-    # (In production, these are set at module load time, but we override them
-    # per-test by directly monkeypatching them here.)
+    # Override the constants directly (they are resolved at module import time,
+    # so setenv has no effect; we patch the actual module-level constants).
     monkeypatch.setattr(runner_mod, "SPAWN_MIN_RAM_AVAIL_GB", 5.0)
     monkeypatch.setattr(runner_mod, "SPAWN_MIN_SWAP_FREE_GB", 2.0)
 
@@ -221,6 +217,9 @@ def test_spawn_freeze_guard_block_reason_threshold_override(monkeypatch):
 async def test_daemon_claim_loop_withholds_under_pressure(monkeypatch, caplog):
     """AC#1: Daemon.run() does not call queue.claim() when guard returns reason."""
     caplog.set_level(logging.WARNING)
+
+    # Monkeypatch POLL_INTERVAL_S to make test fast and deterministic.
+    monkeypatch.setattr(runner_mod, "POLL_INTERVAL_S", 0.001)
 
     # Mock queue.claim() to track calls.
     claim_calls = []
@@ -281,6 +280,9 @@ async def test_daemon_claim_loop_proceeds_when_guard_clear(monkeypatch, caplog):
     """AC#1: Daemon.run() calls queue.claim() when guard returns None."""
     caplog.set_level(logging.INFO)
 
+    # Monkeypatch POLL_INTERVAL_S to make test fast and deterministic.
+    monkeypatch.setattr(runner_mod, "POLL_INTERVAL_S", 0.001)
+
     claim_calls = []
 
     class FakeQueue:
@@ -334,6 +336,9 @@ async def test_daemon_claim_loop_proceeds_when_guard_clear(monkeypatch, caplog):
 async def test_daemon_freeze_guard_flag_disables(monkeypatch):
     """AC#4: CLAUDE_QUEUE_FREEZE_GUARD=0 disables guard, claim proceeds always."""
     monkeypatch.setenv("CLAUDE_QUEUE_FREEZE_GUARD", "0")
+
+    # Monkeypatch POLL_INTERVAL_S to make test fast and deterministic.
+    monkeypatch.setattr(runner_mod, "POLL_INTERVAL_S", 0.001)
 
     claim_calls = []
 
@@ -424,3 +429,72 @@ def test_spawn_freeze_guard_log_discipline(monkeypatch, caplog):
     assert warn_count >= 1, f"Expected at least 1 ENGAGED, got {warn_count}"
     assert clear_count >= 1, f"Expected at least 1 CLEARED, got {clear_count}"
     assert "test: guard still engaged" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_daemon_run_log_discipline_multi_tick(monkeypatch, caplog):
+    """AC#8: Integration test — verify Daemon.run() itself logs WARN on
+    guard transitions and DEBUG per intermediate tick."""
+    caplog.set_level(logging.DEBUG)
+
+    # Monkeypatch POLL_INTERVAL_S and guard function to control flow.
+    monkeypatch.setattr(runner_mod, "POLL_INTERVAL_S", 0.001)
+
+    call_count = [0]
+
+    def conditional_block():
+        # Ticks 0-2: pressure (engage on tick 0)
+        # Ticks 3-5: clear (clear on tick 3)
+        # Ticks 6+: pressure again (engage on tick 6)
+        call_count[0] += 1
+        if call_count[0] <= 3:
+            return "simulated pressure"
+        elif call_count[0] <= 6:
+            return None
+        else:
+            return "simulated pressure"
+
+    monkeypatch.setattr(runner_mod, "_spawn_freeze_guard_block_reason", conditional_block)
+
+    # Mock queue to always return None (no task) so loop ticks without spawning.
+    class FakeQueue:
+        def claim(self):
+            return None
+        active_dir = None
+        queue_dir = None
+
+    def fake_startup_sweep(q):
+        pass
+
+    monkeypatch.setattr(runner_mod, "startup_sweep", fake_startup_sweep)
+
+    daemon = runner_mod.Daemon(workers=2)
+    daemon.queue = FakeQueue()
+
+    # Run for exactly 8 ticks (roughly), then stop.
+    tick_count = [0]
+
+    async def count_ticks():
+        while not daemon.stop_claiming.is_set() and tick_count[0] < 8:
+            tick_count[0] += 1
+            if tick_count[0] >= 8:
+                daemon.stop_claiming.set()
+            await asyncio.sleep(0.0001)  # very short sleep to let daemon loop progress
+
+    ticker = asyncio.create_task(count_ticks())
+
+    try:
+        await asyncio.wait_for(daemon.run(), timeout=5.0)
+    except asyncio.TimeoutError:
+        pass
+
+    ticker.cancel()
+    try:
+        await ticker
+    except asyncio.CancelledError:
+        pass
+
+    # Verify log discipline: WARN on engage and clear, DEBUG in between.
+    assert "freeze-guard ENGAGED" in caplog.text, "Expected ENGAGED log"
+    assert "freeze-guard CLEARED" in caplog.text, "Expected CLEARED log"
+    assert "freeze-guard still engaged" in caplog.text, "Expected DEBUG per intermediate tick"
