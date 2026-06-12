@@ -28,6 +28,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import psutil
+
 from agents_core.claude_queue import CLAUDE_QUEUE_DIR, ClaudeQueue
 from agents_core.gpu import PACIFIC, Priority as QueuePriority  # noqa: F401
 from agents_core.notify import Priority as PushoverPriority, send_notification
@@ -566,6 +568,40 @@ async def _run_task(queue: ClaudeQueue, task: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Freeze-guard: pure-psutil RAM/swap-headroom claim gate
+# ---------------------------------------------------------------------------
+# guaardvark@51d9829c131d — plugins/swarm/service/orchestrator.py
+# Cheap pure-psutil RAM/swap floor; re-checked before bringing on each new
+# subprocess so parallel claude -p workers can't drive the box to a swap freeze.
+# NOTE: thresholds re-calibrated for BRIX (28GB RAM / 8GB swap, ~3.7GB swap at
+# idle) — guaardvark's 60GB-box values (6.0 / 1.0) do NOT transfer; see spec.
+
+SPAWN_MIN_RAM_AVAIL_GB = float(os.environ.get("CLAUDE_QUEUE_MIN_RAM_GB", "4.0"))
+SPAWN_MIN_SWAP_FREE_GB = float(os.environ.get("CLAUDE_QUEUE_MIN_SWAP_FREE_GB", "1.5"))
+_GB = 1024 ** 3
+
+_guard_blocking: bool = False
+
+
+def _spawn_freeze_guard_block_reason() -> str | None:
+    """Reason to withhold claiming a new subprocess, or None. Pure psutil so it
+    never blocks on a missing probe; on read failure returns None (the guard fails
+    open, never the thing that blocks all work)."""
+    try:
+        vm = psutil.virtual_memory()
+        sw = psutil.swap_memory()
+        ram_avail_gb = vm.available / _GB
+        swap_free_gb = (sw.total - sw.used) / _GB
+    except Exception:
+        return None
+    if ram_avail_gb < SPAWN_MIN_RAM_AVAIL_GB:
+        return f"RAM available {ram_avail_gb:.1f} GB < {SPAWN_MIN_RAM_AVAIL_GB:.1f} GB floor"
+    if swap_free_gb < SPAWN_MIN_SWAP_FREE_GB:
+        return f"swap free {swap_free_gb:.1f} GB < {SPAWN_MIN_SWAP_FREE_GB:.1f} GB headroom"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -607,6 +643,21 @@ class Daemon:
             if self.sem.locked():
                 await asyncio.sleep(POLL_INTERVAL_S)
                 continue
+
+            global _guard_blocking
+            if os.environ.get("CLAUDE_QUEUE_FREEZE_GUARD", "1") != "0":
+                block_reason = _spawn_freeze_guard_block_reason()
+                if block_reason is not None:
+                    if not _guard_blocking:
+                        _guard_blocking = True
+                        log.warning("claude-queue freeze-guard ENGAGED: withholding claims (%s)", block_reason)
+                    else:
+                        log.debug("claude-queue freeze-guard still engaged (%s)", block_reason)
+                    await asyncio.sleep(POLL_INTERVAL_S)
+                    continue
+                elif _guard_blocking:
+                    _guard_blocking = False
+                    log.warning("claude-queue freeze-guard CLEARED: resuming claims")
 
             task = self.queue.claim()
             if task is None:
