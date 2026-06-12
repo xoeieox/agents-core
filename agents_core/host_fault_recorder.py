@@ -12,9 +12,11 @@ Schema v2 (2026-06-12):
   - process.cmdline: list[str] | null — victim process argv (from /proc/<pid>/cmdline).
     null if process was reaped (common in OOM) or unreachable. Best-effort.
   - process.cmdline_unavailable_reason: str | null — when cmdline is null, explains why:
-    "no_such_pid", "permission", "empty", or other reason. null if cmdline is available.
+    "no_such_pid", "permission", "empty", or other reason. Absent if cmdline is available.
   - top_rss_processes[].cmdline: list[str] | null — cmdline per top-RSS process.
     Reliable path since processes listed are still alive. null if unreadable.
+  - top_rss_processes[].cmdline_unavailable_reason: str | null — reason if cmdline is null.
+    Absent if cmdline is available.
 """
 from __future__ import annotations
 

@@ -245,12 +245,16 @@ def test_capture_snapshot_cmdline_from_live_pid(tmp_path, monkeypatch):
 
 
 def test_capture_snapshot_cmdline_unavailable_for_dead_pid(tmp_path, monkeypatch):
-    """Snapshot records cmdline_unavailable_reason for a nonexistent pid."""
+    """Snapshot records cmdline_unavailable_reason when cmdline is unavailable."""
     monkeypatch.setattr(
         "agents_core.host_fault_recorder.FAULT_EVENT_DIR", tmp_path
     )
-    # Use a pid that almost certainly doesn't exist
-    ev = _make_event(pid=9999999)
+    # Mock _read_cmdline to simulate a dead process
+    monkeypatch.setattr(
+        "agents_core.host_fault_recorder._read_cmdline",
+        lambda pid: (None, "no_such_pid")
+    )
+    ev = _make_event(pid=1)
     snap = capture_snapshot(ev)
     data = json.loads(snap.read_text())
 
@@ -259,24 +263,48 @@ def test_capture_snapshot_cmdline_unavailable_for_dead_pid(tmp_path, monkeypatch
     assert data["process"]["cmdline_unavailable_reason"] == "no_such_pid"
 
 
-def test_top_rss_processes_includes_cmdline(tmp_path, monkeypatch):
+def test_top_rss_processes_includes_cmdline(monkeypatch):
     """Each entry in top_rss_processes includes a cmdline field (may be null)."""
-    import os
     from agents_core.host_fault_recorder import _top_rss_processes
 
-    # Get the top 5 processes; the current process should be in the list
+    # Mock subprocess.run to return ps output without calling the real ps
+    class FakeProcResult:
+        def __init__(self):
+            # Simulated ps output: comm=, pid=, rss=
+            self.stdout = "python3 1000 1024\nbash 2000 512\n"
+            self.returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "ps":
+            return FakeProcResult()
+        raise RuntimeError(f"Unexpected command: {cmd}")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    # Mock _read_cmdline to return predictable results
+    def fake_read_cmdline(pid):
+        if pid == 1000:
+            return (["python3", "script.py"], None)
+        elif pid == 2000:
+            return (None, "permission")
+        else:
+            return (None, "no_such_pid")
+
+    monkeypatch.setattr(
+        "agents_core.host_fault_recorder._read_cmdline",
+        fake_read_cmdline
+    )
+
     results = _top_rss_processes(n=5)
 
-    assert len(results) > 0
-    for entry in results:
-        assert "cmdline" in entry
-        # cmdline may be null (if process is privileged), but the field must exist
-        if entry["cmdline"] is None:
-            # If cmdline is null, there should be a reason
-            assert "cmdline_unavailable_reason" in entry
-        else:
-            # If cmdline is present, it's a list of strings
-            assert isinstance(entry["cmdline"], list)
+    assert len(results) == 2
+    # First entry: has cmdline
+    assert results[0]["cmdline"] == ["python3", "script.py"]
+    assert "cmdline_unavailable_reason" not in results[0]
+
+    # Second entry: no cmdline, but reason is present
+    assert results[1]["cmdline"] is None
+    assert results[1]["cmdline_unavailable_reason"] == "permission"
 
 
 # ---------------------------------------------------------------------------
