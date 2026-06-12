@@ -190,6 +190,7 @@ def _apply_wake_fail(
     on_wake_fail: str | None,
     operator_class: str,
     prompt: str,
+    _provenance_out: list | None = None,
     **kwargs,
 ) -> str | None:
     """Apply the declared on_wake_fail policy when GW cannot be woken.
@@ -201,6 +202,9 @@ def _apply_wake_fail(
       "error" — raise OperatorUnreachableError so the caller decides.
 
     If the fallback call_operator() itself raises, the exception propagates unchanged.
+
+    _provenance_out: optional list to append (operator_class, reason) tuples for tracking
+                     which operator actually answered (used by adapters for observability).
     """
     policy = on_wake_fail or "skip"
 
@@ -215,9 +219,12 @@ def _apply_wake_fail(
         # Remove gravitywell-specific kwargs that the fallback operator doesn't accept
         fallback_kwargs = {
             k: v for k, v in kwargs.items()
-            if k not in ("think", "on_wake_fail")
+            if k not in ("think", "on_wake_fail", "_provenance_out")
         }
-        return call_operator(policy, prompt, **fallback_kwargs)
+        result = call_operator(policy, prompt, _provenance_out=_provenance_out, **fallback_kwargs)
+        if _provenance_out is not None:
+            _provenance_out.append(("fallback", policy))
+        return result
 
     if policy == "error":
         raise OperatorUnreachableError(
@@ -230,10 +237,11 @@ def _apply_wake_fail(
 
 
 def call_operator(operator_class: str, prompt: str, model: str = None,
+                  _provenance_out: list | None = None,
                   **kwargs) -> str | None:
     """Route a completion request to the appropriate backend operator.
 
-    operator_class ∈ {"qwen", "sonnet", "opus", "haiku"}.
+    operator_class ∈ {"qwen", "sonnet", "opus", "haiku", "gravitywell"}.
     Raises ValueError for unknown classes.
 
     Default models:
@@ -241,6 +249,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         sonnet → "claude-sonnet-4-6"
         opus   → "claude-opus-4-7"
         haiku  → "claude-haiku-4-5-20251001"
+        gravitywell → "gravitywell-122b"
 
     qwen routes via the local llama-server (same path as call_llm()).
 
@@ -250,6 +259,13 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
     `_run_llm_call_task` handler completes the task and writes the output file.
     No direct Anthropic-API calls — kill-switched per
     decision/no-anthropic-api-direct.
+
+    gravitywell routes via the doorman to the GravityWell llama.cpp endpoint.
+    On unreachable, falls back per on_wake_fail policy.
+
+    _provenance_out: optional list to append (reason, effective_operator) tuples
+                     for tracking which operator actually answered. Used by adapters
+                     for observability (e.g., recording effective voicing in council runs).
 
     Return contract:
       - str on success (the model's response text, identical to call_llm()'s).
@@ -301,7 +317,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         # (it's a positional arg there) or gravitywell-internal keys.
         wake_fail_kwargs = {
             k: v for k, v in kwargs.items()
-            if k not in ("on_wake_fail", "think", "bundle_ids")
+            if k not in ("on_wake_fail", "think", "bundle_ids", "_provenance_out")
         }
 
         from agents_core.doorman_client import DoormanClient, DoormanUnreachable
@@ -311,19 +327,38 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                 "gravitywell", work_id, ttl_sec=timeout + 60, reason="call_operator"
             )
             if res.get("status") != "serving":
-                return _apply_wake_fail(on_wake_fail, operator_class, prompt, **wake_fail_kwargs)
+                # GW not serving - explicit degrade
+                if _provenance_out is not None:
+                    _provenance_out.append(("gw_not_serving", "gravitywell"))
+                return _apply_wake_fail(on_wake_fail, operator_class, prompt,
+                                       _provenance_out=_provenance_out, **wake_fail_kwargs)
             try:
-                return _call_gravitywell_backend(prompt=prompt, think=think, **gw_kwargs)
+                result = _call_gravitywell_backend(prompt=prompt, think=think, **gw_kwargs)
+                if _provenance_out is not None:
+                    _provenance_out.append(("success", "gravitywell"))
+                return result
             finally:
                 client.release("gravitywell", work_id)
-        except (DoormanUnreachable, OperatorUnreachableError):
-            return _apply_wake_fail(on_wake_fail, operator_class, prompt, **wake_fail_kwargs)
+        except DoormanUnreachable:
+            # Doorman unreachable - cannot check GW status
+            if _provenance_out is not None:
+                _provenance_out.append(("doorman_unreachable", "gravitywell"))
+            return _apply_wake_fail(on_wake_fail, operator_class, prompt,
+                                   _provenance_out=_provenance_out, **wake_fail_kwargs)
+        except OperatorUnreachableError:
+            # GW unreachable - HTTP/network failure after doorman says serving
+            if _provenance_out is not None:
+                _provenance_out.append(("serving_http_error", "gravitywell"))
+            return _apply_wake_fail(on_wake_fail, operator_class, prompt,
+                                   _provenance_out=_provenance_out, **wake_fail_kwargs)
 
     # Anthropic-family: route via ClaudeQueue → call_claude_cli.
     # No direct Anthropic-API code path (decision/no-anthropic-api-direct).
     resolved_model = model or OPERATOR_DEFAULTS[operator_class]
     from agents_core.claude_queue_sync import submit_and_wait
     timeout = int(kwargs.get("timeout", 300))
+    if _provenance_out is not None:
+        _provenance_out.append(("success", operator_class))
     return submit_and_wait(
         {
             "task_type": "llm_call",

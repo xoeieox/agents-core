@@ -45,10 +45,17 @@ class GravityWellAdapter:
 
     Quality surface → on_wake_fail='sonnet' (paid fallback, logged loudly).
     Per-call doorman lease keeps GW warm across a deliberation's voices.
+
+    Tracks effective operator per turn in voicing_events for observability.
     """
     temperature: float = 0.8
     timeout: int = 300
     on_wake_fail: str = "sonnet"
+    voicing_events: list = None
+
+    def __post_init__(self):
+        if self.voicing_events is None:
+            self.voicing_events = []
 
     def chat(self, system: str, messages) -> str:
         """Invoke GravityWell as a Mirror Council voice.
@@ -61,13 +68,42 @@ class GravityWellAdapter:
             str: The voiced response (empty string if GW returns None).
             Never raises OperatorUnreachableError (on_wake_fail handles all
             GW-unreachable shapes and returns str or falls back to Sonnet).
+
+        Side effect: appends to voicing_events list with per-call provenance.
         """
         prompt = _flatten_messages(messages)
+        provenance: list = []
         result = call_operator(
             "gravitywell", prompt,
             system=system,
             temperature=self.temperature,
             timeout=self.timeout,
             on_wake_fail=self.on_wake_fail,
+            _provenance_out=provenance,
         )
+        # provenance is a list of (reason, operator) tuples.
+        # Find the effective operator and the actual failure reason (if any).
+        # The effective operator is from the last "success" entry.
+        # The failure reason is from the first non-"success", non-"fallback" entry.
+        if provenance:
+            effective_operator = None
+            failure_reason = None
+
+            for reason, op in provenance:
+                if reason == "success":
+                    effective_operator = op
+                elif reason != "fallback" and failure_reason is None:
+                    failure_reason = reason
+
+            # Determine final reason: use failure reason if present, else success
+            final_reason = failure_reason or "success"
+
+            # Fallback: use last entry's operator if we didn't find a success
+            if effective_operator is None and provenance:
+                _, effective_operator = provenance[-1]
+
+            self.voicing_events.append({
+                "effective_operator": effective_operator or "unknown",
+                "reason": final_reason,
+            })
         return result or ""
