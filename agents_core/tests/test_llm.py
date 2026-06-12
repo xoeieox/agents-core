@@ -251,3 +251,110 @@ def test_call_llm_delegates_to_call_operator():
         log=None,
         bundle_ids=["x"],
     )
+
+
+# ---------------------------------------------------------------------------
+# Voicing Provenance Tests (GravityWell effective-operator tracking)
+# ---------------------------------------------------------------------------
+
+def test_gravitywell_successful_call_records_provenance():
+    """call_operator('gravitywell') on success appends ('success', 'gravitywell') to provenance."""
+    from agents_core import llm as llm_mod
+    from agents_core.doorman_client import DoormanClient
+
+    fake_gw_resp = _make_llama_response("gw answer")
+
+    provenance = []
+    with patch.object(DoormanClient, "acquire", return_value={"status": "serving"}), \
+         patch.object(DoormanClient, "release"), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="gw answer"):
+
+        result = llm_mod.call_operator(
+            "gravitywell", prompt="test",
+            on_wake_fail="sonnet",
+            _provenance_out=provenance,
+        )
+
+    assert result == "gw answer"
+    assert ("success", "gravitywell") in provenance
+
+
+def test_gravitywell_fallback_on_doorman_unreachable():
+    """call_operator('gravitywell') appends doorman_unreachable reason when doorman is down."""
+    from agents_core import llm as llm_mod
+    from agents_core.doorman_client import DoormanClient, DoormanUnreachable
+
+    provenance = []
+    with patch.object(DoormanClient, "acquire", side_effect=DoormanUnreachable("doorman down")), \
+         patch.object(DoormanClient, "release"), \
+         patch("agents_core.claude_queue_sync.submit_and_wait", return_value="fallback answer"):
+
+        result = llm_mod.call_operator(
+            "gravitywell", prompt="test",
+            on_wake_fail="sonnet",
+            _provenance_out=provenance,
+        )
+
+    assert result == "fallback answer"
+    assert ("doorman_unreachable", "gravitywell") in provenance
+    assert ("fallback", "sonnet") in provenance
+
+
+def test_gravitywell_fallback_on_gw_not_serving():
+    """call_operator('gravitywell') appends gw_not_serving reason when doorman says not serving."""
+    from agents_core import llm as llm_mod
+    from agents_core.doorman_client import DoormanClient
+
+    provenance = []
+    with patch.object(DoormanClient, "acquire", return_value={"status": "offline"}), \
+         patch.object(DoormanClient, "release"), \
+         patch("agents_core.claude_queue_sync.submit_and_wait", return_value="fallback answer"):
+
+        result = llm_mod.call_operator(
+            "gravitywell", prompt="test",
+            on_wake_fail="sonnet",
+            _provenance_out=provenance,
+        )
+
+    assert result == "fallback answer"
+    assert ("gw_not_serving", "gravitywell") in provenance
+    assert ("fallback", "sonnet") in provenance
+
+
+def test_gravitywell_fallback_on_http_error():
+    """call_operator('gravitywell') appends serving_http_error when GW returns HTTP error."""
+    from agents_core import llm as llm_mod
+    from agents_core.doorman_client import DoormanClient
+    from agents_core.llm import OperatorUnreachableError
+
+    provenance = []
+    with patch.object(DoormanClient, "acquire", return_value={"status": "serving"}), \
+         patch.object(DoormanClient, "release"), \
+         patch("agents_core.llm._call_gravitywell_backend",
+               side_effect=OperatorUnreachableError("http://gw:8081", Exception("500"))), \
+         patch("agents_core.claude_queue_sync.submit_and_wait", return_value="fallback answer"):
+
+        result = llm_mod.call_operator(
+            "gravitywell", prompt="test",
+            on_wake_fail="sonnet",
+            _provenance_out=provenance,
+        )
+
+    assert result == "fallback answer"
+    assert ("serving_http_error", "gravitywell") in provenance
+    assert ("fallback", "sonnet") in provenance
+
+
+def test_non_gravitywell_operator_records_success_provenance():
+    """call_operator('sonnet') appends ('success', 'sonnet') to provenance."""
+    from agents_core import llm as llm_mod
+
+    provenance = []
+    with patch("agents_core.claude_queue_sync.submit_and_wait", return_value="sonnet answer"):
+        result = llm_mod.call_operator(
+            "sonnet", prompt="test",
+            _provenance_out=provenance,
+        )
+
+    assert result == "sonnet answer"
+    assert ("success", "sonnet") in provenance

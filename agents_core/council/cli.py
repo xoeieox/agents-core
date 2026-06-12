@@ -729,6 +729,9 @@ def run_deliberation(run_id: str) -> None:
             }
         )
         run["synthesis"] = _parse_synthesis(synth_content)
+        # Stub mode voicing provenance: set effective_voicing to match requested (no actual operation)
+        run["effective_voicing"] = run.get("voicing", "sonnet")
+        run["voicing_degraded"] = False
         # Common deliberation tail — MUST run in stub mode too (H2 fix per v3->v4).
         # entities=None is safe: _cast_positions uses env-var fast-path in stub mode.
         _apply_position_cast_tail(
@@ -781,6 +784,9 @@ def run_deliberation(run_id: str) -> None:
 
         Engine().run(director=director, entities=entities, on_step=on_step)
 
+        # Record effective voicing from adapter (gravitywell or fallback)
+        _apply_voicing_provenance(run, adapter)
+
         if mode == "scene":
             run["status"] = "closed"
         else:
@@ -799,6 +805,71 @@ def run_deliberation(run_id: str) -> None:
         run["completed_at"] = datetime.now().isoformat(timespec="seconds")
         save_run(run)
         raise
+
+
+def _apply_voicing_provenance(run: dict, adapter) -> None:
+    """Record effective voicing in the run record based on adapter provenance.
+
+    For GravityWellAdapter, reads voicing_events list and updates run["effective_voicing"]
+    and related fields. For other adapters, sets effective_voicing to match requested voicing.
+
+    Mutates run in-place, adding/updating:
+    - effective_voicing: the operator that actually answered (e.g., "gravitywell" or "sonnet")
+    - voicing_degraded: bool, True if effective != requested
+    - voicing_degraded_reason: the reason for degradation (if any)
+    - Per-turn effective_voicing keys in run["turns"][]
+    """
+    from agents_core.council.gravitywell_adapter import GravityWellAdapter
+
+    requested_voicing = run.get("voicing", "sonnet")
+
+    if isinstance(adapter, GravityWellAdapter):
+        if adapter.voicing_events:
+            # Aggregate voicing events: check if all are gravitywell (clean) or mixed
+            operators = [e.get("effective_operator") for e in adapter.voicing_events]
+            reasons = [e.get("reason") for e in adapter.voicing_events]
+
+            # Determine effective_voicing: if all are gravitywell, it's gravitywell; else fallback
+            if all(op == "gravitywell" for op in operators):
+                run["effective_voicing"] = "gravitywell"
+                run["voicing_degraded"] = False
+            else:
+                # Mixed or all fallback - pick the first non-gravitywell operator
+                non_gw = [op for op in operators if op != "gravitywell"]
+                run["effective_voicing"] = non_gw[0] if non_gw else "unknown"
+                run["voicing_degraded"] = True
+                # Collect unique failure reasons (excluding "success" which indicates clean calls)
+                failure_reasons = []
+                for r in reasons:
+                    if r not in failure_reasons and r != "success":
+                        failure_reasons.append(r)
+                # Pick the most specific reason (prioritize by specificity)
+                if "doorman_unreachable" in failure_reasons:
+                    run["voicing_degraded_reason"] = "doorman_unreachable"
+                elif "serving_http_error" in failure_reasons:
+                    run["voicing_degraded_reason"] = "serving_http_error"
+                elif "gw_not_serving" in failure_reasons:
+                    run["voicing_degraded_reason"] = "gw_not_serving"
+                elif "gw_wake_failed" in failure_reasons:
+                    run["voicing_degraded_reason"] = "gw_wake_failed"
+                elif "fallback" in failure_reasons:
+                    run["voicing_degraded_reason"] = "fallback"
+                else:
+                    run["voicing_degraded_reason"] = failure_reasons[0] if failure_reasons else "unknown"
+
+            # Add per-turn effective_voicing keys
+            for i, turn in enumerate(run.get("turns", [])):
+                if i < len(adapter.voicing_events):
+                    turn["effective_voicing"] = adapter.voicing_events[i].get("effective_operator")
+        else:
+            # No voicing events recorded - shouldn't happen in real runs, assume success
+            run["effective_voicing"] = "gravitywell"
+            run["voicing_degraded"] = False
+    elif adapter is not None:
+        # Non-GravityWell adapters: effective == requested
+        run["effective_voicing"] = requested_voicing
+        run["voicing_degraded"] = False
+    # If adapter is None, voicing provenance should already be set by caller (stub mode)
 
 
 def _apply_position_cast_tail(

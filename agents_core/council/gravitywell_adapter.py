@@ -45,10 +45,17 @@ class GravityWellAdapter:
 
     Quality surface → on_wake_fail='sonnet' (paid fallback, logged loudly).
     Per-call doorman lease keeps GW warm across a deliberation's voices.
+
+    Tracks effective operator per turn in voicing_events for observability.
     """
     temperature: float = 0.8
     timeout: int = 300
     on_wake_fail: str = "sonnet"
+    voicing_events: list = None
+
+    def __post_init__(self):
+        if self.voicing_events is None:
+            self.voicing_events = []
 
     def chat(self, system: str, messages) -> str:
         """Invoke GravityWell as a Mirror Council voice.
@@ -61,13 +68,25 @@ class GravityWellAdapter:
             str: The voiced response (empty string if GW returns None).
             Never raises OperatorUnreachableError (on_wake_fail handles all
             GW-unreachable shapes and returns str or falls back to Sonnet).
+
+        Side effect: appends to voicing_events list with per-call provenance.
         """
         prompt = _flatten_messages(messages)
+        provenance: list = []
         result = call_operator(
             "gravitywell", prompt,
             system=system,
             temperature=self.temperature,
             timeout=self.timeout,
             on_wake_fail=self.on_wake_fail,
+            _provenance_out=provenance,
         )
+        # provenance is a list of (reason, operator) tuples; extract the effective operator
+        # The last operator in the list is the one that answered
+        if provenance:
+            reason, effective_operator = provenance[-1]
+            self.voicing_events.append({
+                "effective_operator": effective_operator,
+                "reason": reason,
+            })
         return result or ""
