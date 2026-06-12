@@ -7,6 +7,14 @@ segfault at, Out of memory / oom-kill). On each match:
   3. Checks burst window; sends Pushover + emits mem.db entry if threshold crossed
 
 Read-only: no auto-drop_caches, no service restart, no host-state writes.
+
+Schema v2 (2026-06-12):
+  - process.cmdline: list[str] | null — victim process argv (from /proc/<pid>/cmdline).
+    null if process was reaped (common in OOM) or unreachable. Best-effort.
+  - process.cmdline_unavailable_reason: str | null — when cmdline is null, explains why:
+    "no_such_pid", "permission", "empty", or other reason. null if cmdline is available.
+  - top_rss_processes[].cmdline: list[str] | null — cmdline per top-RSS process.
+    Reliable path since processes listed are still alive. null if unreadable.
 """
 from __future__ import annotations
 
@@ -262,6 +270,31 @@ def parse_fault_line(line: str) -> FaultEvent | None:
 # ---------------------------------------------------------------------------
 
 
+def _read_cmdline(pid: int) -> tuple[list[str] | None, str | None]:
+    """Read /proc/<pid>/cmdline (NUL-separated args).
+
+    Returns (cmdline, unavailable_reason) where:
+    - cmdline is list[str] if readable, None otherwise
+    - unavailable_reason is None if cmdline available, else a reason string
+
+    Never raises; always best-effort.
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            data = f.read()
+            if not data:
+                return None, "empty"
+            # NUL-separated; strip final NUL and split
+            cmdline = data.rstrip(b'\x00').split(b'\x00')
+            return [arg.decode('utf-8', errors='replace') for arg in cmdline], None
+    except FileNotFoundError:
+        return None, "no_such_pid"
+    except PermissionError:
+        return None, "permission"
+    except Exception as e:
+        return None, f"read_error:{type(e).__name__}"
+
+
 def _read_meminfo() -> dict[str, int]:
     result: dict[str, int] = {}
     try:
@@ -317,11 +350,17 @@ def _top_rss_processes(n: int = 10) -> list[dict]:
             parts = line.split()
             if len(parts) >= 3:
                 try:
-                    results.append({
+                    pid = int(parts[1])
+                    cmdline, unavailable_reason = _read_cmdline(pid)
+                    entry = {
                         "comm": parts[0],
-                        "pid": int(parts[1]),
+                        "pid": pid,
                         "rss_kb": int(parts[2]),
-                    })
+                        "cmdline": cmdline,
+                    }
+                    if unavailable_reason is not None:
+                        entry["cmdline_unavailable_reason"] = unavailable_reason
+                    results.append(entry)
                 except ValueError:
                     pass
     except (OSError, subprocess.TimeoutExpired):
@@ -375,22 +414,29 @@ def capture_snapshot(event: FaultEvent) -> Path:
         ("MemTotal", "MemFree", "MemAvailable", "Buffers", "Cached", "SwapFree", "Dirty")
     }
 
+    cmdline, cmdline_unavailable_reason = _read_cmdline(event.pid)
+
+    process_block = {
+        "comm": event.comm,
+        "pid": event.pid,
+        "ip": event.ip,
+        "sp": event.sp,
+        "error_code": event.error_code,
+        "faulting_module": event.faulting_module,
+        "faulting_offset": event.faulting_offset,
+        "cpu": event.cpu,
+        "cmdline": cmdline,
+    }
+    if cmdline_unavailable_reason is not None:
+        process_block["cmdline_unavailable_reason"] = cmdline_unavailable_reason
+
     snapshot = {
-        "schema_version": 1,
+        "schema_version": 2,
         "captured_at_utc": utc_iso,
         "captured_at_pacific": pacific_str,
         "journal_line": event.journal_line,
         "fault_kind": event.fault_kind,
-        "process": {
-            "comm": event.comm,
-            "pid": event.pid,
-            "ip": event.ip,
-            "sp": event.sp,
-            "error_code": event.error_code,
-            "faulting_module": event.faulting_module,
-            "faulting_offset": event.faulting_offset,
-            "cpu": event.cpu,
-        },
+        "process": process_block,
         "system": {
             "loadavg_1": load1,
             "loadavg_5": load5,

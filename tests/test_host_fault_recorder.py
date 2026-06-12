@@ -168,7 +168,7 @@ def test_capture_snapshot_creates_valid_json(tmp_path, monkeypatch):
 
     assert snap.exists()
     data = json.loads(snap.read_text())
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == 2
     assert data["fault_kind"] == "general_protection_fault"
     assert data["process"]["comm"] == "python3"
     assert data["process"]["pid"] == 1234
@@ -218,11 +218,65 @@ def test_capture_snapshot_schema_fields_present(tmp_path, monkeypatch):
     assert required_top <= set(data.keys())
 
     required_proc = {"comm", "pid", "ip", "sp", "error_code",
-                     "faulting_module", "faulting_offset", "cpu"}
+                     "faulting_module", "faulting_offset", "cpu", "cmdline"}
     assert required_proc <= set(data["process"].keys())
 
     required_sys = {"loadavg_1", "loadavg_5", "loadavg_15", "mem_kb", "concurrent_processes"}
     assert required_sys <= set(data["system"].keys())
+
+
+def test_capture_snapshot_cmdline_from_live_pid(tmp_path, monkeypatch):
+    """Snapshot includes cmdline for the current process (which is always alive)."""
+    import os
+    monkeypatch.setattr(
+        "agents_core.host_fault_recorder.FAULT_EVENT_DIR", tmp_path
+    )
+    # Use this process's PID — it will have a readable cmdline
+    own_pid = os.getpid()
+    ev = _make_event(pid=own_pid)
+    snap = capture_snapshot(ev)
+    data = json.loads(snap.read_text())
+
+    assert data["process"]["cmdline"] is not None
+    assert isinstance(data["process"]["cmdline"], list)
+    assert len(data["process"]["cmdline"]) > 0
+    # cmdline_unavailable_reason should not be present if cmdline is available
+    assert "cmdline_unavailable_reason" not in data["process"]
+
+
+def test_capture_snapshot_cmdline_unavailable_for_dead_pid(tmp_path, monkeypatch):
+    """Snapshot records cmdline_unavailable_reason for a nonexistent pid."""
+    monkeypatch.setattr(
+        "agents_core.host_fault_recorder.FAULT_EVENT_DIR", tmp_path
+    )
+    # Use a pid that almost certainly doesn't exist
+    ev = _make_event(pid=9999999)
+    snap = capture_snapshot(ev)
+    data = json.loads(snap.read_text())
+
+    assert data["process"]["cmdline"] is None
+    assert "cmdline_unavailable_reason" in data["process"]
+    assert data["process"]["cmdline_unavailable_reason"] == "no_such_pid"
+
+
+def test_top_rss_processes_includes_cmdline(tmp_path, monkeypatch):
+    """Each entry in top_rss_processes includes a cmdline field (may be null)."""
+    import os
+    from agents_core.host_fault_recorder import _top_rss_processes
+
+    # Get the top 5 processes; the current process should be in the list
+    results = _top_rss_processes(n=5)
+
+    assert len(results) > 0
+    for entry in results:
+        assert "cmdline" in entry
+        # cmdline may be null (if process is privileged), but the field must exist
+        if entry["cmdline"] is None:
+            # If cmdline is null, there should be a reason
+            assert "cmdline_unavailable_reason" in entry
+        else:
+            # If cmdline is present, it's a list of strings
+            assert isinstance(entry["cmdline"], list)
 
 
 # ---------------------------------------------------------------------------
