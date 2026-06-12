@@ -262,8 +262,6 @@ def test_gravitywell_successful_call_records_provenance():
     from agents_core import llm as llm_mod
     from agents_core.doorman_client import DoormanClient
 
-    fake_gw_resp = _make_llama_response("gw answer")
-
     provenance = []
     with patch.object(DoormanClient, "acquire", return_value={"status": "serving"}), \
          patch.object(DoormanClient, "release"), \

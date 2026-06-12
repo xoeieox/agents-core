@@ -850,10 +850,6 @@ def _apply_voicing_provenance(run: dict, adapter) -> None:
                     run["voicing_degraded_reason"] = "serving_http_error"
                 elif "gw_not_serving" in failure_reasons:
                     run["voicing_degraded_reason"] = "gw_not_serving"
-                elif "gw_wake_failed" in failure_reasons:
-                    run["voicing_degraded_reason"] = "gw_wake_failed"
-                elif "fallback" in failure_reasons:
-                    run["voicing_degraded_reason"] = "fallback"
                 else:
                     run["voicing_degraded_reason"] = failure_reasons[0] if failure_reasons else "unknown"
 

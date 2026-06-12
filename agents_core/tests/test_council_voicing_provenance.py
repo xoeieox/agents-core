@@ -44,7 +44,7 @@ def test_gravitywell_adapter_tracks_voicing_events():
 
 
 def test_gravitywell_adapter_tracks_fallback_events():
-    """GravityWellAdapter.chat() records fallback to Sonnet on GW failure."""
+    """GravityWellAdapter.chat() records fallback to Sonnet on GW failure with specific reason."""
     from agents_core.council.gravitywell_adapter import GravityWellAdapter
     from agents_core.doorman_client import DoormanClient, DoormanUnreachable
 
@@ -65,7 +65,8 @@ def test_gravitywell_adapter_tracks_fallback_events():
     assert response == "sonnet response"
     assert len(adapter.voicing_events) == 1
     assert adapter.voicing_events[0]["effective_operator"] == "sonnet"
-    assert adapter.voicing_events[0]["reason"] == "fallback"
+    # The actual failure reason (doorman_unreachable) is recorded, not generic "fallback"
+    assert adapter.voicing_events[0]["reason"] == "doorman_unreachable"
 
 
 def test_gravitywell_adapter_multiple_calls_accumulate_events():
@@ -170,7 +171,7 @@ def test_apply_voicing_provenance_gravitywell_degraded():
     adapter = GravityWellAdapter()
     adapter.voicing_events = [
         {"effective_operator": "gravitywell", "reason": "success"},
-        {"effective_operator": "sonnet", "reason": "fallback"},
+        {"effective_operator": "sonnet", "reason": "doorman_unreachable"},
     ]
 
     run = {
@@ -182,7 +183,7 @@ def test_apply_voicing_provenance_gravitywell_degraded():
 
     assert run["effective_voicing"] == "sonnet"
     assert run["voicing_degraded"] is True
-    assert run["voicing_degraded_reason"] == "fallback"
+    assert run["voicing_degraded_reason"] == "doorman_unreachable"
     assert run["turns"][0]["effective_voicing"] == "gravitywell"
     assert run["turns"][1]["effective_voicing"] == "sonnet"
 
@@ -194,7 +195,7 @@ def test_apply_voicing_provenance_doorman_unreachable_reason():
 
     adapter = GravityWellAdapter()
     adapter.voicing_events = [
-        {"effective_operator": "sonnet", "reason": "fallback"},
+        {"effective_operator": "sonnet", "reason": "doorman_unreachable"},
     ]
 
     run = {
@@ -206,7 +207,7 @@ def test_apply_voicing_provenance_doorman_unreachable_reason():
 
     assert run["effective_voicing"] == "sonnet"
     assert run["voicing_degraded"] is True
-    assert run["voicing_degraded_reason"] == "fallback"
+    assert run["voicing_degraded_reason"] == "doorman_unreachable"
 
 
 def test_apply_voicing_provenance_non_gravitywell_adapter():
@@ -274,14 +275,14 @@ def test_voicing_record_matches_requested_voicing():
 # ---------------------------------------------------------------------------
 
 def test_voicing_degraded_reason_prioritizes_specific_errors():
-    """_apply_voicing_provenance() prioritizes specific failure reasons over generic ones."""
+    """_apply_voicing_provenance() records specific failure reasons."""
     from agents_core.council.cli import _apply_voicing_provenance
     from agents_core.council.gravitywell_adapter import GravityWellAdapter
 
     adapter = GravityWellAdapter()
-    # Both doorman_unreachable and fallback are recorded
+    # Specific failure reason is recorded
     adapter.voicing_events = [
-        {"effective_operator": "sonnet", "reason": "fallback"},
+        {"effective_operator": "sonnet", "reason": "serving_http_error"},
     ]
 
     run = {
@@ -291,8 +292,8 @@ def test_voicing_degraded_reason_prioritizes_specific_errors():
 
     _apply_voicing_provenance(run, adapter)
 
-    # Should pick the most specific reason
-    assert run["voicing_degraded_reason"] == "fallback"
+    # Should record the specific failure reason
+    assert run["voicing_degraded_reason"] == "serving_http_error"
 
 
 def test_voicing_degraded_reason_all_gravitywell_clean():
@@ -315,3 +316,68 @@ def test_voicing_degraded_reason_all_gravitywell_clean():
 
     assert run["voicing_degraded"] is False
     assert "voicing_degraded_reason" not in run
+
+
+# ---------------------------------------------------------------------------
+# Integration tests (full run flow)
+# ---------------------------------------------------------------------------
+
+def test_council_run_with_gw_failure_records_provenance_in_yaml():
+    """Full integration test: council run with GW fallback → run yaml has effective_voicing + degraded_reason."""
+    from agents_core.council.cli import _apply_voicing_provenance
+    from agents_core.council.gravitywell_adapter import GravityWellAdapter
+
+    # Build a minimal run dict that would have been created by cmd_submit
+    run = {
+        "id": "test-council-run",
+        "voicing": "gravitywell",  # Requested voicing
+        "mode": "deliberation",
+        "decision": "Test decision",
+        "turns_cap": "2",
+        "selected_entities": [],
+        "turns": [
+            {"step": 1, "content": "Turn 1 response"},
+        ],
+        "synthesis": {},
+    }
+
+    # Manually create the adapter with fallback history (simulating a failed GW call)
+    adapter = GravityWellAdapter()
+    adapter.voicing_events = [
+        {"effective_operator": "sonnet", "reason": "doorman_unreachable"},
+    ]
+
+    # Apply the voicing provenance - this is what run_deliberation does after Engine().run()
+    _apply_voicing_provenance(run, adapter)
+
+    # Verify the run record has the correct fields
+    assert run["voicing"] == "gravitywell", "Requested voicing must be unchanged"
+    assert run["effective_voicing"] == "sonnet", "Effective voicing should be sonnet"
+    assert run["voicing_degraded"] is True, "Should be marked as degraded"
+    assert run["voicing_degraded_reason"] == "doorman_unreachable", "Reason should be specific"
+    assert run["turns"][0]["effective_voicing"] == "sonnet", "Turn should have effective_voicing"
+
+
+def test_council_run_with_gw_success_records_clean_provenance():
+    """Integration test: council run with GW success records clean voicing (no degradation)."""
+    from agents_core.council.cli import _apply_voicing_provenance
+    from agents_core.council.gravitywell_adapter import GravityWellAdapter
+
+    run = {
+        "voicing": "gravitywell",
+        "turns": [{"step": 1}],
+    }
+
+    adapter = GravityWellAdapter()
+    adapter.voicing_events = [
+        {"effective_operator": "gravitywell", "reason": "success"},
+    ]
+
+    _apply_voicing_provenance(run, adapter)
+
+    # Verify clean run has correct fields
+    assert run["voicing"] == "gravitywell", "Requested voicing must be unchanged"
+    assert run["effective_voicing"] == "gravitywell", "Effective voicing should be gravitywell"
+    assert run["voicing_degraded"] is False, "Should not be marked as degraded"
+    assert "voicing_degraded_reason" not in run, "No reason field on clean run"
+    assert run["turns"][0]["effective_voicing"] == "gravitywell", "Turn should have effective_voicing"

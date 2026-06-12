@@ -81,12 +81,29 @@ class GravityWellAdapter:
             on_wake_fail=self.on_wake_fail,
             _provenance_out=provenance,
         )
-        # provenance is a list of (reason, operator) tuples; extract the effective operator
-        # The last operator in the list is the one that answered
+        # provenance is a list of (reason, operator) tuples.
+        # Find the effective operator and the actual failure reason (if any).
+        # The effective operator is from the last "success" entry.
+        # The failure reason is from the first non-"success", non-"fallback" entry.
         if provenance:
-            reason, effective_operator = provenance[-1]
+            effective_operator = None
+            failure_reason = None
+
+            for reason, op in provenance:
+                if reason == "success":
+                    effective_operator = op
+                elif reason != "fallback" and failure_reason is None:
+                    failure_reason = reason
+
+            # Determine final reason: use failure reason if present, else success
+            final_reason = failure_reason or "success"
+
+            # Fallback: use last entry's operator if we didn't find a success
+            if effective_operator is None and provenance:
+                _, effective_operator = provenance[-1]
+
             self.voicing_events.append({
-                "effective_operator": effective_operator,
-                "reason": reason,
+                "effective_operator": effective_operator or "unknown",
+                "reason": final_reason,
             })
         return result or ""
