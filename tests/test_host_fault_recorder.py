@@ -168,7 +168,7 @@ def test_capture_snapshot_creates_valid_json(tmp_path, monkeypatch):
 
     assert snap.exists()
     data = json.loads(snap.read_text())
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == 2
     assert data["fault_kind"] == "general_protection_fault"
     assert data["process"]["comm"] == "python3"
     assert data["process"]["pid"] == 1234
@@ -218,11 +218,93 @@ def test_capture_snapshot_schema_fields_present(tmp_path, monkeypatch):
     assert required_top <= set(data.keys())
 
     required_proc = {"comm", "pid", "ip", "sp", "error_code",
-                     "faulting_module", "faulting_offset", "cpu"}
+                     "faulting_module", "faulting_offset", "cpu", "cmdline"}
     assert required_proc <= set(data["process"].keys())
 
     required_sys = {"loadavg_1", "loadavg_5", "loadavg_15", "mem_kb", "concurrent_processes"}
     assert required_sys <= set(data["system"].keys())
+
+
+def test_capture_snapshot_cmdline_from_live_pid(tmp_path, monkeypatch):
+    """Snapshot includes cmdline for the current process (which is always alive)."""
+    import os
+    monkeypatch.setattr(
+        "agents_core.host_fault_recorder.FAULT_EVENT_DIR", tmp_path
+    )
+    # Use this process's PID — it will have a readable cmdline
+    own_pid = os.getpid()
+    ev = _make_event(pid=own_pid)
+    snap = capture_snapshot(ev)
+    data = json.loads(snap.read_text())
+
+    assert data["process"]["cmdline"] is not None
+    assert isinstance(data["process"]["cmdline"], list)
+    assert len(data["process"]["cmdline"]) > 0
+    # cmdline_unavailable_reason should not be present if cmdline is available
+    assert "cmdline_unavailable_reason" not in data["process"]
+
+
+def test_capture_snapshot_cmdline_unavailable_for_dead_pid(tmp_path, monkeypatch):
+    """Snapshot records cmdline_unavailable_reason when cmdline is unavailable."""
+    monkeypatch.setattr(
+        "agents_core.host_fault_recorder.FAULT_EVENT_DIR", tmp_path
+    )
+    # Mock _read_cmdline to simulate a dead process
+    monkeypatch.setattr(
+        "agents_core.host_fault_recorder._read_cmdline",
+        lambda pid: (None, "no_such_pid")
+    )
+    ev = _make_event(pid=1)
+    snap = capture_snapshot(ev)
+    data = json.loads(snap.read_text())
+
+    assert data["process"]["cmdline"] is None
+    assert "cmdline_unavailable_reason" in data["process"]
+    assert data["process"]["cmdline_unavailable_reason"] == "no_such_pid"
+
+
+def test_top_rss_processes_includes_cmdline(monkeypatch):
+    """Each entry in top_rss_processes includes a cmdline field (may be null)."""
+    from agents_core.host_fault_recorder import _top_rss_processes
+
+    # Mock subprocess.run to return ps output without calling the real ps
+    class FakeProcResult:
+        def __init__(self):
+            # Simulated ps output: comm=, pid=, rss=
+            self.stdout = "python3 1000 1024\nbash 2000 512\n"
+            self.returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "ps":
+            return FakeProcResult()
+        raise RuntimeError(f"Unexpected command: {cmd}")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    # Mock _read_cmdline to return predictable results
+    def fake_read_cmdline(pid):
+        if pid == 1000:
+            return (["python3", "script.py"], None)
+        elif pid == 2000:
+            return (None, "permission")
+        else:
+            return (None, "no_such_pid")
+
+    monkeypatch.setattr(
+        "agents_core.host_fault_recorder._read_cmdline",
+        fake_read_cmdline
+    )
+
+    results = _top_rss_processes(n=5)
+
+    assert len(results) == 2
+    # First entry: has cmdline
+    assert results[0]["cmdline"] == ["python3", "script.py"]
+    assert "cmdline_unavailable_reason" not in results[0]
+
+    # Second entry: no cmdline, but reason is present
+    assert results[1]["cmdline"] is None
+    assert results[1]["cmdline_unavailable_reason"] == "permission"
 
 
 # ---------------------------------------------------------------------------
