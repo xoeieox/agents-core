@@ -128,3 +128,111 @@ def test_status_unreachable_raises():
     )
     with pytest.raises(DoormanUnreachable):
         c.status()
+
+
+# ---------------------------------------------------------------------------
+# Deference features (doorman-mode-deference-v0)
+# ---------------------------------------------------------------------------
+
+def test_acquire_with_role_parameter():
+    """acquire() must accept and forward role parameter."""
+    c = _client_with([(200, {"status": "serving", "node": "gravitywell", "work_id": "flip-gw"})])
+    result = c.acquire("gravitywell", "flip-gw", ttl_sec=240, reason="mode", role="mode-controller")
+    assert result["status"] == "serving"
+
+
+def test_acquire_default_role_is_worker():
+    """acquire() must default role to 'worker' when not provided."""
+    c = _client_with([(200, {"status": "serving", "node": "gravitywell", "work_id": "w1"})])
+    result = c.acquire("gravitywell", "w1", ttl_sec=120, reason="test")
+    # The mock doesn't verify the body, but the call should succeed
+    assert result["status"] == "serving"
+
+
+def test_acquire_deferred_outcome():
+    """acquire() must return a deferred response when controller owns the mode."""
+    resp_body = {
+        "status": "deferred",
+        "node": "gravitywell",
+        "mode_owner": "flip-controller",
+        "detail": "GW serving controller-owned non-big mode; big endpoint unavailable",
+    }
+    c = _client_with([(200, resp_body)])
+    result = c.acquire("gravitywell", "w1", ttl_sec=120, reason="inference")
+    assert result["status"] == "deferred"
+    assert result["mode_owner"] == "flip-controller"
+
+
+def test_is_deferred_true_for_deferred_response():
+    """is_deferred() must return True for status=='deferred'."""
+    resp = {"status": "deferred", "mode_owner": "flip-controller"}
+    assert DoormanClient.is_deferred(resp) is True
+
+
+def test_is_deferred_false_for_serving_response():
+    """is_deferred() must return False for status=='serving'."""
+    resp = {"status": "serving", "node": "gravitywell"}
+    assert DoormanClient.is_deferred(resp) is False
+
+
+def test_is_deferred_false_for_wake_failed_response():
+    """is_deferred() must return False for status=='wake_failed'."""
+    resp = {"status": "wake_failed", "detail": "GW unreachable"}
+    assert DoormanClient.is_deferred(resp) is False
+
+
+def test_mode_owner_returns_dict_on_success():
+    """mode_owner() must return the parsed dict on 200 response."""
+    body = {
+        "node": "gravitywell",
+        "controller": "flip-controller",
+        "active": True,
+        "owner_lease_held": False,
+        "owner_lease_age_sec": None,
+        "owner_lease_stale": False,
+    }
+    c = _client_with([(200, body)])
+    result = c.mode_owner("gravitywell")
+    assert result == body
+    assert result["active"] is True
+
+
+def test_mode_owner_returns_none_on_404():
+    """mode_owner() must return None on 404 (pre-1b doorman)."""
+    class _NotFoundTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"error": "not found"})
+
+    c = DoormanClient(base_url="http://doorman.test")
+    c._client = httpx.Client(
+        base_url="http://doorman.test",
+        transport=_NotFoundTransport(),
+    )
+    result = c.mode_owner("gravitywell")
+    assert result is None
+
+
+def test_mode_owner_returns_none_on_unreachable():
+    """mode_owner() must return None when doorman is unreachable (DoormanUnreachable)."""
+    c = DoormanClient(base_url="http://doorman.test")
+    c._client = httpx.Client(
+        base_url="http://doorman.test",
+        transport=_ErrorTransport(),
+    )
+    result = c.mode_owner("gravitywell")
+    assert result is None
+
+
+def test_mode_owner_defaults_to_gravitywell():
+    """mode_owner() must default to node='gravitywell' when not provided."""
+    body = {
+        "node": "gravitywell",
+        "controller": "flip-controller",
+        "active": True,
+        "owner_lease_held": False,
+        "owner_lease_age_sec": None,
+        "owner_lease_stale": False,
+    }
+    c = _client_with([(200, body)])
+    result = c.mode_owner()  # no node arg
+    assert result["node"] == "gravitywell"

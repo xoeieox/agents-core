@@ -8,6 +8,11 @@ Reads configuration from environment:
 Raises DoormanUnreachable when the HTTP layer itself fails (connection error,
 timeout). The operator treats DoormanUnreachable exactly like status:"wake_failed":
 it cannot guarantee GW is awake, so it applies the per-surface on_wake_fail policy.
+
+Acquire statuses:
+  "serving" — GW is serving; lease registered and keepawake hold placed
+  "deferred" — GW is serving a controller-owned non-big mode; caller cannot use big
+  "wake_failed" — GW failed to wake or serve; big endpoint unavailable for non-controller reason
 """
 
 from __future__ import annotations
@@ -64,14 +69,25 @@ class DoormanClient:
         except httpx.TimeoutException as e:
             raise DoormanUnreachable(f"doorman timeout at {self._base_url}: {e}") from e
 
-    def acquire(self, node: str, work_id: str, ttl_sec: int, reason: str) -> dict:
-        """Acquire a lease for node. Returns {status, node, work_id} on success
-        or {status:"wake_failed", detail:...} if GW could not be woken."""
+    def acquire(self, node: str, work_id: str, ttl_sec: int, reason: str, role: str = "worker") -> dict:
+        """Acquire a lease for node.
+
+        Args:
+          role: optional role descriptor (default "worker"). Use "mode-controller"
+                if acquiring as the flip-controller so the doorman recognizes
+                controller ownership and defers to it.
+
+        Returns dict with status field:
+          "serving" — GW is serving; lease registered and keepawake hold placed
+          "deferred" — GW is serving a controller-owned non-big mode; no lease registered
+          "wake_failed" — GW failed to wake
+        """
         return self._post("/lease/acquire", {
             "node": node,
             "work_id": work_id,
             "ttl_sec": ttl_sec,
             "reason": reason,
+            "role": role,
         })
 
     def release(self, node: str, work_id: str) -> None:
@@ -83,6 +99,33 @@ class DoormanClient:
 
     def healthz(self) -> dict:
         return self._get("/healthz")
+
+    def mode_owner(self, node: str = "gravitywell") -> dict | None:
+        """Get the /v0/mode-owner deference-liveness probe.
+
+        Args:
+          node: node name (default "gravitywell")
+
+        Returns dict with keys: node, controller, active, owner_lease_held,
+        owner_lease_age_sec, owner_lease_stale. Returns None if the doorman
+        does not support this endpoint (404 — pre-1b doorman) or is unreachable.
+        """
+        try:
+            return self._get(f"/v0/mode-owner?node={node}")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
+        except DoormanUnreachable:
+            return None
+
+    @staticmethod
+    def is_deferred(resp: dict) -> bool:
+        """Convenience predicate: is this acquire response a deferred outcome?
+
+        Returns True iff resp["status"] == "deferred", False otherwise.
+        """
+        return resp.get("status") == "deferred"
 
     def close(self):
         self._client.close()
