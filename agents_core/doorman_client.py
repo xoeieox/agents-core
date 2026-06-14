@@ -12,7 +12,7 @@ it cannot guarantee GW is awake, so it applies the per-surface on_wake_fail poli
 Acquire statuses:
   "serving" — GW is serving; lease registered and keepawake hold placed
   "deferred" — GW is serving a controller-owned non-big mode; caller cannot use big
-  "wake_failed" — GW failed to wake or deferred acquire returned no lease
+  "wake_failed" — GW failed to wake or serve; big endpoint unavailable for non-controller reason
 """
 
 from __future__ import annotations

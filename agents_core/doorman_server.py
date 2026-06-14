@@ -48,6 +48,7 @@ Safety properties (gravitywell-doorman-clean-stop-v0):
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import os
@@ -148,8 +149,8 @@ class _NodeState:
     def _controller_lease_active(self) -> bool:
         """Check if a mode-controller lease is currently active (non-expired).
 
-        Must be called under self.lock AFTER self._gc_stale().
-        Returns True iff some non-expired lease has role == "mode-controller".
+        Must be called under self.lock. Returns True iff some non-expired lease
+        has role == "mode-controller".
         """
         now = time.time()
         for lease_info in self.leases.values():
@@ -176,9 +177,9 @@ class _NodeState:
 
         Flow (gravitywell-doorman-clean-stop-v0 + doorman-mode-deference-v0):
           1. Fast-path: _is_serving() → return True (service already up).
-          2. Check deference: if DOORMAN_DEFER_TO_CONTROLLER and (role=="mode-controller"
-             or an active mode-controller lease exists), return DEFERRED (no yank).
-          3. wake-gravitywell: idempotent host-wake (no-op if already up).
+          2. wake-gravitywell: idempotent host-wake (no-op if already up).
+          3. Check deference: if DOORMAN_DEFER_TO_CONTROLLER and (role=="mode-controller"
+             or an active mode-controller lease exists), return DEFERRED (no gw-serve big).
           4. gw-serve big: start llama-server.service if stopped (idempotent).
           5. Poll /health until serving or GW_WAKE_DEADLINE_SEC (covers ~25s
              cold-load after gw-serve big).
@@ -188,15 +189,6 @@ class _NodeState:
             self.last_error = None
             self.service_stopped = False
             return True
-
-        # Deference guard: if controller owns the mode, don't yank
-        if DOORMAN_DEFER_TO_CONTROLLER:
-            if role == "mode-controller" or self._controller_lease_active():
-                log.info(
-                    f"[{self.node_name}] GW not serving but controller owns mode — "
-                    f"deferring (no gw-serve big)"
-                )
-                return DEFERRED
 
         log.info(f"[{self.node_name}] GW not serving — running wake-gravitywell")
         try:
@@ -214,6 +206,15 @@ class _NodeState:
             log.error(f"[{self.node_name}] {err}")
             self.last_error = err
             return False
+
+        # Deference guard: if controller owns the mode, don't issue gw-serve big
+        if DOORMAN_DEFER_TO_CONTROLLER:
+            if role == "mode-controller" or self._controller_lease_active():
+                log.info(
+                    f"[{self.node_name}] GW not serving but controller owns mode — "
+                    f"deferring (no gw-serve big)"
+                )
+                return DEFERRED
 
         # Ensure the serving unit is up (idempotent — fast no-op if already active)
         log.info(f"[{self.node_name}] running gw-serve big to ensure llama-server.service is up")
@@ -300,13 +301,18 @@ class _NodeState:
                     f"[{self.node_name}] mode-controller lease TTL-expired (not released); "
                     f"deference lapsed; legacy wake/serve will auto-recover"
                 )
+                acquired_at = info.get("acquired_at")
+                last_renewed_iso = (
+                    datetime.datetime.utcfromtimestamp(acquired_at).isoformat() + "Z"
+                    if acquired_at else None
+                )
                 _write_idle_log(
                     self.node_name,
                     "controller-orphan-reclaim",
                     len(self.leases) - 1,  # count before deletion
                     evicted_lease=wid,
                     evicted_role="mode-controller",
-                    last_renewed=info.get("acquired_at"),
+                    last_renewed=last_renewed_iso,
                     ttl_sec=info.get("ttl_sec"),
                     detail="mode-controller lease TTL-expired (not released); deference lapsed; legacy wake/serve",
                 )
