@@ -14,6 +14,10 @@ Environment variables:
   DOORMAN_BEARER_TOKEN   — optional shared bearer token
   DOORMAN_IDLE_LOG       — path for structured idle-lifecycle JSONL log
                            (default /var/log/doorman-idle.jsonl)
+  DOORMAN_DEFER_TO_CONTROLLER — enable deference to flip-controller (default true);
+                                 also kill-switch for non-big flips (REQUIRE_DOORMAN_DEFERENCE gate)
+  DOORMAN_CONTROLLER_NAME     — identity of the mode-controller (default flip-controller);
+                                reported by /v0/mode-owner
   GW_URL                 — GravityWell base URL (default http://203.0.113.11:8081)
                            NOTE: must match the GW_URL configured for agents_core.llm
                            (the operator reads the same env var for inference POSTs).
@@ -66,8 +70,14 @@ GW_HOLD_REFRESH_SEC = int(os.environ.get("GW_HOLD_REFRESH_SEC", "45"))
 # Calibrate from /var/log/doorman-idle.jsonl observations — never auto-tuned.
 GW_STOP_GRACE_SEC = int(os.environ.get("GW_STOP_GRACE_SEC", "600"))
 
+DOORMAN_DEFER_TO_CONTROLLER = os.environ.get("DOORMAN_DEFER_TO_CONTROLLER", "true").lower() == "true"
+DOORMAN_CONTROLLER_NAME = os.environ.get("DOORMAN_CONTROLLER_NAME", "flip-controller")
+
 HOLD_NAME = "doorman"
 DOORMAN_IDLE_LOG = os.environ.get("DOORMAN_IDLE_LOG", "/var/log/doorman-idle.jsonl")
+
+# Sentinel for deferred acquire (controller owns the mode)
+DEFERRED = object()
 
 
 def _error(code: str, message: str) -> dict:
@@ -75,7 +85,7 @@ def _error(code: str, message: str) -> dict:
 
 
 def _write_idle_log(
-    node: str, event: str, lease_count: int, idle_secs: float | None = None
+    node: str, event: str, lease_count: int, idle_secs: float | None = None, **extra_fields
 ) -> None:
     """Append one structured entry to the idle-lifecycle observation log.
 
@@ -91,6 +101,7 @@ def _write_idle_log(
     }
     if idle_secs is not None:
         entry["idle_secs"] = round(idle_secs, 2)
+    entry.update(extra_fields)
     try:
         with open(DOORMAN_IDLE_LOG, "a") as fh:
             fh.write(json.dumps(entry) + "\n")
@@ -115,7 +126,7 @@ class _NodeState:
         self.lock = threading.Lock()
         self.gw_url = gw_url
         self.node_name = node_name
-        # keyed by work_id → {acquired_at: float, ttl_sec: int, reason: str}
+        # keyed by work_id → {acquired_at: float, ttl_sec: int, reason: str, role: str}
         self.leases: dict[str, dict] = {}
         self.last_wake_at: float | None = None
         self.last_error: str | None = None
@@ -134,21 +145,42 @@ class _NodeState:
         except Exception:
             return False
 
+    def _controller_lease_active(self) -> bool:
+        """Check if a mode-controller lease is currently active (non-expired).
+
+        Must be called under self.lock AFTER self._gc_stale().
+        Returns True iff some non-expired lease has role == "mode-controller".
+        """
+        now = time.time()
+        for lease_info in self.leases.values():
+            if (lease_info.get("role") == "mode-controller"
+                and now <= lease_info["acquired_at"] + lease_info["ttl_sec"]):
+                return True
+        return False
+
     # ------------------------------------------------------------------
     # ensure_serving — must be called under lock
     # ------------------------------------------------------------------
 
-    def ensure_serving(self) -> bool:
+    def ensure_serving(self, role: str | None = None) -> bool | object:
         """Wake GW if needed, start the serving unit, and wait until it serves.
 
-        Returns True on success. Called under self.lock — serializes concurrent
-        wake attempts so only one wake-gravitywell subprocess runs at a time.
+        Returns True on success, DEFERRED if controller owns the mode, False on failure.
+        Called under self.lock — serializes concurrent wake attempts so only one
+        wake-gravitywell subprocess runs at a time.
 
-        Flow (gravitywell-doorman-clean-stop-v0):
+        Args:
+          role: optional role of the caller (e.g., "mode-controller" for flip-controller).
+                If role=="mode-controller", this is the controller's own acquire and
+                short-circuits to DEFERRED without needing a pre-registered lease.
+
+        Flow (gravitywell-doorman-clean-stop-v0 + doorman-mode-deference-v0):
           1. Fast-path: _is_serving() → return True (service already up).
-          2. wake-gravitywell: idempotent host-wake (no-op if already up).
-          3. gw-serve big: start llama-server.service if stopped (idempotent).
-          4. Poll /health until serving or GW_WAKE_DEADLINE_SEC (covers ~25s
+          2. Check deference: if DOORMAN_DEFER_TO_CONTROLLER and (role=="mode-controller"
+             or an active mode-controller lease exists), return DEFERRED (no yank).
+          3. wake-gravitywell: idempotent host-wake (no-op if already up).
+          4. gw-serve big: start llama-server.service if stopped (idempotent).
+          5. Poll /health until serving or GW_WAKE_DEADLINE_SEC (covers ~25s
              cold-load after gw-serve big).
         """
         # Fast path: already awake and serving
@@ -156,6 +188,15 @@ class _NodeState:
             self.last_error = None
             self.service_stopped = False
             return True
+
+        # Deference guard: if controller owns the mode, don't yank
+        if DOORMAN_DEFER_TO_CONTROLLER:
+            if role == "mode-controller" or self._controller_lease_active():
+                log.info(
+                    f"[{self.node_name}] GW not serving but controller owns mode — "
+                    f"deferring (no gw-serve big)"
+                )
+                return DEFERRED
 
         log.info(f"[{self.node_name}] GW not serving — running wake-gravitywell")
         try:
@@ -241,19 +282,48 @@ class _NodeState:
     # ------------------------------------------------------------------
 
     def _gc_stale(self) -> list[str]:
-        """Remove expired leases. Returns list of GC'd work_ids."""
+        """Remove expired leases. Returns list of GC'd work_ids.
+
+        Emits an orphan-reclaim scar event if a mode-controller lease is evicted.
+        """
         now = time.time()
         expired = [
             wid for wid, info in self.leases.items()
             if now > info["acquired_at"] + info["ttl_sec"]
         ]
         for wid in expired:
+            info = self.leases[wid]
             log.info(f"[{self.node_name}] GC stale lease work_id={wid}")
+            # Emit scar if a mode-controller lease is being evicted
+            if info.get("role") == "mode-controller":
+                log.warning(
+                    f"[{self.node_name}] mode-controller lease TTL-expired (not released); "
+                    f"deference lapsed; legacy wake/serve will auto-recover"
+                )
+                _write_idle_log(
+                    self.node_name,
+                    "controller-orphan-reclaim",
+                    len(self.leases) - 1,  # count before deletion
+                    evicted_lease=wid,
+                    evicted_role="mode-controller",
+                    last_renewed=info.get("acquired_at"),
+                    ttl_sec=info.get("ttl_sec"),
+                    detail="mode-controller lease TTL-expired (not released); deference lapsed; legacy wake/serve",
+                )
             del self.leases[wid]
         return expired
 
-    def acquire_lease(self, work_id: str, ttl_sec: int, reason: str) -> bool:
-        """Try to ensure GW is serving, then register the lease. Returns True on success."""
+    def acquire_lease(self, work_id: str, ttl_sec: int, reason: str, role: str = "worker") -> bool | object:
+        """Try to ensure GW is serving, then register the lease.
+
+        Returns True on success, DEFERRED if a foreign caller acquires during controller
+        ownership (no lease registered), False on failure.
+
+        Args:
+          role: optional role descriptor (default "worker"). E.g., "mode-controller"
+                for the flip-controller's keepawake lease. Stored on the lease dict
+                for later ownership checks.
+        """
         # Clear idle tracking: an arriving lease means the node is no longer idle
         was_idle = self.idle_since is not None
         self.idle_since = None
@@ -261,13 +331,30 @@ class _NodeState:
             _write_idle_log(self.node_name, "resumed", len(self.leases))
 
         # ensure_serving serializes concurrent wakes under the same lock
-        ok = self.ensure_serving()
+        ok = self.ensure_serving(role=role)
+        if ok is DEFERRED:
+            # Controller's own acquire (role="mode-controller") registers the lease and hold
+            # even though ensure_serving returns DEFERRED (no gw-serve big was issued).
+            # Foreign acquires during controller ownership don't register a lease.
+            if role == "mode-controller":
+                self.leases[work_id] = {
+                    "acquired_at": time.time(),
+                    "ttl_sec": ttl_sec,
+                    "reason": reason,
+                    "role": role,
+                }
+                self._place_hold()
+                return DEFERRED  # still return DEFERRED so endpoint knows not to issue gw-serve big
+            else:
+                # Foreign caller during controller ownership — return deferred, no lease
+                return DEFERRED
         if not ok:
             return False
         self.leases[work_id] = {
             "acquired_at": time.time(),
             "ttl_sec": ttl_sec,
             "reason": reason,
+            "role": role,
         }
         self._place_hold()
         return True
@@ -289,9 +376,13 @@ class _NodeState:
         with self.lock:
             self._gc_stale()
             serving = self._is_serving(timeout=2.0)
+            # Check if controller owns the mode
+            controller_owns = self._controller_lease_active()
             # Derive serving_mode without an extra ssh gw-serve status round-trip
             if serving:
                 serving_mode = "big"
+            elif controller_owns:
+                serving_mode = "deferred"
             elif self.service_stopped:
                 serving_mode = "stopped"
             else:
@@ -308,6 +399,7 @@ class _NodeState:
                 ],
                 "last_wake_at": self.last_wake_at,
                 "last_error": self.last_error,
+                "mode_owner": DOORMAN_CONTROLLER_NAME if controller_owns else None,
             }
 
 
@@ -476,6 +568,44 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         }
 
     # ------------------------------------------------------------------
+    # GET /v0/mode-owner — deference-liveness probe (doorman-mode-deference-v0)
+    # ------------------------------------------------------------------
+
+    @app.get("/v0/mode-owner")
+    def mode_owner(node: str = "gravitywell"):
+        if node not in nodes:
+            return JSONResponse(
+                status_code=400,
+                content=_error("bad_node", f"unknown node {node!r}"),
+            )
+
+        state = nodes[node]
+        with state.lock:
+            state._gc_stale()
+            owner_lease_held = state._controller_lease_active()
+            # Compute owner_lease_age_sec and stale flag
+            owner_lease_age_sec = None
+            owner_lease_stale = False
+            if owner_lease_held:
+                now = time.time()
+                for lease_info in state.leases.values():
+                    if lease_info.get("role") == "mode-controller":
+                        age_sec = now - lease_info["acquired_at"]
+                        owner_lease_age_sec = age_sec
+                        # Past renewal point (60% of TTL)
+                        owner_lease_stale = age_sec > lease_info["ttl_sec"] * 0.6
+                        break
+
+        return {
+            "node": node,
+            "controller": DOORMAN_CONTROLLER_NAME,
+            "active": DOORMAN_DEFER_TO_CONTROLLER,
+            "owner_lease_held": owner_lease_held,
+            "owner_lease_age_sec": owner_lease_age_sec,
+            "owner_lease_stale": owner_lease_stale,
+        }
+
+    # ------------------------------------------------------------------
     # POST /lease/acquire
     # ------------------------------------------------------------------
 
@@ -485,6 +615,7 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         work_id = body.get("work_id", "")
         ttl_sec = int(body.get("ttl_sec", 300))
         reason = body.get("reason", "")
+        role = body.get("role", "worker")
 
         if node not in nodes:
             return JSONResponse(
@@ -499,8 +630,15 @@ def create_app(gw_url: str | None = None) -> FastAPI:
 
         state = nodes[node]
         with state.lock:
-            ok = state.acquire_lease(work_id, ttl_sec, reason)
+            ok = state.acquire_lease(work_id, ttl_sec, reason, role=role)
 
+        if ok is DEFERRED:
+            return {
+                "status": "deferred",
+                "node": node,
+                "mode_owner": DOORMAN_CONTROLLER_NAME,
+                "detail": "GW serving controller-owned non-big mode; big endpoint unavailable",
+            }
         if not ok:
             return {"status": "wake_failed", "detail": state.last_error or "wake failed"}
 

@@ -15,6 +15,13 @@ Covers:
   - [clean-stop] gw-serve stop rc≠0 → last_error set, thread alive, retried next tick
   - [clean-stop] gw-serve big rc≠0 → acquire returns False (wake_failed-equivalent)
   - [clean-stop] /status serving_mode field present
+  - [doorman-mode-deference-v0] deference suppresses gw-serve big when controller owns mode
+  - [doorman-mode-deference-v0] foreign acquire returns deferred when controller owns mode
+  - [doorman-mode-deference-v0] controller's own acquire (role=mode-controller) registers lease
+  - [doorman-mode-deference-v0] /v0/mode-owner endpoint returns active/owner_lease_held
+  - [doorman-mode-deference-v0] orphan-reclaim scar emitted when mode-controller lease TTL-expires
+  - [doorman-mode-deference-v0] typed role recognition (not work_id inference)
+  - [doorman-mode-deference-v0] kill-switch: DOORMAN_DEFER_TO_CONTROLLER=false disables deference
 """
 
 from __future__ import annotations
@@ -29,6 +36,9 @@ from fastapi.testclient import TestClient
 from agents_core.doorman_server import (
     GW_URL_DEFAULT,
     HOLD_NAME,
+    DEFERRED,
+    DOORMAN_DEFER_TO_CONTROLLER,
+    DOORMAN_CONTROLLER_NAME,
     _NodeState,
     _write_idle_log,
     create_app,
@@ -630,3 +640,382 @@ class TestDeferredStop:
             t.join(timeout=2.0)
 
         assert len(stop_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Deference guard (doorman-mode-deference-v0)
+# ---------------------------------------------------------------------------
+
+class TestDeference:
+    """Tests for deference to flip-controller's mode ownership."""
+
+    def test_controller_lease_active_recognizes_mode_controller_role(self):
+        """_controller_lease_active must return True when mode-controller lease exists."""
+        state = _make_state()
+        state.leases["flip-controller-gw"] = {
+            "acquired_at": time.time(),
+            "ttl_sec": 240,
+            "reason": "mode control",
+            "role": "mode-controller",
+        }
+        state._gc_stale()  # should not GC — lease is fresh
+        assert state._controller_lease_active() is True
+
+    def test_controller_lease_active_ignores_worker_role(self):
+        """_controller_lease_active must return False for worker-role leases."""
+        state = _make_state()
+        state.leases["worker-lease"] = {
+            "acquired_at": time.time(),
+            "ttl_sec": 300,
+            "reason": "inference",
+            "role": "worker",
+        }
+        state._gc_stale()
+        assert state._controller_lease_active() is False
+
+    def test_controller_lease_active_false_when_expired(self):
+        """_controller_lease_active returns False for expired mode-controller leases."""
+        state = _make_state()
+        state.leases["expired-controller"] = {
+            "acquired_at": time.time() - 1000,  # expired
+            "ttl_sec": 1,
+            "reason": "dead",
+            "role": "mode-controller",
+        }
+        state._gc_stale()
+        assert state._controller_lease_active() is False
+        assert "expired-controller" not in state.leases
+
+    def test_deference_suppress_gw_serve_big_when_controller_owns(self):
+        """ensure_serving(role=None) must not issue gw-serve big when mode-controller lease active."""
+        state = _make_state()
+        state.leases["flip-controller-gw"] = {
+            "acquired_at": time.time(),
+            "ttl_sec": 240,
+            "reason": "mode control",
+            "role": "mode-controller",
+        }
+
+        gw_serve_called = []
+
+        def fake_run(cmd, **kwargs):
+            if "gw-serve" in str(cmd) and "big" in str(cmd):
+                gw_serve_called.append(cmd)
+            return MagicMock(returncode=0, stderr="")
+
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            result = state.ensure_serving()
+
+        assert result is DEFERRED
+        assert len(gw_serve_called) == 0  # gw-serve big was NOT called
+
+    def test_controller_own_acquire_short_circuits_deferred(self):
+        """ensure_serving(role='mode-controller') returns DEFERRED without needing pre-registered lease."""
+        state = _make_state()
+        # No leases yet — controller's own acquire
+        gw_serve_called = []
+
+        def fake_run(cmd, **kwargs):
+            if "gw-serve" in str(cmd) and "big" in str(cmd):
+                gw_serve_called.append(cmd)
+            return MagicMock(returncode=0, stderr="")
+
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            result = state.ensure_serving(role="mode-controller")
+
+        assert result is DEFERRED
+        assert len(gw_serve_called) == 0  # no gw-serve big
+
+    def test_acquire_lease_controller_own_registers_and_places_hold(self):
+        """Controller's own acquire (role='mode-controller') must register lease and place hold."""
+        state = _make_state()
+
+        hold_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "gw-keepawake" in str(cmd) and "hold" in str(cmd):
+                hold_calls.append(cmd)
+            return MagicMock(returncode=0, stderr="")
+
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            result = state.acquire_lease(
+                "flip-controller-gw", ttl_sec=240, reason="mode control", role="mode-controller"
+            )
+
+        assert result is DEFERRED  # The call itself is deferred (no gw-serve big)
+        # But we placed the hold and registered the lease
+        assert "flip-controller-gw" in state.leases
+        assert state.leases["flip-controller-gw"]["role"] == "mode-controller"
+        assert len(hold_calls) >= 1
+
+    def test_foreign_acquire_returns_deferred_when_controller_owns(self):
+        """A foreign acquire during controller ownership returns deferred, no lease registered."""
+        state = _make_state()
+        # Setup: controller owns the mode
+        state.leases["flip-controller-gw"] = {
+            "acquired_at": time.time(),
+            "ttl_sec": 240,
+            "reason": "mode control",
+            "role": "mode-controller",
+        }
+
+        gw_serve_called = []
+
+        def fake_run(cmd, **kwargs):
+            if "gw-serve" in str(cmd) and "big" in str(cmd):
+                gw_serve_called.append(cmd)
+            return MagicMock(returncode=0, stderr="")
+
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            # Foreign worker acquire
+            result = state.acquire_lease(
+                "worker-lease-1", ttl_sec=120, reason="inference", role="worker"
+            )
+
+        assert result is DEFERRED
+        assert "worker-lease-1" not in state.leases  # No lease registered for foreign deferred
+        assert len(gw_serve_called) == 0  # No yank
+
+    def test_legacy_wake_when_no_controller_lease(self):
+        """When no controller lease, a worker acquire takes legacy wake+gw-serve big path."""
+        state = _make_state()
+        # No controller lease — legacy behavior
+
+        wake_called = []
+        gw_serve_called = []
+        serving_iter = iter([False, True])  # Not serving, then serving after wake
+
+        def fake_run(cmd, **kwargs):
+            if "wake-gravitywell" in str(cmd):
+                wake_called.append(cmd)
+            if "gw-serve" in str(cmd) and "big" in str(cmd):
+                gw_serve_called.append(cmd)
+            return MagicMock(returncode=0, stderr="")
+
+        def fake_is_serving(_timeout=3.0):
+            return next(serving_iter, True)
+
+        with patch.object(state, "_is_serving", side_effect=fake_is_serving), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("time.sleep"), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            result = state.acquire_lease(
+                "worker-lease", ttl_sec=120, reason="inference", role="worker"
+            )
+
+        assert result is True  # Success
+        assert "worker-lease" in state.leases
+        assert len(wake_called) >= 1  # wake-gravitywell was called
+        assert len(gw_serve_called) >= 1  # gw-serve big was called
+
+    def test_type_role_only_not_work_id_inference(self):
+        """Ownership is recognized by typed role field, NOT by work_id prefix."""
+        state = _make_state()
+        # A lease with work_id="flip-controller-gw" (the name!) but role="worker"
+        state.leases["flip-controller-gw"] = {
+            "acquired_at": time.time(),
+            "ttl_sec": 240,
+            "reason": "inference",
+            "role": "worker",  # Not a mode-controller!
+        }
+
+        wake_called = []
+        gw_serve_called = []
+        serving_iter = iter([False, True])
+
+        def fake_run(cmd, **kwargs):
+            if "wake-gravitywell" in str(cmd):
+                wake_called.append(cmd)
+            if "gw-serve" in str(cmd) and "big" in str(cmd):
+                gw_serve_called.append(cmd)
+            return MagicMock(returncode=0, stderr="")
+
+        def fake_is_serving(_timeout=3.0):
+            return next(serving_iter, True)
+
+        with patch.object(state, "_is_serving", side_effect=fake_is_serving), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("time.sleep"), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            result = state.acquire_lease(
+                "worker-new", ttl_sec=120, reason="inference", role="worker"
+            )
+
+        # Legacy path taken — not deferred
+        assert result is True
+        assert len(gw_serve_called) >= 1  # gw-serve big WAS called
+
+    def test_kill_switch_defer_to_controller_false_disables_deference(self):
+        """When DOORMAN_DEFER_TO_CONTROLLER=false, deference is disabled and legacy path taken."""
+        state = _make_state()
+        state.leases["flip-controller-gw"] = {
+            "acquired_at": time.time(),
+            "ttl_sec": 240,
+            "reason": "mode control",
+            "role": "mode-controller",
+        }
+
+        gw_serve_called = []
+        serving_iter = iter([False, True])
+
+        def fake_run(cmd, **kwargs):
+            if "gw-serve" in str(cmd) and "big" in str(cmd):
+                gw_serve_called.append(cmd)
+            return MagicMock(returncode=0, stderr="")
+
+        def fake_is_serving(_timeout=3.0):
+            return next(serving_iter, True)
+
+        with patch.object(state, "_is_serving", side_effect=fake_is_serving), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("time.sleep"), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", False):
+            result = state.ensure_serving()
+
+        # Kill-switch off → legacy path → gw-serve big IS called
+        assert result is True
+        assert len(gw_serve_called) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Deference HTTP endpoint tests (doorman-mode-deference-v0)
+# ---------------------------------------------------------------------------
+
+class TestDeferenceEndpoints:
+    """Tests for /v0/mode-owner and deferred acquire responses."""
+
+    def test_mode_owner_active_true_when_defer_enabled(self):
+        c = _client_no_auth()
+        with patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            r = c.get("/v0/mode-owner?node=gravitywell")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["active"] is True
+
+    def test_mode_owner_active_false_when_defer_disabled(self):
+        c = _client_no_auth()
+        with patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", False):
+            r = c.get("/v0/mode-owner?node=gravitywell")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["active"] is False
+
+    def test_mode_owner_owner_lease_held_false_when_no_controller(self):
+        c = _client_no_auth()
+        r = c.get("/v0/mode-owner?node=gravitywell")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["owner_lease_held"] is False
+        assert body["owner_lease_age_sec"] is None
+        assert body["owner_lease_stale"] is False
+
+    def test_mode_owner_unknown_node_returns_400(self):
+        c = _client_no_auth()
+        r = c.get("/v0/mode-owner?node=starhouse")
+        assert r.status_code == 400
+
+    def test_acquire_deferred_response(self):
+        with patch("agents_core.doorman_server._start_refresh_thread"):
+            app = create_app(gw_url=GW_URL_DEFAULT)
+        c = TestClient(app)
+
+        # Setup: inject a mode-controller lease so next foreign acquire defers
+        with patch("agents_core.doorman_server._NodeState.acquire_lease") as mock_acquire:
+            mock_acquire.return_value = DEFERRED
+            r = c.post("/lease/acquire", json={
+                "node": "gravitywell",
+                "work_id": "worker-1",
+                "ttl_sec": 120,
+                "reason": "inference",
+                "role": "worker",
+            })
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "deferred"
+        assert "mode_owner" in body
+        assert "detail" in body
+
+    def test_status_serving_mode_deferred_when_controller_owns(self):
+        """When mode-controller lease is active and GW not serving, serving_mode=="deferred"."""
+        state = _NodeState(GW_URL_DEFAULT)
+        state.leases["flip-controller-gw"] = {
+            "acquired_at": time.time(),
+            "ttl_sec": 240,
+            "reason": "mode control",
+            "role": "mode-controller",
+        }
+        with patch.object(state, "_is_serving", return_value=False):
+            snapshot = state.status_snapshot()
+        assert snapshot["serving_mode"] == "deferred"
+        assert snapshot["mode_owner"] is not None
+
+    def test_status_mode_owner_none_when_no_controller(self):
+        """mode_owner should be None when no controller lease active."""
+        state = _NodeState(GW_URL_DEFAULT)
+        with patch.object(state, "_is_serving", return_value=False):
+            snapshot = state.status_snapshot()
+        assert snapshot["mode_owner"] is None
+
+
+# ---------------------------------------------------------------------------
+# Orphan-reclaim scar (doorman-mode-deference-v0)
+# ---------------------------------------------------------------------------
+
+class TestOrphanReclaim:
+    """Tests for orphan-reclaim scar emission when mode-controller lease TTL-expires."""
+
+    def test_gc_stale_emits_scar_for_mode_controller_eviction(self):
+        state = _make_state()
+        state.leases["flip-controller-gw"] = {
+            "acquired_at": time.time() - 1000,  # expired
+            "ttl_sec": 1,
+            "reason": "mode control",
+            "role": "mode-controller",
+        }
+
+        scar_events = []
+
+        def fake_write_idle_log(node, event, lease_count, **extra_fields):
+            if event == "controller-orphan-reclaim":
+                scar_events.append((node, event, extra_fields))
+
+        with patch("agents_core.doorman_server._write_idle_log", side_effect=fake_write_idle_log):
+            expired = state._gc_stale()
+
+        assert "flip-controller-gw" in expired
+        assert "flip-controller-gw" not in state.leases
+        assert len(scar_events) == 1
+        node, event, extra = scar_events[0]
+        assert node == "gravitywell"
+        assert extra["evicted_lease"] == "flip-controller-gw"
+        assert extra["evicted_role"] == "mode-controller"
+
+    def test_gc_stale_no_scar_for_worker_eviction(self):
+        """No scar should be emitted when a worker-role lease TTL-expires."""
+        state = _make_state()
+        state.leases["worker-lease"] = {
+            "acquired_at": time.time() - 1000,  # expired
+            "ttl_sec": 1,
+            "reason": "inference",
+            "role": "worker",
+        }
+
+        scar_events = []
+
+        def fake_write_idle_log(node, event, lease_count, **extra_fields):
+            if event == "controller-orphan-reclaim":
+                scar_events.append((node, event, extra_fields))
+
+        with patch("agents_core.doorman_server._write_idle_log", side_effect=fake_write_idle_log):
+            expired = state._gc_stale()
+
+        assert "worker-lease" in expired
+        assert len(scar_events) == 0  # No scar for worker
