@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from agents_core.slots import (
+    NEXT_KINDS,
     SCHEMA,
     OffMasterWriteError,
     SlotNotFoundError,
@@ -213,6 +214,116 @@ def test_escalate(store: SlotStore):
     slot = store.get(sid)
     assert slot["status"] == "escalated"
     assert slot["escalation"] == {"to": "facets", "reason": "authority undeclared"}
+
+
+# --- handoff / next --------------------------------------------------------
+
+def test_set_next_happy_path(store: SlotStore):
+    sid = store.create_slot("proj-A", CONTRIB)
+    store.set_next(
+        sid,
+        by="agent-1",
+        kind="review-pr",
+        ref="pr-123",
+        blocked_on=["slot-x"],
+        proposal="await reviewer feedback",
+        actuated=False,
+    )
+    slot = store.get(sid)
+    assert slot["next"] == {
+        "kind": "review-pr",
+        "ref": "pr-123",
+        "blocked_on": ["slot-x"],
+        "proposal": "await reviewer feedback",
+        "actuated": False,
+    }
+    assert slot["last_update"]  # updated
+
+def test_set_next_defaults(store: SlotStore):
+    sid = store.create_slot("proj-A", CONTRIB)
+    store.set_next(sid, by="agent-1", kind="done")
+    slot = store.get(sid)
+    assert slot["next"] == {
+        "kind": "done",
+        "ref": None,
+        "blocked_on": [],
+        "proposal": "",
+        "actuated": False,
+    }
+
+def test_set_next_blocked_on_dedups_and_sorts(store: SlotStore):
+    sid = store.create_slot("proj-A", CONTRIB)
+    store.set_next(
+        sid,
+        by="agent-1",
+        kind="await-human",
+        blocked_on=["c", "a", "b", "a"],  # duplicates, unsorted
+    )
+    slot = store.get(sid)
+    assert slot["next"]["blocked_on"] == ["a", "b", "c"]  # deduplicated and sorted
+
+def test_set_next_kind_validation(store: SlotStore):
+    sid = store.create_slot("proj-A", CONTRIB)
+    # Invalid kind raises ValueError
+    with pytest.raises(ValueError):
+        store.set_next(sid, by="agent-1", kind="invalid-kind")
+    # Each valid kind is accepted
+    for kind in NEXT_KINDS:
+        store.set_next(sid, by="agent-1", kind=kind)
+        assert store.get(sid)["next"]["kind"] == kind
+
+def test_set_next_non_owner_rejected(store: SlotStore):
+    sid = store.create_slot("proj-A", CONTRIB)
+    with pytest.raises(SlotOwnershipError):
+        store.set_next(sid, by="intruder", kind="done")
+    # Unchanged
+    assert store.get(sid)["next"] == {}
+
+def test_set_next_off_master_raises(tmp_path: Path, monkeypatch):
+    # Create slot when IS_MASTER is True (default fixture state)
+    db = tmp_path / "off-master.db"
+    store = SlotStore(db_path=db)
+    sid = store.create_slot("p", {"type": "fixer", "id": "a"})
+    store.close()
+    # Now reopen with IS_MASTER False
+    monkeypatch.setattr("agents_core.slots.IS_MASTER", False)
+    store2 = SlotStore(db_path=db)
+    with pytest.raises(OffMasterWriteError):
+        store2.set_next(sid, by="a", kind="done")
+    store2.close()
+
+def test_migration_adds_next_column_to_legacy_db(tmp_path: Path):
+    """A pre-existing DB without the next column must be upgraded by _migrate's
+    ADD COLUMN on open, and the column must default to '{}'."""
+    db = tmp_path / "legacy.db"
+    # A schema without the next column (simulate pre-v0 state).
+    legacy_schema = "\n".join(
+        ln for ln in SCHEMA.splitlines() if "next" not in ln.lower()
+    )
+    assert "next" not in legacy_schema.lower()  # guard: next is truly absent
+    conn = sqlite3.connect(db)
+    conn.executescript(legacy_schema)
+    # A row written before next existed. Set contributor_id so we can write to it later.
+    conn.execute(
+        "INSERT INTO slots (slot_id, project_id, contributor_id, status, last_update, created_at) "
+        "VALUES ('s1', 'proj-A', 'legacy-agent', 'dispatched', ?, ?)",
+        ("2026-06-01T00:00:00+00:00", "2026-06-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(slots)").fetchall()}
+    conn.close()
+    assert "next" not in cols  # confirm the ADD COLUMN path is untrodden
+
+    # Opening via SlotStore runs _migrate -> the next column is added.
+    store = SlotStore(db_path=db)
+    migrated = {r[1] for r in store._conn.execute("PRAGMA table_info(slots)").fetchall()}
+    assert "next" in migrated
+    # The pre-existing row reads back with next defaulted to {}.
+    assert store.get("s1")["next"] == {}
+    # And set_next now works against the upgraded legacy table.
+    store.set_next("s1", by="legacy-agent", kind="done")
+    assert store.get("s1")["next"]["kind"] == "done"
+    store.close()
 
 
 # --- query -----------------------------------------------------------------

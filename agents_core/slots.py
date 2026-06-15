@@ -63,6 +63,12 @@ STATUSES = frozenset({
 TERMINAL_STATUSES = frozenset({"landed", "abandoned"})
 INACTIVE_STATUSES = frozenset({"landed", "abandoned", "parked"})
 
+# Handoff-baton kinds that a controller (Morph) can dispatch on without parsing prose.
+# Closed set: exactly these dispatch verbs; anything else is a ValueError.
+NEXT_KINDS = frozenset({
+    "review-pr", "bind-next", "deploy", "await-human", "done", "blocked",
+})
+
 # Contributor types (design doc). Not enforced — permissive — but documented.
 CONTRIBUTOR_TYPES = frozenset({
     "fixer", "reviewer", "council", "facets", "expert", "human", "gardener",
@@ -89,6 +95,7 @@ CREATE TABLE IF NOT EXISTS slots (
     horizon            TEXT NOT NULL DEFAULT '{}',
     checkpoints        TEXT NOT NULL DEFAULT '[]',
     escalation         TEXT NOT NULL DEFAULT '{}',
+    next               TEXT NOT NULL DEFAULT '{}',
     -- observer (Weaver-derived) fields: written by observers, NEVER by the
     -- contributor-of-record. Kept in a separate column namespace so the two
     -- signals never collide (design doc: "observers write to separate fields").
@@ -110,7 +117,7 @@ CREATE INDEX IF NOT EXISTS slots_contrib ON slots(contributor_id);
 """
 
 # JSON-encoded columns, parsed back to objects on read.
-_JSON_FIELDS = ("domain_touch", "horizon", "checkpoints", "escalation", "facets_verdict")
+_JSON_FIELDS = ("domain_touch", "horizon", "checkpoints", "escalation", "facets_verdict", "next")
 
 # Observer-namespace columns added after the initial gate-5 schema. CREATE TABLE
 # IF NOT EXISTS won't add columns to a pre-existing table, so they are applied as
@@ -118,6 +125,7 @@ _JSON_FIELDS = ("domain_touch", "horizon", "checkpoints", "escalation", "facets_
 _ADDED_COLUMNS = (
     ("facets_verdict", "TEXT"),
     ("facets_last_update", "TEXT"),
+    ("next", "TEXT NOT NULL DEFAULT '{}'"),
 )
 
 
@@ -317,6 +325,47 @@ class SlotStore:
                 "UPDATE slots SET status=?, escalation=?, last_update=? WHERE slot_id=?",
                 ("escalated", json.dumps({"to": to, "reason": reason}, sort_keys=True),
                  now, slot_id),
+            )
+            self._conn.commit()
+        return True
+
+    def set_next(
+        self,
+        slot_id: str,
+        *,
+        by: str,
+        kind: str,
+        ref: str | None = None,
+        blocked_on: list[str] | None = None,
+        proposal: str = "",
+        actuated: bool = False,
+    ) -> bool:
+        """Publish the next handoff baton (what should happen next).
+
+        ``kind`` must be in NEXT_KINDS — the dispatch verbs Morph can act on.
+        ``blocked_on`` is a list of slot_ids this slot depends on (deduplicated,
+        sorted). ``proposal`` is optional human-readable context. ``actuated``
+        indicates whether this has been acted on yet (defaults False, UI-honesty).
+        Contributor-of-record only.
+        """
+        self._check_writable()
+        if kind not in NEXT_KINDS:
+            raise ValueError(
+                f"invalid kind {kind!r}; must be one of {sorted(NEXT_KINDS)}"
+            )
+        now = _now()
+        next_record = {
+            "kind": kind,
+            "ref": ref,
+            "blocked_on": sorted(set(blocked_on or [])),
+            "proposal": proposal,
+            "actuated": bool(actuated),
+        }
+        with self._lock:
+            self._require_owner(slot_id, by)
+            self._conn.execute(
+                "UPDATE slots SET next=?, last_update=? WHERE slot_id=?",
+                (json.dumps(next_record, sort_keys=True), now, slot_id),
             )
             self._conn.commit()
         return True
