@@ -66,6 +66,7 @@ DEFAULT_VOICING = "sonnet"
 DEFAULT_MODE = "deliberation"
 VALID_MODES = ("deliberation", "scene")
 SCENE_N_RANGE = (2, 3)
+RECENCY_LOOKBACK = 6
 
 # Roles are recorded in the run YAML's `selected_entities` list so the
 # runtime subprocess can construct the right Entity type per slot.
@@ -213,6 +214,37 @@ def _parse_mem_keys(raw: str) -> list[str]:
     return keys
 
 
+def recent_pair_entities(lookback: int = RECENCY_LOOKBACK) -> list[str]:
+    """Entity ids that filled seats 1-2 in the most recent `lookback` deliberation
+    runs, newest first, de-duplicated. Far-seat (`third_voice`) excluded."""
+    if not COUNCIL_DIR.exists():
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    deliberation_count = 0
+    for run_file in sorted(COUNCIL_DIR.glob("*.yaml"), reverse=True):
+        if deliberation_count >= lookback:
+            break
+        try:
+            data = yaml.safe_load(run_file.read_text())
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("mode") != "deliberation":
+            continue
+        deliberation_count += 1
+        for entity in data.get("selected_entities", []):
+            if not isinstance(entity, dict):
+                continue
+            if entity.get("role") in ("first_voice", "second_voice"):
+                eid = entity.get("id")
+                if eid and eid not in seen:
+                    seen.add(eid)
+                    result.append(eid)
+    return result
+
+
 def select_entities(
     decision: str,
     roster: list[dict],
@@ -220,6 +252,7 @@ def select_entities(
     n: int = 2,
     with_entity: str | None = None,
     mode: str = DEFAULT_MODE,
+    recent_pair_ids: list[str] | None = None,
     log=None,
 ) -> dict:
     """LLM-driven entity selection. Returns: {"selected": [...], "reasoning": "..."}"""
@@ -257,6 +290,20 @@ def select_entities(
         f"RELATED PRIOR COHESION FINDINGS:\n{findings_text}\n--- END PRIOR FINDINGS ---"
     )
 
+    effective_recent: list[str] = []
+    if recent_pair_ids and mode == "deliberation":
+        effective_recent = [rid for rid in recent_pair_ids if rid != pinned]
+
+    recency_clause = ""
+    if effective_recent:
+        ids_str = ", ".join(effective_recent)
+        recency_clause = (
+            "\n\nRECENT DIALECTICAL PAIR (these voices filled seats 1-2 in recent councils): "
+            f"{ids_str}. Prefer a FRESH pairing - avoid these unless one is *uniquely* required "
+            "for THIS specific decision; if you reuse one, your reasoning must say why no fresher "
+            "voice could occupy that seat."
+        )
+
     remaining = n - 1 if pinned else n
     if mode == "scene":
         header = "You are selecting characters from a roster to inhabit a scene."
@@ -274,6 +321,34 @@ def select_entities(
             f"<2-3 sentences on why these {n} characters together would make "
             "the scene crackle>"
         )
+    elif n == 3:
+        header = "You are selecting three characters from a roster to deliberate a decision."
+        prompt_label = "DECISION TO DELIBERATE"
+        guidance = (
+            f"Pick {'the other two participants' if pinned else 'three participants'} "
+            "for this deliberation.\n\n"
+            "SEATS 1-2 (dialectical pair): Choose for the richest friction and "
+            "complementarity — whose lived context and habits of mind create the most "
+            "productive tension for this specific decision. Avoid participants who would "
+            "merely agree. Prefer lived, 'muddied' perspectives (historical/fiction) over "
+            "crystallized archetypes. Consider what domain the decision is in, what "
+            "tensions it hides, and how the pair's blindspots might cover each other."
+            + recency_clause
+            + "\n\nSEAT 3 (FAR SEAT — distant vantage): Choose this voice from a FAR-REACHING "
+            "spot in the roster — a different culture, discipline, era, tradition, or kind "
+            "of figure (e.g. literary rather than historical). The goal is to MAXIMIZE "
+            "VANTAGE DISTANCE from the first two and supply the perspective the dialectical "
+            "pair structurally lacks. This is NOT a contrarian, trickster, or devil's "
+            "advocate: it widens the vantage, it does not disrupt. Avoid three figures of "
+            "the same school, era, or register. Ask: what perspective is the dialectical "
+            "pair structurally blind to, and who from a far-reaching cultural, "
+            "disciplinary, or temporal origin would supply it?"
+        )
+        reasoning_hint = (
+            "<2-3 sentences: name the dialectical spine the first two bring, then NAME "
+            "THE VANTAGE the far seat supplies — the specific perspective the pair "
+            "structurally lacks that this third voice contributes>"
+        )
     else:
         header = "You are selecting two characters from a roster to deliberate a decision."
         prompt_label = "DECISION TO DELIBERATE"
@@ -288,6 +363,7 @@ def select_entities(
             "- What tensions does the decision hide? Who would surface them?\n"
             "- What blindspot does each candidate have? Would two candidates' "
             "blindspots cover each other?"
+            + recency_clause
         )
         reasoning_hint = (
             "<2-3 sentences on why these two create the richest friction for "
@@ -1009,8 +1085,8 @@ def _validate_mode_n(
 ) -> None:
     if mode not in VALID_MODES:
         raise ValueError(f"Unknown mode: {mode!r} (valid: {VALID_MODES})")
-    if mode == "deliberation" and n != 2:
-        raise ValueError("deliberation mode requires n=2")
+    if mode == "deliberation" and n not in (2, 3):
+        raise ValueError("deliberation mode requires n in (2, 3)")
     if mode == "scene" and n not in SCENE_N_RANGE:
         raise ValueError(f"scene mode requires n in {SCENE_N_RANGE}, got {n}")
     if narrator:
@@ -1029,6 +1105,12 @@ def _role_assignments(
     narrator_voice: str | None = None,
 ) -> list[dict]:
     if mode == "deliberation":
+        if len(selected) == 3:
+            return [
+                {"id": selected[0], "role": "first_voice"},
+                {"id": selected[1], "role": "second_voice"},
+                {"id": selected[2], "role": "third_voice"},
+            ]
         return [
             {"id": selected[0], "role": "first_voice"},
             {"id": selected[1], "role": "second_voice"},
@@ -1053,7 +1135,12 @@ def cmd_submit(args: argparse.Namespace) -> int:
     mode = args.mode
     narrator = bool(args.narrator or args.narrator_voice)
     if args.n is None:
-        n = 3 if narrator else 2
+        if narrator:
+            n = 3
+        elif mode == "deliberation":
+            n = 3
+        else:
+            n = 2
     else:
         n = args.n
     _validate_mode_n(mode, n, narrator=narrator, with_entity=args.with_entity)
@@ -1081,6 +1168,13 @@ def cmd_submit(args: argparse.Namespace) -> int:
     roster = build_roster()
     print(f"[council] roster size: {len(roster)}", flush=True)
 
+    recent_pair_ids = recent_pair_entities()
+    if recent_pair_ids:
+        print(
+            f"[council] recency penalty: down-weighting {', '.join(recent_pair_ids)}",
+            flush=True,
+        )
+
     print("[council] selecting entities (via claude sonnet)...", flush=True)
     selection = select_entities(
         decision=args.decision,
@@ -1089,6 +1183,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         n=n_characters,
         with_entity=args.with_entity,
         mode=mode,
+        recent_pair_ids=recent_pair_ids,
     )
     print(
         f"[council] selected: {' + '.join(selection['selected'])}"

@@ -315,3 +315,154 @@ def test_cmd_show_prints_yaml(tmp_path, monkeypatch, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "resolved" in out
+
+
+# ---------------------------------------------------------------------------
+# Three-seat deliberation tests
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_submit_deliberation_default_n_is_3(tmp_path, monkeypatch):
+    """When mode=deliberation and args.n is None, default n should be 3."""
+    from agents_core.council import cli as council_cli
+
+    monkeypatch.setattr(council_cli, "COUNCIL_DIR", tmp_path)
+    monkeypatch.setattr(council_cli, "LOG_DIR", tmp_path / "logs")
+
+    mock_selection = {
+        "selected": ["ada-lovelace-canonical", "benjamin-franklin-canonical", "alan-turing-canonical"],
+        "reasoning": "tension + far-reach",
+    }
+    submitted_tasks = []
+
+    class _FakeQueue:
+        def submit(self, task, task_id=None):
+            submitted_tasks.append(task)
+            return task_id
+
+    monkeypatch.setattr(council_cli, "gather_mem_context", lambda d: {"terms": [], "hits": []})
+    monkeypatch.setattr(council_cli, "build_roster", lambda: [])
+    monkeypatch.setattr(council_cli, "select_entities", lambda **kw: mock_selection)
+    monkeypatch.setattr(council_cli, "recent_pair_entities", lambda: [])
+
+    import agents_core.claude_queue as cq_mod
+    monkeypatch.setattr(cq_mod, "ClaudeQueue", lambda: _FakeQueue())
+
+    args = _make_submit_args(n=None)  # No explicit n
+    rc = council_cli.cmd_submit(args)
+
+    assert rc == 0
+    yamls = list(tmp_path.glob("*.yaml"))
+    assert len(yamls) == 1
+    run_data = yaml.safe_load(yamls[0].read_text())
+    assert len(run_data["selected_entities"]) == 3
+    roles = [e["role"] for e in run_data["selected_entities"]]
+    assert roles == ["first_voice", "second_voice", "third_voice"]
+
+
+def test_validate_mode_n_allows_n3_deliberation():
+    from agents_core.council.cli import _validate_mode_n
+
+    # Should not raise
+    _validate_mode_n("deliberation", 3)
+
+
+def test_validate_mode_n_rejects_n4_deliberation():
+    from agents_core.council.cli import _validate_mode_n
+
+    with pytest.raises(ValueError, match="deliberation mode requires n in"):
+        _validate_mode_n("deliberation", 4)
+
+
+def test_role_assignments_three_seat():
+    from agents_core.council.cli import _role_assignments
+
+    selected = ["alice", "bob", "charlie"]
+    result = _role_assignments(selected, "deliberation")
+    assert len(result) == 3
+    assert result[0] == {"id": "alice", "role": "first_voice"}
+    assert result[1] == {"id": "bob", "role": "second_voice"}
+    assert result[2] == {"id": "charlie", "role": "third_voice"}
+
+
+def test_recent_pair_entities_excludes_third_voice(tmp_path, monkeypatch):
+    from agents_core.council import cli as council_cli
+
+    monkeypatch.setattr(council_cli, "COUNCIL_DIR", tmp_path)
+
+    # Write two deliberation runs with 3 entities each
+    run1 = {
+        "run_id": "2026-05-01-000000-aaaaaa",
+        "mode": "deliberation",
+        "selected_entities": [
+            {"id": "alice", "role": "first_voice"},
+            {"id": "bob", "role": "second_voice"},
+            {"id": "charlie", "role": "third_voice"},
+        ],
+    }
+    run2 = {
+        "run_id": "2026-05-02-000000-bbbbbb",
+        "mode": "deliberation",
+        "selected_entities": [
+            {"id": "diana", "role": "first_voice"},
+            {"id": "eve", "role": "second_voice"},
+            {"id": "frank", "role": "third_voice"},
+        ],
+    }
+
+    (tmp_path / "2026-05-01-000000-aaaaaa.yaml").write_text(yaml.safe_dump(run1))
+    (tmp_path / "2026-05-02-000000-bbbbbb.yaml").write_text(yaml.safe_dump(run2))
+
+    result = council_cli.recent_pair_entities()
+
+    # Should return [diana, eve, alice, bob] (newest first, excluding third_voice roles)
+    assert len(result) == 4
+    assert "charlie" not in result
+    assert "frank" not in result
+    assert result[0] in ("diana", "eve")  # Most recent
+    assert result[1] in ("diana", "eve")
+
+
+def test_recent_pair_entities_empty_dir(tmp_path, monkeypatch):
+    from agents_core.council import cli as council_cli
+
+    monkeypatch.setattr(council_cli, "COUNCIL_DIR", tmp_path / "nonexistent")
+    result = council_cli.recent_pair_entities()
+    assert result == []
+
+
+def test_cmd_submit_passes_recent_pair_ids_to_select_entities(tmp_path, monkeypatch, capsys):
+    from agents_core.council import cli as council_cli
+
+    monkeypatch.setattr(council_cli, "COUNCIL_DIR", tmp_path)
+    monkeypatch.setattr(council_cli, "LOG_DIR", tmp_path / "logs")
+
+    mock_selection = {"selected": ["x", "y", "z"], "reasoning": "..."}
+    captured_kwargs = {}
+
+    def _mock_select(**kwargs):
+        captured_kwargs.update(kwargs)
+        return mock_selection
+
+    class _FakeQueue:
+        def submit(self, task, task_id=None):
+            return task_id
+
+    monkeypatch.setattr(council_cli, "gather_mem_context", lambda d: {"terms": [], "hits": []})
+    monkeypatch.setattr(council_cli, "build_roster", lambda: [])
+    monkeypatch.setattr(council_cli, "select_entities", _mock_select)
+    monkeypatch.setattr(council_cli, "recent_pair_entities", lambda: ["ada-lovelace-canonical"])
+
+    import agents_core.claude_queue as cq_mod
+    monkeypatch.setattr(cq_mod, "ClaudeQueue", lambda: _FakeQueue())
+
+    council_cli.cmd_submit(_make_submit_args())
+
+    # Verify recent_pair_ids was passed to select_entities
+    assert "recent_pair_ids" in captured_kwargs
+    assert captured_kwargs["recent_pair_ids"] == ["ada-lovelace-canonical"]
+
+    # Verify the recency penalty message was printed
+    out = capsys.readouterr().out
+    assert "recency penalty" in out
+    assert "ada-lovelace-canonical" in out
