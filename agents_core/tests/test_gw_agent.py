@@ -5,6 +5,8 @@ error recovery, and transcript generation.
 """
 
 import json
+import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -264,15 +266,18 @@ class TestCallGWAgent:
 
     def test_transcript_schema(self):
         """Transcript entries have correct schema."""
-        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
              patch("requests.post") as mock_post:
 
             mock_doorman = MagicMock()
             mock_doorman_class.return_value = mock_doorman
             mock_doorman.acquire.return_value = {"status": "serving"}
 
-            # Use a file that definitely exists (the test file itself)
-            test_file_path = "agents_core/tests/test_gw_agent.py"
+            # Create a test file in the temporary directory
+            test_file_path = "test_content.txt"
+            test_file_full_path = Path(tmpdir) / test_file_path
+            test_file_full_path.write_text("This is test content.\n")
 
             tool_call_response = {
                 "choices": [
@@ -313,10 +318,10 @@ class TestCallGWAgent:
                 MagicMock(json=lambda: conclude_response),
             ]
 
-            # Use cwd that contains the test file
+            # Use the temporary directory as cwd
             _, transcript = call_gw_agent(
                 prompt="Test.",
-                cwd="/tmp/lapis-pm-worktrees/claude_20260615_104624_3226_fixergravitywellreviewag",
+                cwd=tmpdir,
                 return_transcript=True,
             )
 
