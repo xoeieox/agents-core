@@ -126,6 +126,8 @@ _ADDED_COLUMNS = (
     ("facets_verdict", "TEXT"),
     ("facets_last_update", "TEXT"),
     ("next", "TEXT NOT NULL DEFAULT '{}'"),
+    ("next_actuated", "INTEGER DEFAULT 0"),
+    ("next_actuated_at", "TEXT"),
 )
 
 
@@ -350,6 +352,9 @@ class SlotStore:
         sorted). ``proposal`` is optional human-readable context. ``actuated``
         indicates whether this has been acted on yet (defaults False, UI-honesty).
         Contributor-of-record only.
+
+        A fresh baton starts un-actuated (next_actuated=0); when this method publishes
+        a new baton, it resets the actuation state.
         """
         self._check_writable()
         if kind not in NEXT_KINDS:
@@ -367,7 +372,7 @@ class SlotStore:
         with self._lock:
             self._require_owner(slot_id, by)
             self._conn.execute(
-                "UPDATE slots SET next=?, last_update=? WHERE slot_id=?",
+                "UPDATE slots SET next=?, next_actuated=0, next_actuated_at=NULL, last_update=? WHERE slot_id=?",
                 (json.dumps(next_record, sort_keys=True), now, slot_id),
             )
             self._conn.commit()
@@ -422,6 +427,43 @@ class SlotStore:
             self._conn.execute(
                 "UPDATE slots SET facets_verdict=?, facets_last_update=? WHERE slot_id=?",
                 (json.dumps(payload, sort_keys=True), now, slot_id),
+            )
+            self._conn.commit()
+        return True
+
+    def set_actuated(self, slot_id: str, *, by: str = "morph") -> bool:
+        """Mark a slot's ``next`` baton as actuated (acknowledged/acted-upon).
+
+        This is a non-owner-guarded observer-pattern write (separate column namespace,
+        like ``observer_update`` and ``facets_ratify``). Morph (Unit 3) uses this
+        after acting on a baton: it marks the baton acknowledged but does NOT change
+        the contributor's owner-guarded fields (status, kind, ref, blocked_on, proposal).
+
+        Idempotent: if there is no ``next`` baton, or it is already actuated, returns
+        False without error (safe for at-least-once retry). On successful actuation of
+        a fresh baton, returns True.
+
+        Raises SlotNotFoundError if the slot does not exist.
+        """
+        self._check_writable()
+        now = _now()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM slots WHERE slot_id=?", (slot_id,)
+            ).fetchone()
+            if row is None:
+                raise SlotNotFoundError(slot_id)
+            # Idempotent: if no next baton or already actuated, return False.
+            next_data = json.loads(row["next"]) if row["next"] else {}
+            if not next_data:
+                return False
+            # Check if already actuated (via the separate next_actuated column).
+            if row["next_actuated"]:
+                return False
+            # Mark as actuated in the separate column namespace.
+            self._conn.execute(
+                "UPDATE slots SET next_actuated=1, next_actuated_at=? WHERE slot_id=?",
+                (now, slot_id),
             )
             self._conn.commit()
         return True
@@ -594,6 +636,10 @@ class SlotStore:
                 d[field] = json.loads(d[field]) if d.get(field) else None
             except (json.JSONDecodeError, TypeError):
                 d[field] = None
+        # Sync the separate next_actuated column back into the next JSON blob for
+        # back-compat: readers see actuated as bool(next_actuated) in the next dict.
+        if d.get("next") and isinstance(d["next"], dict):
+            d["next"]["actuated"] = bool(d.get("next_actuated"))
         return d
 
 
