@@ -326,6 +326,130 @@ def test_migration_adds_next_column_to_legacy_db(tmp_path: Path):
     store.close()
 
 
+# --- set_actuated (non-owner-guarded baton actuation) ----------------------
+
+def test_set_actuated_marks_next_baton(store: SlotStore):
+    """set_actuated on a slot with an un-acted next baton -> True; read shows actuated."""
+    sid = store.create_slot("proj-A", CONTRIB)
+    store.set_next(
+        sid,
+        by="agent-1",
+        kind="review-pr",
+        ref="pr-123",
+        actuated=False,
+    )
+    # Before actuating
+    assert store.get(sid)["next"]["actuated"] is False
+    # Morph actuates the baton (non-owner, no error)
+    result = store.set_actuated(sid, by="morph")
+    assert result is True
+    # After actuating, the read projection shows actuated=True
+    slot = store.get(sid)
+    assert slot["next"]["actuated"] is True
+    assert slot["next_actuated"] == 1
+    assert slot["next_actuated_at"] is not None
+
+def test_set_actuated_idempotent_second_call(store: SlotStore):
+    """A second set_actuated on the same baton -> False (idempotent, no error)."""
+    sid = store.create_slot("proj-A", CONTRIB)
+    store.set_next(sid, by="agent-1", kind="done")
+    assert store.set_actuated(sid, by="morph") is True
+    # Second call returns False (already actuated)
+    assert store.set_actuated(sid, by="morph") is False
+    # State unchanged
+    assert store.get(sid)["next"]["actuated"] is True
+
+def test_set_actuated_no_next_baton_returns_false(store: SlotStore):
+    """set_actuated on a slot with no next baton -> False (idempotent)."""
+    sid = store.create_slot("proj-A", CONTRIB)
+    # No next baton set yet
+    assert store.get(sid)["next"] == {}
+    result = store.set_actuated(sid, by="morph")
+    assert result is False
+    # Still no next baton
+    assert store.get(sid)["next"] == {}
+
+def test_set_actuated_non_owner_succeeds(store: SlotStore):
+    """set_actuated by non-owner (morph) succeeds — no SlotOwnershipError.
+
+    This is the regression the unit exists to prevent: Morph must be able to
+    mark a baton actuated despite not being the slot's contributor-of-record.
+    """
+    sid = store.create_slot("proj-A", {"type": "fixer", "id": "agent-1"})
+    store.set_next(sid, by="agent-1", kind="done")
+    # Morph (different contributor) actuates without error
+    result = store.set_actuated(sid, by="morph")
+    assert result is True
+    assert store.get(sid)["next"]["actuated"] is True
+
+def test_set_actuated_no_clobber_baton_fields(store: SlotStore):
+    """After set_actuated, baton's kind/ref/blocked_on/proposal and status unchanged."""
+    sid = store.create_slot("proj-A", CONTRIB)
+    store.set_next(
+        sid,
+        by="agent-1",
+        kind="review-pr",
+        ref="pr-999",
+        blocked_on=["slot-dep"],
+        proposal="wait for reviewer",
+        actuated=False,
+    )
+    store.update_status(sid, "in-progress", by="agent-1")
+    # Snapshot before actuating
+    before = store.get(sid)
+    assert before["next"]["kind"] == "review-pr"
+    assert before["next"]["ref"] == "pr-999"
+    assert before["next"]["blocked_on"] == ["slot-dep"]
+    assert before["next"]["proposal"] == "wait for reviewer"
+    assert before["status"] == "in-progress"
+    # Actuate
+    store.set_actuated(sid, by="morph")
+    # After actuating, contributor fields unchanged
+    after = store.get(sid)
+    assert after["next"]["kind"] == "review-pr"
+    assert after["next"]["ref"] == "pr-999"
+    assert after["next"]["blocked_on"] == ["slot-dep"]
+    assert after["next"]["proposal"] == "wait for reviewer"
+    assert after["status"] == "in-progress"
+    # Only actuated flag changed
+    assert after["next"]["actuated"] is True
+
+def test_set_actuated_missing_slot_raises(store: SlotStore):
+    """set_actuated on missing slot -> SlotNotFoundError."""
+    with pytest.raises(SlotNotFoundError):
+        store.set_actuated("nope", by="morph")
+
+def test_set_next_resets_actuated_on_new_baton(store: SlotStore):
+    """set_next publishing a NEW baton resets actuated to False (fresh baton un-acted)."""
+    sid = store.create_slot("proj-A", CONTRIB)
+    # First baton
+    store.set_next(sid, by="agent-1", kind="review-pr", ref="pr-1")
+    store.set_actuated(sid, by="morph")
+    assert store.get(sid)["next"]["actuated"] is True
+    # Contributor publishes a NEW baton — actuated resets to False
+    store.set_next(sid, by="agent-1", kind="deploy", ref="v2", actuated=False)
+    slot = store.get(sid)
+    assert slot["next"]["kind"] == "deploy"
+    assert slot["next"]["ref"] == "v2"
+    assert slot["next"]["actuated"] is False  # Fresh baton is un-acted
+    assert slot["next_actuated"] == 0
+    assert slot["next_actuated_at"] is None
+
+def test_set_actuated_read_only_mode_raises(tmp_path: Path, monkeypatch):
+    """set_actuated in read-only mode raises OffMasterWriteError."""
+    db = tmp_path / "off-master.db"
+    store = SlotStore(db_path=db)
+    sid = store.create_slot("p", {"type": "fixer", "id": "a"})
+    store.set_next(sid, by="a", kind="done")
+    store.close()
+    # Reopen in read-only mode
+    monkeypatch.setattr("agents_core.slots.IS_MASTER", False)
+    store2 = SlotStore(db_path=db)
+    with pytest.raises(OffMasterWriteError):
+        store2.set_actuated(sid, by="morph")
+    store2.close()
+
+
 # --- query -----------------------------------------------------------------
 
 def test_query_filters(store: SlotStore):
