@@ -66,7 +66,7 @@ INACTIVE_STATUSES = frozenset({"landed", "abandoned", "parked"})
 # Handoff-baton kinds that a controller (Morph) can dispatch on without parsing prose.
 # Closed set: exactly these dispatch verbs; anything else is a ValueError.
 NEXT_KINDS = frozenset({
-    "review-pr", "bind-next", "deploy", "await-human", "done", "blocked",
+    "review-pr", "bind-next", "deploy", "await-human", "done", "blocked", "exploring",
 })
 
 # Contributor types (design doc). Not enforced — permissive — but documented.
@@ -343,6 +343,9 @@ class SlotStore:
         """Publish the next handoff baton (what should happen next).
 
         ``kind`` must be in NEXT_KINDS — the dispatch verbs Morph can act on.
+        The ``exploring`` kind is the quiet-pause state: Morph halts auto-advance
+        but does NOT notify (unlike ``await-human`` or ``blocked`` which trigger
+        notifications). All other kinds represent active transitions.
         ``blocked_on`` is a list of slot_ids this slot depends on (deduplicated,
         sorted). ``proposal`` is optional human-readable context. ``actuated``
         indicates whether this has been acted on yet (defaults False, UI-honesty).
