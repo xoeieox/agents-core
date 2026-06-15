@@ -2,6 +2,7 @@
 
 Modules:
     llm       — llama-server (call_llm) + Claude CLI (call_claude_cli)
+    gw_agent  — GravityWell review-agent harness (call_gw_agent)
     forgejo   — Forgejo REST helper (create_pr, merge_pr, get_pr_diff, ...)
     notify    — Pushover wrapper (send_notification, Priority)
     targets   — /srv/lapis/targets YAML store (Target, TargetStore)
@@ -13,9 +14,10 @@ Modules:
     worktree  — per-task git worktree lifecycle (WORKTREE_ROOT, setup_worktree, ...)
 """
 
+from agents_core.gw_agent import call_gw_agent
 from agents_core.retrieval import Hit, retrieve
 from agents_core.shaper import DispatchResult, ShapedAgent, Shaper
 
 __version__ = "0.3.0"
 
-__all__ = ["Hit", "retrieve", "Shaper", "ShapedAgent", "DispatchResult"]
+__all__ = ["call_gw_agent", "Hit", "retrieve", "Shaper", "ShapedAgent", "DispatchResult"]
