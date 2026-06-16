@@ -143,6 +143,10 @@ def _call_gravitywell_backend(
     be kept in sync (see doorman-server.env and operator environment docs).
 
     Does NOT accept bundle_ids — GW gets system verbatim, no chub-bundle injection.
+
+    Retryable transient errors (timeout, connection errors, chunked encoding)
+    are retried up to 3 attempts (2 retries) with backoff 2s then 4s.
+    Persistent errors raise OperatorUnreachableError; non-request errors return None.
     """
     messages = []
     if system:
@@ -169,10 +173,19 @@ def _call_gravitywell_backend(
             msg = data["choices"][0]["message"]
             text = msg.get("content") or msg.get("reasoning_content") or ""
             return text if text.strip() else None
-        except (requests.exceptions.HTTPError,
-                requests.exceptions.ConnectionError) as e:
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.HTTPError,
+                requests.exceptions.ChunkedEncodingError) as e:
             if attempt < max_retries - 1:
-                backoff = 10 * (2 ** attempt)
+                # ChunkedEncodingError is retryable because GW calls are stateless
+                # from the client's perspective (read-only; no server-side commit).
+                if attempt == 0:
+                    backoff = 2
+                elif attempt == 1:
+                    backoff = 4
+                else:
+                    backoff = 0  # Should not reach here, but guard it
                 if log:
                     log(f"GW call failed (attempt {attempt + 1}/{max_retries}): {e}")
                 time.sleep(backoff)
@@ -181,6 +194,8 @@ def _call_gravitywell_backend(
                     log(f"GW call failed after {max_retries} attempts: {e}")
                 raise OperatorUnreachableError(GW_URL, e)
         except Exception as e:
+            # Non-request errors (KeyError, IndexError, JSONDecodeError on response parsing)
+            # are not retried; return None to distinguish from transient failures.
             if log:
                 log(f"GW call error: {e}")
             return None

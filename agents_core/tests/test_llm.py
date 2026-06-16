@@ -356,3 +356,154 @@ def test_non_gravitywell_operator_records_success_provenance():
 
     assert result == "sonnet answer"
     assert ("success", "sonnet") in provenance
+
+
+# ---------------------------------------------------------------------------
+# GravityWell Retry Hardening Tests (gw-backend-retry-hardening-v0)
+# ---------------------------------------------------------------------------
+
+def _make_gw_response(text: str):
+    """Minimal requests.Response mock for a successful GravityWell reply."""
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {
+        "choices": [{"message": {"content": text, "reasoning_content": None}}]
+    }
+    return resp
+
+
+def test_gravitywell_retries_on_timeout():
+    """_call_gravitywell_backend retries on ReadTimeout and returns completion on success."""
+    import requests as req
+    from agents_core.llm import _call_gravitywell_backend
+
+    timeout_err = req.exceptions.Timeout("read timeout")
+    success_resp = _make_gw_response("recovered after timeout")
+
+    with patch("agents_core.llm.requests.post",
+               side_effect=[timeout_err, timeout_err, success_resp]), \
+         patch("agents_core.llm.time.sleep") as mock_sleep:
+        result = _call_gravitywell_backend(prompt="retry me")
+
+    assert result == "recovered after timeout"
+    # Verify backoff was called: attempt 0 (2s) and attempt 1 (4s)
+    assert mock_sleep.call_count == 2
+    mock_sleep.assert_any_call(2)
+    mock_sleep.assert_any_call(4)
+
+
+def test_gravitywell_raises_on_persistent_timeout():
+    """_call_gravitywell_backend raises OperatorUnreachableError after timeout exhaustion."""
+    import requests as req
+    from agents_core.llm import _call_gravitywell_backend, OperatorUnreachableError, GW_URL
+
+    timeout_err = req.exceptions.Timeout("persistent timeout")
+
+    with patch("agents_core.llm.requests.post", side_effect=timeout_err), \
+         patch("agents_core.llm.time.sleep"):
+        with pytest.raises(OperatorUnreachableError) as exc_info:
+            _call_gravitywell_backend(prompt="will fail")
+
+    exc = exc_info.value
+    assert exc.url == GW_URL
+    assert isinstance(exc.last_error, req.exceptions.Timeout)
+
+
+def test_gravitywell_retries_on_chunked_encoding_error():
+    """_call_gravitywell_backend retries on ChunkedEncodingError (stateless calls)."""
+    import requests as req
+    from agents_core.llm import _call_gravitywell_backend
+
+    chunked_err = req.exceptions.ChunkedEncodingError("connection broken")
+    success_resp = _make_gw_response("recovered from chunked error")
+
+    with patch("agents_core.llm.requests.post",
+               side_effect=[chunked_err, success_resp]), \
+         patch("agents_core.llm.time.sleep") as mock_sleep:
+        result = _call_gravitywell_backend(prompt="retry chunked")
+
+    assert result == "recovered from chunked error"
+    # Only one backoff (after attempt 0)
+    assert mock_sleep.call_count == 1
+    mock_sleep.assert_called_with(2)
+
+
+def test_gravitywell_empty_content_returns_none():
+    """_call_gravitywell_backend returns None for successful 200 with empty content (unchanged behavior)."""
+    from agents_core.llm import _call_gravitywell_backend
+
+    empty_resp = MagicMock()
+    empty_resp.raise_for_status = MagicMock()
+    empty_resp.json.return_value = {
+        "choices": [{"message": {"content": "", "reasoning_content": None}}]
+    }
+
+    with patch("agents_core.llm.requests.post", return_value=empty_resp):
+        result = _call_gravitywell_backend(prompt="empty reply")
+
+    assert result is None
+
+
+def test_gravitywell_malformed_body_returns_none_via_generic_handler():
+    """_call_gravitywell_backend returns None for malformed response (KeyError/IndexError)."""
+    from agents_core.llm import _call_gravitywell_backend
+
+    # Missing "choices" key
+    malformed_resp = MagicMock()
+    malformed_resp.raise_for_status = MagicMock()
+    malformed_resp.json.return_value = {"error": "unexpected structure"}
+
+    with patch("agents_core.llm.requests.post", return_value=malformed_resp):
+        result = _call_gravitywell_backend(prompt="malformed response")
+
+    assert result is None
+
+
+def test_gravitywell_empty_choices_list_returns_none():
+    """_call_gravitywell_backend returns None for empty choices list (IndexError)."""
+    from agents_core.llm import _call_gravitywell_backend
+
+    empty_choices_resp = MagicMock()
+    empty_choices_resp.raise_for_status = MagicMock()
+    empty_choices_resp.json.return_value = {"choices": []}
+
+    with patch("agents_core.llm.requests.post", return_value=empty_choices_resp):
+        result = _call_gravitywell_backend(prompt="empty choices")
+
+    assert result is None
+
+
+def test_gravitywell_backoff_timing_cumulative():
+    """_call_gravitywell_backend total backoff (6s) does not exceed timeout_per_persona budget."""
+    import requests as req
+    from agents_core.llm import _call_gravitywell_backend, OperatorUnreachableError
+
+    timeout_err = req.exceptions.Timeout("timeout")
+
+    with patch("agents_core.llm.requests.post", side_effect=timeout_err), \
+         patch("agents_core.llm.time.sleep") as mock_sleep:
+        with pytest.raises(OperatorUnreachableError):
+            _call_gravitywell_backend(prompt="backoff test")
+
+    # Two backoffs: 2s (after attempt 0) and 4s (after attempt 1)
+    assert mock_sleep.call_count == 2
+    total_sleep = sum(call[0][0] for call in mock_sleep.call_args_list)
+    assert total_sleep == 6
+    assert total_sleep <= 6  # Should not exceed the 6s cap
+
+
+def test_gravitywell_http_error_is_retryable():
+    """_call_gravitywell_backend retries on HTTPError (e.g., 503)."""
+    import requests as req
+    from agents_core.llm import _call_gravitywell_backend
+
+    http_err = req.exceptions.HTTPError("503 Service Unavailable")
+    success_resp = _make_gw_response("recovered from 503")
+
+    with patch("agents_core.llm.requests.post",
+               side_effect=[http_err, success_resp]), \
+         patch("agents_core.llm.time.sleep") as mock_sleep:
+        result = _call_gravitywell_backend(prompt="retry http")
+
+    assert result == "recovered from 503"
+    mock_sleep.assert_called_once_with(2)
