@@ -58,7 +58,7 @@ def _gw_acquire_timeout() -> float:
                 f"fallback to on_wake_fail policy. Set GW_ACQUIRE_TIMEOUT_SEC >= "
                 f"{gw_wake_deadline_sec} to fix.",
                 RuntimeWarning,
-                stacklevel=3,
+                stacklevel=2,
             )
         return override_value
 
@@ -94,7 +94,10 @@ class DoormanClient:
 
     def _post(self, path: str, body: dict, timeout: float | None = None) -> dict:
         try:
-            resp = self._client.post(path, json=body, timeout=timeout)
+            kwargs = {"json": body}
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            resp = self._client.post(path, **kwargs)
             resp.raise_for_status()
             return resp.json()
         except httpx.TransportError as e:

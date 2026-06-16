@@ -328,26 +328,31 @@ def test_acquire_respects_timeout_parameter():
 def test_acquire_slow_response_with_long_timeout():
     """acquire() with a long timeout must not timeout on a slow response.
 
-    Simulates a slow doorman response that would timeout with short timeout.
-    Uses toy timescale: GW_WAKE_DEADLINE_SEC=2, margin=1, so acquire timeout=3.
-    Old default (30s) >> new derived (3s) to verify coupling.
+    Simulates a slow doorman response that would timeout with the old short timeout
+    but succeeds with the new long timeout. Demonstrates the boundary at toy scale.
+    Env: GW_WAKE_DEADLINE_SEC=2, margin=1, so acquire timeout=3s (new).
+    Also patches DOORMAN_CLIENT_TIMEOUT to 1s (old ceiling), and uses a 1.5s delay.
+    Delay sits between old ceiling (1s) and new timeout (3s).
     """
     class _SlowTransport(httpx.BaseTransport):
-        def __init__(self, delay_sec: float = 0.5):
+        def __init__(self, delay_sec: float = 1.5):
             self.delay_sec = delay_sec
 
         def handle_request(self, request: httpx.Request) -> httpx.Response:
-            # In a real scenario, this would be the doorman blocking on
-            # ensure_serving(). We simulate with a small delay (~0.5s).
-            # The point is: with the old 30s default, this would never timeout.
-            # With the new coupling, the timeout is 2+1=3s, which is still > 0.5s.
+            # Simulate doorman blocking on ensure_serving().
+            # Delay (1.5s) > old DOORMAN_CLIENT_TIMEOUT (1s) would fail without override.
+            # Delay (1.5s) < new _gw_acquire_timeout() (3s) succeeds with override.
             import time
             time.sleep(self.delay_sec)
             return httpx.Response(200, json={"status": "serving"})
 
     with mock.patch.dict(
         os.environ,
-        {"GW_WAKE_DEADLINE_SEC": "2", "GW_ACQUIRE_MARGIN_SEC": "1"},
+        {
+            "GW_WAKE_DEADLINE_SEC": "2",
+            "GW_ACQUIRE_MARGIN_SEC": "1",
+            "DOORMAN_CLIENT_TIMEOUT": "1",  # Scale down old ceiling for test
+        },
         clear=False,
     ):
         os.environ.pop("GW_ACQUIRE_TIMEOUT_SEC", None)
@@ -355,10 +360,11 @@ def test_acquire_slow_response_with_long_timeout():
         c = DoormanClient(base_url="http://doorman.test")
         c._client = httpx.Client(
             base_url="http://doorman.test",
-            transport=_SlowTransport(delay_sec=0.1),  # Small delay, well within 3s timeout
+            transport=_SlowTransport(delay_sec=1.5),  # Between old (1s) and new (3s)
         )
 
-        # This should succeed without raising TimeoutException
+        # This should succeed without raising TimeoutException because
+        # the override timeout (3s) allows the slow response.
         result = c.acquire("gravitywell", "w1", ttl_sec=120, reason="test",
                           timeout=_gw_acquire_timeout())
         assert result["status"] == "serving"
