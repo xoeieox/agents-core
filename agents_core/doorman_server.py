@@ -64,6 +64,11 @@ from fastapi.responses import JSONResponse
 log = logging.getLogger("doorman-server")
 
 GW_URL_DEFAULT = "http://203.0.113.11:8081"
+# GW_WAKE_DEADLINE_SEC coupling: this deadline (default 180s) must be kept in sync
+# with the client-side acquire timeout in agents_core.doorman_client._gw_acquire_timeout(),
+# which derives the HTTP acquire timeout as GW_WAKE_DEADLINE_SEC + GW_ACQUIRE_MARGIN_SEC.
+# The client timeout must be >= this deadline so successful cold wakes (which can take
+# up to GW_WAKE_DEADLINE_SEC) are never misread as DoormanUnreachable timeouts.
 GW_WAKE_DEADLINE_SEC = int(os.environ.get("GW_WAKE_DEADLINE_SEC", "180"))
 GW_HOLD_TTL_SEC = int(os.environ.get("GW_HOLD_TTL_SEC", "120"))
 GW_HOLD_REFRESH_SEC = int(os.environ.get("GW_HOLD_REFRESH_SEC", "45"))

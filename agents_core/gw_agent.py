@@ -390,7 +390,7 @@ def call_gw_agent(
     ctx_tokens = 0
 
     # Acquire doorman lease for the whole run.
-    from agents_core.doorman_client import DoormanClient, DoormanUnreachable
+    from agents_core.doorman_client import DoormanClient, DoormanUnreachable, _gw_acquire_timeout
 
     client = DoormanClient()
     try:
@@ -400,6 +400,7 @@ def call_gw_agent(
                 work_id,
                 ttl_sec=timeout + 60,
                 reason="gw_agent",
+                timeout=_gw_acquire_timeout(),
             )
         except DoormanUnreachable as e:
             if log:

@@ -320,11 +320,12 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
             if k not in ("on_wake_fail", "think", "bundle_ids", "_provenance_out")
         }
 
-        from agents_core.doorman_client import DoormanClient, DoormanUnreachable
+        from agents_core.doorman_client import DoormanClient, DoormanUnreachable, _gw_acquire_timeout
         client = DoormanClient()
         try:
             res = client.acquire(
-                "gravitywell", work_id, ttl_sec=timeout + 60, reason="call_operator"
+                "gravitywell", work_id, ttl_sec=timeout + 60, reason="call_operator",
+                timeout=_gw_acquire_timeout()
             )
             if res.get("status") != "serving":
                 # GW not serving - explicit degrade
