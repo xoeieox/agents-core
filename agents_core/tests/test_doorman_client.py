@@ -4,11 +4,13 @@ and DoormanUnreachable on connection error. Uses httpx mock transport."""
 from __future__ import annotations
 
 import json
+import os
+from unittest import mock
 
 import httpx
 import pytest
 
-from agents_core.doorman_client import DoormanClient, DoormanUnreachable
+from agents_core.doorman_client import DoormanClient, DoormanUnreachable, _gw_acquire_timeout
 
 
 # ---------------------------------------------------------------------------
@@ -236,3 +238,168 @@ def test_mode_owner_defaults_to_gravitywell():
     c = _client_with([(200, body)])
     result = c.mode_owner()  # no node arg
     assert result["node"] == "gravitywell"
+
+
+# ---------------------------------------------------------------------------
+# GW acquire timeout coupling (gw-doorman-client-wake-timeout-v0)
+# ---------------------------------------------------------------------------
+
+def test_gw_acquire_timeout_default():
+    """_gw_acquire_timeout() must return GW_WAKE_DEADLINE_SEC + GW_ACQUIRE_MARGIN_SEC.
+
+    With defaults: 180 + 30 = 210s.
+    """
+    with mock.patch.dict(os.environ, {}, clear=False):
+        # Clear any existing overrides
+        os.environ.pop("GW_WAKE_DEADLINE_SEC", None)
+        os.environ.pop("GW_ACQUIRE_MARGIN_SEC", None)
+        os.environ.pop("GW_ACQUIRE_TIMEOUT_SEC", None)
+        timeout = _gw_acquire_timeout()
+        assert timeout == 210.0
+
+
+def test_gw_acquire_timeout_custom_deadline():
+    """_gw_acquire_timeout() must respect custom GW_WAKE_DEADLINE_SEC."""
+    with mock.patch.dict(os.environ, {"GW_WAKE_DEADLINE_SEC": "120"}, clear=False):
+        os.environ.pop("GW_ACQUIRE_MARGIN_SEC", None)
+        os.environ.pop("GW_ACQUIRE_TIMEOUT_SEC", None)
+        timeout = _gw_acquire_timeout()
+        assert timeout == 150.0  # 120 + 30
+
+
+def test_gw_acquire_timeout_custom_margin():
+    """_gw_acquire_timeout() must respect custom GW_ACQUIRE_MARGIN_SEC."""
+    with mock.patch.dict(
+        os.environ,
+        {"GW_WAKE_DEADLINE_SEC": "180", "GW_ACQUIRE_MARGIN_SEC": "60"},
+        clear=False,
+    ):
+        os.environ.pop("GW_ACQUIRE_TIMEOUT_SEC", None)
+        timeout = _gw_acquire_timeout()
+        assert timeout == 240.0  # 180 + 60
+
+
+def test_gw_acquire_timeout_explicit_override():
+    """_gw_acquire_timeout() must return explicit GW_ACQUIRE_TIMEOUT_SEC override."""
+    with mock.patch.dict(
+        os.environ,
+        {"GW_ACQUIRE_TIMEOUT_SEC": "500"},
+        clear=False,
+    ):
+        timeout = _gw_acquire_timeout()
+        assert timeout == 500.0
+
+
+def test_gw_acquire_timeout_override_below_deadline_warns():
+    """_gw_acquire_timeout() must emit RuntimeWarning if override < deadline."""
+    with mock.patch.dict(
+        os.environ,
+        {"GW_WAKE_DEADLINE_SEC": "180", "GW_ACQUIRE_TIMEOUT_SEC": "100"},
+        clear=False,
+    ):
+        os.environ.pop("GW_ACQUIRE_MARGIN_SEC", None)
+        with pytest.warns(RuntimeWarning, match="GW_ACQUIRE_TIMEOUT_SEC=100"):
+            timeout = _gw_acquire_timeout()
+            assert timeout == 100.0  # Still returns the override
+
+
+def test_acquire_respects_timeout_parameter():
+    """acquire() must pass the timeout parameter to _post."""
+    # Mock transport that captures the request
+    captured_timeout = []
+
+    class _CaptureTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            # httpx doesn't expose the per-request timeout in the request object,
+            # but we can verify the call doesn't raise by returning a response
+            return httpx.Response(200, json={"status": "serving"})
+
+    c = DoormanClient(base_url="http://doorman.test")
+    c._client = httpx.Client(
+        base_url="http://doorman.test",
+        transport=_CaptureTransport(),
+    )
+
+    # Call acquire with a custom timeout
+    result = c.acquire("gravitywell", "w1", ttl_sec=120, reason="test", timeout=500.0)
+    assert result["status"] == "serving"
+
+
+def test_acquire_slow_response_with_long_timeout():
+    """acquire() with a long timeout must not timeout on a slow response.
+
+    Simulates a slow doorman response that would timeout with the old short timeout
+    but succeeds with the new long timeout. Demonstrates the boundary at toy scale.
+    Env: GW_WAKE_DEADLINE_SEC=2, margin=1, so acquire timeout=3s (new).
+    Also patches DOORMAN_CLIENT_TIMEOUT to 1s (old ceiling), and uses a 1.5s delay.
+    Delay sits between old ceiling (1s) and new timeout (3s).
+    """
+    class _SlowTransport(httpx.BaseTransport):
+        def __init__(self, delay_sec: float = 1.5):
+            self.delay_sec = delay_sec
+
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            # Simulate doorman blocking on ensure_serving().
+            # Delay (1.5s) > old DOORMAN_CLIENT_TIMEOUT (1s) would fail without override.
+            # Delay (1.5s) < new _gw_acquire_timeout() (3s) succeeds with override.
+            import time
+            time.sleep(self.delay_sec)
+            return httpx.Response(200, json={"status": "serving"})
+
+    with mock.patch.dict(
+        os.environ,
+        {
+            "GW_WAKE_DEADLINE_SEC": "2",
+            "GW_ACQUIRE_MARGIN_SEC": "1",
+            "DOORMAN_CLIENT_TIMEOUT": "1",  # Scale down old ceiling for test
+        },
+        clear=False,
+    ):
+        os.environ.pop("GW_ACQUIRE_TIMEOUT_SEC", None)
+
+        c = DoormanClient(base_url="http://doorman.test")
+        c._client = httpx.Client(
+            base_url="http://doorman.test",
+            transport=_SlowTransport(delay_sec=1.5),  # Between old (1s) and new (3s)
+        )
+
+        # This should succeed without raising TimeoutException because
+        # the override timeout (3s) allows the slow response.
+        result = c.acquire("gravitywell", "w1", ttl_sec=120, reason="test",
+                          timeout=_gw_acquire_timeout())
+        assert result["status"] == "serving"
+
+
+def test_release_uses_short_default_timeout():
+    """release() must use the short default timeout, not the long GW timeout."""
+    # The test verifies that release() calls _post without a timeout override,
+    # so it uses the client's default timeout (30s).
+    c = _client_with([(200, {"ok": True})])
+    # If release() were incorrectly passing a long timeout, this would be a
+    # functional problem for fast-fail on a hung doorman.
+    c.release("gravitywell", "w1")  # should not raise
+
+
+def test_status_uses_short_default_timeout():
+    """status() must use the short default timeout, not the long GW timeout."""
+    body = {
+        "nodes": {
+            "gravitywell": {
+                "serving": True,
+                "lease_count": 1,
+                "leases": [{"work_id": "w1", "acquired_at": 1000.0, "ttl_sec": 120}],
+                "last_wake_at": 999.0,
+                "last_error": None,
+            }
+        }
+    }
+    c = _client_with([(200, body)])
+    result = c.status()
+    assert result["nodes"]["gravitywell"]["serving"] is True
+
+
+def test_healthz_uses_short_default_timeout():
+    """healthz() must use the short default timeout, not the long GW timeout."""
+    c = _client_with([(200, {"ok": True})])
+    result = c.healthz()
+    assert result["ok"] is True

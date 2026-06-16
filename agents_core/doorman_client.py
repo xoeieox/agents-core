@@ -4,6 +4,11 @@ Reads configuration from environment:
   DOORMAN_SERVER         — base URL (default http://127.0.0.1:8407)
   DOORMAN_BEARER_TOKEN   — optional bearer token (must match server)
   DOORMAN_CLIENT_TIMEOUT — per-request timeout in seconds (default 30.0)
+  GW_WAKE_DEADLINE_SEC   — GravityWell wake deadline in seconds, used by doorman-server
+                           (default 180; also drives acquire timeout coupling)
+  GW_ACQUIRE_MARGIN_SEC  — margin for acquire timeout above wake deadline (default 30)
+  GW_ACQUIRE_TIMEOUT_SEC — (optional) override acquire timeout; if set below
+                           GW_WAKE_DEADLINE_SEC, a warning is emitted
 
 Raises DoormanUnreachable when the HTTP layer itself fails (connection error,
 timeout). The operator treats DoormanUnreachable exactly like status:"wake_failed":
@@ -18,8 +23,46 @@ Acquire statuses:
 from __future__ import annotations
 
 import os
+import warnings
 
 import httpx
+
+
+def _gw_acquire_timeout() -> float:
+    """Derive the GW acquire timeout from the server's wake deadline.
+
+    Returns GW_WAKE_DEADLINE_SEC + GW_ACQUIRE_MARGIN_SEC (defaults to 180 + 30 = 210s).
+
+    The acquire HTTP request must outlive the doorman's wake deadline so that
+    successful cold wakes (which can take up to GW_WAKE_DEADLINE_SEC) are never
+    misread as DoormanUnreachable timeouts. This function reads the same
+    GW_WAKE_DEADLINE_SEC env var that doorman_server.py reads, ensuring coupling.
+
+    If an explicit GW_ACQUIRE_TIMEOUT_SEC override is set below GW_WAKE_DEADLINE_SEC,
+    emits a loud RuntimeWarning (not an error) so that mis-configurations are
+    observable but not service-breaking.
+    """
+    gw_wake_deadline_sec = int(os.environ.get("GW_WAKE_DEADLINE_SEC", "180"))
+    gw_acquire_margin_sec = int(os.environ.get("GW_ACQUIRE_MARGIN_SEC", "30"))
+    derived_timeout = gw_wake_deadline_sec + gw_acquire_margin_sec
+
+    # Check for explicit override
+    explicit_override = os.environ.get("GW_ACQUIRE_TIMEOUT_SEC")
+    if explicit_override is not None:
+        override_value = float(explicit_override)
+        if override_value < gw_wake_deadline_sec:
+            warnings.warn(
+                f"GW_ACQUIRE_TIMEOUT_SEC={override_value} is below "
+                f"GW_WAKE_DEADLINE_SEC={gw_wake_deadline_sec}; acquire HTTP calls "
+                f"may timeout before the doorman completes the wake, causing silent "
+                f"fallback to on_wake_fail policy. Set GW_ACQUIRE_TIMEOUT_SEC >= "
+                f"{gw_wake_deadline_sec} to fix.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return override_value
+
+    return float(derived_timeout)
 
 
 class DoormanUnreachable(Exception):
@@ -49,9 +92,12 @@ class DoormanClient:
             timeout=_timeout,
         )
 
-    def _post(self, path: str, body: dict) -> dict:
+    def _post(self, path: str, body: dict, timeout: float | None = None) -> dict:
         try:
-            resp = self._client.post(path, json=body)
+            kwargs = {"json": body}
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            resp = self._client.post(path, **kwargs)
             resp.raise_for_status()
             return resp.json()
         except httpx.TransportError as e:
@@ -69,13 +115,16 @@ class DoormanClient:
         except httpx.TimeoutException as e:
             raise DoormanUnreachable(f"doorman timeout at {self._base_url}: {e}") from e
 
-    def acquire(self, node: str, work_id: str, ttl_sec: int, reason: str, role: str = "worker") -> dict:
+    def acquire(self, node: str, work_id: str, ttl_sec: int, reason: str, role: str = "worker", timeout: float | None = None) -> dict:
         """Acquire a lease for node.
 
         Args:
           role: optional role descriptor (default "worker"). Use "mode-controller"
                 if acquiring as the flip-controller so the doorman recognizes
                 controller ownership and defers to it.
+          timeout: optional per-request timeout override (default uses client timeout).
+                   For GW acquire, pass _gw_acquire_timeout() to ensure the HTTP
+                   timeout outlives the server's GW_WAKE_DEADLINE_SEC.
 
         Returns dict with status field:
           "serving" — GW is serving; lease registered and keepawake hold placed
@@ -88,7 +137,7 @@ class DoormanClient:
             "ttl_sec": ttl_sec,
             "reason": reason,
             "role": role,
-        })
+        }, timeout=timeout)
 
     def release(self, node: str, work_id: str) -> None:
         """Release a lease. Idempotent — unknown work_id is a no-op."""
