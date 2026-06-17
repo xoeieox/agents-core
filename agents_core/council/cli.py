@@ -898,6 +898,9 @@ def run_deliberation(run_id: str) -> None:
         # Record effective voicing from adapter (gravitywell or fallback)
         _apply_voicing_provenance(run, adapter)
 
+        # Emit in-stream voicing-degradation signal (Leg A of gw-voicing-stdout-signal-v0)
+        _emit_voicing_signal(run, adapter, run_id)
+
         if mode == "scene":
             run["status"] = "closed"
         else:
@@ -918,6 +921,30 @@ def run_deliberation(run_id: str) -> None:
         run["paid_spend"] = _calculate_paid_spend(run)
         save_run(run)
         raise
+
+
+def _emit_voicing_signal(run: dict, adapter, run_id: str) -> None:
+    """Emit in-stream voicing-degradation signal (Leg A of gw-voicing-stdout-signal-v0).
+
+    Emits a single structured line per run when GW was requested:
+    - Degraded: "[council] VOICING DEGRADED run_id=<id> requested=gravitywell effective=<op> reason=<reason>"
+    - Clean: "[council] voicing ok run_id=<id> effective=gravitywell" (only if adapter produced voicing_events)
+
+    Does not emit for non-GW runs (noise reduction).
+    """
+    from agents_core.council.gravitywell_adapter import GravityWellAdapter
+
+    if run.get("voicing") == "gravitywell":
+        requested = run.get("voicing", "unknown")
+        if run["voicing_degraded"] is True:
+            reason = run.get("voicing_degraded_reason", "unknown")
+            effective = run.get("effective_voicing", "unknown")
+            print(f"[council] VOICING DEGRADED run_id={run_id} requested={requested} effective={effective} reason={reason}", flush=True)
+        elif run["voicing_degraded"] is False and run.get("effective_voicing") == "gravitywell":
+            # SENTINEL guard: only emit positive line if adapter actually produced voicing_events
+            # (avoids spurious "voicing ok" from the no-events path in _apply_voicing_provenance)
+            if isinstance(adapter, GravityWellAdapter) and adapter.voicing_events:
+                print(f"[council] voicing ok run_id={run_id} effective=gravitywell", flush=True)
 
 
 def _apply_voicing_provenance(run: dict, adapter) -> None:

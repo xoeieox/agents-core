@@ -381,3 +381,115 @@ def test_council_run_with_gw_success_records_clean_provenance():
     assert run["voicing_degraded"] is False, "Should not be marked as degraded"
     assert "voicing_degraded_reason" not in run, "No reason field on clean run"
     assert run["turns"][0]["effective_voicing"] == "gravitywell", "Turn should have effective_voicing"
+
+
+# ---------------------------------------------------------------------------
+# Voicing signal emission tests (Leg A — stdout signal)
+# ---------------------------------------------------------------------------
+
+def test_voicing_signal_degraded_line_emitted(capsys):
+    """Voicing signal: DEGRADED line is emitted when voicing_degraded is True."""
+    from agents_core.council.cli import _apply_voicing_provenance, _emit_voicing_signal
+    from agents_core.council.gravitywell_adapter import GravityWellAdapter
+
+    run = {
+        "run_id": "test-run-123",
+        "voicing": "gravitywell",
+        "turns": [{"step": 1}],
+    }
+
+    adapter = GravityWellAdapter()
+    adapter.voicing_events = [
+        {"effective_operator": "sonnet", "reason": "doorman_unreachable"},
+    ]
+
+    _apply_voicing_provenance(run, adapter)
+    _emit_voicing_signal(run, adapter, "test-run-123")
+
+    captured = capsys.readouterr()
+    assert "[council] VOICING DEGRADED" in captured.out
+    assert "run_id=test-run-123" in captured.out
+    assert "requested=gravitywell" in captured.out
+    assert "effective=sonnet" in captured.out
+    assert "reason=doorman_unreachable" in captured.out
+
+
+def test_voicing_signal_clean_line_emitted(capsys):
+    """Voicing signal: positive 'voicing ok' line is emitted when clean GW run."""
+    from agents_core.council.cli import _apply_voicing_provenance, _emit_voicing_signal
+    from agents_core.council.gravitywell_adapter import GravityWellAdapter
+
+    run = {
+        "run_id": "test-run-456",
+        "voicing": "gravitywell",
+        "turns": [{"step": 1}],
+    }
+
+    adapter = GravityWellAdapter()
+    adapter.voicing_events = [
+        {"effective_operator": "gravitywell", "reason": "success"},
+    ]
+
+    _apply_voicing_provenance(run, adapter)
+    _emit_voicing_signal(run, adapter, "test-run-456")
+
+    captured = capsys.readouterr()
+    assert "[council] voicing ok" in captured.out
+    assert "run_id=test-run-456" in captured.out
+    assert "effective=gravitywell" in captured.out
+    # Should NOT contain DEGRADED
+    assert "VOICING DEGRADED" not in captured.out
+
+
+def test_voicing_signal_no_emission_for_non_gw_run(capsys):
+    """Voicing signal: no signal emitted for non-GW runs (noise reduction)."""
+    from agents_core.council.cli import _apply_voicing_provenance, _emit_voicing_signal
+    from agents_core.council.gravitywell_adapter import GravityWellAdapter
+
+    run = {
+        "run_id": "test-run-789",
+        "voicing": "sonnet",  # Not gravitywell
+        "turns": [{"step": 1}],
+    }
+
+    adapter = GravityWellAdapter()
+    adapter.voicing_events = []
+
+    _apply_voicing_provenance(run, adapter)
+    _emit_voicing_signal(run, adapter, "test-run-789")
+
+    captured = capsys.readouterr()
+    # No voicing signal should be emitted for non-GW runs
+    assert "[council]" not in captured.out or "voicing" not in captured.out
+
+
+def test_voicing_signal_sentinel_guard_no_events(capsys):
+    """Voicing signal: SENTINEL guard prevents spurious 'voicing ok' when no voicing_events."""
+    from agents_core.council.cli import _apply_voicing_provenance, _emit_voicing_signal
+    from agents_core.council.gravitywell_adapter import GravityWellAdapter
+
+    # This simulates the no-events path (line 975-976 in _apply_voicing_provenance)
+    # where effective_voicing=gravitywell and voicing_degraded=False despite no events
+    run = {
+        "run_id": "test-run-noevents",
+        "voicing": "gravitywell",
+        "turns": [],
+    }
+
+    adapter = GravityWellAdapter()
+    # No voicing_events - simulates the empty path
+
+    _apply_voicing_provenance(run, adapter)
+
+    # Verify that the function set the fields as expected for no-events path
+    assert run["voicing_degraded"] is False
+    assert run["effective_voicing"] == "gravitywell"
+    assert len(adapter.voicing_events) == 0
+
+    # Emit the signal with SENTINEL guard
+    _emit_voicing_signal(run, adapter, "test-run-noevents")
+
+    captured = capsys.readouterr()
+    # Should NOT emit positive line (sentinel guard blocks it)
+    assert "[council] voicing ok" not in captured.out
+    assert "[council] VOICING DEGRADED" not in captured.out
