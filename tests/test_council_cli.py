@@ -474,10 +474,14 @@ def test_cmd_submit_passes_recent_pair_ids_to_select_entities(tmp_path, monkeypa
 
 
 def test_select_entities_stub_path_returns_provenance_fields(tmp_path, monkeypatch):
-    """Verify stub mode returns selection_operator and selection_degraded."""
+    """Verify stub mode returns selection_operator and selection_degraded, and does not call call_operator."""
     from agents_core.council import cli as council_cli
 
     monkeypatch.setenv("COUNCIL_ENGINE_STUB", "1")
+
+    # Mock call_operator to ensure it's never called in stub mode
+    mock_call_operator = MagicMock()
+    monkeypatch.setattr(council_cli, "call_operator", mock_call_operator)
 
     # Build minimal roster
     roster = [
@@ -496,6 +500,50 @@ def test_select_entities_stub_path_returns_provenance_fields(tmp_path, monkeypat
     assert "reasoning" in result
     assert result["selection_operator"] == "stub"
     assert result["selection_degraded"] is False
+    # Hermeticity check: call_operator must not be called in stub mode
+    mock_call_operator.assert_not_called()
+
+
+def test_select_entities_real_path_with_mocked_call_operator(tmp_path, monkeypatch):
+    """Verify real-path select_entities with mocked call_operator derives selection_operator and selection_degraded."""
+    from agents_core.council import cli as council_cli
+
+    # Ensure COUNCIL_ENGINE_STUB is NOT set (real path)
+    monkeypatch.delenv("COUNCIL_ENGINE_STUB", raising=False)
+
+    # Build minimal roster with resolvable character_ids
+    roster = [
+        {"character_id": "a", "character_name": "A", "pool": "test", "cultural_context": ""},
+        {"character_id": "b", "character_name": "B", "pool": "test", "cultural_context": ""},
+    ]
+
+    # Mock call_operator to return valid JSON selection
+    mock_response = '{"selected": ["a", "b"], "reasoning": "tension"}'
+
+    def mock_call_operator(operator, prompt, **kwargs):
+        # Populate _provenance_out if provided
+        prov_out = kwargs.get("_provenance_out")
+        if prov_out is not None:
+            prov_out.append(("success", operator))
+        return mock_response
+
+    monkeypatch.setattr(council_cli, "call_operator", mock_call_operator)
+
+    # Mock find_card_path to make all ids resolvable
+    monkeypatch.setattr(council_cli, "find_card_path", lambda cid: Path(f"/fake/{cid}.yaml"))
+
+    result = council_cli.select_entities(
+        decision="test",
+        roster=roster,
+        context={"terms": [], "hits": []},
+        n=2,
+    )
+
+    # Verify provenance fields are set correctly
+    assert result["selection_operator"] == "gravitywell"
+    assert result["selection_degraded"] is False
+    assert result["selected"] == ["a", "b"]
+    assert "reasoning" in result
 
 
 def test_cmd_submit_run_dict_includes_selection_provenance(tmp_path, monkeypatch):

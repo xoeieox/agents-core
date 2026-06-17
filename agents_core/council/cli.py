@@ -520,16 +520,15 @@ Respond with ONLY a JSON object:
             f"Selection returned duplicate entities: {resolved}"
         )
 
-    # Derive selection_operator from provenance (last success entry)
+    # Derive selection_operator from provenance (last success entry).
+    # call_operator with on_wake_fail="sonnet" always appends a success entry or raises,
+    # so selection_operator is guaranteed to be set (never "unknown").
     selection_operator = "unknown"
     if _sel_prov:
         for reason, operator in reversed(_sel_prov):
             if reason == "success":
                 selection_operator = operator
                 break
-        # If no success, take the first operator mentioned (fallback case)
-        if selection_operator == "unknown" and _sel_prov:
-            selection_operator = _sel_prov[-1][1]
 
     selection_degraded = selection_operator != "gravitywell"
 
