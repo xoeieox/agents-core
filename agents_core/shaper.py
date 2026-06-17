@@ -107,6 +107,7 @@ class ShapedAgent:
     timeout_s: int
     capture_meta: bool = False
     notify: bool = False
+    notify_policy: str = "always"
 
 
 @dataclass
@@ -156,6 +157,7 @@ class Shaper:
                 timeout_s=int(body.get("timeout_s", 300)),
                 capture_meta=bool(body.get("capture_meta", False)),
                 notify=bool(body.get("notify", False)),
+                notify_policy=str(body.get("notify_policy", "always")),
             )
         self._registry = registry
 
@@ -306,6 +308,7 @@ class Shaper:
                 "model": agent.model,
                 "description": f"{agent.name}:{target_id}",
                 "notify": agent.notify,
+                "notify_policy": agent.notify_policy,
                 "payload": {"command": cmd, "spec_path": str(spec_path)},
             }, task_id=task_id)
             output_path = f"/srv/lapis/claude-queue/completed/{task_id}-output.md"
