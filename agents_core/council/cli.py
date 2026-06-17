@@ -53,7 +53,7 @@ from pathlib import Path
 
 import yaml
 
-from agents_core.llm import call_claude_cli  # noqa: E402
+from agents_core.llm import call_operator  # noqa: E402
 from agents_core.council.gravitywell_adapter import GravityWellAdapter
 
 COUNCIL_DIR = Path("/srv/lapis/council")
@@ -62,7 +62,7 @@ CARDS_ROOT = Path(
 )
 DEFAULT_POOLS = ["personal", "historical", "fiction"]
 DEFAULT_TURNS = 8
-DEFAULT_VOICING = "sonnet"
+DEFAULT_VOICING = "gravitywell"
 DEFAULT_MODE = "deliberation"
 VALID_MODES = ("deliberation", "scene")
 SCENE_N_RANGE = (2, 3)
@@ -255,7 +255,16 @@ def select_entities(
     recent_pair_ids: list[str] | None = None,
     log=None,
 ) -> dict:
-    """LLM-driven entity selection. Returns: {"selected": [...], "reasoning": "..."}"""
+    """LLM-driven entity selection. Returns: {"selected": [...], "reasoning": "...", "selection_operator": "...", "selection_degraded": <bool>}"""
+    if os.environ.get("COUNCIL_ENGINE_STUB") == "1":
+        resolvable_ids = [r["character_id"] for r in roster if find_card_path(r["character_id"])][:n]
+        return {
+            "selected": resolvable_ids,
+            "reasoning": "[stub]",
+            "selection_operator": "stub",
+            "selection_degraded": False,
+        }
+
     pinned = with_entity or None
 
     lines = []
@@ -416,13 +425,17 @@ Respond with ONLY a JSON object:
         "presence together would produce a scene worth reading."
     )
 
-    raw = call_claude_cli(
-        prompt=prompt,
+    _sel_prov = []
+    raw = call_operator(
+        "gravitywell",
+        prompt,
         system=system_msg,
-        model="sonnet",
+        temperature=0.4,
         timeout=300,
         json_mode=True,
+        on_wake_fail="sonnet",
         log=log,
+        _provenance_out=_sel_prov,
     )
     if not raw:
         raise RuntimeError("Entity selection failed — Claude CLI returned nothing")
@@ -471,13 +484,16 @@ Respond with ONLY a JSON object:
             f"the ROSTER. Return the same JSON shape."
         )
         retry_prompt = prompt + f"\n\n--- CORRECTION NEEDED ---\n{retry_note}"
-        raw2 = call_claude_cli(
-            prompt=retry_prompt,
+        raw2 = call_operator(
+            "gravitywell",
+            retry_prompt,
             system=system_msg,
-            model="sonnet",
+            temperature=0.4,
             timeout=300,
             json_mode=True,
+            on_wake_fail="sonnet",
             log=log,
+            _provenance_out=_sel_prov,
         )
         data2 = _extract_json(raw2 or "")
         active_data = data2
@@ -503,7 +519,26 @@ Respond with ONLY a JSON object:
         raise RuntimeError(
             f"Selection returned duplicate entities: {resolved}"
         )
-    return {"selected": resolved, "reasoning": active_data.get("reasoning", "")}
+
+    # Derive selection_operator from provenance (last success entry)
+    selection_operator = "unknown"
+    if _sel_prov:
+        for reason, operator in reversed(_sel_prov):
+            if reason == "success":
+                selection_operator = operator
+                break
+        # If no success, take the first operator mentioned (fallback case)
+        if selection_operator == "unknown" and _sel_prov:
+            selection_operator = _sel_prov[-1][1]
+
+    selection_degraded = selection_operator != "gravitywell"
+
+    return {
+        "selected": resolved,
+        "reasoning": active_data.get("reasoning", ""),
+        "selection_operator": selection_operator,
+        "selection_degraded": selection_degraded,
+    }
 
 
 def _extract_json(text: str) -> dict:
@@ -815,6 +850,7 @@ def run_deliberation(run_id: str) -> None:
             kernel_version=kernel_version, cache=_cache,
         )
         run["completed_at"] = datetime.now().isoformat(timespec="seconds")
+        run["paid_spend"] = _calculate_paid_spend(run)
         save_run(run)
         return
 
@@ -874,11 +910,13 @@ def run_deliberation(run_id: str) -> None:
                 kernel_version=kernel_version, cache=_cache,
             )
         run["completed_at"] = datetime.now().isoformat(timespec="seconds")
+        run["paid_spend"] = _calculate_paid_spend(run)
         save_run(run)
     except Exception as e:
         run["status"] = "failed"
         run["error"] = f"{type(e).__name__}: {e}"
         run["completed_at"] = datetime.now().isoformat(timespec="seconds")
+        run["paid_spend"] = _calculate_paid_spend(run)
         save_run(run)
         raise
 
@@ -1052,6 +1090,23 @@ def _parse_synthesis(text: str) -> dict:
     }
 
 
+def _calculate_paid_spend(run: dict) -> bool:
+    """Derive paid_spend flag from selection and voicing provenance.
+
+    Returns True if the run incurred paid spend:
+    - selector fell back to a paid model, or
+    - voicing fell back to a paid model, or
+    - voicing explicitly requested a paid model, or
+    - selection explicitly used a paid model.
+    """
+    return bool(
+        run.get("selection_degraded")
+        or run.get("voicing_degraded")
+        or run.get("voicing") in ("haiku", "sonnet", "opus")
+        or run.get("selection_voicing") in ("haiku", "sonnet", "opus")
+    )
+
+
 def _status_from_synthesis(synthesis: dict) -> str:
     """Map synthesis confidence to run status.
 
@@ -1175,7 +1230,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             flush=True,
         )
 
-    print("[council] selecting entities (via claude sonnet)...", flush=True)
+    print("[council] selecting entities (via gravitywell, fallback=sonnet)...", flush=True)
     selection = select_entities(
         decision=args.decision,
         roster=roster,
@@ -1205,6 +1260,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
             narrator_voice=args.narrator_voice,
         ),
         "selection_reasoning": selection["reasoning"],
+        "selection_voicing": selection.get("selection_operator", "unknown"),
+        "selection_degraded": selection.get("selection_degraded", False),
         "voicing": args.voicing,
         "turns_cap": args.turns,
         "turns": [],
