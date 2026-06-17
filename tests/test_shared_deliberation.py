@@ -215,9 +215,11 @@ async def test_both_legs_fail(monkeypatch, init_semaphore):
     """If both legs fail, HTTP service returns 500."""
     from fastapi.testclient import TestClient
     from agents_core.shared_deliberation.service import create_app
+    from agents_core.shared_deliberation import orchestrator
 
     monkeypatch.setenv("FACETS_DISPATCH_DISABLED", "1")
-    monkeypatch.setenv("SHARED_DELIBERATION_COUNCIL_STUB", "0")  # Disable stub; no real submission
+    # Monkeypatch _submit_council to return None (council leg fails)
+    monkeypatch.setattr(orchestrator, "_submit_council", lambda text, voicing: None)
 
     app = create_app()
     client = TestClient(app)

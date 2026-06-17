@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 import httpx
 
@@ -33,11 +34,12 @@ class SharedDeliberationClient:
         if self.bearer_token:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
 
+        timeout = float(os.environ.get("SHARED_DELIBERATION_CLIENT_TIMEOUT_S", "2400.0"))
         response = await self._client.post(
             f"{self.base_url}/v0/deliberate",
             json=request.to_dict(),
             headers=headers,
-            timeout=30.0,
+            timeout=timeout,
         )
         response.raise_for_status()
         data = response.json()
