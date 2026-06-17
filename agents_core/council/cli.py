@@ -898,6 +898,20 @@ def run_deliberation(run_id: str) -> None:
         # Record effective voicing from adapter (gravitywell or fallback)
         _apply_voicing_provenance(run, adapter)
 
+        # Emit in-stream voicing-degradation signal (Leg A of gw-voicing-stdout-signal-v0)
+        if run.get("voicing") == "gravitywell":
+            run_id = run.get("id", "unknown")
+            requested = run.get("voicing", "unknown")
+            if run["voicing_degraded"] is True:
+                reason = run.get("voicing_degraded_reason", "unknown")
+                effective = run.get("effective_voicing", "unknown")
+                print(f"[council] VOICING DEGRADED run_id={run_id} requested={requested} effective={effective} reason={reason}", flush=True)
+            elif run["voicing_degraded"] is False and run.get("effective_voicing") == "gravitywell":
+                # SENTINEL guard: only emit positive line if adapter actually produced voicing_events
+                # (avoids spurious "voicing ok" from the no-events path at line 975-976)
+                if isinstance(adapter, GravityWellAdapter) and adapter.voicing_events:
+                    print(f"[council] voicing ok run_id={run_id} effective=gravitywell", flush=True)
+
         if mode == "scene":
             run["status"] = "closed"
         else:
