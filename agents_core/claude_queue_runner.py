@@ -19,6 +19,7 @@ prints the result and exits; the file-write lives here, not there, mirroring
 """
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -65,6 +66,8 @@ _COUNCIL_DIR = Path("/srv/lapis/council")
 _COUNCIL_LOG_DIR = Path("/srv/lapis/council/logs")
 _COUNCIL_ORPHAN_AGE_SECS = int(os.environ.get("COUNCIL_ORPHAN_AGE_SECS", "3600"))
 
+SILENCED_LOG = Path("/srv/lapis/notify-audit/silenced.jsonl")
+
 # Terminal status sets per mode.
 _DELIBERATION_TERMINAL = frozenset({"resolved", "open", "laid-down"})
 _SCENE_TERMINAL = frozenset({"closed"})
@@ -107,6 +110,56 @@ def _extract_ops_primitives(task_id: str, task_type: str,
 
 
 # ---------------------------------------------------------------------------
+# Failure classification and silenced-event logging
+# ---------------------------------------------------------------------------
+
+def _failure_class(result: str) -> str:
+    """Classify a failure result string as 'infra' or 'execution'.
+
+    Inspects only the **first line** of the formatted result string
+    (e.g. "EXIT 1:\n…", "ERROR: worktree_setup:\n…"), not raw subprocess output.
+    This is distinct from _classify_runner_failure which scans all lines.
+
+    Contract: use startswith (not substring 'in') to match prefixes.
+    """
+    lines = result.splitlines()
+    first = lines[0] if lines else ""
+
+    if first.startswith("ERROR:"):
+        return "infra"
+    if first.startswith(("EXIT ", "TIMEOUT:", "INTERRUPTED ")):
+        return "execution"
+    return "infra"  # unknown/empty → conservative infra
+
+
+def _log_silenced(event: str, task: dict, *, failure_class: str | None,
+                  demoted_from: str, result: str) -> None:
+    """Append one JSON line to SILENCED_LOG for a demoted notification.
+
+    Best-effort: wrap the whole body in try/except so a logging failure
+    never raises and never causes a push.
+    """
+    try:
+        SILENCED_LOG.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(PACIFIC).isoformat()
+        result_head = (result.splitlines()[0] if result else "")[:300]
+        entry = {
+            "ts": ts,
+            "source": "claude_queue_runner",
+            "task_id": task.get("id"),
+            "description": _fmt_task_label(task),
+            "event": event,
+            "failure_class": failure_class,
+            "demoted_from": demoted_from,
+            "result_head": result_head,
+        }
+        with open(SILENCED_LOG, "a") as f:
+            f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    except Exception as e:
+        log.warning(f"failed to log silenced event: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Notification helpers
 #
 # These are local to the runner. `agents_core.notify` exports
@@ -125,6 +178,11 @@ def _fmt_task_label(task: dict) -> str:
 def notify_completion(task: dict, output_path: str) -> None:
     if not task.get("notify"):
         return
+    policy = task.get("notify_policy", "always")
+    if policy == "infra-only":
+        _log_silenced("completion", task, failure_class=None,
+                     demoted_from="NORMAL", result="")
+        return
     send_notification(
         message=f"Claude task completed: {_fmt_task_label(task)}\nOutput: {output_path}",
         title="claude-queue",
@@ -134,6 +192,19 @@ def notify_completion(task: dict, output_path: str) -> None:
 
 def notify_failure(task: dict, result: str) -> None:
     if not task.get("notify"):
+        return
+    policy = task.get("notify_policy", "always")
+    if policy == "infra-only":
+        cls = _failure_class(result)
+        if cls == "infra":
+            send_notification(
+                message=f"Claude task FAILED (infra): {_fmt_task_label(task)}\n{result.splitlines()[0][:300] if result else '(no output)'}",
+                title="claude-queue",
+                priority=PushoverPriority.HIGH,
+            )
+        else:
+            _log_silenced("failure", task, failure_class=cls,
+                         demoted_from="HIGH", result=result)
         return
     summary = result.splitlines()[0][:300] if result else "(no output)"
     send_notification(

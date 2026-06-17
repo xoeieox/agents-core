@@ -165,6 +165,7 @@ TASK_DEFAULTS = {
     "submitted_by": "unknown",
     "timeout_seconds": 300,
     "notify": False,
+    "notify_policy": "always",
     "model": None,
     "payload": {},
     "description": None,
