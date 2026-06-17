@@ -466,3 +466,207 @@ def test_cmd_submit_passes_recent_pair_ids_to_select_entities(tmp_path, monkeypa
     out = capsys.readouterr().out
     assert "recency penalty" in out
     assert "ada-lovelace-canonical" in out
+
+
+# ---------------------------------------------------------------------------
+# Provenance and paid_spend tests
+# ---------------------------------------------------------------------------
+
+
+def test_select_entities_stub_path_returns_provenance_fields(tmp_path, monkeypatch):
+    """Verify stub mode returns selection_operator and selection_degraded, and does not call call_operator."""
+    from agents_core.council import cli as council_cli
+
+    monkeypatch.setenv("COUNCIL_ENGINE_STUB", "1")
+
+    # Mock call_operator to ensure it's never called in stub mode
+    mock_call_operator = MagicMock()
+    monkeypatch.setattr(council_cli, "call_operator", mock_call_operator)
+
+    # Build minimal roster
+    roster = [
+        {"character_id": "a", "character_name": "A", "pool": "test", "cultural_context": ""},
+        {"character_id": "b", "character_name": "B", "pool": "test", "cultural_context": ""},
+    ]
+
+    result = council_cli.select_entities(
+        decision="test",
+        roster=roster,
+        context={"terms": [], "hits": []},
+        n=2,
+    )
+
+    assert "selected" in result
+    assert "reasoning" in result
+    assert result["selection_operator"] == "stub"
+    assert result["selection_degraded"] is False
+    # Hermeticity check: call_operator must not be called in stub mode
+    mock_call_operator.assert_not_called()
+
+
+def test_select_entities_real_path_with_mocked_call_operator(tmp_path, monkeypatch):
+    """Verify real-path select_entities with mocked call_operator derives selection_operator and selection_degraded."""
+    from agents_core.council import cli as council_cli
+
+    # Ensure COUNCIL_ENGINE_STUB is NOT set (real path)
+    monkeypatch.delenv("COUNCIL_ENGINE_STUB", raising=False)
+
+    # Build minimal roster with resolvable character_ids
+    roster = [
+        {"character_id": "a", "character_name": "A", "pool": "test", "cultural_context": ""},
+        {"character_id": "b", "character_name": "B", "pool": "test", "cultural_context": ""},
+    ]
+
+    # Mock call_operator to return valid JSON selection
+    mock_response = '{"selected": ["a", "b"], "reasoning": "tension"}'
+
+    def mock_call_operator(operator, prompt, **kwargs):
+        # Populate _provenance_out if provided
+        prov_out = kwargs.get("_provenance_out")
+        if prov_out is not None:
+            prov_out.append(("success", operator))
+        return mock_response
+
+    monkeypatch.setattr(council_cli, "call_operator", mock_call_operator)
+
+    # Mock find_card_path to make all ids resolvable
+    monkeypatch.setattr(council_cli, "find_card_path", lambda cid: Path(f"/fake/{cid}.yaml"))
+
+    result = council_cli.select_entities(
+        decision="test",
+        roster=roster,
+        context={"terms": [], "hits": []},
+        n=2,
+    )
+
+    # Verify provenance fields are set correctly
+    assert result["selection_operator"] == "gravitywell"
+    assert result["selection_degraded"] is False
+    assert result["selected"] == ["a", "b"]
+    assert "reasoning" in result
+
+
+def test_cmd_submit_run_dict_includes_selection_provenance(tmp_path, monkeypatch):
+    """Verify run dict includes selection_voicing and selection_degraded."""
+    from agents_core.council import cli as council_cli
+
+    monkeypatch.setattr(council_cli, "COUNCIL_DIR", tmp_path)
+    monkeypatch.setattr(council_cli, "LOG_DIR", tmp_path / "logs")
+
+    mock_selection = {
+        "selected": ["a", "b"],
+        "reasoning": "test",
+        "selection_operator": "gravitywell",
+        "selection_degraded": False,
+    }
+
+    class _FakeQueue:
+        def submit(self, task, task_id=None):
+            return task_id
+
+    monkeypatch.setattr(council_cli, "gather_mem_context", lambda d: {"terms": [], "hits": []})
+    monkeypatch.setattr(council_cli, "build_roster", lambda: [])
+    monkeypatch.setattr(council_cli, "select_entities", lambda **kw: mock_selection)
+
+    import agents_core.claude_queue as cq_mod
+    monkeypatch.setattr(cq_mod, "ClaudeQueue", lambda: _FakeQueue())
+
+    council_cli.cmd_submit(_make_submit_args())
+
+    yamls = list(tmp_path.glob("*.yaml"))
+    assert len(yamls) == 1
+    run_data = yaml.safe_load(yamls[0].read_text())
+    assert run_data["selection_voicing"] == "gravitywell"
+    assert run_data["selection_degraded"] is False
+
+
+def test_stub_deliberation_includes_paid_spend(tmp_path, monkeypatch):
+    """Verify stub-mode run sets paid_spend correctly."""
+    from agents_core.council import cli as council_cli
+    from agents_core.council import cache
+
+    monkeypatch.setattr(council_cli, "COUNCIL_DIR", tmp_path)
+    monkeypatch.setattr(cache, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setenv("COUNCIL_ENGINE_STUB", "1")
+    monkeypatch.setenv("COUNCIL_STUB_POSITIONS", "agree,agree")
+
+    run_id = "2026-06-17-test-paid-spend"
+    run = {
+        "run_id": run_id,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "status": "deliberating",
+        "mode": "deliberation",
+        "decision": "Test decision",
+        "context_gathered": {"terms": [], "hits": []},
+        "selected_entities": [
+            {"id": "entity-a", "role": "first_voice"},
+            {"id": "entity-b", "role": "second_voice"},
+        ],
+        "selection_reasoning": "stub test",
+        "selection_voicing": "stub",
+        "selection_degraded": False,
+        "voicing": "gravitywell",
+        "turns_cap": 8,
+        "turns": [],
+    }
+    run_yaml = tmp_path / f"{run_id}.yaml"
+    run_yaml.write_text(yaml.safe_dump(run, sort_keys=False, allow_unicode=True))
+
+    council_cli.run_deliberation(run_id)
+    result = yaml.safe_load(run_yaml.read_text())
+
+    assert "paid_spend" in result
+    # With selection_degraded=False and voicing="gravitywell", paid_spend should be False
+    assert result["paid_spend"] is False
+
+
+def test_paid_spend_flag_set_when_selection_degraded(tmp_path, monkeypatch):
+    """Verify paid_spend is True when selection_degraded is True."""
+    from agents_core.council import cli as council_cli
+
+    run = {
+        "selection_degraded": True,
+        "selection_voicing": "sonnet",
+        "voicing_degraded": False,
+        "voicing": "gravitywell",
+    }
+    assert council_cli._calculate_paid_spend(run) is True
+
+
+def test_paid_spend_flag_set_when_voicing_degraded(tmp_path, monkeypatch):
+    """Verify paid_spend is True when voicing_degraded is True."""
+    from agents_core.council import cli as council_cli
+
+    run = {
+        "selection_degraded": False,
+        "selection_voicing": "gravitywell",
+        "voicing_degraded": True,
+        "voicing": "sonnet",
+    }
+    assert council_cli._calculate_paid_spend(run) is True
+
+
+def test_paid_spend_flag_set_when_explicit_paid_voicing(tmp_path, monkeypatch):
+    """Verify paid_spend is True when voicing is explicitly paid."""
+    from agents_core.council import cli as council_cli
+
+    run = {
+        "selection_degraded": False,
+        "selection_voicing": "gravitywell",
+        "voicing_degraded": False,
+        "voicing": "sonnet",
+    }
+    assert council_cli._calculate_paid_spend(run) is True
+
+
+def test_paid_spend_flag_false_for_free_voicing(tmp_path, monkeypatch):
+    """Verify paid_spend is False for free voicing and selection."""
+    from agents_core.council import cli as council_cli
+
+    run = {
+        "selection_degraded": False,
+        "selection_voicing": "gravitywell",
+        "voicing_degraded": False,
+        "voicing": "gravitywell",
+    }
+    assert council_cli._calculate_paid_spend(run) is False
