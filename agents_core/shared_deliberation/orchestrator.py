@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import subprocess
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -24,11 +23,24 @@ log = logging.getLogger("shared-deliberation")
 # Bounded concurrency for Facets subprocesses (gate against GW lane stampede)
 _facets_semaphore: Optional[asyncio.Semaphore] = None
 
+# Reserved seam modes for jagged-seam tap (v0: empty; H3 will register modes here)
+_registered_seam_modes: list = []
+
 
 def init_facets_semaphore(max_concurrent: int = 2) -> None:
     """Initialize the Facets concurrency gate. Called once at service startup."""
     global _facets_semaphore
     _facets_semaphore = asyncio.Semaphore(max_concurrent)
+
+
+def register_seam_mode(mode) -> None:
+    """Register a seam mode for jagged-seam deliberation (H3 tap).
+
+    The mode must implement: async def run(seam_config, text, context) -> dict
+    with keys: name, ok, result, errors.
+    """
+    global _registered_seam_modes
+    _registered_seam_modes.append(mode)
 
 
 async def _facets_subprocess(
@@ -143,7 +155,9 @@ async def _council_subprocess(
     if not run_id:
         return (False, None, None, "Failed to submit council")
 
-    council_data, error = await asyncio.to_thread(_poll_council, run_id)
+    # Read timeout from env; default 1800s (30 min)
+    timeout_s = int(os.environ.get("SHARED_DELIBERATION_COUNCIL_TIMEOUT_S", "1800"))
+    council_data, error = await asyncio.to_thread(_poll_council, run_id, timeout_s)
     if error:
         return (False, run_id, None, error)
 
@@ -235,16 +249,9 @@ def _poll_council(run_id: str, timeout_s: int = 1800) -> tuple[Optional[dict], O
             return (None, error)
 
     # Timeout
-    return (
-        {
-            "status": "timeout",
-            "landing": None,
-            "confidence": None,
-            "open_questions": [],
-            "positions": [],
-        },
-        None,
-    )
+    error = f"Council poll timeout after {timeout_s}s"
+    log.error(error)
+    return (None, error)
 
 
 async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope:
@@ -262,24 +269,30 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
     triage_escalated = False
     triage_reason = "caller-requested"
 
-    # Run Facets always
-    facets_ok, facets_dict, facets_id, facets_error = await _facets_subprocess(
-        request.text,
-        request.context,
-        request.facets_operator,
-    )
+    # Run both legs concurrently via asyncio.gather
+    async def _facets_leg():
+        return await _facets_subprocess(
+            request.text,
+            request.context,
+            request.facets_operator,
+        )
 
-    # Run Council only if triage == "full"
-    council_ok = False
-    council_run_id = None
-    council_data = None
-    council_error = None
-
-    if triage == "full":
-        council_ok, council_run_id, council_data, council_error = await _council_subprocess(
+    async def _council_leg():
+        # Council only runs if triage == "full"; otherwise return (False, None, None, None)
+        if triage != "full":
+            return (False, None, None, None)
+        return await _council_subprocess(
             request.text,
             request.council_voicing,
         )
+
+    facets_result, council_result = await asyncio.gather(
+        _facets_leg(),
+        _council_leg(),
+    )
+
+    facets_ok, facets_dict, facets_id, facets_error = facets_result
+    council_ok, council_run_id, council_data, council_error = council_result
 
     # Extract operator info from Facets
     operator_requested = None

@@ -212,21 +212,25 @@ async def test_facets_failure_council_success(monkeypatch, stub_council, init_se
 
 @pytest.mark.asyncio
 async def test_both_legs_fail(monkeypatch, init_semaphore):
-    """If both legs fail, envelope still returns with both _ok=False."""
+    """If both legs fail, HTTP service returns 500."""
+    from fastapi.testclient import TestClient
+    from agents_core.shared_deliberation.service import create_app
+
     monkeypatch.setenv("FACETS_DISPATCH_DISABLED", "1")
     monkeypatch.setenv("SHARED_DELIBERATION_COUNCIL_STUB", "0")  # Disable stub; no real submission
 
-    request = DeliberationRequest(
-        text="Test",
-        context={},
-        triage="full",
-    )
-    envelope = await run_deliberation(request)
+    app = create_app()
+    client = TestClient(app)
 
-    # Both failed
-    assert envelope.facets_ok is False
-    assert envelope.council_ok is False
-    # Still HTTP 200; errors dict has details
+    request_data = {
+        "text": "Test",
+        "context": {},
+        "triage": "full",
+    }
+    response = client.post("/v0/deliberate", json=request_data)
+
+    # Both failed -> HTTP 500
+    assert response.status_code == 500
 
 
 # Test 7: Client integration

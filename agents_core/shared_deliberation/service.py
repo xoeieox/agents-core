@@ -79,10 +79,16 @@ def create_app() -> FastAPI:
 
         try:
             envelope = await run_deliberation(req)
+            # Check for total failure: both legs failed (both *_ok=False)
+            # For lightweight triage, council is not attempted, so only check facets
+            if envelope.triage == "full" and not envelope.facets_ok and not envelope.council_ok:
+                # Total orchestration failure
+                raise HTTPException(status_code=500, detail="Both Facets and Council failed")
             return envelope.to_dict()
+        except HTTPException:
+            raise
         except Exception as e:
             log.exception("Deliberation error")
-            # Partial failure still returns 200; only return 5xx on total orchestration failure
             raise HTTPException(status_code=500, detail=f"Orchestration error: {e}")
 
     return app
