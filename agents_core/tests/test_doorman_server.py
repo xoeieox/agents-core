@@ -1081,16 +1081,24 @@ class TestServingCache:
             if tick_count["n"] >= 2:
                 state.idle_since = None
 
+        # Mock _refresh_serving_cache to not write cache in the loop,
+        # so we can test that the stop path itself sets the cache
+        original_refresh = state._refresh_serving_cache
+        def no_cache_refresh():
+            # Probe but don't write cache (to isolate the stop-path cache write)
+            state._is_serving(timeout=2.0)
+
         with patch("subprocess.run", side_effect=fake_run), \
              patch("time.sleep", side_effect=fake_sleep), \
              patch.object(state, "_is_serving", return_value=False), \
+             patch.object(state, "_refresh_serving_cache", side_effect=no_cache_refresh), \
              patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0), \
              patch("agents_core.doorman_server.GW_STOP_GRACE_SEC", 600), \
              patch("agents_core.doorman_server._write_idle_log"):
             t = _start_refresh_thread(nodes)
             t.join(timeout=2.0)
 
-        # After stop success, cache must be False
+        # After stop success, cache must be False (set by the stop path, not refresh)
         assert state._cached_serving is False
         assert state._serving_checked_at > 0
 
@@ -1114,16 +1122,25 @@ class TestServingCache:
             if tick_count["n"] >= 2:
                 pass
 
+        # Mock _refresh_serving_cache to not write cache in the loop,
+        # so we can test that the idempotency-success path sets the cache
+        original_refresh = state._refresh_serving_cache
+        def no_cache_refresh():
+            # Probe but don't write cache (to isolate the stop-path cache write)
+            state._is_serving(timeout=2.0)
+
         # _is_serving returns False → idempotency success → cache should be False
         with patch("subprocess.run", side_effect=fake_run), \
              patch("time.sleep", side_effect=fake_sleep), \
              patch.object(state, "_is_serving", return_value=False), \
+             patch.object(state, "_refresh_serving_cache", side_effect=no_cache_refresh), \
              patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0), \
              patch("agents_core.doorman_server.GW_STOP_GRACE_SEC", 600), \
              patch("agents_core.doorman_server._write_idle_log"):
             t = _start_refresh_thread(nodes)
             t.join(timeout=2.0)
 
+        # Cache must be False from idempotency-success path (rc!=0 but already down)
         assert state._cached_serving is False
         assert state._serving_checked_at > 0
 
@@ -1191,7 +1208,9 @@ class TestServingCache:
             if sleep_calls:
                 state.idle_since = None
 
-        with patch.object(state, "_refresh_serving_cache", side_effect=tracked_refresh), \
+        # Mock _is_serving so original_refresh() doesn't make live HTTP calls
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch.object(state, "_refresh_serving_cache", side_effect=tracked_refresh), \
              patch("time.sleep", side_effect=tracked_sleep), \
              patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0.1):
             t = _start_refresh_thread(nodes)
