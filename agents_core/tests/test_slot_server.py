@@ -19,6 +19,7 @@ from __future__ import annotations
 import multiprocessing
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -373,3 +374,193 @@ class TestCRUD:
         r = client.get("/v0/stats")
         assert r.status_code == 200
         assert r.json()["total_slots"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# ETag conditional reads (AC1-AC4) + Cache-Control headers
+# ---------------------------------------------------------------------------
+
+class TestETags:
+    @pytest.fixture
+    def client(self, db):
+        return _client(db, "")
+
+    @pytest.fixture
+    def sid(self, client):
+        r = client.post(
+            "/v0/slots",
+            json={"project_id": "proj-A", "contributor": {"type": "fixer", "id": "agent-1"}},
+        )
+        assert r.status_code == 201
+        return r.json()["slot_id"]
+
+    def test_list_slots_returns_etag_header(self, client, sid):
+        """AC1: GET /v0/slots returns ETag header."""
+        r = client.get("/v0/slots")
+        assert r.status_code == 200
+        assert "ETag" in r.headers
+        assert r.headers["ETag"].startswith('"')
+
+    def test_list_slots_returns_cache_control_header(self, client, sid):
+        """AC1: GET /v0/slots returns Cache-Control: no-cache header."""
+        r = client.get("/v0/slots")
+        assert r.status_code == 200
+        assert "Cache-Control" in r.headers
+        assert "no-cache" in r.headers["Cache-Control"]
+
+    def test_etag_stable_across_identical_requests(self, client, sid):
+        """AC1: ETag is stable across two identical requests with no intervening writes."""
+        r1 = client.get("/v0/slots")
+        etag1 = r1.headers["ETag"]
+        r2 = client.get("/v0/slots")
+        etag2 = r2.headers["ETag"]
+        assert etag1 == etag2
+
+    def test_304_on_if_none_match_match(self, client, sid):
+        """AC2: If-None-Match matching the ETag returns 304 Not Modified.
+        Verify query() is NOT called when 304 fires (optimization validates)."""
+        r1 = client.get("/v0/slots")
+        etag = r1.headers["ETag"]
+        # Spy on SlotStore.query to verify it is NOT called on 304.
+        with patch('agents_core.slot_server.SlotStore.query') as mock_query:
+            r2 = client.get("/v0/slots", headers={"If-None-Match": etag})
+            assert r2.status_code == 304
+            assert r2.headers["ETag"] == etag
+            # 304 should have empty body
+            assert r2.text == ""
+            # Verify query was NOT called (only read_version should run).
+            mock_query.assert_not_called()
+
+    def test_200_on_if_none_match_mismatch(self, client, sid):
+        """AC2: If-None-Match NOT matching returns 200 with content."""
+        r1 = client.get("/v0/slots")
+        r2 = client.get("/v0/slots", headers={"If-None-Match": '"wrong-etag"'})
+        assert r2.status_code == 200
+        assert "ETag" in r2.headers
+        assert len(r2.json()) >= 1
+
+    def test_etag_changes_after_create(self, client, sid):
+        """AC3: ETag for a query changes after an insert."""
+        r1 = client.get("/v0/slots")
+        etag1 = r1.headers["ETag"]
+        # Create another slot
+        client.post(
+            "/v0/slots",
+            json={"project_id": "proj-A", "contributor": {"type": "fixer", "id": "agent-2"}},
+        )
+        r2 = client.get("/v0/slots")
+        etag2 = r2.headers["ETag"]
+        assert etag1 != etag2
+
+    def test_etag_changes_after_update(self, client, sid):
+        """AC3: ETag changes after an update."""
+        r1 = client.get("/v0/slots")
+        etag1 = r1.headers["ETag"]
+        # Update a slot status
+        client.post(f"/v0/slots/{sid}/status", json={"status": "in-progress", "by": "agent-1"})
+        r2 = client.get("/v0/slots")
+        etag2 = r2.headers["ETag"]
+        assert etag1 != etag2
+
+    def test_etag_changes_after_expire(self, client, db):
+        """AC3: ETag changes after a delete/expire at the HTTP layer."""
+        # Create a parked slot.
+        r = client.post(
+            "/v0/slots",
+            json={"project_id": "proj-A", "contributor": {"type": "fixer", "id": "agent-1"}, "status": "parked"},
+        )
+        sid = r.json()["slot_id"]
+        # Get the ETag before expiration.
+        r1 = client.get("/v0/slots")
+        etag1 = r1.headers["ETag"]
+        # Manually update the slot's last_update to be > 30 days old so it's eligible for expiration.
+        from datetime import datetime, timedelta, timezone
+        # Access the store via a fresh instance to the same DB.
+        store = SlotStore(db_path=db)
+        old_date = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+        with store._lock:
+            store._conn.execute(
+                "UPDATE slots SET last_update=? WHERE slot_id=?",
+                (old_date, sid),
+            )
+            store._conn.commit()
+        store.close()
+        # Call expire via HTTP.
+        client.post("/v0/expire")
+        r2 = client.get("/v0/slots")
+        etag2 = r2.headers["ETag"]
+        # ETag should change (the old parked slot was deleted, so COUNT decreased).
+        assert etag1 != etag2
+
+    def test_etag_filter_specific_project(self, client):
+        """AC4: ETag changes when filter changes."""
+        # Create two slots in different projects
+        r1 = client.post(
+            "/v0/slots",
+            json={"project_id": "proj-A", "contributor": {"type": "fixer", "id": "agent-1"}},
+        )
+        sid_a = r1.json()["slot_id"]
+        client.post(
+            "/v0/slots",
+            json={"project_id": "proj-B", "contributor": {"type": "fixer", "id": "agent-1"}},
+        )
+        # ETags for different project filters should differ
+        r_a = client.get("/v0/slots?project_id=proj-A")
+        r_b = client.get("/v0/slots?project_id=proj-B")
+        r_all = client.get("/v0/slots")
+        assert r_a.headers["ETag"] != r_b.headers["ETag"]
+        assert r_a.headers["ETag"] != r_all.headers["ETag"]
+        assert r_b.headers["ETag"] != r_all.headers["ETag"]
+
+    def test_cross_filter_if_none_match_does_not_304(self, client):
+        """AC4: Cross-filter If-None-Match does NOT return 304.
+        An ETag from proj-A query must not match when sent with proj-B query."""
+        # Create slots in different projects.
+        client.post(
+            "/v0/slots",
+            json={"project_id": "proj-A", "contributor": {"type": "fixer", "id": "agent-1"}},
+        )
+        client.post(
+            "/v0/slots",
+            json={"project_id": "proj-B", "contributor": {"type": "fixer", "id": "agent-1"}},
+        )
+        # Get ETag for proj-A.
+        r_a = client.get("/v0/slots?project_id=proj-A")
+        etag_a = r_a.headers["ETag"]
+        # Send proj-A's ETag as If-None-Match with proj-B query — should return 200 (mismatch).
+        r_b = client.get("/v0/slots?project_id=proj-B", headers={"If-None-Match": etag_a})
+        assert r_b.status_code == 200
+        # Verify the response contains the proj-B slot(s).
+        assert "ETag" in r_b.headers
+        assert len(r_b.json()) >= 1
+
+    def test_get_slot_returns_etag_header(self, client, sid):
+        """AC1: GET /v0/slots/{slot_id} returns ETag header."""
+        r = client.get(f"/v0/slots/{sid}")
+        assert r.status_code == 200
+        assert "ETag" in r.headers
+        assert r.headers["ETag"].startswith('"')
+
+    def test_get_slot_returns_cache_control_header(self, client, sid):
+        """AC1: GET /v0/slots/{slot_id} returns Cache-Control: no-cache header."""
+        r = client.get(f"/v0/slots/{sid}")
+        assert r.status_code == 200
+        assert "Cache-Control" in r.headers
+
+    def test_get_slot_304_on_match(self, client, sid):
+        """AC2: GET /v0/slots/{slot_id} with matching If-None-Match returns 304."""
+        r1 = client.get(f"/v0/slots/{sid}")
+        etag = r1.headers["ETag"]
+        r2 = client.get(f"/v0/slots/{sid}", headers={"If-None-Match": etag})
+        assert r2.status_code == 304
+        assert r2.headers["ETag"] == etag
+
+    def test_get_slot_etag_changes_after_update(self, client, sid):
+        """AC3: ETag for a specific slot changes after updating it."""
+        r1 = client.get(f"/v0/slots/{sid}")
+        etag1 = r1.headers["ETag"]
+        # Update the slot
+        client.post(f"/v0/slots/{sid}/status", json={"status": "landed", "by": "agent-1"})
+        r2 = client.get(f"/v0/slots/{sid}")
+        etag2 = r2.headers["ETag"]
+        assert etag1 != etag2

@@ -30,7 +30,9 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import socket
 import sqlite3
@@ -131,6 +133,102 @@ _ADDED_COLUMNS = (
 )
 
 
+class _AdjacentCache:
+    """Single-flight + short-TTL micro-cache for adjacent() calls.
+
+    Pattern adapted (clean-room, no code copied) from the Fast Gemma Challenge dashboard:
+    huggingface.co/spaces/gemma-challenge/gemma-dashboard — single-flight+serve-stale.
+
+    Designed for **sync-threaded** execution (FastAPI threadpool + threading primitives).
+    A future migration to asyncio handlers would silently break this cache.
+    """
+
+    def __init__(self, ttl_sec: float = 2.0):
+        """ttl_sec: cache lifetime (0 disables cache)."""
+        self._cache: dict[tuple, tuple[float, list[dict]]] = {}  # key -> (computed_at, result)
+        self._inflight: dict[tuple, threading.Event] = {}  # key -> Event (per-key single-flight)
+        self._inflight_errors: dict[tuple, Exception] = {}  # key -> Exception on compute failure
+        self._lock = threading.Lock()
+        self._ttl_sec = ttl_sec
+
+    def get(self, key: tuple, compute_fn, store_ref: "SlotStore") -> list[dict]:
+        """Get cached result or compute once (single-flight dedup) per key.
+
+        Args:
+            key: (tuple(sorted(files)), tuple(sorted(mem_keys)), exclude_slot_id, include_inactive)
+            compute_fn: callable() -> list[dict] that runs the actual scan
+            store_ref: the SlotStore instance, for serve-stale error handling
+
+        Returns: list[dict] result from cache, in-flight, or fresh compute.
+        Raises: sqlite3.OperationalError if compute fails and no cache exists.
+        On compute error with warm cache, logs a warning and returns last-good result.
+        """
+        now = datetime.now(timezone.utc).timestamp()
+        should_compute = False
+
+        with self._lock:
+            # Check cache validity (only if TTL > 0, i.e., caching is enabled).
+            if self._ttl_sec > 0 and key in self._cache:
+                computed_at, cached_result = self._cache[key]
+                age = now - computed_at
+                if age < self._ttl_sec:
+                    return cached_result
+                # else: cache expired, fall through to compute (don't return yet)
+
+            # Check if another thread is computing this key — wait for it (only if caching enabled).
+            if self._ttl_sec > 0 and key in self._inflight:
+                event = self._inflight[key]
+            else:
+                # First caller for this key (or caching disabled) — compute fresh.
+                if self._ttl_sec > 0:
+                    event = threading.Event()
+                    self._inflight[key] = event
+                else:
+                    event = None
+                should_compute = True
+
+        if should_compute:
+            try:
+                result = compute_fn()
+                if self._ttl_sec > 0:
+                    with self._lock:
+                        self._cache[key] = (now, result)
+                        self._inflight.pop(key, None)
+                        self._inflight_errors.pop(key, None)
+                        event.set()
+                return result
+            except sqlite3.OperationalError as e:
+                # Serve-stale on DB contention/lock.
+                with self._lock:
+                    if self._ttl_sec > 0 and key in self._cache:
+                        _, cached = self._cache[key]
+                        logging.warning(
+                            f"adjacent() scan failed (DB busy), serving stale cache: {e}"
+                        )
+                        self._inflight.pop(key, None)
+                        self._inflight_errors.pop(key, None)
+                        event.set()
+                        return cached
+                    if event is not None:
+                        self._inflight.pop(key, None)
+                        self._inflight_errors[key] = e
+                        event.set()
+                raise
+        else:
+            # Wait for the in-flight computation to finish.
+            event.wait()
+            with self._lock:
+                # Check if the in-flight compute failed.
+                if key in self._inflight_errors:
+                    error = self._inflight_errors.get(key, None)
+                    raise error
+                if key in self._cache:
+                    _, result = self._cache[key]
+                    return result
+            # Should not reach here, but fallback to empty list if cache somehow vanished.
+            return []
+
+
 class SlotOwnershipError(PermissionError):
     """Raised when a writer that is not the contributor-of-record attempts a
     contributor write (single-writer discipline)."""
@@ -168,6 +266,9 @@ class SlotStore:
         # Serializes concurrent access from the FastAPI threadpool. RLock because
         # escalate() reuses update_status() internally.
         self._lock = threading.RLock()
+        # Single-flight + short-TTL cache for adjacent() scans (env-configurable).
+        ttl_sec = float(os.environ.get("SLOT_ADJACENT_CACHE_TTL_SEC", "2.0"))
+        self._adjacent_cache = _AdjacentCache(ttl_sec)
 
     def _migrate(self):
         """Apply idempotent ADD COLUMN migrations for columns introduced after the
@@ -516,11 +617,35 @@ class SlotStore:
         checkpoint calls this to detect "another slot is touching what I'm about to."
         Proximity is **file + mem-key overlap only** (design doc default; scope-overlap
         detection deferred until a scope taxonomy exists).
+
+        Cached with single-flight dedup (per-key) and serve-stale-on-error for
+        robustness under DB contention.
         """
+        if not (files or mem_keys):
+            return []
+        # Normalize the cache key: lists are unhashable, so use sorted tuples.
+        key = (
+            tuple(sorted(files or [])),
+            tuple(sorted(mem_keys or [])),
+            exclude_slot_id,
+            include_inactive,
+        )
+        return self._adjacent_cache.get(
+            key,
+            lambda: self._adjacent_impl(files, mem_keys, exclude_slot_id, include_inactive),
+            self,
+        )
+
+    def _adjacent_impl(
+        self,
+        files: list[str] | None,
+        mem_keys: list[str] | None,
+        exclude_slot_id: str | None,
+        include_inactive: bool,
+    ) -> list[dict]:
+        """Internal implementation of adjacent() — the actual full-table scan."""
         want_files = set(files or [])
         want_keys = set(mem_keys or [])
-        if not want_files and not want_keys:
-            return []
         out: list[dict] = []
         with self._lock:
             rows = self._conn.execute("SELECT * FROM slots").fetchall()
@@ -540,6 +665,53 @@ class SlotStore:
                 }
                 out.append(d)
         return out
+
+    def read_version(
+        self,
+        project_id: str | None = None,
+        status: str | None = None,
+        contributor_id: str | None = None,
+        slot_id: str | None = None,
+        limit: int | None = None,
+    ) -> str:
+        """Compute an ETag token from COUNT + MAX(last_update) for conditional reads.
+
+        Pattern adapted (clean-room, no code copied) from the Fast Gemma Challenge dashboard:
+        huggingface.co/spaces/gemma-challenge/gemma-dashboard — ETag conditional-read validator.
+
+        The token is stable across calls with the same filters and changes only when the
+        filtered result set changes (insert/update/delete). Used by handlers to emit an ETag
+        header and respond with 304 Not Modified if the client's If-None-Match matches.
+        """
+        sql = "SELECT COUNT(*) AS cnt, MAX(last_update) AS max_lu FROM slots WHERE 1=1 "
+        params: list = []
+        if project_id:
+            sql += "AND project_id=? "
+            params.append(project_id)
+        if status:
+            sql += "AND status=? "
+            params.append(status)
+        if contributor_id:
+            sql += "AND contributor_id=? "
+            params.append(contributor_id)
+        if slot_id:
+            sql += "AND slot_id=? "
+            params.append(slot_id)
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        count = row["cnt"] or 0
+        max_lu = row["max_lu"] or ""
+        # Normalize filters for the token salt.
+        norm = json.dumps({k: v for k, v in {
+            "project_id": project_id,
+            "status": status,
+            "contributor_id": contributor_id,
+            "slot_id": slot_id,
+            "limit": limit,
+        }.items() if v is not None}, sort_keys=True)
+        token = f"{count}-{max_lu}"
+        etag = '"' + hashlib.sha256((norm + token).encode()).hexdigest()[:16] + '"'
+        return etag
 
     def stats(self) -> dict:
         with self._lock:
