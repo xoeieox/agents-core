@@ -139,6 +139,9 @@ class _NodeState:
         # Service-lifecycle fields (gravitywell-doorman-clean-stop-v0)
         self.idle_since: float | None = None   # set when last lease released
         self.service_stopped: bool = False     # True after gw-serve stop confirmed
+        # Cached serving state (doorman-status-cached-serving-v0)
+        self._cached_serving: bool | None = None   # None until first refresh
+        self._serving_checked_at: float = 0.0      # walltime of last successful probe
 
     # ------------------------------------------------------------------
     # Health poll (lock-free — read-only HTTP, safe to call outside lock)
@@ -150,6 +153,22 @@ class _NodeState:
             return resp.status_code == 200 and resp.json().get("status") == "ok"
         except Exception:
             return False
+
+    def _refresh_serving_cache(self) -> None:
+        """Refresh the serving cache by probing _is_serving outside the lock.
+
+        This method MUST be called when the lock is NOT held, as it performs
+        a blocking network call. It then takes the lock briefly to update the
+        cached fields.
+
+        WARNING: This method is non-reentrant — it MUST NOT be called from
+        within an already-held self.lock context or it will deadlock
+        (threading.Lock is non-reentrant).
+        """
+        serving = self._is_serving(timeout=2.0)
+        with self.lock:
+            self._cached_serving = serving
+            self._serving_checked_at = time.time()
 
     def _controller_lease_active(self) -> bool:
         """Check if a mode-controller lease is currently active (non-expired).
@@ -251,6 +270,8 @@ class _NodeState:
                 self.last_wake_at = time.time()
                 self.last_error = None
                 self.service_stopped = False
+                self._cached_serving = True
+                self._serving_checked_at = time.time()
                 self._place_hold()
                 return True
             time.sleep(poll_interval)
@@ -386,7 +407,7 @@ class _NodeState:
     def status_snapshot(self) -> dict:
         with self.lock:
             self._gc_stale()
-            serving = self._is_serving(timeout=2.0)
+            serving = self._cached_serving
             # Check if controller owns the mode
             controller_owns = self._controller_lease_active()
             # Derive serving_mode without an extra ssh gw-serve status round-trip
@@ -401,6 +422,8 @@ class _NodeState:
             return {
                 "serving": serving,
                 "serving_mode": serving_mode,
+                "serving_checked_at": self._serving_checked_at,
+                "snapshot_mode": "cached",
                 "service_stopped": self.service_stopped,
                 "idle_since": self.idle_since,
                 "lease_count": len(self.leases),
@@ -423,10 +446,15 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
 
     def _loop():
         backoff = 0.0
+        first_iteration = True
         while True:
-            time.sleep(max(GW_HOLD_REFRESH_SEC - backoff, GW_HOLD_REFRESH_SEC // 2))
+            if not first_iteration:
+                time.sleep(max(GW_HOLD_REFRESH_SEC - backoff, GW_HOLD_REFRESH_SEC // 2))
+            first_iteration = False
             backoff = 0.0
             for node_name, state in nodes.items():
+                # Refresh serving cache OUTSIDE the lock (probing is a blocking network call)
+                state._refresh_serving_cache()
                 with state.lock:
                     state._gc_stale()
                     if not state.leases:
@@ -451,6 +479,8 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                                     if stop_proc.returncode == 0:
                                         state.service_stopped = True
                                         state.idle_since = None
+                                        state._cached_serving = False
+                                        state._serving_checked_at = time.time()
                                         log.warning(
                                             f"[{node_name}] gw-serve stop succeeded — "
                                             f"llama-server.service stopped, host now "
@@ -466,6 +496,8 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                                             # Already stopped — treat as success
                                             state.service_stopped = True
                                             state.idle_since = None
+                                            state._cached_serving = False
+                                            state._serving_checked_at = time.time()
                                             log.warning(
                                                 f"[{node_name}] gw-serve stop "
                                                 f"rc={stop_proc.returncode} but service "
