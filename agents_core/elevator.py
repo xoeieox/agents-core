@@ -83,7 +83,8 @@ CREATE TABLE IF NOT EXISTS queue_items (
     result_ref         TEXT,
     slot_ref           TEXT,
     depends_on         TEXT,
-    provenance         TEXT
+    provenance         TEXT,
+    result             TEXT
 );
 
 CREATE INDEX IF NOT EXISTS queue_items_lane_status_created
@@ -123,6 +124,7 @@ class ElevatorStore:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
         self._lock = threading.RLock()
+        self._migrate_add_result_column()
         # Start reaper thread (master only).
         self._reaper_stop = threading.Event()
         self._reaper_thread = None
@@ -139,6 +141,16 @@ class ElevatorStore:
                 f"off-master write attempt on {HOSTNAME}; "
                 f"POST to {ELEVATOR_MASTER_URL} instead"
             )
+
+    def _migrate_add_result_column(self):
+        """Idempotent migration: add result column if it doesn't exist."""
+        with self._lock:
+            # Check if result column already exists.
+            cursor = self._conn.execute("PRAGMA table_info(queue_items)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "result" not in columns:
+                self._conn.execute("ALTER TABLE queue_items ADD COLUMN result TEXT")
+                self._conn.commit()
 
     def close(self):
         """Shut down the reaper and close the database."""
@@ -228,6 +240,7 @@ class ElevatorStore:
         item_id: str,
         result_ref: str | None = None,
         provenance: dict | None = None,
+        result: str | None = None,
     ) -> bool:
         """Mark a claimed item as served. Idempotent on an already-served item.
 
@@ -249,8 +262,8 @@ class ElevatorStore:
             provenance_json = json.dumps(provenance) if provenance else None
             self._conn.execute(
                 "UPDATE queue_items SET status='served', served_at=?, "
-                "result_ref=?, provenance=? WHERE item_id=?",
-                (now, result_ref, provenance_json, item_id),
+                "result_ref=?, provenance=?, result=? WHERE item_id=?",
+                (now, result_ref, provenance_json, result, item_id),
             )
             self._conn.commit()
         return True
