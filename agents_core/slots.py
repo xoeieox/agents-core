@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import socket
 import sqlite3
@@ -146,6 +147,7 @@ class _AdjacentCache:
         """ttl_sec: cache lifetime (0 disables cache)."""
         self._cache: dict[tuple, tuple[float, list[dict]]] = {}  # key -> (computed_at, result)
         self._inflight: dict[tuple, threading.Event] = {}  # key -> Event (per-key single-flight)
+        self._inflight_errors: dict[tuple, Exception] = {}  # key -> Exception on compute failure
         self._lock = threading.Lock()
         self._ttl_sec = ttl_sec
 
@@ -192,6 +194,7 @@ class _AdjacentCache:
                     with self._lock:
                         self._cache[key] = (now, result)
                         self._inflight.pop(key, None)
+                        self._inflight_errors.pop(key, None)
                         event.set()
                 return result
             except sqlite3.OperationalError as e:
@@ -199,21 +202,26 @@ class _AdjacentCache:
                 with self._lock:
                     if self._ttl_sec > 0 and key in self._cache:
                         _, cached = self._cache[key]
-                        import logging
                         logging.warning(
                             f"adjacent() scan failed (DB busy), serving stale cache: {e}"
                         )
                         self._inflight.pop(key, None)
+                        self._inflight_errors.pop(key, None)
                         event.set()
                         return cached
                     if event is not None:
                         self._inflight.pop(key, None)
+                        self._inflight_errors[key] = e
                         event.set()
                 raise
         else:
             # Wait for the in-flight computation to finish.
             event.wait()
             with self._lock:
+                # Check if the in-flight compute failed.
+                if key in self._inflight_errors:
+                    error = self._inflight_errors.pop(key, None)
+                    raise error
                 if key in self._cache:
                     _, result = self._cache[key]
                     return result
@@ -664,6 +672,7 @@ class SlotStore:
         status: str | None = None,
         contributor_id: str | None = None,
         slot_id: str | None = None,
+        limit: int | None = None,
     ) -> str:
         """Compute an ETag token from COUNT + MAX(last_update) for conditional reads.
 
@@ -698,6 +707,7 @@ class SlotStore:
             "status": status,
             "contributor_id": contributor_id,
             "slot_id": slot_id,
+            "limit": limit,
         }.items() if v is not None}, sort_keys=True)
         token = f"{count}-{max_lu}"
         etag = '"' + hashlib.sha256((norm + token).encode()).hexdigest()[:16] + '"'

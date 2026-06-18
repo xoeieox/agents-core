@@ -179,6 +179,7 @@ def create_app(db_path: Path, elevator_db_path: Path | None = None) -> FastAPI:
             project_id=project_id or None,
             status=status or None,
             contributor_id=contributor_id or None,
+            limit=limit,
         )
         # Check If-None-Match: if client's ETag matches, return 304 Not Modified.
         if_none_match = request.headers.get("If-None-Match", "").strip()
