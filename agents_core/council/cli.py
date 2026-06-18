@@ -1083,7 +1083,12 @@ def _build_adapter(voicing: str, ClaudeAdapter, LlamaAdapter):
     if voicing == "gravitywell":
         return GravityWellAdapter(temperature=0.8)
     if voicing in ("haiku", "sonnet", "opus"):
-        return ClaudeAdapter(model=voicing, timeout=300)
+        raise ValueError(
+            f"Paid-model voicing {voicing!r} is not available via the council CLI. "
+            "Use voicing='gravitywell' (default). Sonnet/Haiku/Opus voicing "
+            "was removed to prevent the per-turn claude -p subprocess firehose "
+            "(~10 cold sessions per deliberation run)."
+        )
     raise ValueError(f"Unknown voicing: {voicing!r}")
 
 
@@ -1402,8 +1407,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--n", type=int, default=None)
     sp.add_argument("--turns", type=int, default=DEFAULT_TURNS)
     sp.add_argument(
-        "--voicing", choices=["local", "gravitywell", "haiku", "sonnet", "opus"],
+        "--voicing", choices=["local", "gravitywell"],
         default=DEFAULT_VOICING,
+        help="Voicing operator. Only gravitywell (default, GW queue) and local (LlamaAdapter) are available. "
+        "Paid-model voicing was removed to prevent the per-turn subprocess firehose.",
     )
     sp.add_argument("--with", dest="with_entity", default=None)
     sp.add_argument("--narrator", action="store_true")

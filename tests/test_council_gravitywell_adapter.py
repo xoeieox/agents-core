@@ -162,14 +162,14 @@ def test_build_adapter_local():
     llama_stub.assert_called_once_with(temperature=0.8, max_tokens=900)
 
 
-def test_build_adapter_sonnet():
-    """_build_adapter('sonnet', ...) still returns ClaudeAdapter (unchanged)."""
+def test_build_adapter_sonnet_raises():
+    """_build_adapter('sonnet', ...) raises ValueError (paid-model voicing removed)."""
     from agents_core.council.cli import _build_adapter
 
     claude_stub = MagicMock()
     llama_stub = MagicMock()
-    _build_adapter("sonnet", claude_stub, llama_stub)
-    claude_stub.assert_called_once_with(model="sonnet", timeout=300)
+    with pytest.raises(ValueError, match="Paid-model voicing"):
+        _build_adapter("sonnet", claude_stub, llama_stub)
 
 
 def test_build_adapter_unknown_raises():
