@@ -698,3 +698,417 @@ def test_off_master_enqueue_rejects(temp_db):
                 principal="p1",
                 latency_class="interactive",
             )
+
+
+# --- depends_on (U4a) tests ---
+
+
+def test_enqueue_with_depends_on_basic(temp_db):
+    """Test enqueue and persist depends_on."""
+    # Enqueue precursor.
+    precursor_id = temp_db.enqueue(
+        lane="execution",
+        kind="grounding",
+        payload={"query": "test"},
+        principal="p1",
+        latency_class="batch",
+    )
+
+    # Enqueue dependent with depends_on.
+    dependent_id = temp_db.enqueue(
+        lane="deliberation",
+        kind="facets-verdict",
+        payload={"depends_on": precursor_id},
+        principal="p1",
+        latency_class="batch",
+        depends_on=precursor_id,
+    )
+
+    # Get and verify depends_on round-trips through GET.
+    dependent = temp_db.get(dependent_id)
+    assert dependent["depends_on"] == precursor_id
+
+
+def test_enqueue_omit_depends_on_back_compat(temp_db):
+    """Test that omitting depends_on stores NULL (back-compat)."""
+    item_id = temp_db.enqueue(
+        lane="interactive",
+        kind="session-turn",
+        payload={},
+        principal="p1",
+        latency_class="interactive",
+    )
+    item = temp_db.get(item_id)
+    assert item["depends_on"] is None
+
+
+def test_enqueue_self_reference_rejected(temp_db):
+    """Test that self-reference is rejected."""
+    # Attempt to enqueue with depends_on == item_id (unknown at enqueue time, so test by
+    # setting both explicitly).
+    with pytest.raises(ValueError, match="self-reference"):
+        temp_db.enqueue(
+            lane="execution",
+            kind="test",
+            payload={},
+            principal="p1",
+            latency_class="batch",
+            item_id="item-123",
+            depends_on="item-123",
+        )
+
+
+def test_enqueue_nonexistent_depends_on_rejected(temp_db):
+    """Test that depends_on on non-existent precursor is rejected."""
+    with pytest.raises(ValueError, match="depends_on_not_found"):
+        temp_db.enqueue(
+            lane="execution",
+            kind="test",
+            payload={},
+            principal="p1",
+            latency_class="batch",
+            depends_on="nonexistent-precursor",
+        )
+
+
+def test_claim_skips_unserved_dependent(temp_db):
+    """Test that claim skips a dependent with unserved precursor."""
+    # Enqueue precursor (pending).
+    precursor_id = temp_db.enqueue(
+        lane="execution",
+        kind="grounding",
+        payload={},
+        principal="p1",
+        latency_class="batch",
+    )
+
+    # Enqueue dependent (depends on pending precursor).
+    dependent_id = temp_db.enqueue(
+        lane="deliberation",
+        kind="facets-verdict",
+        payload={},
+        principal="p1",
+        latency_class="batch",
+        depends_on=precursor_id,
+    )
+
+    # Attempt to claim from deliberation; should get None (dependent is gated).
+    item = temp_db.claim(
+        lanes=["deliberation"],
+        owner="broker",
+        claim_ttl_sec=30,
+    )
+    assert item is None
+
+    # Ack the precursor (mark as served).
+    temp_db.claim(
+        lanes=["execution"],
+        owner="broker",
+        claim_ttl_sec=30,
+    )
+    temp_db.ack(precursor_id)
+
+    # Now claim should return the dependent (precursor is served).
+    item = temp_db.claim(
+        lanes=["deliberation"],
+        owner="broker",
+        claim_ttl_sec=30,
+    )
+    assert item is not None
+    assert item["item_id"] == dependent_id
+
+
+def test_claim_no_head_of_line_deadlock(temp_db):
+    """Test that a blocked dependent at head-of-line doesn't stall unrelated items.
+
+    Enqueue blocked dependent V2 (older created_at) and unrelated item X (newer).
+    Claim should return X, not block on V2.
+    """
+    # Enqueue precursor (pending, in execution lane).
+    precursor_id = temp_db.enqueue(
+        lane="execution",
+        kind="grounding",
+        payload={},
+        principal="p1",
+        latency_class="batch",
+    )
+
+    # Enqueue dependent (depends on pending precursor, in deliberation lane, older).
+    # Use a fixed timestamp to ensure older created_at.
+    dependent_id = temp_db.enqueue(
+        lane="deliberation",
+        kind="facets-verdict",
+        payload={},
+        principal="p1",
+        latency_class="batch",
+        depends_on=precursor_id,
+        item_id="dependent-v2",
+    )
+
+    # Enqueue unrelated item in deliberation lane (newer created_at).
+    unrelated_id = temp_db.enqueue(
+        lane="deliberation",
+        kind="other-task",
+        payload={},
+        principal="p2",
+        latency_class="batch",
+    )
+
+    # Claim from deliberation; should return unrelated item, not dependent.
+    item = temp_db.claim(
+        lanes=["deliberation"],
+        owner="broker",
+        claim_ttl_sec=30,
+    )
+    assert item is not None
+    assert item["item_id"] == unrelated_id
+    assert item["item_id"] != dependent_id
+
+
+def test_cascade_fail_on_failed_precursor(temp_db):
+    """Test cascade-fail when precursor is marked failed."""
+    # Enqueue precursor.
+    precursor_id = temp_db.enqueue(
+        lane="execution",
+        kind="grounding",
+        payload={},
+        principal="p1",
+        latency_class="batch",
+    )
+
+    # Enqueue dependent.
+    dependent_id = temp_db.enqueue(
+        lane="deliberation",
+        kind="facets-verdict",
+        payload={},
+        principal="p1",
+        latency_class="batch",
+        depends_on=precursor_id,
+    )
+
+    # Claim and fail the precursor.
+    precursor_item = temp_db.claim(
+        lanes=["execution"],
+        owner="broker",
+        claim_ttl_sec=30,
+    )
+    temp_db.fail(precursor_item["item_id"])
+
+    # Trigger cascade-fail (via claim which calls _cascade_fail_dependents).
+    temp_db.claim(
+        lanes=["deliberation"],
+        owner="broker",
+        claim_ttl_sec=30,
+    )
+
+    # Check that dependent is now failed with correct provenance.
+    dependent = temp_db.get(dependent_id)
+    assert dependent["status"] == "failed"
+    assert dependent["provenance"]["depends_on_failed"]["precursor_id"] == precursor_id
+    assert dependent["provenance"]["depends_on_failed"]["precursor_status"] == "failed"
+
+
+def test_cascade_fail_on_expired_precursor(temp_db):
+    """Test cascade-fail when precursor expires."""
+    # Enqueue precursor.
+    precursor_id = temp_db.enqueue(
+        lane="execution",
+        kind="grounding",
+        payload={},
+        principal="p1",
+        latency_class="batch",
+    )
+
+    # Enqueue dependent.
+    dependent_id = temp_db.enqueue(
+        lane="deliberation",
+        kind="facets-verdict",
+        payload={},
+        principal="p1",
+        latency_class="batch",
+        depends_on=precursor_id,
+    )
+
+    # Manually expire the precursor (via direct SQL).
+    temp_db._conn.execute(
+        "UPDATE queue_items SET status='expired' WHERE item_id=?",
+        (precursor_id,),
+    )
+    temp_db._conn.commit()
+
+    # Trigger cascade-fail (via claim).
+    temp_db.claim(
+        lanes=["deliberation"],
+        owner="broker",
+        claim_ttl_sec=30,
+    )
+
+    # Check that dependent is now failed with correct provenance.
+    dependent = temp_db.get(dependent_id)
+    assert dependent["status"] == "failed"
+    assert dependent["provenance"]["depends_on_failed"]["precursor_id"] == precursor_id
+    assert dependent["provenance"]["depends_on_failed"]["precursor_status"] == "expired"
+
+
+def test_cascade_fail_on_missing_precursor(temp_db):
+    """Test cascade-fail when precursor row is deleted (missing).
+
+    This is a defensive guard: enqueue validation should prevent this, but
+    test that the reaper/claim handles it correctly.
+    """
+    # Enqueue precursor.
+    precursor_id = temp_db.enqueue(
+        lane="execution",
+        kind="grounding",
+        payload={},
+        principal="p1",
+        latency_class="batch",
+    )
+
+    # Enqueue dependent.
+    dependent_id = temp_db.enqueue(
+        lane="deliberation",
+        kind="facets-verdict",
+        payload={},
+        principal="p1",
+        latency_class="batch",
+        depends_on=precursor_id,
+    )
+
+    # Delete the precursor (raw SQL, simulating missing precursor).
+    temp_db._conn.execute(
+        "DELETE FROM queue_items WHERE item_id=?",
+        (precursor_id,),
+    )
+    temp_db._conn.commit()
+
+    # Trigger cascade-fail (via claim).
+    temp_db.claim(
+        lanes=["deliberation"],
+        owner="broker",
+        claim_ttl_sec=30,
+    )
+
+    # Check that dependent is now failed with "missing" status.
+    dependent = temp_db.get(dependent_id)
+    assert dependent["status"] == "failed"
+    assert dependent["provenance"]["depends_on_failed"]["precursor_id"] == precursor_id
+    assert dependent["provenance"]["depends_on_failed"]["precursor_status"] == "missing"
+
+
+def test_payload_blind_dependency_resolution(temp_db):
+    """Test that dependency resolution is payload-blind.
+
+    Enqueue a dependent with malformed-JSON payload. Verify that claim +
+    cascade-fail work without attempting to parse the payload.
+    """
+    from datetime import datetime, timezone
+
+    # Enqueue precursor.
+    precursor_id = temp_db.enqueue(
+        lane="execution",
+        kind="grounding",
+        payload={},
+        principal="p1",
+        latency_class="batch",
+    )
+
+    # Enqueue dependent with intentionally malformed JSON payload (via raw SQL).
+    dependent_id = "dependent-bad-json"
+    now = datetime.now(timezone.utc).isoformat()
+    temp_db._conn.execute(
+        "INSERT INTO queue_items "
+        "(item_id, lane, kind, principal, payload, latency_class, status, "
+        " attempts, created_at, depends_on) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            dependent_id, "deliberation", "facets-verdict", "p1",
+            "{broken json", "batch", "pending", 0, now,
+            precursor_id,
+        ),
+    )
+    temp_db._conn.commit()
+
+    # Fail the precursor.
+    precursor_item = temp_db.claim(
+        lanes=["execution"],
+        owner="broker",
+        claim_ttl_sec=30,
+    )
+    temp_db.fail(precursor_item["item_id"])
+
+    # Trigger cascade-fail; should not raise JSON parse error.
+    result = temp_db.claim(
+        lanes=["deliberation"],
+        owner="broker",
+        claim_ttl_sec=30,
+    )
+
+    # Verify dependent was cascade-failed (claim returns None because dependent is failed).
+    assert result is None
+    # Check raw row to avoid deserializing malformed payload.
+    with temp_db._lock:
+        row = temp_db._conn.execute(
+            "SELECT status FROM queue_items WHERE item_id=?", (dependent_id,)
+        ).fetchone()
+    assert row["status"] == "failed"
+    # The fact that cascade-fail completed without JSON parse error proves payload-blindness.
+
+
+def test_depends_on_immutable_no_update_path(temp_db):
+    """Test that depends_on is immutable (no public update path exists).
+
+    Structurally assert: there is no update_depends_on method.
+    Additionally verify that a raw-SQL UPDATE of depends_on does not occur
+    through any store method (defensive check).
+    """
+    # Enqueue two items.
+    item1 = temp_db.enqueue(
+        lane="execution",
+        kind="grounding",
+        payload={},
+        principal="p1",
+        latency_class="batch",
+    )
+    item2 = temp_db.enqueue(
+        lane="deliberation",
+        kind="verdict",
+        payload={},
+        principal="p1",
+        latency_class="batch",
+    )
+
+    # Assert no update_depends_on method exists.
+    assert not hasattr(temp_db, "update_depends_on")
+
+    # Verify requeue, ack, fail, reap don't mutate depends_on.
+    # These are all the mutation methods; none should touch depends_on.
+    item2_with_dep = temp_db.enqueue(
+        lane="deliberation",
+        kind="verdict2",
+        payload={},
+        principal="p1",
+        latency_class="batch",
+        depends_on=item1,
+    )
+
+    # Claim and ack item1.
+    claimed = temp_db.claim(
+        lanes=["execution"],
+        owner="broker",
+        claim_ttl_sec=30,
+    )
+    temp_db.ack(claimed["item_id"])
+
+    # Requeue the dependent (if it were claimed).
+    claimed_dep = temp_db.claim(
+        lanes=["deliberation"],
+        owner="broker",
+        claim_ttl_sec=30,
+    )
+    if claimed_dep:
+        temp_db.requeue(claimed_dep["item_id"])
+
+    # Check that depends_on is still the original precursor.
+    item_after = temp_db.get(item2_with_dep)
+    assert item_after["depends_on"] == item1

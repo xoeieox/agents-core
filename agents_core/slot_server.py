@@ -362,6 +362,7 @@ def create_app(db_path: Path, elevator_db_path: Path | None = None) -> FastAPI:
                 principal=body["principal"],
                 latency_class=body["latency_class"],
                 slot_ref=body.get("slot_ref"),
+                depends_on=body.get("depends_on"),
             )
         except KeyError as e:
             raise HTTPException(

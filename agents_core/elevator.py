@@ -170,6 +170,7 @@ class ElevatorStore:
         latency_class: str,
         slot_ref: str | None = None,
         item_id: str | None = None,
+        depends_on: str | None = None,
     ) -> str:
         """Enqueue a work item. Returns item_id."""
         self._check_writable()
@@ -180,20 +181,35 @@ class ElevatorStore:
 
         iid = item_id or uuid.uuid4().hex[:16]
         now = _now()
+
+        # Validate depends_on atomically with insertion.
+        if depends_on is not None:
+            if depends_on == iid:
+                raise ValueError(f"self-reference: item cannot depend on itself")
+
         with self._lock:
             exists = self._conn.execute(
                 "SELECT 1 FROM queue_items WHERE item_id = ?", (iid,)
             ).fetchone()
             if exists:
                 raise ValueError(f"item_id already exists: {iid}")
+
+            # If depends_on is set, verify precursor exists in this same transaction.
+            if depends_on is not None:
+                precursor = self._conn.execute(
+                    "SELECT 1 FROM queue_items WHERE item_id = ?", (depends_on,)
+                ).fetchone()
+                if not precursor:
+                    raise ValueError(f"depends_on_not_found: precursor item {depends_on!r} does not exist")
+
             self._conn.execute(
                 "INSERT INTO queue_items "
                 "(item_id, lane, kind, principal, payload, latency_class, status, "
-                " attempts, created_at, slot_ref) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " attempts, created_at, slot_ref, depends_on) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     iid, lane, kind, principal, json.dumps(payload),
-                    latency_class, "pending", 0, now, slot_ref,
+                    latency_class, "pending", 0, now, slot_ref, depends_on,
                 ),
             )
             self._conn.commit()
@@ -207,9 +223,11 @@ class ElevatorStore:
         """Atomically claim the head-of-line pending item across ordered lanes.
 
         Returns the claimed item (as a dict) with status='claimed', or None if no
-        pending items exist in the given lanes. Inline reaps stale claims first."""
+        pending items exist in the given lanes. Skips rows with unserved dependencies.
+        Inline reaps stale claims and cascade-fails dependents of terminal precursors first."""
         self._check_writable()
         self._reap_inline()
+        self._cascade_fail_dependents()
 
         now = _now()
         with self._lock:
@@ -217,6 +235,9 @@ class ElevatorStore:
             for lane in lanes:
                 row = self._conn.execute(
                     "SELECT * FROM queue_items WHERE lane=? AND status='pending' "
+                    "AND (depends_on IS NULL "
+                    "  OR EXISTS (SELECT 1 FROM queue_items p "
+                    "             WHERE p.item_id = queue_items.depends_on AND p.status='served')) "
                     "ORDER BY created_at ASC LIMIT 1",
                     (lane,),
                 ).fetchone()
@@ -448,6 +469,49 @@ class ElevatorStore:
             self._conn.commit()
 
         return {"expired": expired, "reclaimed": reclaimed}
+
+    def _cascade_fail_dependents(self) -> None:
+        """Cascade-fail pending items whose precursors are in terminal states.
+
+        A pending item with a non-null depends_on is cascade-failed if:
+        - Its precursor is 'failed' or 'expired'
+        - Its precursor row does not exist (missing)
+
+        Each cascade-fail sets provenance with 'depends_on_failed' key.
+        This is called before claim() and after reap() to ensure wedged dependents are cleaned.
+        """
+        with self._lock:
+            # Find all pending dependents whose precursors are failed, expired, or missing.
+            # Use a cursor loop to handle per-row provenance JSON.
+            cursor = self._conn.execute(
+                "SELECT q.item_id, q.depends_on, "
+                "       COALESCE(p.status, 'missing') as precursor_status "
+                "FROM queue_items q "
+                "LEFT JOIN queue_items p ON q.depends_on = p.item_id "
+                "WHERE q.status='pending' AND q.depends_on IS NOT NULL "
+                "AND (p.status IN ('failed', 'expired') OR p.status IS NULL)"
+            )
+            rows = cursor.fetchall()
+
+            for row in rows:
+                item_id = row["item_id"]
+                precursor_id = row["depends_on"]
+                precursor_status = row["precursor_status"]
+
+                provenance_dict = {
+                    "depends_on_failed": {
+                        "precursor_id": precursor_id,
+                        "precursor_status": precursor_status,
+                    }
+                }
+                provenance_json = json.dumps(provenance_dict)
+                self._conn.execute(
+                    "UPDATE queue_items SET status='failed', provenance=? WHERE item_id=?",
+                    (provenance_json, item_id),
+                )
+
+            if rows:
+                self._conn.commit()
 
     # -- helpers ----------------------------------------------------------
 
