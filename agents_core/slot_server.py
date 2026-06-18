@@ -14,6 +14,8 @@ Environment variables (server side):
   SLOTS_BIND_HOST    — uvicorn bind host (default 127.0.0.1)
   SLOTS_BIND_PORT    — uvicorn bind port (default 8405)
   SLOTS_LOG_LEVEL    — uvicorn log level (default info)
+  SLOT_ADJACENT_CACHE_TTL_SEC — TTL for the single-flight adjacent() cache in seconds
+                                (default 2.0; set to 0 to disable caching)
 
   SLOTS_BEARER_TOKEN — auth token in one of two forms:
     - "secret"                  legacy shared mode: any authenticated caller may write
@@ -25,6 +27,16 @@ Environment variables (server side):
 
 Auth implementation:
   Bearer comparison uses hmac.compare_digest (constant-time) to prevent timing attacks.
+
+Execution-model contract (correctness precondition):
+  The read cache (ETag token computation and the single-flight adjacent() cache)
+  assumes **sync-threaded execution** — FastAPI on a threadpool + threading primitives
+  (threading.RLock, threading.Event). This is how slot-server runs today.
+
+  If slot-server is ever migrated to asyncio-native handlers (async def, asyncio.Lock),
+  the threading-based single-flight cache will silently break and serve stale/incorrect
+  data. Before migrating to asyncio, replace the threading.Event single-flight with an
+  asyncio.Event-based implementation.
 
 Agent-operable, NOT agent-as-destination: every write carries a contributor-of-record
 (`by`), the single-writer guard rejects impostor writes, and the blackboard feeds the
@@ -160,12 +172,28 @@ def create_app(db_path: Path, elevator_db_path: Path | None = None) -> FastAPI:
         status: str = "",
         contributor_id: str = "",
         limit: int = 100,
+        request: Request = None,
     ):
-        return store.query(
+        # Compute ETag for conditional reads (same filters as query).
+        etag = store.read_version(
+            project_id=project_id or None,
+            status=status or None,
+            contributor_id=contributor_id or None,
+        )
+        # Check If-None-Match: if client's ETag matches, return 304 Not Modified.
+        if_none_match = request.headers.get("If-None-Match", "").strip()
+        if if_none_match == etag:
+            return Response(status_code=304, headers={"ETag": etag})
+        # Else run query and return 200 with headers.
+        data = store.query(
             project_id=project_id or None,
             status=status or None,
             contributor_id=contributor_id or None,
             limit=limit,
+        )
+        return JSONResponse(
+            content=data,
+            headers={"ETag": etag, "Cache-Control": "no-cache"},
         )
 
     @app.get("/v0/slots/adjacent")
@@ -185,14 +213,24 @@ def create_app(db_path: Path, elevator_db_path: Path | None = None) -> FastAPI:
         )
 
     @app.get("/v0/slots/{slot_id}")
-    def get_slot(slot_id: str):
+    def get_slot(slot_id: str, request: Request = None):
+        # Compute ETag specific to this slot_id.
+        etag = store.read_version(slot_id=slot_id)
+        # Check If-None-Match.
+        if_none_match = request.headers.get("If-None-Match", "").strip()
+        if if_none_match == etag:
+            return Response(status_code=304, headers={"ETag": etag})
+        # Else fetch and return 200 with headers.
         slot = store.get(slot_id)
         if slot is None:
             raise HTTPException(
                 status_code=404,
                 detail=_error("not_found", f"Slot '{slot_id}' not found"),
             )
-        return slot
+        return JSONResponse(
+            content=slot,
+            headers={"ETag": etag, "Cache-Control": "no-cache"},
+        )
 
     @app.get("/v0/stats")
     def stats():

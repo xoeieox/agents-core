@@ -640,3 +640,224 @@ def test_off_master_reads_still_work(tmp_path: Path, monkeypatch):
     assert store2.query() != []
     assert store2.stats()["total_slots"] == 1
     store2.close()
+
+
+# --- ETag conditional reads (AC1-AC4) ----------------------------------------
+
+def test_read_version_etag_stable_across_calls(store: SlotStore):
+    """AC1: ETag is stable across two identical requests with no intervening writes."""
+    sid = store.create_slot("proj-A", CONTRIB)
+    # Compute ETag twice, should be identical
+    etag1 = store.read_version()
+    etag2 = store.read_version()
+    assert etag1 == etag2
+    assert etag1.startswith('"') and etag1.endswith('"')
+
+
+def test_read_version_changes_on_insert(store: SlotStore):
+    """AC3: ETag changes after an insert."""
+    etag_before = store.read_version()
+    store.create_slot("proj-A", CONTRIB)
+    etag_after = store.read_version()
+    assert etag_before != etag_after
+
+
+def test_read_version_changes_on_update(store: SlotStore):
+    """AC3: ETag changes after an update (last_update bumped)."""
+    sid = store.create_slot("proj-A", CONTRIB)
+    etag_before = store.read_version()
+    store.update_status(sid, "in-progress", by="agent-1")
+    etag_after = store.read_version()
+    assert etag_before != etag_after
+
+
+def test_read_version_changes_on_delete(store: SlotStore):
+    """AC3: ETag changes after a delete/expire."""
+    store.create_slot("proj-A", CONTRIB, slot_id="s1")
+    etag_before = store.read_version()
+    # Expire the slot by forcing its status and age
+    store.update_status("s1", "abandoned", by="agent-1")
+    with store._lock:
+        old_time = "2025-01-01T00:00:00+00:00"
+        store._conn.execute("UPDATE slots SET last_update=? WHERE slot_id=?", (old_time, "s1"))
+        store._conn.commit()
+    store.expire()
+    etag_after = store.read_version()
+    assert etag_before != etag_after
+
+
+def test_read_version_filter_project_id(store: SlotStore):
+    """AC4: ETag is filter-correct — different filters produce different ETags."""
+    store.create_slot("proj-A", CONTRIB, slot_id="s1")
+    store.create_slot("proj-B", CONTRIB, slot_id="s2")
+    etag_a = store.read_version(project_id="proj-A")
+    etag_b = store.read_version(project_id="proj-B")
+    etag_all = store.read_version()
+    assert etag_a != etag_b != etag_all
+
+
+def test_read_version_filter_status(store: SlotStore):
+    """AC4: ETag differentiates by status filter."""
+    sid = store.create_slot("proj-A", CONTRIB)
+    etag_dispatched = store.read_version(status="dispatched")
+    store.update_status(sid, "in-progress", by="agent-1")
+    etag_after = store.read_version(status="dispatched")
+    assert etag_dispatched != etag_after
+
+
+def test_read_version_slot_id_specific(store: SlotStore):
+    """AC4: ETag can be computed for a specific slot_id."""
+    sid = store.create_slot("proj-A", CONTRIB)
+    etag_slot = store.read_version(slot_id=sid)
+    etag_all = store.read_version()
+    assert etag_slot != etag_all
+    # Update that slot, its ETag changes
+    store.update_status(sid, "landed", by="agent-1")
+    etag_slot_after = store.read_version(slot_id=sid)
+    assert etag_slot != etag_slot_after
+
+
+def test_read_version_filter_contributor_id(store: SlotStore):
+    """AC4: ETag differentiates by contributor_id filter."""
+    store.create_slot("proj-A", {"type": "fixer", "id": "agent-1"}, slot_id="s1")
+    store.create_slot("proj-A", {"type": "fixer", "id": "agent-2"}, slot_id="s2")
+    etag_a1 = store.read_version(contributor_id="agent-1")
+    etag_a2 = store.read_version(contributor_id="agent-2")
+    assert etag_a1 != etag_a2
+
+
+# --- Adjacent cache: single-flight + TTL (AC5-AC6) ---------------------------
+
+def test_adjacent_cache_single_flight_dedup(store: SlotStore, monkeypatch):
+    """AC5: Concurrent identical adjacent() calls trigger exactly one full-table scan."""
+    a = store.create_slot("proj-A", CONTRIB)
+    store.set_domain_touch(a, files=["app.py"], by="agent-1")
+
+    call_count = [0]
+    original_impl = store._adjacent_impl
+
+    def counted_impl(*args, **kwargs):
+        call_count[0] += 1
+        return original_impl(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_adjacent_impl", counted_impl)
+
+    # Two concurrent threads with the same key
+    result1, result2 = [None], [None]
+
+    def thread1():
+        result1[0] = store.adjacent(files=["app.py"])
+
+    def thread2():
+        result2[0] = store.adjacent(files=["app.py"])
+
+    t1 = threading.Thread(target=thread1)
+    t2 = threading.Thread(target=thread2)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    # Both got the same result
+    assert result1[0] == result2[0]
+    assert len(result1[0]) == 1
+    # But the implementation was called only once (single-flight dedup)
+    assert call_count[0] == 1
+
+
+def test_adjacent_cache_ttl_zero_disables_cache(store: SlotStore, tmp_path: Path, monkeypatch):
+    """AC5: With TTL=0, every adjacent() call triggers a fresh scan."""
+    monkeypatch.setenv("SLOT_ADJACENT_CACHE_TTL_SEC", "0")
+    store2 = SlotStore(db_path=tmp_path / "slots2.db")
+    a = store2.create_slot("proj-A", CONTRIB)
+    store2.set_domain_touch(a, files=["app.py"], by="agent-1")
+
+    call_count = [0]
+    original_impl = store2._adjacent_impl
+
+    def counted_impl(*args, **kwargs):
+        call_count[0] += 1
+        return original_impl(*args, **kwargs)
+
+    monkeypatch.setattr(store2, "_adjacent_impl", counted_impl)
+
+    # Call adjacent() twice with same params
+    store2.adjacent(files=["app.py"])
+    store2.adjacent(files=["app.py"])
+
+    # With TTL=0, cache is disabled, so both calls hit the implementation
+    assert call_count[0] == 2
+    store2.close()
+
+
+def test_adjacent_cache_ttl_respects_freshness(store: SlotStore, tmp_path: Path, monkeypatch):
+    """AC5: With TTL>0, old cache entries are refreshed on the next call."""
+    monkeypatch.setenv("SLOT_ADJACENT_CACHE_TTL_SEC", "0.1")  # 100ms TTL
+    store2 = SlotStore(db_path=tmp_path / "slots3.db")
+    a = store2.create_slot("proj-A", CONTRIB)
+    store2.set_domain_touch(a, files=["app.py"], by="agent-1")
+
+    call_count = [0]
+    original_impl = store2._adjacent_impl
+
+    def counted_impl(*args, **kwargs):
+        call_count[0] += 1
+        return original_impl(*args, **kwargs)
+
+    monkeypatch.setattr(store2, "_adjacent_impl", counted_impl)
+
+    # First call: cache miss, call the impl
+    store2.adjacent(files=["app.py"])
+    assert call_count[0] == 1
+
+    # Second call immediately after: cache hit
+    store2.adjacent(files=["app.py"])
+    assert call_count[0] == 1
+
+    # Wait for TTL to expire
+    import time
+    time.sleep(0.15)
+
+    # Third call after TTL: cache miss again, call the impl
+    store2.adjacent(files=["app.py"])
+    assert call_count[0] == 2
+
+    store2.close()
+
+
+def test_adjacent_cache_serve_stale_on_error(store: SlotStore, tmp_path: Path, monkeypatch):
+    """AC6: With a warm cache, OperationalError returns the last-good result."""
+    a = store.create_slot("proj-A", CONTRIB)
+    store.set_domain_touch(a, files=["app.py"], by="agent-1")
+
+    # Warm the cache
+    result = store.adjacent(files=["app.py"])
+    assert len(result) == 1
+
+    # Inject an error on the next compute
+    original_impl = store._adjacent_impl
+    def error_impl(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "_adjacent_impl", error_impl)
+
+    # Call should not raise, but return the cached result
+    result_stale = store.adjacent(files=["app.py"])
+    assert result_stale == result
+
+
+def test_adjacent_cache_serve_stale_no_cache_raises(store: SlotStore, monkeypatch):
+    """AC6: With a cold cache, OperationalError propagates."""
+    a = store.create_slot("proj-A", CONTRIB)
+    store.set_domain_touch(a, files=["app.py"], by="agent-1")
+
+    # Inject an error WITHOUT warming the cache first
+    original_impl = store._adjacent_impl
+    def error_impl(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "_adjacent_impl", error_impl)
+
+    # Call should raise since there's no cached result
+    with pytest.raises(sqlite3.OperationalError):
+        store.adjacent(files=["app.py"])
