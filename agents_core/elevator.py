@@ -370,7 +370,7 @@ class ElevatorStore:
 
             # Attempt to fetch doorman serving_ready (best-effort, no error on failure).
             try:
-                resp = httpx.get("http://203.0.113.10:8407/status", timeout=2.0)
+                resp = httpx.get("http://127.0.0.1:8407/status", timeout=2.0)
                 if resp.status_code == 200:
                     data = resp.json()
                     gw_data = data.get("nodes", {}).get("gravitywell", {})
