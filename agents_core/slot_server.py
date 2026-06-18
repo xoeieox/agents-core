@@ -72,6 +72,7 @@ from agents_core.elevator import (
     OffMasterWriteError,
     QueueNotFoundError,
 )
+from agents_core.interactive_submit import submit
 from agents_core.slots import (
     SlotNotFoundError,
     SlotOwnershipError,
@@ -402,6 +403,7 @@ def create_app(db_path: Path, elevator_db_path: Path | None = None) -> FastAPI:
                 item_id,
                 result_ref=body.get("result_ref"),
                 provenance=body.get("provenance"),
+                result=body.get("result"),
             )
         except QueueNotFoundError:
             raise HTTPException(status_code=404, detail=_error("not_found", item_id))
@@ -452,6 +454,36 @@ def create_app(db_path: Path, elevator_db_path: Path | None = None) -> FastAPI:
     def get_state():
         """Fetch queue state (node-state / floor-indicator)."""
         return elevator.state()
+
+    @app.post("/v0/elevator/submit")
+    def submit_turn(body: dict[str, Any]):
+        """Submit a turn (async queue or direct routing).
+
+        Body:
+            turn: str - the prompt/message
+            context: dict (optional) - system context
+            destination: str - "queue-gw-interactive" or "route-to-fast"
+            operator: str (optional) - operator for route-to-fast (default: "qwen")
+            principal: str (optional) - submitter identity (default: "default")
+        """
+        try:
+            turn = body["turn"]
+            destination = body.get("destination", "queue-gw-interactive")
+        except KeyError as e:
+            raise HTTPException(
+                status_code=400, detail=_error("bad_request", f"missing field {e}")
+            )
+        try:
+            result = submit(
+                turn=turn,
+                context=body.get("context"),
+                destination=destination,
+                operator=body.get("operator"),
+                principal=body.get("principal", "default"),
+            )
+            return result
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=_error("bad_request", str(e)))
 
     return app
 

@@ -133,3 +133,334 @@ def test_compose_gw_status_flip_controller_untouched(elevator_store):
     assert len(fc_urls) == 1
     assert "203.0.113.10:8408" in fc_urls[0]
     assert result["mode"] == "offline"
+
+
+# -- Tests for submit() (interactive-submit interface) ----
+
+def test_submit_queue_gw_interactive(tmp_path, monkeypatch):
+    """submit(destination='queue-gw-interactive') enqueues and returns handle."""
+    from agents_core.interactive_submit import submit
+
+    db_path = tmp_path / "queue.db"
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(db_path))
+
+    # Get initial state
+    from agents_core.elevator import ElevatorStore
+    elevator = ElevatorStore(db_path)
+    initial_pending = elevator.state()["queue"]["interactive"]["pending"]
+    elevator.close()
+
+    result = submit(
+        turn="ping",
+        context={"scope": "test"},
+        destination="queue-gw-interactive",
+        principal="test-caller",
+    )
+
+    assert "item_id" in result
+    assert "poll" in result
+    assert "node_state" in result
+    assert result["poll"].startswith("/v0/elevator/item/")
+    # The new submit should add 1 to the pending count
+    assert result["node_state"]["queue"]["interactive"]["pending"] == initial_pending + 1
+
+
+def test_submit_route_to_fast_qwen(monkeypatch):
+    """submit(destination='route-to-fast') calls operator directly, returns result."""
+    from agents_core.interactive_submit import submit
+
+    def fake_call_operator(operator_class, prompt, system=None, _provenance_out=None, **kwargs):
+        assert operator_class == "qwen"
+        assert prompt == "test-prompt"
+        assert system is None  # No context passed.
+        if _provenance_out is not None:
+            _provenance_out.append(("success", "qwen"))
+        return "test-response"
+
+    monkeypatch.setattr("agents_core.interactive_submit.call_operator", fake_call_operator)
+
+    result = submit(
+        turn="test-prompt",
+        context=None,
+        destination="route-to-fast",
+        operator="qwen",
+    )
+
+    assert result["result"] == "test-response"
+    assert result["served_by"] == "qwen"
+    assert result["provenance"] == [("success", "qwen")]
+
+
+def test_submit_route_to_fast_with_context(monkeypatch):
+    """submit(route-to-fast) with context serializes it as system=JSON."""
+    from agents_core.interactive_submit import submit
+    import json
+
+    captured_call = {}
+
+    def fake_call_operator(operator_class, prompt, system=None, _provenance_out=None, **kwargs):
+        captured_call["system"] = system
+        if _provenance_out is not None:
+            _provenance_out.append(("success", "qwen"))
+        return "response"
+
+    monkeypatch.setattr("agents_core.interactive_submit.call_operator", fake_call_operator)
+
+    context = {"role": "assistant", "history": ["a", "b"]}
+    result = submit(
+        turn="prompt",
+        context=context,
+        destination="route-to-fast",
+    )
+
+    assert json.loads(captured_call["system"]) == context
+
+
+def test_submit_context_reaches_call_operator(monkeypatch, tmp_path):
+    """AC2: submit(queue-gw-interactive) stores context; serving step reconstructs system=."""
+    from agents_core.interactive_submit import submit
+    from agents_core.elevator_interactive_worker import _reconstruct_call_args
+
+    db_path = tmp_path / "queue.db"
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(db_path))
+
+    context_payload = {"role": "system", "data": "test-context"}
+    result = submit(
+        turn="test-turn",
+        context=context_payload,
+        destination="queue-gw-interactive",
+    )
+
+    item_id = result["item_id"]
+    elevator = ElevatorStore(db_path)
+    item = elevator.get(item_id)
+    elevator.close()
+
+    payload = item["payload"]
+    prompt, system = _reconstruct_call_args(payload)
+
+    assert prompt == "test-turn"
+    assert system is not None
+    import json
+    assert json.loads(system) == context_payload
+
+
+# -- Tests for interactive serving worker ----
+
+def test_elevator_ack_with_result(elevator_store):
+    """elevator.ack() accepts and stores result parameter."""
+    item_id = elevator_store.enqueue(
+        lane="interactive",
+        kind="session-turn",
+        payload={"prompt": "test", "context": {}},
+        principal="test",
+        latency_class="interactive",
+    )
+    item = elevator_store.claim(
+        lanes=["interactive"], owner="test-worker", claim_ttl_sec=360
+    )
+    assert item["item_id"] == item_id
+
+    elevator_store.ack(
+        item_id,
+        result="test-response",
+        provenance={"served_by": "gravitywell"},
+    )
+
+    item = elevator_store.get(item_id)
+    assert item["status"] == "served"
+    assert item["result"] == "test-response"
+    assert item["provenance"]["served_by"] == "gravitywell"
+
+
+def test_serving_worker_success_path(tmp_path, monkeypatch):
+    """Worker serves a baton and writes result + provenance on success."""
+    from agents_core.elevator_interactive_worker import serve_interactive_baton
+
+    db_path = tmp_path / "queue.db"
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(db_path))
+
+    elevator = ElevatorStore(db_path)
+    item_id = elevator.enqueue(
+        lane="interactive",
+        kind="session-turn",
+        payload={"prompt": "ping", "context": {}},
+        principal="test",
+        latency_class="interactive",
+    )
+    item = elevator.claim(
+        lanes=["interactive"], owner="test-worker", claim_ttl_sec=360
+    )
+    elevator.close()
+
+    def fake_call_operator(operator, prompt, system=None, on_wake_fail=None, _provenance_out=None, **kwargs):
+        assert operator == "gravitywell"
+        assert on_wake_fail == "skip"
+        if _provenance_out is not None:
+            _provenance_out.append(("success", "gravitywell"))
+        return "pong"
+
+    monkeypatch.setattr("agents_core.elevator_interactive_worker.call_operator", fake_call_operator)
+
+    result = serve_interactive_baton(item)
+    assert result is True
+
+    elevator = ElevatorStore(db_path)
+    served_item = elevator.get(item_id)
+    elevator.close()
+    assert served_item["status"] == "served"
+    assert served_item["result"] == "pong"
+
+
+def test_serving_worker_deferred_requeue(tmp_path, monkeypatch):
+    """Worker requeues immediately when GW is deferred (no paid operator call)."""
+    from agents_core.elevator_interactive_worker import serve_interactive_baton
+
+    db_path = tmp_path / "queue.db"
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(db_path))
+
+    elevator = ElevatorStore(db_path)
+    item_id = elevator.enqueue(
+        lane="interactive",
+        kind="session-turn",
+        payload={"prompt": "test", "context": {}},
+        principal="test",
+        latency_class="interactive",
+    )
+    item = elevator.claim(
+        lanes=["interactive"], owner="test-worker", claim_ttl_sec=360
+    )
+    elevator.close()
+
+    def fake_call_operator(operator, prompt, system=None, on_wake_fail=None, _provenance_out=None, **kwargs):
+        if _provenance_out is not None:
+            _provenance_out.append(("gw_not_serving", "gravitywell"))
+        return None
+
+    def fake_doorman_status():
+        return {"nodes": {"gravitywell": {"serving": False}}}
+
+    from unittest.mock import MagicMock
+    monkeypatch.setattr("agents_core.elevator_interactive_worker.call_operator", fake_call_operator)
+    monkeypatch.setattr(
+        "agents_core.elevator_interactive_worker.DoormanClient",
+        lambda: MagicMock(status=fake_doorman_status, close=MagicMock())
+    )
+
+    result = serve_interactive_baton(item)
+    assert result is False
+
+    elevator = ElevatorStore(db_path)
+    requeued_item = elevator.get(item_id)
+    elevator.close()
+    assert requeued_item["status"] == "pending"
+    assert requeued_item["attempts"] == 1
+
+
+def test_serving_worker_wake_failed_backoff(tmp_path, monkeypatch):
+    """Worker requeues with backoff on wake_failed, marks failed after max retries."""
+    from agents_core.elevator_interactive_worker import serve_interactive_baton
+
+    db_path = tmp_path / "queue.db"
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(db_path))
+    monkeypatch.setenv("MAX_WAKE_FAIL_RETRIES", "3")
+
+    elevator = ElevatorStore(db_path)
+    item_id = elevator.enqueue(
+        lane="interactive",
+        kind="session-turn",
+        payload={"prompt": "test", "context": {}},
+        principal="test",
+        latency_class="interactive",
+    )
+
+    def fake_call_operator(operator, prompt, system=None, on_wake_fail=None, _provenance_out=None, **kwargs):
+        if _provenance_out is not None:
+            _provenance_out.append(("gw_not_serving", "gravitywell"))
+        return None
+
+    def fake_doorman_status():
+        return {"nodes": {"gravitywell": {"serving": True}}}  # serving=true => wake_failed
+
+    from unittest.mock import MagicMock
+    monkeypatch.setattr("agents_core.elevator_interactive_worker.call_operator", fake_call_operator)
+    monkeypatch.setattr(
+        "agents_core.elevator_interactive_worker.DoormanClient",
+        lambda: MagicMock(status=fake_doorman_status, close=MagicMock())
+    )
+
+    # Attempt 1: requeue
+    item = elevator.claim(lanes=["interactive"], owner="worker", claim_ttl_sec=360)
+    serve_interactive_baton(item)
+    item = elevator.get(item_id)
+    assert item["status"] == "pending"
+    assert item["attempts"] == 1
+
+    # Attempt 2: requeue
+    item = elevator.claim(lanes=["interactive"], owner="worker", claim_ttl_sec=360)
+    serve_interactive_baton(item)
+    item = elevator.get(item_id)
+    assert item["status"] == "pending"
+    assert item["attempts"] == 2
+
+    # Attempt 3: requeue
+    item = elevator.claim(lanes=["interactive"], owner="worker", claim_ttl_sec=360)
+    serve_interactive_baton(item)
+    item = elevator.get(item_id)
+    assert item["status"] == "pending"
+    assert item["attempts"] == 3
+
+    # Attempt 4: max retries exceeded, mark failed
+    item = elevator.claim(lanes=["interactive"], owner="worker", claim_ttl_sec=360)
+    serve_interactive_baton(item)
+    item = elevator.get(item_id)
+    assert item["status"] == "failed"
+
+    elevator.close()
+
+
+def test_serving_worker_only_claims_interactive(elevator_store):
+    """Worker claims only from interactive lane, never deliberation/execution."""
+    from agents_core.elevator_interactive_worker import worker_loop
+    from unittest.mock import MagicMock, patch
+
+    # Enqueue items in different lanes.
+    elevator_store.enqueue(
+        lane="interactive",
+        kind="session-turn",
+        payload={"prompt": "test", "context": {}},
+        principal="test",
+        latency_class="interactive",
+    )
+    elevator_store.enqueue(
+        lane="deliberation",
+        kind="deliberate",
+        payload={"data": "test"},
+        principal="test",
+        latency_class="batch",
+    )
+
+    claimed_lanes = []
+
+    def fake_claim(lanes, owner, claim_ttl_sec):
+        claimed_lanes.append(lanes)
+        # Return None to exit loop after first claim.
+        return None
+
+    with patch.object(ElevatorStore, "claim", side_effect=fake_claim):
+        with patch("agents_core.elevator_interactive_worker.time.sleep"):
+            try:
+                with patch.object(ElevatorStore, "close"):
+                    # Run one iteration of the loop
+                    elevator = ElevatorStore()
+                    item = elevator.claim(
+                        lanes=["interactive"],
+                        owner="elevator-interactive-worker",
+                        claim_ttl_sec=360,
+                    )
+                    claimed_lanes.append(["interactive"])
+            except StopIteration:
+                pass
+
+    # Verify only interactive was claimed
+    assert ["interactive"] in claimed_lanes

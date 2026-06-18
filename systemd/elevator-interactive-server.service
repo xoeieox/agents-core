@@ -1,0 +1,15 @@
+[Unit]
+Description=Interactive serving worker — claims and serves GW interactive batons
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 -m agents_core.elevator_interactive_worker
+Environment=PYTHONPATH=/srv/agents
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=-%h/.config/elevator/interactive.env
+
+[Install]
+WantedBy=default.target
