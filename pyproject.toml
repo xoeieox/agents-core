@@ -27,6 +27,7 @@ gpu-queue-server = "agents_core.gpu_server:main"
 slot-server = "agents_core.slot_server:main"
 keeper-query = "agents_core.keeper_query:main"
 doorman-server = "agents_core.doorman_server:main"
+shared-deliberation-server = "agents_core.shared_deliberation.service:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
