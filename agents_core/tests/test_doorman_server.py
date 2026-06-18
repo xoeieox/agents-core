@@ -376,11 +376,13 @@ class TestEndpoints:
         assert "service_stopped" in gw
 
     def test_status_serving_mode_big_when_serving(self):
-        c = _client_no_auth()
-        with patch("agents_core.doorman_server._NodeState._is_serving", return_value=True):
-            r = c.get("/status")
-        gw = r.json()["nodes"]["gravitywell"]
-        assert gw["serving_mode"] == "big"
+        state = _NodeState(GW_URL_DEFAULT)
+        state._cached_serving = True
+        state._serving_checked_at = time.time()
+        snapshot = state.status_snapshot()
+        assert snapshot["serving_mode"] == "big"
+        assert snapshot["snapshot_mode"] == "cached"
+        assert snapshot["serving_checked_at"] > 0
 
     def test_status_serving_mode_stopped_when_service_stopped(self):
         with patch("agents_core.doorman_server._start_refresh_thread"):
@@ -963,6 +965,275 @@ class TestDeferenceEndpoints:
         with patch.object(state, "_is_serving", return_value=False):
             snapshot = state.status_snapshot()
         assert snapshot["mode_owner"] is None
+
+
+# ---------------------------------------------------------------------------
+# Serving cache (doorman-status-cached-serving-v0)
+# ---------------------------------------------------------------------------
+
+class TestServingCache:
+    """Tests for the cached serving state and fast /status endpoint."""
+
+    def test_status_snapshot_reads_cache_not_probes_live(self):
+        """AC1: status_snapshot must read _cached_serving, not call _is_serving."""
+        state = _make_state()
+        state._cached_serving = True
+        state._serving_checked_at = time.time()
+
+        with patch.object(state, "_is_serving") as mock_probe:
+            snapshot = state.status_snapshot()
+
+        # _is_serving must NOT be called by status_snapshot
+        mock_probe.assert_not_called()
+        assert snapshot["serving"] is True
+
+    def test_status_snapshot_null_serving_on_startup_race(self):
+        """When cache is None (startup before first refresh), return null serving."""
+        state = _make_state()
+        # Default state: _cached_serving = None, _serving_checked_at = 0.0
+        assert state._cached_serving is None
+        assert state._serving_checked_at == 0.0
+
+        snapshot = state.status_snapshot()
+        assert snapshot["serving"] is None
+        assert snapshot["serving_checked_at"] == 0.0
+
+    def test_cache_fields_in_status_response(self):
+        """AC5: /status response includes serving_checked_at and snapshot_mode."""
+        state = _make_state()
+        state._cached_serving = False
+        state._serving_checked_at = 1234567890.0
+
+        snapshot = state.status_snapshot()
+        assert "serving_checked_at" in snapshot
+        assert snapshot["serving_checked_at"] == 1234567890.0
+        assert "snapshot_mode" in snapshot
+        assert snapshot["snapshot_mode"] == "cached"
+
+    def test_refresh_cache_populates_and_timestamps(self):
+        """AC3: _refresh_serving_cache probes and updates cache + timestamp."""
+        state = _make_state()
+        before = time.time()
+
+        with patch.object(state, "_is_serving", return_value=True):
+            state._refresh_serving_cache()
+
+        after = time.time()
+        assert state._cached_serving is True
+        assert before <= state._serving_checked_at <= after
+
+    def test_refresh_cache_outside_lock(self):
+        """AC4: _refresh_serving_cache probes _is_serving OUTSIDE the lock."""
+        state = _make_state()
+        lock_held_during_probe = {"yes": False}
+
+        def fake_is_serving(timeout=3.0):
+            # Try to acquire the lock without blocking
+            acquired = state.lock.acquire(blocking=False)
+            if not acquired:
+                lock_held_during_probe["yes"] = True
+            else:
+                state.lock.release()
+            return True
+
+        with patch.object(state, "_is_serving", side_effect=fake_is_serving):
+            state._refresh_serving_cache()
+
+        # Lock must NOT be held during the probe
+        assert lock_held_during_probe["yes"] is False
+
+    def test_ensure_serving_wake_success_sets_cache_true(self):
+        """AC3: successful wake in ensure_serving sets _cached_serving=True."""
+        state = _make_state()
+        serving_iter = iter([False, True])  # not serving, then serving after wake
+
+        def fake_is_serving(_timeout=3.0):
+            return next(serving_iter, True)
+
+        with patch.object(state, "_is_serving", side_effect=fake_is_serving), \
+             patch("subprocess.run") as mock_sub, \
+             patch("time.sleep"):
+            mock_sub.return_value = MagicMock(returncode=0, stderr="")
+            result = state.ensure_serving()
+
+        assert result is True
+        # Cache must be updated to True after successful wake
+        assert state._cached_serving is True
+        assert state._serving_checked_at > 0
+
+    def test_gw_serve_stop_success_sets_cache_false(self):
+        """AC3: gw-serve stop (rc==0) sets _cached_serving=False."""
+        from agents_core.doorman_server import _start_refresh_thread
+
+        nodes, state = {}, _NodeState(GW_URL_DEFAULT)
+        state.idle_since = time.time() - 700  # past grace
+        nodes["gravitywell"] = state
+
+        def fake_run(cmd, **kwargs):
+            if "gw-serve" in str(cmd) and "stop" in str(cmd):
+                return MagicMock(returncode=0, stderr="")
+            return MagicMock(returncode=0, stderr="")
+
+        tick_count = {"n": 0}
+
+        def fake_sleep(s):
+            tick_count["n"] += 1
+            if tick_count["n"] >= 2:
+                state.idle_since = None
+
+        # Mock _refresh_serving_cache to not write cache in the loop,
+        # so we can test that the stop path itself sets the cache
+        original_refresh = state._refresh_serving_cache
+        def no_cache_refresh():
+            # Probe but don't write cache (to isolate the stop-path cache write)
+            state._is_serving(timeout=2.0)
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("time.sleep", side_effect=fake_sleep), \
+             patch.object(state, "_is_serving", return_value=False), \
+             patch.object(state, "_refresh_serving_cache", side_effect=no_cache_refresh), \
+             patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0), \
+             patch("agents_core.doorman_server.GW_STOP_GRACE_SEC", 600), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            t = _start_refresh_thread(nodes)
+            t.join(timeout=2.0)
+
+        # After stop success, cache must be False (set by the stop path, not refresh)
+        assert state._cached_serving is False
+        assert state._serving_checked_at > 0
+
+    def test_gw_serve_stop_idempotency_sets_cache_false(self):
+        """AC3: gw-serve stop idempotency (rc!=0, already down) sets cache=False."""
+        from agents_core.doorman_server import _start_refresh_thread
+
+        nodes, state = {}, _NodeState(GW_URL_DEFAULT)
+        state.idle_since = time.time() - 700  # past grace
+        nodes["gravitywell"] = state
+
+        def fake_run(cmd, **kwargs):
+            if "gw-serve" in str(cmd) and "stop" in str(cmd):
+                return MagicMock(returncode=1, stderr="already stopped")
+            return MagicMock(returncode=0, stderr="")
+
+        tick_count = {"n": 0}
+
+        def fake_sleep(s):
+            tick_count["n"] += 1
+            if tick_count["n"] >= 2:
+                pass
+
+        # Mock _refresh_serving_cache to not write cache in the loop,
+        # so we can test that the idempotency-success path sets the cache
+        original_refresh = state._refresh_serving_cache
+        def no_cache_refresh():
+            # Probe but don't write cache (to isolate the stop-path cache write)
+            state._is_serving(timeout=2.0)
+
+        # _is_serving returns False → idempotency success → cache should be False
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("time.sleep", side_effect=fake_sleep), \
+             patch.object(state, "_is_serving", return_value=False), \
+             patch.object(state, "_refresh_serving_cache", side_effect=no_cache_refresh), \
+             patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0), \
+             patch("agents_core.doorman_server.GW_STOP_GRACE_SEC", 600), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            t = _start_refresh_thread(nodes)
+            t.join(timeout=2.0)
+
+        # Cache must be False from idempotency-success path (rc!=0 but already down)
+        assert state._cached_serving is False
+        assert state._serving_checked_at > 0
+
+    def test_refresh_loop_calls_refresh_outside_lock_no_deadlock(self):
+        """AC7: _loop calls _refresh_serving_cache OUTSIDE the per-node lock."""
+        from agents_core.doorman_server import _start_refresh_thread
+
+        state = _NodeState(GW_URL_DEFAULT)
+        state.leases["w1"] = {"acquired_at": time.time(), "ttl_sec": 300, "reason": "t"}
+        nodes = {"gravitywell": state}
+
+        refresh_calls = []
+
+        # Mock _refresh_serving_cache to track calls and verify lock is not held
+        original_refresh = state._refresh_serving_cache
+
+        def tracked_refresh():
+            acquired = state.lock.acquire(blocking=False)
+            if acquired:
+                # Lock was NOT held — correct!
+                refresh_calls.append("lock_free")
+                state.lock.release()
+            else:
+                # Lock WAS held — would deadlock!
+                refresh_calls.append("lock_held")
+            # Call the real refresh
+            original_refresh()
+
+        tick_count = {"n": 0}
+
+        def fake_sleep(s):
+            tick_count["n"] += 1
+            if tick_count["n"] >= 2:
+                state.leases.clear()
+
+        with patch.object(state, "_refresh_serving_cache", side_effect=tracked_refresh), \
+             patch("time.sleep", side_effect=fake_sleep), \
+             patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0):
+            t = _start_refresh_thread(nodes)
+            t.join(timeout=2.0)
+
+        # _refresh_serving_cache must have been called with lock NOT held
+        assert "lock_free" in refresh_calls
+        assert "lock_held" not in refresh_calls
+
+    def test_startup_refresh_before_sleep(self):
+        """AC6: refresh thread does first _refresh_serving_cache before sleep."""
+        from agents_core.doorman_server import _start_refresh_thread
+
+        state = _NodeState(GW_URL_DEFAULT)
+        nodes = {"gravitywell": state}
+
+        refresh_calls = []
+        sleep_calls = []
+
+        original_refresh = state._refresh_serving_cache
+
+        def tracked_refresh():
+            refresh_calls.append(time.time())
+            original_refresh()
+
+        def tracked_sleep(s):
+            sleep_calls.append(time.time())
+            # Stop after first sleep
+            if sleep_calls:
+                state.idle_since = None
+
+        # Mock _is_serving so original_refresh() doesn't make live HTTP calls
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch.object(state, "_refresh_serving_cache", side_effect=tracked_refresh), \
+             patch("time.sleep", side_effect=tracked_sleep), \
+             patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0.1):
+            t = _start_refresh_thread(nodes)
+            t.join(timeout=2.0)
+
+        # First refresh must happen before first sleep
+        assert len(refresh_calls) >= 1
+        assert len(sleep_calls) >= 1
+        assert refresh_calls[0] < sleep_calls[0]
+
+    def test_acquire_does_not_write_cache_fast_path(self):
+        """Fast-path ensure_serving (already serving) must NOT write cache."""
+        state = _make_state()
+        state._cached_serving = None  # Cache starts uninitialized
+
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch("subprocess.run"):
+            result = state.ensure_serving()
+
+        # Fast path succeeded but must NOT update cache (only doorman-driven transitions do)
+        assert result is True
+        # Cache stays None (not a doorman-driven wake, just a confirmation)
+        assert state._cached_serving is None
 
 
 # ---------------------------------------------------------------------------
