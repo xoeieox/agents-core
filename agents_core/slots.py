@@ -220,7 +220,7 @@ class _AdjacentCache:
             with self._lock:
                 # Check if the in-flight compute failed.
                 if key in self._inflight_errors:
-                    error = self._inflight_errors.pop(key, None)
+                    error = self._inflight_errors.get(key, None)
                     raise error
                 if key in self._cache:
                     _, result = self._cache[key]

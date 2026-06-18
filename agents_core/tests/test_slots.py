@@ -861,3 +861,43 @@ def test_adjacent_cache_serve_stale_no_cache_raises(store: SlotStore, monkeypatc
     # Call should raise since there's no cached result
     with pytest.raises(sqlite3.OperationalError):
         store.adjacent(files=["app.py"])
+
+
+def test_adjacent_cache_multi_waiter_error(store: SlotStore, monkeypatch):
+    """Multi-waiter error race fix: all waiters must see the error, not just the first.
+
+    When compute fails with a cold cache, multiple concurrent waiters should all
+    re-raise the error, not silently return [] for later waiters.
+    """
+    a = store.create_slot("proj-A", CONTRIB)
+    store.set_domain_touch(a, files=["app.py"], by="agent-1")
+
+    # Inject an error WITHOUT warming the cache first
+    def error_impl(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "_adjacent_impl", error_impl)
+
+    # Multiple concurrent threads with same params
+    errors_caught = []
+    results = [None] * 3
+
+    def thread_worker(idx: int):
+        try:
+            results[idx] = store.adjacent(files=["app.py"])
+            errors_caught.append(None)  # No error raised
+        except sqlite3.OperationalError as e:
+            errors_caught.append(str(e))
+
+    threads = [threading.Thread(target=thread_worker, args=(i,)) for i in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # All threads should have caught the error, not returned [] or cached result
+    assert len(errors_caught) == 3
+    # All three should have caught the OperationalError
+    assert all("database is locked" in e for e in errors_caught if e is not None)
+    # None should have silently returned a result
+    assert all(r is None for r in results)
