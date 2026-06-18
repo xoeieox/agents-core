@@ -4,12 +4,14 @@ import json
 import tempfile
 import time
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
 from agents_core.elevator import (
     ELEVATOR_PENDING_MAX_AGE_SEC,
     ElevatorStore,
+    OffMasterWriteError,
     QueueNotFoundError,
 )
 
@@ -604,3 +606,95 @@ def test_synthetic_demo(temp_db):
     assert item["result_ref"] == "result://synthetic-demo-result"
     assert item["provenance"]["phase"] == "big"
     assert item["provenance"]["wait_ms"] == 5000
+
+
+def test_reap_returns_counts(temp_db):
+    """Test that reap() returns actual expired and reclaimed counts."""
+    # Enqueue items with short TTL and aged timestamps.
+    item_id1 = temp_db.enqueue(
+        lane="interactive",
+        kind="test",
+        payload={},
+        principal="p1",
+        latency_class="interactive",
+    )
+    item_id2 = temp_db.enqueue(
+        lane="interactive",
+        kind="test",
+        payload={},
+        principal="p2",
+        latency_class="interactive",
+    )
+
+    # Claim one item with very short TTL.
+    temp_db.claim(
+        lanes=["interactive"],
+        owner="broker",
+        claim_ttl_sec=1,
+    )
+
+    # Sleep to exceed TTL.
+    time.sleep(2)
+
+    # Reap should return counts.
+    result = temp_db.reap()
+    assert isinstance(result, dict)
+    assert "expired" in result
+    assert "reclaimed" in result
+    assert result["reclaimed"] == 1  # One stale claim reclaimed
+    # The other item is still pending (not aged enough yet).
+
+
+def test_compose_gw_status_with_flip_controller(temp_db):
+    """Test _compose_gw_status with mocked flip-controller response."""
+    with mock.patch("agents_core.elevator.httpx") as mock_httpx:
+        mock_client = mock.MagicMock()
+        mock_httpx.get = mock.MagicMock()
+
+        # Mock flip-controller response.
+        flip_resp = mock.MagicMock()
+        flip_resp.status_code = 200
+        flip_resp.json.return_value = {"mode": "big"}
+
+        # Mock doorman response.
+        doorman_resp = mock.MagicMock()
+        doorman_resp.status_code = 200
+        doorman_resp.json.return_value = {"nodes": {"gravitywell": {"serving": True}}}
+
+        def mock_get(url, timeout=None):
+            if "8408" in url:
+                return flip_resp
+            elif "8407" in url:
+                return doorman_resp
+            raise Exception("Unknown URL")
+
+        mock_httpx.get = mock_get
+
+        result = temp_db._compose_gw_status()
+        assert result["mode"] == "big"
+        assert result["serving_ready"] is True
+
+
+def test_compose_gw_status_degraded(temp_db):
+    """Test _compose_gw_status degrades gracefully when services unavailable."""
+    with mock.patch("agents_core.elevator.httpx") as mock_httpx:
+        # Simulate httpx not available or timeout.
+        mock_httpx.get = mock.MagicMock(side_effect=Exception("Connection timeout"))
+
+        result = temp_db._compose_gw_status()
+        assert result["mode"] == "unknown"
+        assert result["serving_ready"] is None
+
+
+def test_off_master_enqueue_rejects(temp_db):
+    """Test that enqueue rejects on non-master node."""
+    with mock.patch("agents_core.elevator.IS_MASTER", False):
+        store = temp_db
+        with pytest.raises(OffMasterWriteError):
+            store.enqueue(
+                lane="interactive",
+                kind="test",
+                payload={},
+                principal="p1",
+                latency_class="interactive",
+            )

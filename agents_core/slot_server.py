@@ -29,6 +29,18 @@ Auth implementation:
 Agent-operable, NOT agent-as-destination: every write carries a contributor-of-record
 (`by`), the single-writer guard rejects impostor writes, and the blackboard feeds the
 human-readable Composer surface (post-GravityWell). Reads are advisory discovery.
+
+Deployment:
+  The slot_server binary is installed as a console_script via agents_core/pyproject.toml.
+  It may be managed as:
+  1. Systemd service (slot-server.service at /srv/agents/systemd/) — enable with:
+       sudo systemctl enable /srv/agents/systemd/slot-server.service
+       sudo systemctl start slot-server
+  2. Unmanaged bare PID (current state as of 2026-06-17) — restart manually:
+       pkill -f "^/.*slot-server$"
+       # New instance will start on next scheduled tick or manual invocation
+  The elevator queue routes (/v0/elevator/*) added in gw-elevator-queue-substrate-v0
+  are served by this same process (port 8405); no separate queue-server is needed.
 """
 
 from __future__ import annotations
@@ -45,6 +57,7 @@ from fastapi.responses import JSONResponse
 
 from agents_core.elevator import (
     ElevatorStore,
+    OffMasterWriteError,
     QueueNotFoundError,
 )
 from agents_core.slots import (
@@ -104,6 +117,14 @@ def create_app(db_path: Path, elevator_db_path: Path | None = None) -> FastAPI:
                     content=_error("unauthorized", "Missing or invalid bearer token"),
                 )
         return await call_next(request)
+
+    @app.exception_handler(OffMasterWriteError)
+    async def off_master_write_error_handler(request: Request, exc: OffMasterWriteError):
+        """Handle off-master write attempts with a 403 error."""
+        return JSONResponse(
+            status_code=403,
+            content=_error("forbidden", str(exc)),
+        )
 
     def _check_by_principal(by: str) -> None:
         """Reject writes where the caller's authenticated principal doesn't match `by`.
@@ -314,7 +335,7 @@ def create_app(db_path: Path, elevator_db_path: Path | None = None) -> FastAPI:
     def claim_item(body: dict[str, Any]):
         """Claim the next pending item from the given lanes."""
         try:
-            lanes = body.get("lanes", list(("interactive", "deliberation", "execution")))
+            lanes = body.get("lanes", ["interactive", "deliberation", "execution"])
             owner = body["owner"]
             claim_ttl_sec = body.get("claim_ttl_sec", 30)
             item = elevator.claim(lanes=lanes, owner=owner, claim_ttl_sec=claim_ttl_sec)

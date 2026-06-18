@@ -1,8 +1,10 @@
 """Tests for elevator queue HTTP routes on slot_server."""
 
 import json
+import os
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -434,3 +436,106 @@ def test_lane_priority_ordering(client):
         },
     ).json()
     assert claim3["item_id"] == exec_id
+
+
+@pytest.fixture
+def client_with_auth():
+    """Create a test client with bearer auth enabled."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        slot_db = Path(tmpdir) / "slots.db"
+        elevator_db = Path(tmpdir) / "elevator.db"
+        # Set bearer token in environment.
+        os.environ["SLOTS_BEARER_TOKEN"] = "test-secret-token"
+        try:
+            app = create_app(slot_db, elevator_db_path=elevator_db)
+            yield TestClient(app)
+        finally:
+            del os.environ["SLOTS_BEARER_TOKEN"]
+
+
+def test_bearer_auth_required_enqueue(client_with_auth):
+    """Test that enqueue requires bearer token."""
+    response = client_with_auth.post(
+        "/v0/elevator/enqueue",
+        json={
+            "lane": "interactive",
+            "kind": "test",
+            "payload": {},
+            "principal": "p1",
+            "latency_class": "interactive",
+        },
+    )
+    assert response.status_code == 401
+    assert "bearer token" in response.json()["error"]["message"].lower()
+
+
+def test_bearer_auth_wrong_token_enqueue(client_with_auth):
+    """Test that enqueue rejects wrong bearer token."""
+    response = client_with_auth.post(
+        "/v0/elevator/enqueue",
+        headers={"Authorization": "Bearer wrong-token"},
+        json={
+            "lane": "interactive",
+            "kind": "test",
+            "payload": {},
+            "principal": "p1",
+            "latency_class": "interactive",
+        },
+    )
+    assert response.status_code == 401
+
+
+def test_bearer_auth_valid_token_enqueue(client_with_auth):
+    """Test that enqueue accepts valid bearer token."""
+    response = client_with_auth.post(
+        "/v0/elevator/enqueue",
+        headers={"Authorization": "Bearer test-secret-token"},
+        json={
+            "lane": "interactive",
+            "kind": "test",
+            "payload": {},
+            "principal": "p1",
+            "latency_class": "interactive",
+        },
+    )
+    assert response.status_code == 201
+
+
+def test_bearer_auth_required_claim(client_with_auth):
+    """Test that claim requires bearer token."""
+    response = client_with_auth.post(
+        "/v0/elevator/claim",
+        json={
+            "lanes": ["interactive"],
+            "owner": "broker",
+            "claim_ttl_sec": 30,
+        },
+    )
+    assert response.status_code == 401
+
+
+def test_bearer_auth_required_ack(client_with_auth):
+    """Test that ack requires bearer token."""
+    response = client_with_auth.post(
+        "/v0/elevator/ack",
+        json={"item_id": "test-id"},
+    )
+    assert response.status_code == 401
+
+
+def test_off_master_write_protection(client):
+    """Test that writes from non-master nodes are rejected."""
+    with mock.patch("agents_core.elevator.IS_MASTER", False):
+        response = client.post(
+            "/v0/elevator/enqueue",
+            json={
+                "lane": "interactive",
+                "kind": "test",
+                "payload": {},
+                "principal": "p1",
+                "latency_class": "interactive",
+            },
+        )
+        # Should return 403 Forbidden (off-master write attempt).
+        assert response.status_code == 403
+        assert "off-master" in response.json()["error"]["message"].lower()

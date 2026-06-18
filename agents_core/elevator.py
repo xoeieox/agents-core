@@ -37,6 +37,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    import httpx
+except ImportError:
+    httpx = None
+
 
 # --- Configuration ---
 
@@ -118,12 +123,14 @@ class ElevatorStore:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
         self._lock = threading.RLock()
-        # Start reaper thread.
+        # Start reaper thread (master only).
         self._reaper_stop = threading.Event()
-        self._reaper_thread = threading.Thread(
-            target=self._reaper_loop, daemon=True, name="elevator-reaper"
-        )
-        self._reaper_thread.start()
+        self._reaper_thread = None
+        if IS_MASTER:
+            self._reaper_thread = threading.Thread(
+                target=self._reaper_loop, daemon=True, name="elevator-reaper"
+            )
+            self._reaper_thread.start()
 
     def _check_writable(self):
         """Ensure this node is the master before allowing writes."""
@@ -136,7 +143,8 @@ class ElevatorStore:
     def close(self):
         """Shut down the reaper and close the database."""
         self._reaper_stop.set()
-        self._reaper_thread.join(timeout=5)
+        if self._reaper_thread:
+            self._reaper_thread.join(timeout=5)
         self._conn.close()
 
     # -- enqueue (producer) -----------------------------------------------
@@ -344,21 +352,39 @@ class ElevatorStore:
 
         Returns a dict with mode/serving_ready/healthy/unknown fields.
         If either service is unreachable, returns unknown/null gracefully."""
-        try:
-            # This would import the actual HTTP client and fetch from flip-controller
-            # and doorman. For now, return unknown as a placeholder (U1 spec says
-            # this is best-effort, can return unknown if unreachable).
-            return {
-                "mode": "unknown",
-                "serving_ready": None,
-                "healthy": None,
-            }
-        except Exception:
-            return {
-                "mode": "unknown",
-                "serving_ready": None,
-                "healthy": None,
-            }
+        mode = "unknown"
+        serving_ready = None
+        healthy = None
+
+        # Attempt to fetch flip-controller mode (best-effort, no error on failure).
+        if httpx:
+            try:
+                resp = httpx.get("http://203.0.113.10:8408/v0/status", timeout=2.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    flip_mode = data.get("mode")
+                    if flip_mode in ("big", "swarm", "offline", "transitioning"):
+                        mode = flip_mode
+            except Exception:
+                pass
+
+            # Attempt to fetch doorman serving_ready (best-effort, no error on failure).
+            try:
+                resp = httpx.get("http://203.0.113.10:8407/status", timeout=2.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    gw_data = data.get("nodes", {}).get("gravitywell", {})
+                    # Map nodes.gravitywell.serving → gw.serving_ready.
+                    if "serving" in gw_data:
+                        serving_ready = gw_data["serving"]
+            except Exception:
+                pass
+
+        return {
+            "mode": mode,
+            "serving_ready": serving_ready,
+            "healthy": healthy,
+        }
 
     # -- reaper (maintenance) ---------------------------------------------
 
@@ -376,11 +402,12 @@ class ElevatorStore:
 
         Returns {"expired": count, "reclaimed": count}."""
         self._check_writable()
-        self._reap_inline()
-        return {"expired": 0, "reclaimed": 0}  # Counts are tracked inline.
+        return self._reap_inline()
 
-    def _reap_inline(self):
-        """Inline reap: expire pending items and reclaim stale claims."""
+    def _reap_inline(self) -> dict[str, int]:
+        """Inline reap: expire pending items and reclaim stale claims.
+
+        Returns {"expired": count, "reclaimed": count}."""
         now = datetime.now(timezone.utc)
         now_str = now.isoformat()
         max_age = timedelta(seconds=ELEVATOR_PENDING_MAX_AGE_SEC)
@@ -388,14 +415,15 @@ class ElevatorStore:
         with self._lock:
             # Expire pending items older than max_age.
             cutoff = (now - max_age).isoformat()
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "UPDATE queue_items SET status='expired' "
                 "WHERE status='pending' AND created_at < ?",
                 (cutoff,),
             )
+            expired = cursor.rowcount
 
             # Reclaim stale claims: claimed items past their claim_ttl_sec.
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "UPDATE queue_items SET status='pending', attempts=attempts+1, "
                 "claimed_at=NULL, claim_owner=NULL, claim_ttl_sec=NULL "
                 "WHERE status='claimed' AND claim_ttl_sec IS NOT NULL "
@@ -403,11 +431,14 @@ class ElevatorStore:
                 "AND datetime(claimed_at) < datetime(?, '-' || claim_ttl_sec || ' seconds')",
                 (now_str,),
             )
+            reclaimed = cursor.rowcount
             self._conn.commit()
+
+        return {"expired": expired, "reclaimed": reclaimed}
 
     # -- helpers ----------------------------------------------------------
 
-    def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any] | None:
         """Convert a sqlite3.Row to a dict with parsed JSON fields."""
         if not row:
             return None
