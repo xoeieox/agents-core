@@ -1,0 +1,436 @@
+"""Tests for elevator queue HTTP routes on slot_server."""
+
+import json
+import tempfile
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from agents_core.slot_server import create_app
+
+
+@pytest.fixture
+def client():
+    """Create a test client with a temporary database."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        slot_db = Path(tmpdir) / "slots.db"
+        elevator_db = Path(tmpdir) / "elevator.db"
+        app = create_app(slot_db, elevator_db_path=elevator_db)
+        yield TestClient(app)
+
+
+def test_enqueue_basic(client):
+    """Test basic enqueue via POST /v0/elevator/enqueue."""
+    response = client.post(
+        "/v0/elevator/enqueue",
+        json={
+            "lane": "interactive",
+            "kind": "session-turn",
+            "payload": {"prompt": "hello"},
+            "principal": "session-123",
+            "latency_class": "interactive",
+        },
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["status"] == "pending"
+    assert data["lane"] == "interactive"
+    assert data["payload"]["prompt"] == "hello"
+
+
+def test_enqueue_missing_field(client):
+    """Test enqueue rejects missing required field."""
+    response = client.post(
+        "/v0/elevator/enqueue",
+        json={
+            "lane": "interactive",
+            "kind": "session-turn",
+            "payload": {},
+            # missing principal
+            "latency_class": "interactive",
+        },
+    )
+    assert response.status_code == 400
+    assert "missing field" in response.json()["detail"]["error"]["message"]
+
+
+def test_enqueue_invalid_lane(client):
+    """Test enqueue rejects invalid lane."""
+    response = client.post(
+        "/v0/elevator/enqueue",
+        json={
+            "lane": "invalid",
+            "kind": "test",
+            "payload": {},
+            "principal": "p1",
+            "latency_class": "interactive",
+        },
+    )
+    assert response.status_code == 400
+    assert "invalid lane" in response.json()["detail"]["error"]["message"]
+
+
+def test_claim_basic(client):
+    """Test claim via POST /v0/elevator/claim."""
+    # Enqueue an item.
+    enqueue_resp = client.post(
+        "/v0/elevator/enqueue",
+        json={
+            "lane": "interactive",
+            "kind": "test",
+            "payload": {},
+            "principal": "p1",
+            "latency_class": "interactive",
+        },
+    )
+    item_id = enqueue_resp.json()["item_id"]
+
+    # Claim it.
+    response = client.post(
+        "/v0/elevator/claim",
+        json={
+            "lanes": ["interactive", "deliberation", "execution"],
+            "owner": "broker-1",
+            "claim_ttl_sec": 30,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["item_id"] == item_id
+    assert data["status"] == "claimed"
+    assert data["claim_owner"] == "broker-1"
+
+
+def test_claim_no_items(client):
+    """Test claim returns null when no pending items."""
+    response = client.post(
+        "/v0/elevator/claim",
+        json={
+            "lanes": ["interactive"],
+            "owner": "broker-1",
+            "claim_ttl_sec": 30,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() is None
+
+
+def test_claim_missing_owner(client):
+    """Test claim rejects missing owner field."""
+    response = client.post(
+        "/v0/elevator/claim",
+        json={
+            "lanes": ["interactive"],
+            # missing owner
+            "claim_ttl_sec": 30,
+        },
+    )
+    assert response.status_code == 400
+    assert "missing field" in response.json()["detail"]["error"]["message"]
+
+
+def test_ack_basic(client):
+    """Test ack via POST /v0/elevator/ack."""
+    # Enqueue and claim.
+    enqueue_resp = client.post(
+        "/v0/elevator/enqueue",
+        json={
+            "lane": "interactive",
+            "kind": "test",
+            "payload": {},
+            "principal": "p1",
+            "latency_class": "interactive",
+        },
+    )
+    item_id = enqueue_resp.json()["item_id"]
+
+    client.post(
+        "/v0/elevator/claim",
+        json={
+            "lanes": ["interactive"],
+            "owner": "broker",
+            "claim_ttl_sec": 30,
+        },
+    )
+
+    # Ack.
+    response = client.post(
+        "/v0/elevator/ack",
+        json={
+            "item_id": item_id,
+            "result_ref": "result://abc",
+            "provenance": {"phase": "big"},
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "served"
+    assert data["result_ref"] == "result://abc"
+
+
+def test_ack_nonexistent_item(client):
+    """Test ack returns 404 for nonexistent item."""
+    response = client.post(
+        "/v0/elevator/ack",
+        json={
+            "item_id": "nonexistent",
+        },
+    )
+    assert response.status_code == 404
+
+
+def test_requeue_basic(client):
+    """Test requeue via POST /v0/elevator/requeue."""
+    # Enqueue and claim.
+    enqueue_resp = client.post(
+        "/v0/elevator/enqueue",
+        json={
+            "lane": "interactive",
+            "kind": "test",
+            "payload": {},
+            "principal": "p1",
+            "latency_class": "interactive",
+        },
+    )
+    item_id = enqueue_resp.json()["item_id"]
+
+    client.post(
+        "/v0/elevator/claim",
+        json={
+            "lanes": ["interactive"],
+            "owner": "broker",
+            "claim_ttl_sec": 30,
+        },
+    )
+
+    # Requeue.
+    response = client.post(
+        "/v0/elevator/requeue",
+        json={"item_id": item_id},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "pending"
+
+
+def test_requeue_nonexistent_item(client):
+    """Test requeue returns 404 for nonexistent item."""
+    response = client.post(
+        "/v0/elevator/requeue",
+        json={"item_id": "nonexistent"},
+    )
+    assert response.status_code == 404
+
+
+def test_fail_basic(client):
+    """Test fail via POST /v0/elevator/fail."""
+    # Enqueue and claim.
+    enqueue_resp = client.post(
+        "/v0/elevator/enqueue",
+        json={
+            "lane": "interactive",
+            "kind": "test",
+            "payload": {},
+            "principal": "p1",
+            "latency_class": "interactive",
+        },
+    )
+    item_id = enqueue_resp.json()["item_id"]
+
+    client.post(
+        "/v0/elevator/claim",
+        json={
+            "lanes": ["interactive"],
+            "owner": "broker",
+            "claim_ttl_sec": 30,
+        },
+    )
+
+    # Fail.
+    response = client.post(
+        "/v0/elevator/fail",
+        json={"item_id": item_id},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "failed"
+
+
+def test_fail_nonexistent_item(client):
+    """Test fail returns 404 for nonexistent item."""
+    response = client.post(
+        "/v0/elevator/fail",
+        json={"item_id": "nonexistent"},
+    )
+    assert response.status_code == 404
+
+
+def test_get_item_basic(client):
+    """Test GET /v0/elevator/item/{item_id}."""
+    # Enqueue.
+    enqueue_resp = client.post(
+        "/v0/elevator/enqueue",
+        json={
+            "lane": "interactive",
+            "kind": "test",
+            "payload": {"x": 1},
+            "principal": "p1",
+            "latency_class": "interactive",
+        },
+    )
+    item_id = enqueue_resp.json()["item_id"]
+
+    # Get.
+    response = client.get(f"/v0/elevator/item/{item_id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["item_id"] == item_id
+    assert data["payload"]["x"] == 1
+
+
+def test_get_item_not_found(client):
+    """Test GET /v0/elevator/item/{item_id} returns 404 for nonexistent item."""
+    response = client.get("/v0/elevator/item/nonexistent")
+    assert response.status_code == 404
+
+
+def test_get_state_basic(client):
+    """Test GET /v0/elevator/state returns queue + gw blocks."""
+    # Enqueue items.
+    client.post(
+        "/v0/elevator/enqueue",
+        json={
+            "lane": "interactive",
+            "kind": "test",
+            "payload": {},
+            "principal": "p1",
+            "latency_class": "interactive",
+        },
+    )
+    client.post(
+        "/v0/elevator/enqueue",
+        json={
+            "lane": "deliberation",
+            "kind": "test",
+            "payload": {},
+            "principal": "p2",
+            "latency_class": "batch",
+        },
+    )
+
+    response = client.get("/v0/elevator/state")
+    assert response.status_code == 200
+    data = response.json()
+
+    # Check queue block.
+    assert "queue" in data
+    assert "interactive" in data["queue"]
+    assert "deliberation" in data["queue"]
+    assert "execution" in data["queue"]
+    assert data["queue"]["interactive"]["pending"] == 1
+    assert data["queue"]["deliberation"]["pending"] == 1
+    assert data["queue"]["execution"]["pending"] == 0
+
+    # Check gw block (best-effort, may be unknown).
+    assert "gw" in data
+    assert "as_of" in data
+
+
+def test_state_oldest_age_sec(client):
+    """Test that state includes oldest_age_sec for pending items."""
+    # Enqueue.
+    client.post(
+        "/v0/elevator/enqueue",
+        json={
+            "lane": "interactive",
+            "kind": "test",
+            "payload": {},
+            "principal": "p1",
+            "latency_class": "interactive",
+        },
+    )
+
+    response = client.get("/v0/elevator/state")
+    data = response.json()
+    assert data["queue"]["interactive"]["oldest_age_sec"] is not None
+    assert data["queue"]["interactive"]["oldest_age_sec"] >= 0
+
+
+def test_state_no_pending_items(client):
+    """Test state when no pending items exist."""
+    response = client.get("/v0/elevator/state")
+    data = response.json()
+    assert data["queue"]["interactive"]["pending"] == 0
+    assert data["queue"]["interactive"]["oldest_age_sec"] is None
+
+
+def test_lane_priority_ordering(client):
+    """Test that claim respects lane priority via HTTP."""
+    # Enqueue in mixed order.
+    exec_resp = client.post(
+        "/v0/elevator/enqueue",
+        json={
+            "lane": "execution",
+            "kind": "fixer",
+            "payload": {},
+            "principal": "p1",
+            "latency_class": "batch",
+        },
+    )
+    exec_id = exec_resp.json()["item_id"]
+
+    delib_resp = client.post(
+        "/v0/elevator/enqueue",
+        json={
+            "lane": "deliberation",
+            "kind": "council",
+            "payload": {},
+            "principal": "p2",
+            "latency_class": "batch",
+        },
+    )
+    delib_id = delib_resp.json()["item_id"]
+
+    inter_resp = client.post(
+        "/v0/elevator/enqueue",
+        json={
+            "lane": "interactive",
+            "kind": "session-turn",
+            "payload": {},
+            "principal": "p3",
+            "latency_class": "interactive",
+        },
+    )
+    inter_id = inter_resp.json()["item_id"]
+
+    # Claim across all lanes; should respect priority.
+    claim1 = client.post(
+        "/v0/elevator/claim",
+        json={
+            "lanes": ["interactive", "deliberation", "execution"],
+            "owner": "broker",
+            "claim_ttl_sec": 30,
+        },
+    ).json()
+    assert claim1["item_id"] == inter_id
+
+    claim2 = client.post(
+        "/v0/elevator/claim",
+        json={
+            "lanes": ["interactive", "deliberation", "execution"],
+            "owner": "broker",
+            "claim_ttl_sec": 30,
+        },
+    ).json()
+    assert claim2["item_id"] == delib_id
+
+    claim3 = client.post(
+        "/v0/elevator/claim",
+        json={
+            "lanes": ["interactive", "deliberation", "execution"],
+            "owner": "broker",
+            "claim_ttl_sec": 30,
+        },
+    ).json()
+    assert claim3["item_id"] == exec_id

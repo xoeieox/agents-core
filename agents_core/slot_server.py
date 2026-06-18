@@ -43,6 +43,10 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
+from agents_core.elevator import (
+    ElevatorStore,
+    QueueNotFoundError,
+)
 from agents_core.slots import (
     SlotNotFoundError,
     SlotOwnershipError,
@@ -61,9 +65,10 @@ def _csv(value: str | None) -> list[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
-def create_app(db_path: Path) -> FastAPI:
+def create_app(db_path: Path, elevator_db_path: Path | None = None) -> FastAPI:
     app = FastAPI(title="slot-server", version="0")
     store = SlotStore(db_path)
+    elevator = ElevatorStore(elevator_db_path or Path("/data/elevator/queue.db"))
 
     _raw_token = os.environ.get("SLOTS_BEARER_TOKEN", "")
     # Per-principal mode: "contributor_id:secret" — the part before the first colon
@@ -280,6 +285,113 @@ def create_app(db_path: Path) -> FastAPI:
         except ValueError as e:
             raise HTTPException(status_code=400, detail=_error("bad_request", str(e)))
         return store.get(slot_id)
+
+    # ------------------------------------------------------------------
+    # Elevator queue routes
+    # ------------------------------------------------------------------
+
+    @app.post("/v0/elevator/enqueue", status_code=201)
+    def enqueue_item(body: dict[str, Any]):
+        """Enqueue a work item to the elevator queue."""
+        try:
+            item_id = elevator.enqueue(
+                lane=body["lane"],
+                kind=body["kind"],
+                payload=body["payload"],
+                principal=body["principal"],
+                latency_class=body["latency_class"],
+                slot_ref=body.get("slot_ref"),
+            )
+        except KeyError as e:
+            raise HTTPException(
+                status_code=400, detail=_error("bad_request", f"missing field {e}")
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=_error("bad_request", str(e)))
+        return elevator.get(item_id)
+
+    @app.post("/v0/elevator/claim")
+    def claim_item(body: dict[str, Any]):
+        """Claim the next pending item from the given lanes."""
+        try:
+            lanes = body.get("lanes", list(("interactive", "deliberation", "execution")))
+            owner = body["owner"]
+            claim_ttl_sec = body.get("claim_ttl_sec", 30)
+            item = elevator.claim(lanes=lanes, owner=owner, claim_ttl_sec=claim_ttl_sec)
+        except KeyError as e:
+            raise HTTPException(
+                status_code=400, detail=_error("bad_request", f"missing field {e}")
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=_error("bad_request", str(e)))
+        if item is None:
+            return None  # No pending items.
+        return item
+
+    @app.post("/v0/elevator/ack")
+    def ack_item(body: dict[str, Any]):
+        """Acknowledge a served item."""
+        try:
+            item_id = body["item_id"]
+        except KeyError as e:
+            raise HTTPException(
+                status_code=400, detail=_error("bad_request", f"missing field {e}")
+            )
+        try:
+            elevator.ack(
+                item_id,
+                result_ref=body.get("result_ref"),
+                provenance=body.get("provenance"),
+            )
+        except QueueNotFoundError:
+            raise HTTPException(status_code=404, detail=_error("not_found", item_id))
+        return elevator.get(item_id)
+
+    @app.post("/v0/elevator/requeue")
+    def requeue_item(body: dict[str, Any]):
+        """Requeue a claimed item back to pending."""
+        try:
+            item_id = body["item_id"]
+        except KeyError as e:
+            raise HTTPException(
+                status_code=400, detail=_error("bad_request", f"missing field {e}")
+            )
+        try:
+            elevator.requeue(item_id)
+        except QueueNotFoundError:
+            raise HTTPException(status_code=404, detail=_error("not_found", item_id))
+        return elevator.get(item_id)
+
+    @app.post("/v0/elevator/fail")
+    def fail_item(body: dict[str, Any]):
+        """Mark a claimed item as permanently failed."""
+        try:
+            item_id = body["item_id"]
+        except KeyError as e:
+            raise HTTPException(
+                status_code=400, detail=_error("bad_request", f"missing field {e}")
+            )
+        try:
+            elevator.fail(item_id)
+        except QueueNotFoundError:
+            raise HTTPException(status_code=404, detail=_error("not_found", item_id))
+        return elevator.get(item_id)
+
+    @app.get("/v0/elevator/item/{item_id}")
+    def get_item(item_id: str):
+        """Fetch an elevator queue item by ID."""
+        item = elevator.get(item_id)
+        if item is None:
+            raise HTTPException(
+                status_code=404,
+                detail=_error("not_found", f"Item '{item_id}' not found"),
+            )
+        return item
+
+    @app.get("/v0/elevator/state")
+    def get_state():
+        """Fetch queue state (node-state / floor-indicator)."""
+        return elevator.state()
 
     return app
 
