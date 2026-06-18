@@ -39,7 +39,7 @@ def init_semaphore():
 
 # Test 1: Facets leg via the service
 @pytest.mark.asyncio
-async def test_facets_leg_stub(stub_facets, init_semaphore):
+async def test_facets_leg_stub(stub_facets, stub_council, init_semaphore):
     """Submit a deliberation request, assert structured envelope returns with Facets result."""
     request = DeliberationRequest(
         text="Review this spec for scope and fit.",
@@ -56,7 +56,7 @@ async def test_facets_leg_stub(stub_facets, init_semaphore):
 
 # Test 2: operator_requested surfaced
 @pytest.mark.asyncio
-async def test_operator_requested_surfaced(stub_facets, init_semaphore):
+async def test_operator_requested_surfaced(stub_facets, stub_council, init_semaphore):
     """With GW unavailable (stub), assert operator_requested is surfaced."""
     request = DeliberationRequest(
         text="Deliberate on this.",
