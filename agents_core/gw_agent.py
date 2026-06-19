@@ -731,6 +731,12 @@ def call_gw_agent(
         # Exhausted max_steps without conclusion; try forced conclusion.
         if log:
             log(f"[gw_agent] max_steps ({max_steps}) reached without conclusion")
+        # Get the last actual content before calling _force_conclusion (which mutates messages)
+        last_content = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant" and msg.get("content"):
+                last_content = msg.get("content", "")
+                break
         forced_content = _force_conclusion(messages, backend_url, timeout, json_mode, log)
         if forced_content:
             return _finalize_result(
@@ -740,7 +746,6 @@ def call_gw_agent(
                 transcript,
             )
         # Forced conclusion failed; fall back to exhaustion marker.
-        last_content = messages[-1].get("content", "") if messages else ""
         return _finalize_result(
             messages,
             last_content,
@@ -891,13 +896,6 @@ def _force_conclusion(
     if tool_calls_leaked:
         if log:
             log(f"[gw_agent] forced conclusion response leaked tool_calls; rejecting")
-        return ""
-
-    # Validate that content is not a tool-call block (heuristic check).
-    # Tool-call blocks typically contain "tool_calls", "function", "id", etc.
-    if content and ("tool_calls" in content.lower() or "function" in content.lower()):
-        if log:
-            log(f"[gw_agent] forced conclusion content looks like a tool-call block; rejecting")
         return ""
 
     return content

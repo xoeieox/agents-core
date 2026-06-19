@@ -269,8 +269,9 @@ class TestCallGWAgent:
                 "usage": {"total_tokens": 150},
             }
 
-            # Loop: 1, 2, 3 (nudge), 4 (break + forced conclusion)
+            # Loop: 1, 2, 3 (nudge), 4 (break), then forced conclusion
             mock_post.side_effect = [
+                MagicMock(json=lambda: repeated_response),
                 MagicMock(json=lambda: repeated_response),
                 MagicMock(json=lambda: repeated_response),
                 MagicMock(json=lambda: repeated_response),
@@ -284,8 +285,8 @@ class TestCallGWAgent:
 
             # Should break on the 4th repeat (after nudge on 3rd) and use forced conclusion
             assert result == "Analysis done."
-            # Calls: 1 (first), 2, 3 (nudge), 4 (break + forced conclusion) = 4 calls
-            assert mock_post.call_count == 4
+            # Calls: 1, 2, 3 (nudge), 4 (break + forced conclusion) = 5 calls total
+            assert mock_post.call_count == 5
 
     def test_lease_released_on_exception(self):
         """Doorman lease is released even if GW request fails."""
@@ -1007,8 +1008,9 @@ class TestForcedConclusion:
                 "usage": {"total_tokens": 150},
             }
 
-            # 1st call (grep), 2nd call (grep), nudge, 3rd call (grep), forced conclusion
+            # 1st call (grep), 2nd call (grep), 3rd call (grep + nudge), 4th call (grep + break), forced conclusion
             mock_post.side_effect = [
+                MagicMock(json=lambda: repeated_response),
                 MagicMock(json=lambda: repeated_response),
                 MagicMock(json=lambda: repeated_response),
                 MagicMock(json=lambda: repeated_response),
@@ -1022,8 +1024,8 @@ class TestForcedConclusion:
 
             # Should have forced conclusion verdict, not exhaustion marker
             assert result == "Analysis complete."
-            # Verify that forced conclusion was called (4 POST calls)
-            assert mock_post.call_count == 4
+            # Verify that forced conclusion was called (4 repeated + 1 forced conclusion = 5 POST calls)
+            assert mock_post.call_count == 5
 
     def test_forced_conclusion_not_recorded_in_transcript(self):
         """Forced conclusion turn is not recorded in the transcript."""
