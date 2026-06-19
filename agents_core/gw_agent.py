@@ -231,7 +231,7 @@ class OpenPrsExecutor(ToolExecutor):
 
             # Fetch open PRs
             try:
-                prs = forgejo.get_open_prs(repo, owner=forgejo.LAPIS_ORG)
+                prs = forgejo.get_open_prs(repo, owner=None)
             except Exception as e:
                 return {"error": f"failed to fetch open PRs: {e}"}
 
