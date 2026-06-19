@@ -211,6 +211,125 @@ class MemExecutor(ToolExecutor):
             return {"error": f"mem failed: {e}"}
 
 
+class OpenPrsExecutor(ToolExecutor):
+    """Execute list_open_prs(repo, with_files?) to enumerate open PRs with optional file lists."""
+
+    def __init__(self, cwd: str | None = None):
+        # PRs are remote resources, no cwd confinement; accept for API consistency
+        pass
+
+    def execute(self, arguments: dict) -> str | dict:
+        try:
+            repo = arguments.get("repo", "")
+            with_files = arguments.get("with_files", False)
+
+            if not repo:
+                return {"error": "repo parameter is required"}
+
+            # Import here to avoid circular dependency
+            from agents_core import forgejo
+
+            # Fetch open PRs
+            try:
+                prs = forgejo.get_open_prs(repo)
+            except Exception as e:
+                return {"error": f"failed to fetch open PRs: {e}"}
+
+            # Format result: keep all PRs, cap only body snippet
+            result = []
+            for pr in prs:
+                pr_record = {
+                    "number": pr.get("number"),
+                    "title": pr.get("title", ""),
+                    "head": pr.get("head", {}).get("ref", ""),
+                    "base": pr.get("base", {}).get("ref", ""),
+                    "updated_at": pr.get("updated_at", ""),
+                }
+
+                # Snip body to ~200 chars, mark if truncated
+                body = pr.get("body", "")
+                if body and len(body) > 200:
+                    pr_record["body"] = body[:200] + "…"
+                else:
+                    pr_record["body"] = body
+
+                # Optionally fetch changed files
+                if with_files:
+                    changed_files = self._get_changed_files(repo, pr.get("number"))
+                    pr_record["changed_files"] = changed_files
+
+                result.append(pr_record)
+
+            # Return as JSON string
+            result_str = json.dumps(result)
+
+            # Cap only if absolutely necessary (should rarely happen given that we kept all signals intact)
+            if len(result_str) > GW_AGENT_TOOL_OUTPUT_CAP:
+                result_str = result_str[:GW_AGENT_TOOL_OUTPUT_CAP] + "\n…[output truncated; all PRs included but some details may be incomplete]"
+
+            return result_str
+        except Exception as e:
+            return {"error": f"list_open_prs failed: {e}"}
+
+    def _get_changed_files(self, repo: str, pr_number: int) -> list[str]:
+        """Fetch changed files for a PR, with fallback to diff parsing.
+
+        Prefers the PR files API endpoint if available, falls back to diff parsing.
+        Caps list to ~50 files per PR, marking truncation if needed.
+        """
+        from agents_core import forgejo
+
+        changed_files = []
+
+        # Try the PR files endpoint first (Forgejo API v1 /pulls/{n}/files)
+        try:
+            import httpx
+
+            headers = {
+                "Authorization": f"token {forgejo.FORGEJO_TOKEN}",
+                "Accept": "application/json",
+            }
+            url = f"{forgejo.API}/repos/{forgejo._owner(None)}/{repo}/pulls/{pr_number}/files"
+            r = httpx.get(url, headers=headers, timeout=15)
+            r.raise_for_status()
+            files_data = r.json()
+            if isinstance(files_data, list):
+                for f in files_data:
+                    if f.get("filename"):
+                        changed_files.append(f["filename"])
+                    if len(changed_files) >= 50:
+                        changed_files.append(f"…(+{len(files_data) - len(changed_files)} more)")
+                        break
+                return changed_files
+        except Exception:
+            # Fall through to diff parsing if files endpoint fails
+            pass
+
+        # Fall back to diff parsing
+        try:
+            diff = forgejo.get_pr_diff(repo, pr_number)
+            changed_files = self._parse_diff_for_paths(diff)
+            return changed_files[:50] if len(changed_files) <= 50 else changed_files[:50] + [f"…(+{len(changed_files) - 50} more)"]
+        except Exception:
+            # If diff parsing also fails, return empty list
+            return []
+
+    def _parse_diff_for_paths(self, diff: str) -> list[str]:
+        """Extract file paths from a diff robustly.
+
+        Looks for `+++ b/<path>` headers and extracts the full path
+        without whitespace-tokenization (to preserve paths with spaces).
+        """
+        paths = []
+        for line in diff.split("\n"):
+            if line.startswith("+++ b/"):
+                # Extract everything after "+++ b/" to end of line
+                path = line[6:]  # len("+++ b/") == 6
+                if path:
+                    paths.append(path)
+        return list(dict.fromkeys(paths))  # Remove duplicates while preserving order
+
+
 DEFAULT_READONLY_TOOLS: dict[str, dict[str, Any]] = {
     "read_file": {
         "type": "function",
@@ -297,6 +416,27 @@ DEFAULT_READONLY_TOOLS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "list_open_prs": {
+        "type": "function",
+        "function": {
+            "name": "list_open_prs",
+            "description": "List open pull requests in a repository, optionally including the file paths each PR touches for overlap detection.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository name (e.g., 'agents-core').",
+                    },
+                    "with_files": {
+                        "type": "boolean",
+                        "description": "Optional: if true, include changed_files list per PR for overlap detection (default false).",
+                    },
+                },
+                "required": ["repo"],
+            },
+        },
+    },
 }
 
 
@@ -307,6 +447,7 @@ def _get_tool_executors(cwd: str | None = None) -> dict[str, ToolExecutor]:
         "grep": GrepExecutor(cwd),
         "git": GitExecutor(cwd),
         "mem": MemExecutor(cwd),
+        "list_open_prs": OpenPrsExecutor(cwd),
     }
 
 
