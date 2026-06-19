@@ -27,6 +27,8 @@ LLAMACPP_URL = f"http://{TAILSCALE_IP}:8081"
 PACIFIC = ZoneInfo("America/Los_Angeles")
 
 GW_URL = os.environ.get("GW_URL", "http://203.0.113.11:8081")
+SWARM_URL = os.environ.get("SWARM_URL", GW_URL)
+SWARM_MAX_CONCURRENT = int(os.environ.get("SWARM_MAX_CONCURRENT", "4"))
 
 
 class OperatorUnreachableError(Exception):
@@ -123,6 +125,76 @@ def _call_qwen_backend(prompt: str, system: str = None, timeout: int = 600,
             return None
 
 
+def _post_chat_completion(
+    base_url: str,
+    model: str,
+    messages: list[dict],
+    timeout: int = 600,
+    json_mode: bool = False,
+    temperature: float = 0.7,
+    think: bool = False,
+    max_retries: int = 3,
+    log=None,
+    cache_prompt: bool | None = None,
+    chat_template_kwargs: dict | None = None,
+) -> str | None:
+    """Shared POST core for OpenAI-compatible chat/completions endpoints.
+
+    Posts to {base_url}/v1/chat/completions with messages and optional chat_template_kwargs.
+    Retries up to max_retries on transient errors (timeout, connection, chunked encoding).
+    Returns response text on success, None on parse errors, raises OperatorUnreachableError
+    on persistent HTTP/network failures.
+
+    Used by _call_gravitywell_backend, call_swarm, and other chat-completion callers.
+    """
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if cache_prompt is not None:
+        payload["cache_prompt"] = cache_prompt
+    if chat_template_kwargs is not None:
+        payload["chat_template_kwargs"] = chat_template_kwargs
+    elif think:
+        payload["chat_template_kwargs"] = {"enable_thinking": think}
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(
+                f"{base_url}/v1/chat/completions",
+                json=payload, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            msg = data["choices"][0]["message"]
+            text = msg.get("content") or msg.get("reasoning_content") or ""
+            return text if text.strip() else None
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.HTTPError,
+                requests.exceptions.ChunkedEncodingError) as e:
+            if attempt < max_retries - 1:
+                if attempt == 0:
+                    backoff = 2
+                elif attempt == 1:
+                    backoff = 4
+                else:
+                    backoff = 0
+                if log:
+                    log(f"Chat completion call failed (attempt {attempt + 1}/{max_retries}): {e}")
+                time.sleep(backoff)
+            else:
+                if log:
+                    log(f"Chat completion call failed after {max_retries} attempts: {e}")
+                raise OperatorUnreachableError(base_url, e)
+        except Exception as e:
+            if log:
+                log(f"Chat completion call error: {e}")
+            return None
+
+
 def _call_gravitywell_backend(
     prompt: str,
     system: str = None,
@@ -153,52 +225,20 @@ def _call_gravitywell_backend(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    payload = {
-        "messages": messages,
-        "temperature": temperature,
-        "cache_prompt": True,
-        "chat_template_kwargs": {"enable_thinking": think},
-    }
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
-
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            resp = requests.post(
-                f"{GW_URL}/v1/chat/completions",
-                json=payload, timeout=timeout)
-            resp.raise_for_status()
-            data = resp.json()
-            msg = data["choices"][0]["message"]
-            text = msg.get("content") or msg.get("reasoning_content") or ""
-            return text if text.strip() else None
-        except (requests.exceptions.Timeout,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.HTTPError,
-                requests.exceptions.ChunkedEncodingError) as e:
-            if attempt < max_retries - 1:
-                # ChunkedEncodingError is retryable because GW calls are stateless
-                # from the client's perspective (read-only; no server-side commit).
-                if attempt == 0:
-                    backoff = 2
-                elif attempt == 1:
-                    backoff = 4
-                else:
-                    backoff = 0  # Should not reach here, but guard it
-                if log:
-                    log(f"GW call failed (attempt {attempt + 1}/{max_retries}): {e}")
-                time.sleep(backoff)
-            else:
-                if log:
-                    log(f"GW call failed after {max_retries} attempts: {e}")
-                raise OperatorUnreachableError(GW_URL, e)
-        except Exception as e:
-            # Non-request errors (KeyError, IndexError, JSONDecodeError on response parsing)
-            # are not retried; return None to distinguish from transient failures.
-            if log:
-                log(f"GW call error: {e}")
-            return None
+    # Use shared POST core
+    return _post_chat_completion(
+        base_url=GW_URL,
+        model=OPERATOR_DEFAULTS["gravitywell"],
+        messages=messages,
+        timeout=timeout,
+        json_mode=json_mode,
+        temperature=temperature,
+        think=think,
+        max_retries=3,
+        log=log,
+        cache_prompt=True,
+        chat_template_kwargs={"enable_thinking": think},
+    )
 
 
 def _apply_wake_fail(
@@ -591,6 +631,168 @@ def call_claude_cli(
                 f"is_error={envelope.get('is_error')}, type={envelope.get('type')}")
         return _ret(None, envelope)
     return _ret(text, envelope)
+
+
+# ---------------------------------------------------------------------------
+# Lease-free swarm client
+# ---------------------------------------------------------------------------
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def swarm_serving(swarm_url: str = SWARM_URL, timeout: int = 4) -> bool:
+    """Check if the swarm endpoint is ready to serve.
+
+    Probes {swarm_url}/v1/models (must be 200 + non-empty) AND
+    {swarm_url}/health (must be 200). Both must succeed for serving=True.
+
+    Does NOT use the doorman (which returns False for a healthy vLLM).
+    Does NOT check systemctl (a unit can be active while the model is still loading).
+    Does NOT assume phase (liveness ≠ phase): both big-llama.cpp and swarm-vLLM bind
+    the same :8081 and speak OpenAI, so this probe proves only that *an* OpenAI
+    endpoint is live — phase (swarm resident vs big) is the caller's responsibility.
+
+    Returns False on any error (timeout, connection error, HTTP error, empty models).
+    """
+    try:
+        models_resp = requests.get(f"{swarm_url}/v1/models", timeout=timeout)
+        models_resp.raise_for_status()
+        models_data = models_resp.json()
+        if not models_data.get("data") or len(models_data["data"]) == 0:
+            return False
+
+        health_resp = requests.get(f"{swarm_url}/health", timeout=timeout)
+        health_resp.raise_for_status()
+        return True
+    except Exception:
+        return False
+
+
+def swarm_model(swarm_url: str = SWARM_URL, timeout: int = 4) -> str | None:
+    """Get the served model ID from the swarm endpoint.
+
+    Returns the model id (e.g., 'Qwen2.5-3B') from {swarm_url}/v1/models data[0].id.
+    Returns None if the endpoint is not serving or the response is malformed.
+
+    For observability and phase discrimination: a caller comparing swarm_model()
+    against its expected swarm model asserts the model phase (vs big).
+    """
+    try:
+        resp = requests.get(f"{swarm_url}/v1/models", timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("data") and len(data["data"]) > 0:
+            return data["data"][0].get("id")
+        return None
+    except Exception:
+        return None
+
+
+def call_swarm(
+    prompts: list[str],
+    system: str | None = None,
+    max_concurrent: int | None = None,
+    timeout: int = 300,
+    temperature: float = 0.7,
+    model: str | None = None,
+    swarm_url: str = SWARM_URL,
+    log=None,
+) -> list[str | None]:
+    """Lease-free N-wide completion client for the swarm endpoint.
+
+    Posts one /v1/chat/completions request per prompt to {swarm_url}, fans out
+    bounded by max_concurrent (default SWARM_MAX_CONCURRENT=4, env overridable).
+    Preserves input order, isolates per-prompt failures to None (one bad prompt
+    never raises the batch).
+
+    Args:
+        prompts: List of user prompts to complete.
+        system: Optional system prompt (same for all).
+        max_concurrent: Max concurrent requests (default 4, env SWARM_MAX_CONCURRENT).
+        timeout: Per-prompt timeout in seconds (default 300).
+        temperature: Sampling temperature (default 0.7).
+        model: Model name (default None → resolve from /v1/models, model-agnostic).
+        swarm_url: Swarm endpoint URL (default SWARM_URL env).
+        log: Optional logging function.
+
+    Returns:
+        list[str | None]: One entry per prompt, same order. None if that prompt
+        failed (timeout, HTTP error, parse error, endpoint not serving, etc.).
+
+    Safety guarantee (load-bearing):
+        - This module does NOT import DoormanClient (static guarantee).
+        - No doorman acquire, no mode flip, no lease. Posts directly to the swarm.
+        - A behavioral test asserts acquire is never called even in misconfigured env.
+    """
+    if max_concurrent is None:
+        max_concurrent = SWARM_MAX_CONCURRENT
+
+    if not prompts:
+        return []
+
+    if model is None:
+        model = swarm_model(swarm_url, timeout=4)
+        if model is None:
+            if log:
+                log(f"[call_swarm] swarm_not_serving — /v1/models failed or empty")
+            return [None] * len(prompts)
+
+    messages_template = []
+    if system:
+        messages_template.append({"role": "system", "content": system})
+
+    results = [None] * len(prompts)
+    results_lock = __import__("threading").Lock()
+
+    def _post_prompt(index: int, prompt: str) -> tuple[int, str | None, str]:
+        """Post a single prompt and return (index, result, error_label)."""
+        messages = messages_template.copy()
+        messages.append({"role": "user", "content": prompt})
+
+        try:
+            result = _post_chat_completion(
+                base_url=swarm_url,
+                model=model,
+                messages=messages,
+                timeout=timeout,
+                json_mode=False,
+                temperature=temperature,
+                think=False,
+                max_retries=3,
+                log=log,
+            )
+            if result is not None:
+                return (index, result, "success")
+            else:
+                return (index, None, "prompt_parse_error")
+        except OperatorUnreachableError as e:
+            # Check for timeout first (takes precedence)
+            if isinstance(e.last_error, requests.exceptions.Timeout):
+                return (index, None, "prompt_timeout")
+            # Distinguish endpoint unreachable vs per-prompt HTTP error
+            if "Connection" in str(e.last_error) or "resolve" in str(e.last_error).lower():
+                return (index, None, "endpoint_unreachable")
+            else:
+                return (index, None, "prompt_http_error")
+        except Exception as e:
+            if isinstance(e, requests.exceptions.Timeout):
+                return (index, None, "prompt_timeout")
+            return (index, None, "prompt_error")
+
+    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        futures = {
+            executor.submit(_post_prompt, i, prompt): i
+            for i, prompt in enumerate(prompts)
+        }
+
+        for future in as_completed(futures):
+            index, result, error_label = future.result()
+            with results_lock:
+                results[index] = result
+                if error_label != "success":
+                    if log:
+                        log(f"[call_swarm] prompt[{index}] {error_label}")
+
+    return results
 
 
 # --- JSON parsing utilities (from ollama_utils.py) ---
