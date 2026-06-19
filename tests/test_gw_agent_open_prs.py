@@ -195,6 +195,43 @@ def test_open_prs_executor_changed_files_capped_at_50(executor):
     assert any("…" in f for f in changed_files[-1:])  # Last entry marked as truncated
 
 
+def test_open_prs_executor_exactly_50_files_no_false_marker(executor):
+    """Test that a PR with exactly 50 files doesn't get a false truncation marker."""
+    mock_prs = [
+        {
+            "number": 1,
+            "title": "PR with 50 files",
+            "head": {"ref": "feature"},
+            "base": {"ref": "main"},
+            "body": "Description",
+            "updated_at": "2026-06-19T10:00:00Z",
+        },
+    ]
+
+    # Create a mock files list with exactly 50 files
+    mock_files = [{"filename": f"file_{i}.txt"} for i in range(50)]
+
+    def mock_get(url, headers=None, timeout=None, **kwargs):
+        m = MagicMock()
+        m.status_code = 200
+        m.json.return_value = mock_files
+        m.raise_for_status = MagicMock()
+        return m
+
+    with patch("agents_core.forgejo.get_open_prs", return_value=mock_prs):
+        with patch("httpx.get", side_effect=mock_get):
+            result = executor.execute({"repo": "agents-core", "with_files": True})
+
+    prs = json.loads(result)
+    changed_files = prs[0]["changed_files"]
+    # Should have exactly 50 files, no truncation marker
+    assert len(changed_files) == 50
+    # Last entry should be the 50th file, not a truncation marker
+    assert changed_files[-1] == "file_49.txt"
+    # No entry should contain the truncation marker
+    assert not any("…" in f for f in changed_files)
+
+
 def test_open_prs_executor_no_silent_signal_loss(executor):
     """Test that all PRs are returned with complete number/title/head/base fields."""
     mock_prs = [

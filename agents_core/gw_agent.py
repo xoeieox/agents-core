@@ -231,7 +231,7 @@ class OpenPrsExecutor(ToolExecutor):
 
             # Fetch open PRs
             try:
-                prs = forgejo.get_open_prs(repo)
+                prs = forgejo.get_open_prs(repo, owner=forgejo.LAPIS_ORG)
             except Exception as e:
                 return {"error": f"failed to fetch open PRs: {e}"}
 
@@ -283,7 +283,9 @@ class OpenPrsExecutor(ToolExecutor):
                     if f.get("filename"):
                         changed_files.append(f["filename"])
                     if len(changed_files) >= 50:
-                        changed_files.append(f"…(+{len(files_data) - len(changed_files)} more)")
+                        remaining = len(files_data) - 50
+                        if remaining > 0:
+                            changed_files.append(f"…(+{remaining} more)")
                         break
                 return changed_files
         except Exception:
