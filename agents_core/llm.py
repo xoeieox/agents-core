@@ -135,6 +135,8 @@ def _post_chat_completion(
     think: bool = False,
     max_retries: int = 3,
     log=None,
+    cache_prompt: bool | None = True,
+    chat_template_kwargs: dict | None = None,
 ) -> str | None:
     """Shared POST core for OpenAI-compatible chat/completions endpoints.
 
@@ -149,9 +151,13 @@ def _post_chat_completion(
         "model": model,
         "messages": messages,
         "temperature": temperature,
-        "cache_prompt": True,
-        "chat_template_kwargs": {"enable_thinking": think},
     }
+    if cache_prompt is not None:
+        payload["cache_prompt"] = cache_prompt
+    if chat_template_kwargs is not None:
+        payload["chat_template_kwargs"] = chat_template_kwargs
+    elif think:
+        payload["chat_template_kwargs"] = {"enable_thinking": think}
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
@@ -757,6 +763,9 @@ def call_swarm(
             else:
                 return (index, None, "prompt_parse_error")
         except OperatorUnreachableError as e:
+            # Check for timeout first (takes precedence)
+            if isinstance(e.last_error, requests.exceptions.Timeout):
+                return (index, None, "prompt_timeout")
             # Distinguish endpoint unreachable vs per-prompt HTTP error
             if "Connection" in str(e.last_error) or "resolve" in str(e.last_error).lower():
                 return (index, None, "endpoint_unreachable")
