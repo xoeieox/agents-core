@@ -633,13 +633,21 @@ def test_call_swarm_multiple_prompts_preserves_order():
     from agents_core.llm import call_swarm
 
     models_resp = _make_models_response(["Qwen2.5-3B"])
-    resp1 = _make_swarm_response("answer1")
-    resp2 = _make_swarm_response("answer2")
+
+    def mock_post_func(url, json=None, timeout=None):
+        """Return response keyed on prompt content."""
+        if json and "messages" in json:
+            messages = json["messages"]
+            user_msg = next((m for m in messages if m.get("role") == "user"), {})
+            prompt_content = user_msg.get("content", "")
+            if prompt_content == "prompt1":
+                return _make_swarm_response("answer1")
+            elif prompt_content == "prompt2":
+                return _make_swarm_response("answer2")
+        return _make_swarm_response("default")
 
     with patch("agents_core.llm.requests.get", return_value=models_resp), \
-         patch("agents_core.llm.requests.post") as mock_post:
-        # Return different responses in order
-        mock_post.side_effect = [resp1, resp2]
+         patch("agents_core.llm.requests.post", side_effect=mock_post_func):
         result = call_swarm(["prompt1", "prompt2"])
 
     assert len(result) == 2

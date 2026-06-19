@@ -135,7 +135,7 @@ def _post_chat_completion(
     think: bool = False,
     max_retries: int = 3,
     log=None,
-    cache_prompt: bool | None = True,
+    cache_prompt: bool | None = None,
     chat_template_kwargs: dict | None = None,
 ) -> str | None:
     """Shared POST core for OpenAI-compatible chat/completions endpoints.
@@ -236,6 +236,8 @@ def _call_gravitywell_backend(
         think=think,
         max_retries=3,
         log=log,
+        cache_prompt=True,
+        chat_template_kwargs={"enable_thinking": think},
     )
 
 
