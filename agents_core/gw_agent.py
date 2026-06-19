@@ -260,14 +260,8 @@ class OpenPrsExecutor(ToolExecutor):
 
                 result.append(pr_record)
 
-            # Return as JSON string
-            result_str = json.dumps(result)
-
-            # Cap only if absolutely necessary (should rarely happen given that we kept all signals intact)
-            if len(result_str) > GW_AGENT_TOOL_OUTPUT_CAP:
-                result_str = result_str[:GW_AGENT_TOOL_OUTPUT_CAP] + "\n…[output truncated; all PRs included but some details may be incomplete]"
-
-            return result_str
+            # Return as JSON string (body and changed_files are already capped per-PR)
+            return json.dumps(result)
         except Exception as e:
             return {"error": f"list_open_prs failed: {e}"}
 
@@ -281,18 +275,9 @@ class OpenPrsExecutor(ToolExecutor):
 
         changed_files = []
 
-        # Try the PR files endpoint first (Forgejo API v1 /pulls/{n}/files)
+        # Try the PR files endpoint first
         try:
-            import httpx
-
-            headers = {
-                "Authorization": f"token {forgejo.FORGEJO_TOKEN}",
-                "Accept": "application/json",
-            }
-            url = f"{forgejo.API}/repos/{forgejo._owner(None)}/{repo}/pulls/{pr_number}/files"
-            r = httpx.get(url, headers=headers, timeout=15)
-            r.raise_for_status()
-            files_data = r.json()
+            files_data = forgejo.get_pr_files(repo, pr_number)
             if isinstance(files_data, list):
                 for f in files_data:
                     if f.get("filename"):

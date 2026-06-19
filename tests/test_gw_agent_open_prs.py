@@ -327,3 +327,62 @@ def test_open_prs_executor_read_only_semantics(executor):
                         mock_close.assert_not_called()
                         # Verify we got a result
                         assert result is not None
+
+
+def test_open_prs_executor_large_pr_list_no_output_cap_corruption(executor):
+    """Test that large PR lists don't corrupt JSON via invalid truncation.
+
+    This test simulates 20 PRs each with 50 changed_files, which would exceed
+    the 8192 byte output cap if the post-serialization string truncation were
+    still in place. Verifies that:
+    1. The result is valid JSON (json.loads() succeeds)
+    2. All PRs are present in the output
+    3. No PR is silently dropped from the list
+    4. No signal fields (number, title, head, base) are truncated
+    """
+    # Create 20 mock PRs, each with 50 changed files
+    mock_prs = []
+    for pr_num in range(1, 21):
+        mock_prs.append(
+            {
+                "number": pr_num,
+                "title": f"Large PR {pr_num}",
+                "head": {"ref": f"feature/large-{pr_num}"},
+                "base": {"ref": "main"},
+                "body": f"This is a large PR that touches many files. PR number {pr_num}.",
+                "updated_at": f"2026-06-19T{10 + pr_num:02d}:00:00Z",
+            }
+        )
+
+    # Create 50+ file entries per PR for the mock files endpoint
+    mock_files = [{"filename": f"file_{i:03d}.py"} for i in range(55)]
+
+    def mock_get(url, headers=None, timeout=None, **kwargs):
+        m = MagicMock()
+        m.status_code = 200
+        m.json.return_value = mock_files
+        m.raise_for_status = MagicMock()
+        return m
+
+    with patch("agents_core.forgejo.get_open_prs", return_value=mock_prs):
+        with patch("httpx.get", side_effect=mock_get):
+            result = executor.execute({"repo": "agents-core", "with_files": True})
+
+    # Verify result is valid JSON (this would fail if truncation corrupts it)
+    assert isinstance(result, str)
+    prs = json.loads(result)
+
+    # Verify all 20 PRs are present (no silent PR drops)
+    assert len(prs) == 20
+
+    # Verify each PR has complete signal fields and files
+    for i, pr in enumerate(prs):
+        assert pr["number"] == i + 1
+        assert pr["title"] == f"Large PR {i + 1}"
+        assert pr["head"] == f"feature/large-{i + 1}"
+        assert pr["base"] == "main"
+        assert "changed_files" in pr
+        # Each PR should have 50 files + truncation marker (since we provide 55 files)
+        assert len(pr["changed_files"]) == 51
+        # Last entry should be the truncation marker
+        assert "…(+5 more)" in pr["changed_files"][-1]
