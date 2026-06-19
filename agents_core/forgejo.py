@@ -263,6 +263,21 @@ def get_pr_diff(repo: str, pr_number: int, owner: str | None = None) -> str:
     return r.text
 
 
+def get_pr_files(repo: str, pr_number: int, owner: str | None = None) -> list[dict]:
+    """Fetch changed files for a pull request via the files endpoint.
+
+    Returns a list of file objects with 'filename' and other metadata.
+    Raises httpx.HTTPError if the endpoint is unavailable.
+    """
+    r = httpx.get(
+        f"{API}/repos/{_owner(owner)}/{repo}/pulls/{pr_number}/files",
+        headers=_headers(),
+        timeout=TIMEOUT,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 def create_issue(repo: str, title: str, body: str, labels: list[str] | None = None,
                  owner: str | None = None) -> dict:
     """Create an issue on a repository."""
