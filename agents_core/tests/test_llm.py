@@ -507,3 +507,272 @@ def test_gravitywell_http_error_is_retryable():
 
     assert result == "recovered from 503"
     mock_sleep.assert_called_once_with(2)
+
+
+# ---------------------------------------------------------------------------
+# Swarm Tests: call_swarm, swarm_serving, swarm_model
+# ---------------------------------------------------------------------------
+
+def _make_swarm_response(text: str):
+    """Minimal requests.Response mock for a successful swarm reply."""
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {
+        "choices": [{"message": {"content": text}}]
+    }
+    return resp
+
+
+def _make_models_response(models: list[str]):
+    """Mock /v1/models response with a list of model IDs."""
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {
+        "data": [{"id": model} for model in models]
+    }
+    return resp
+
+
+def test_swarm_serving_returns_true_when_both_healthy():
+    """swarm_serving() returns True when /v1/models (200+non-empty) and /health (200)."""
+    from agents_core.llm import swarm_serving
+
+    models_resp = _make_models_response(["Qwen2.5-3B"])
+    health_resp = MagicMock()
+    health_resp.raise_for_status = MagicMock()
+
+    with patch("agents_core.llm.requests.get") as mock_get:
+        mock_get.side_effect = [models_resp, health_resp]
+        result = swarm_serving("http://localhost:8081")
+
+    assert result is True
+    assert mock_get.call_count == 2
+
+
+def test_swarm_serving_false_when_models_empty():
+    """swarm_serving() returns False when /v1/models is empty."""
+    from agents_core.llm import swarm_serving
+
+    empty_models = MagicMock()
+    empty_models.raise_for_status = MagicMock()
+    empty_models.json.return_value = {"data": []}
+
+    with patch("agents_core.llm.requests.get", return_value=empty_models):
+        result = swarm_serving("http://localhost:8081")
+
+    assert result is False
+
+
+def test_swarm_serving_false_when_health_down():
+    """swarm_serving() returns False when /health fails."""
+    from agents_core.llm import swarm_serving
+
+    models_resp = _make_models_response(["Qwen2.5-3B"])
+    health_err = MagicMock()
+    health_err.raise_for_status = MagicMock(side_effect=Exception("health check failed"))
+
+    with patch("agents_core.llm.requests.get") as mock_get:
+        mock_get.side_effect = [models_resp, health_err]
+        result = swarm_serving("http://localhost:8081")
+
+    assert result is False
+
+
+def test_swarm_serving_false_when_unreachable():
+    """swarm_serving() returns False when endpoint is unreachable."""
+    from agents_core.llm import swarm_serving
+    import requests as req
+
+    with patch("agents_core.llm.requests.get",
+               side_effect=req.exceptions.ConnectionError("down")):
+        result = swarm_serving("http://localhost:8081")
+
+    assert result is False
+
+
+def test_swarm_model_returns_model_id():
+    """swarm_model() returns the first model id from /v1/models."""
+    from agents_core.llm import swarm_model
+
+    models_resp = _make_models_response(["Qwen2.5-3B", "other-model"])
+
+    with patch("agents_core.llm.requests.get", return_value=models_resp):
+        result = swarm_model("http://localhost:8081")
+
+    assert result == "Qwen2.5-3B"
+
+
+def test_swarm_model_returns_none_when_unreachable():
+    """swarm_model() returns None when endpoint is unreachable."""
+    from agents_core.llm import swarm_model
+    import requests as req
+
+    with patch("agents_core.llm.requests.get",
+               side_effect=req.exceptions.ConnectionError("down")):
+        result = swarm_model("http://localhost:8081")
+
+    assert result is None
+
+
+def test_call_swarm_single_prompt_success():
+    """call_swarm() with one prompt returns [result]."""
+    from agents_core.llm import call_swarm
+
+    models_resp = _make_models_response(["Qwen2.5-3B"])
+    completion_resp = _make_swarm_response("swarm answer")
+
+    with patch("agents_core.llm.requests.get", return_value=models_resp), \
+         patch("agents_core.llm.requests.post", return_value=completion_resp):
+        result = call_swarm(["hello"])
+
+    assert result == ["swarm answer"]
+
+
+def test_call_swarm_multiple_prompts_preserves_order():
+    """call_swarm() with multiple prompts returns results in input order."""
+    from agents_core.llm import call_swarm
+
+    models_resp = _make_models_response(["Qwen2.5-3B"])
+    resp1 = _make_swarm_response("answer1")
+    resp2 = _make_swarm_response("answer2")
+
+    with patch("agents_core.llm.requests.get", return_value=models_resp), \
+         patch("agents_core.llm.requests.post") as mock_post:
+        # Return different responses in order
+        mock_post.side_effect = [resp1, resp2]
+        result = call_swarm(["prompt1", "prompt2"])
+
+    assert len(result) == 2
+    assert result[0] == "answer1"
+    assert result[1] == "answer2"
+
+
+def test_call_swarm_returns_all_none_when_not_serving():
+    """call_swarm() returns [None, None, ...] when swarm not serving."""
+    from agents_core.llm import call_swarm
+    import requests as req
+
+    with patch("agents_core.llm.requests.get",
+               side_effect=req.exceptions.ConnectionError("down")):
+        result = call_swarm(["p1", "p2", "p3"])
+
+    assert result == [None, None, None]
+
+
+def test_call_swarm_isolates_per_prompt_errors():
+    """call_swarm() maps per-prompt errors to None, preserves successes."""
+    from agents_core.llm import call_swarm
+
+    models_resp = _make_models_response(["Qwen2.5-3B"])
+    success_resp = _make_swarm_response("success")
+    error_resp = MagicMock()
+    error_resp.raise_for_status = MagicMock(side_effect=Exception("error"))
+
+    with patch("agents_core.llm.requests.get", return_value=models_resp), \
+         patch("agents_core.llm.requests.post") as mock_post:
+        mock_post.side_effect = [success_resp, error_resp, success_resp]
+        result = call_swarm(["p1", "p2", "p3"])
+
+    assert len(result) == 3
+    assert result[0] == "success"
+    assert result[1] is None
+    assert result[2] == "success"
+
+
+def test_call_swarm_uses_provided_model():
+    """call_swarm() uses the model param when provided (no /v1/models call)."""
+    from agents_core.llm import call_swarm
+
+    completion_resp = _make_swarm_response("answer")
+
+    with patch("agents_core.llm.requests.get") as mock_get, \
+         patch("agents_core.llm.requests.post", return_value=completion_resp) as mock_post:
+        result = call_swarm(["hello"], model="custom-model")
+
+    # Should NOT call /v1/models when model is provided
+    mock_get.assert_not_called()
+    assert result == ["answer"]
+
+    # POST payload should include the custom model
+    posted_data = mock_post.call_args[1]["json"]
+    assert posted_data["model"] == "custom-model"
+
+
+def test_call_swarm_does_not_import_doorman_client():
+    """call_swarm module scope does NOT import DoormanClient (static guarantee)."""
+    import agents_core.llm as llm_module
+
+    # Verify that DoormanClient is not in the module's top-level namespace
+    # (it may be imported inside call_operator, but not at module scope)
+    assert "DoormanClient" not in dir(llm_module)
+    assert not hasattr(llm_module, "DoormanClient")
+
+
+def test_call_swarm_acquire_never_called():
+    """Behavioral test: call_swarm never calls DoormanClient.acquire (even if imported)."""
+    from agents_core.llm import call_swarm
+    from agents_core.doorman_client import DoormanClient
+
+    models_resp = _make_models_response(["Qwen2.5-3B"])
+    completion_resp = _make_swarm_response("answer")
+
+    with patch.object(DoormanClient, "acquire") as mock_acquire, \
+         patch("agents_core.llm.requests.get", return_value=models_resp), \
+         patch("agents_core.llm.requests.post", return_value=completion_resp):
+        result = call_swarm(["hello"])
+
+    mock_acquire.assert_not_called()
+    assert result == ["answer"]
+
+
+def test_call_swarm_empty_prompts_list_returns_empty():
+    """call_swarm([]) returns []."""
+    from agents_core.llm import call_swarm
+
+    result = call_swarm([])
+
+    assert result == []
+
+
+def test_call_swarm_respects_max_concurrent():
+    """call_swarm() fans out bounded by max_concurrent (default SWARM_MAX_CONCURRENT)."""
+    from agents_core.llm import call_swarm
+
+    models_resp = _make_models_response(["Qwen2.5-3B"])
+    completion_resp = _make_swarm_response("answer")
+
+    # Patch ThreadPoolExecutor at the agents_core.llm module level where it's used
+    with patch("agents_core.llm.requests.get", return_value=models_resp), \
+         patch("agents_core.llm.requests.post", return_value=completion_resp), \
+         patch("agents_core.llm.ThreadPoolExecutor") as mock_executor_class:
+
+        mock_executor = MagicMock()
+        mock_executor_class.return_value = mock_executor
+        mock_executor.__enter__ = MagicMock(return_value=mock_executor)
+        mock_executor.__exit__ = MagicMock(return_value=None)
+        mock_executor.submit = MagicMock()
+        mock_executor.submit.return_value.result = MagicMock(return_value=(0, "answer", "success"))
+
+        # Patch as_completed to return futures in order
+        with patch("agents_core.llm.as_completed") as mock_as_completed:
+            mock_as_completed.return_value = []
+            call_swarm(["p1", "p2"], max_concurrent=2)
+
+        mock_executor_class.assert_called_once_with(max_workers=2)
+
+
+def test_call_swarm_post_includes_system_prompt():
+    """call_swarm() includes system prompt in message payload."""
+    from agents_core.llm import call_swarm
+
+    models_resp = _make_models_response(["Qwen2.5-3B"])
+    completion_resp = _make_swarm_response("answer")
+
+    with patch("agents_core.llm.requests.get", return_value=models_resp), \
+         patch("agents_core.llm.requests.post", return_value=completion_resp) as mock_post:
+        call_swarm(["hello"], system="You are helpful.")
+
+    posted_data = mock_post.call_args[1]["json"]
+    messages = posted_data["messages"]
+    assert messages[0] == {"role": "system", "content": "You are helpful."}
+    assert messages[1] == {"role": "user", "content": "hello"}

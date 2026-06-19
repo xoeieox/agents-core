@@ -402,3 +402,150 @@ class TestFallbackClaudeCli:
             # Verify it was called with sonnet model
             call_kwargs = mock_claude.call_args[1]
             assert call_kwargs["model"] == "sonnet"
+
+
+class TestBackendURLAndAcquireLease:
+    def test_default_behavior_unchanged_with_acquire_lease_true(self):
+        """With defaults (acquire_lease=True, backend_url=None), behavior is byte-identical."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+
+            mock_gw_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "The code looks good.",
+                            "tool_calls": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+            mock_post.return_value.json.return_value = mock_gw_response
+
+            result = call_gw_agent(
+                prompt="Review this code.",
+                system="You are a reviewer.",
+                timeout=10,
+            )
+
+            assert result == "The code looks good."
+            # Verify acquire/release were called
+            mock_doorman.acquire.assert_called_once()
+            mock_doorman.release.assert_called_once()
+            # Verify POST was to GW_URL (the default backend)
+            from agents_core.gw_agent import GW_URL
+            called_url = mock_post.call_args[0][0]
+            assert called_url == f"{GW_URL}/v1/chat/completions"
+
+    def test_backend_url_changes_post_endpoint(self):
+        """With backend_url set, POST goes to the custom URL instead of GW_URL."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+
+            mock_gw_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Swarm answer.",
+                            "tool_calls": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+            mock_post.return_value.json.return_value = mock_gw_response
+
+            custom_url = "http://swarm:8081"
+            result = call_gw_agent(
+                prompt="Review on swarm.",
+                backend_url=custom_url,
+                timeout=10,
+            )
+
+            assert result == "Swarm answer."
+            # Verify POST was to the custom URL
+            called_url = mock_post.call_args[0][0]
+            assert called_url == f"{custom_url}/v1/chat/completions"
+
+    def test_acquire_lease_false_skips_doorman(self):
+        """With acquire_lease=False, doorman.acquire is never called."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+
+            mock_gw_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Swarm answer.",
+                            "tool_calls": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+            mock_post.return_value.json.return_value = mock_gw_response
+
+            result = call_gw_agent(
+                prompt="Review on swarm.",
+                acquire_lease=False,
+                timeout=10,
+            )
+
+            assert result == "Swarm answer."
+            # Verify acquire was NOT called
+            mock_doorman.acquire.assert_not_called()
+            # Verify release was NOT called
+            mock_doorman.release.assert_not_called()
+
+    def test_acquire_lease_false_and_backend_url_together(self):
+        """With both acquire_lease=False and backend_url set, skip doorman and use custom URL."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+
+            mock_gw_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Swarm grounding answer.",
+                            "tool_calls": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+            mock_post.return_value.json.return_value = mock_gw_response
+
+            custom_url = "http://swarm:8081"
+            result = call_gw_agent(
+                prompt="Grounding on swarm.",
+                backend_url=custom_url,
+                acquire_lease=False,
+                timeout=10,
+            )
+
+            assert result == "Swarm grounding answer."
+            # Verify doorman was not touched
+            mock_doorman.acquire.assert_not_called()
+            mock_doorman.release.assert_not_called()
+            # Verify POST was to custom URL
+            called_url = mock_post.call_args[0][0]
+            assert called_url == f"{custom_url}/v1/chat/completions"

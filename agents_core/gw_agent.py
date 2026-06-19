@@ -328,6 +328,8 @@ def call_gw_agent(
     work_id: str | None = None,
     return_transcript: bool = False,
     log: Callable[[str], None] | None = None,
+    backend_url: str | None = None,
+    acquire_lease: bool = True,
 ) -> str | None | tuple[str | None, list[dict]]:
     """Run a multi-step read-only tool-loop on GravityWell.
 
@@ -353,6 +355,12 @@ def call_gw_agent(
         work_id: Trace ID for the doorman lease. If None, generates internally.
         return_transcript: If True, return (text, transcript) tuple instead of just text.
         log: Optional logging function for progress/debug output.
+        backend_url: Optional backend URL override (default None → GW_URL). Used by
+                     swarm consumers (U4b-ii) to post to a different endpoint.
+        acquire_lease: If False, skip doorman lease acquisition entirely (default True).
+                       With defaults (True), behavior is byte-identical: acquire/release
+                       are called, POST is to GW_URL. Only set both backend_url and
+                       acquire_lease=False when running on swarm.
 
     Returns:
         - str or None (or (str|None, list) when return_transcript=True).
@@ -360,9 +368,9 @@ def call_gw_agent(
         - Non-None with "[gw_agent: max_steps reached ...]" suffix means loop exhausted.
         - Transcript (if return_transcript) is a list of dicts with tool execution details.
 
-    The doorman lease is acquired once and held for the entire run; released in finally.
-    Tool errors are recovered gracefully: a malformed call returns a tool-error message
-    so GW can adapt (the loop never crashes on tool execution).
+    The doorman lease is acquired once and held for the entire run; released in finally
+    (unless acquire_lease=False). Tool errors are recovered gracefully: a malformed call
+    returns a tool-error message so GW can adapt (the loop never crashes on tool execution).
     """
     if system == "":
         system = _default_reviewer_system_prompt()
@@ -379,6 +387,9 @@ def call_gw_agent(
     if tools is None:
         tools = DEFAULT_READONLY_TOOLS
 
+    if backend_url is None:
+        backend_url = GW_URL
+
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -389,56 +400,57 @@ def call_gw_agent(
     repeated_calls: dict[str, int] = {}
     ctx_tokens = 0
 
-    # Acquire doorman lease for the whole run.
+    # Acquire doorman lease for the whole run (unless acquire_lease=False for swarm).
     from agents_core.doorman_client import DoormanClient, DoormanUnreachable, _gw_acquire_timeout
 
     client = DoormanClient()
     try:
-        try:
-            res = client.acquire(
-                "gravitywell",
-                work_id,
-                ttl_sec=timeout + 60,
-                reason="gw_agent",
-                timeout=_gw_acquire_timeout(),
-            )
-        except DoormanUnreachable as e:
-            if log:
-                log(f"[gw_agent] doorman unreachable: {e}")
-            if on_wake_fail == "skip":
-                return (None, transcript) if return_transcript else None
-            elif on_wake_fail == "error":
-                raise
-            elif on_wake_fail == "claude":
-                return _fallback_claude_cli(
-                    prompt, system, cwd, json_mode, log, return_transcript, transcript
+        if acquire_lease:
+            try:
+                res = client.acquire(
+                    "gravitywell",
+                    work_id,
+                    ttl_sec=timeout + 60,
+                    reason="gw_agent",
+                    timeout=_gw_acquire_timeout(),
                 )
-            else:
-                raise ValueError(f"unknown on_wake_fail: {on_wake_fail}")
+            except DoormanUnreachable as e:
+                if log:
+                    log(f"[gw_agent] doorman unreachable: {e}")
+                if on_wake_fail == "skip":
+                    return (None, transcript) if return_transcript else None
+                elif on_wake_fail == "error":
+                    raise
+                elif on_wake_fail == "claude":
+                    return _fallback_claude_cli(
+                        prompt, system, cwd, json_mode, log, return_transcript, transcript
+                    )
+                else:
+                    raise ValueError(f"unknown on_wake_fail: {on_wake_fail}")
 
-        if res.get("status") != "serving":
-            if log:
-                log(f"[gw_agent] GW not serving: {res.get('status')}")
-            if on_wake_fail == "skip":
-                return (None, transcript) if return_transcript else None
-            elif on_wake_fail == "error":
-                raise Exception(f"GW not serving: {res.get('status')}")
-            elif on_wake_fail == "claude":
-                return _fallback_claude_cli(
-                    prompt, system, cwd, json_mode, log, return_transcript, transcript
-                )
-            else:
-                raise ValueError(f"unknown on_wake_fail: {on_wake_fail}")
+            if res.get("status") != "serving":
+                if log:
+                    log(f"[gw_agent] GW not serving: {res.get('status')}")
+                if on_wake_fail == "skip":
+                    return (None, transcript) if return_transcript else None
+                elif on_wake_fail == "error":
+                    raise Exception(f"GW not serving: {res.get('status')}")
+                elif on_wake_fail == "claude":
+                    return _fallback_claude_cli(
+                        prompt, system, cwd, json_mode, log, return_transcript, transcript
+                    )
+                else:
+                    raise ValueError(f"unknown on_wake_fail: {on_wake_fail}")
 
         # Loop: request → tool execution → result → request → ...
         for step_num in range(max_steps):
             if log:
                 log(f"[gw_agent] step {step_num + 1}/{max_steps}")
 
-            # POST to GW with current message state.
+            # POST to the backend (GW or swarm) with current message state.
             try:
                 resp = requests.post(
-                    f"{GW_URL}/v1/chat/completions",
+                    f"{backend_url}/v1/chat/completions",
                     json={
                         "messages": messages,
                         "tools": list(tools.values()),
@@ -589,11 +601,12 @@ def call_gw_agent(
         )
 
     finally:
-        try:
-            client.release("gravitywell", work_id)
-        except Exception as e:
-            if log:
-                log(f"[gw_agent] failed to release lease: {e}")
+        if acquire_lease:
+            try:
+                client.release("gravitywell", work_id)
+            except Exception as e:
+                if log:
+                    log(f"[gw_agent] failed to release lease: {e}")
         client.close()
 
 
