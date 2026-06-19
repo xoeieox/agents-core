@@ -448,7 +448,7 @@ def call_gw_agent(
     system: str = "",
     cwd: str | None = None,
     tools: dict[str, dict[str, Any]] | None = None,
-    max_steps: int = 12,
+    max_steps: int = 24,
     timeout: int = 300,
     json_mode: bool = False,
     think: bool = False,
@@ -472,7 +472,8 @@ def call_gw_agent(
              Defaults to "/srv/agents".
         tools: Optional dict of tool definitions (OpenAI format). If None,
                uses DEFAULT_READONLY_TOOLS.
-        max_steps: Max number of tool-call iterations (default 12).
+        max_steps: Max number of tool-call iterations (default 24). When exhausted,
+                   a forced-conclusion turn attempts to emit a parseable verdict.
         timeout: Wall-clock timeout for the entire run (default 300s).
         json_mode: If True, appends "respond with JSON only" to the system prompt.
         think: If True, enables GW's thinking mode (default False).
@@ -644,9 +645,20 @@ def call_gw_agent(
                         nudge_msg = f"You already ran '{tool_name}' with those arguments. Conclude or try something else."
                         messages.append({"role": "user", "content": nudge_msg})
                     elif repeated_calls[call_sig] >= 4:
-                        # Break after 4th repeat (after nudge).
+                        # Break after 4th repeat (after nudge); try forced conclusion.
                         if log:
                             log(f"[gw_agent] breaking due to repeated call (4x): {tool_name}")
+                        forced_content = _force_conclusion(
+                            messages, backend_url, timeout, json_mode, log
+                        )
+                        if forced_content:
+                            return _finalize_result(
+                                messages,
+                                forced_content,
+                                return_transcript,
+                                transcript,
+                            )
+                        # Forced conclusion failed; fall back to exhaustion marker.
                         return _finalize_result(
                             messages,
                             content,
@@ -716,9 +728,18 @@ def call_gw_agent(
                     )
                 return _finalize_result(messages, content, return_transcript, transcript)
 
-        # Exhausted max_steps without conclusion.
+        # Exhausted max_steps without conclusion; try forced conclusion.
         if log:
             log(f"[gw_agent] max_steps ({max_steps}) reached without conclusion")
+        forced_content = _force_conclusion(messages, backend_url, timeout, json_mode, log)
+        if forced_content:
+            return _finalize_result(
+                messages,
+                forced_content,
+                return_transcript,
+                transcript,
+            )
+        # Forced conclusion failed; fall back to exhaustion marker.
         last_content = messages[-1].get("content", "") if messages else ""
         return _finalize_result(
             messages,
@@ -800,6 +821,86 @@ def _truncate_messages(messages: list[dict]) -> list[dict]:
         result.extend(block)
 
     return result
+
+
+def _force_conclusion(
+    messages: list[dict],
+    backend_url: str,
+    timeout: int,
+    json_mode: bool,
+    log: Callable[[str], None] | None,
+) -> str:
+    """Emit a forced conclusion when the agent exhausts its tool budget.
+
+    Makes one final inference call with tools disabled, forcing the model to conclude
+    based on accumulated evidence. Returns the model's content or empty string on failure.
+
+    Validates that the response is not a leaked tool-call (content-integrity check).
+    Does NOT raise exceptions or add to transcript.
+    """
+    # Clean the conversation tail: clear unmatched tool_calls from the trailing
+    # assistant message to ensure the conversation ends on a clean boundary
+    # (required for OpenAI-compatible backends to accept the following user turn).
+    if messages:
+        last_msg = messages[-1]
+        if last_msg.get("role") == "assistant" and last_msg.get("tool_calls"):
+            last_msg["tool_calls"] = []
+
+    # Append the conclusion instruction with explicit negative constraints
+    # forbidding tool use.
+    conclusion_instruction = (
+        "You have reached your investigation budget. You may NOT call any tools, "
+        "and you MUST NOT emit a tool call. Based only on what you have already gathered, "
+        "produce your final answer now as plain content."
+    )
+    if json_mode:
+        conclusion_instruction += " Respond with the required JSON verdict only — no prose, no tool calls."
+
+    messages.append({"role": "user", "content": conclusion_instruction})
+
+    # Make the final POST with tools strictly omitted (not tool_choice: "none").
+    try:
+        resp = requests.post(
+            f"{backend_url}/v1/chat/completions",
+            json={
+                "messages": messages,
+                "temperature": 0.3,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        if log:
+            log(f"[gw_agent] forced conclusion POST failed: {e}")
+        return ""
+
+    # Extract and validate the response.
+    if "choices" not in data or not data["choices"]:
+        if log:
+            log(f"[gw_agent] forced conclusion returned no choices")
+        return ""
+
+    choice = data["choices"][0]
+    assistant_message = choice.get("message", {})
+    content = assistant_message.get("content") or ""
+    tool_calls_leaked = assistant_message.get("tool_calls") or []
+
+    # Reject if the response contains leaked tool calls (re-entered tool loop).
+    if tool_calls_leaked:
+        if log:
+            log(f"[gw_agent] forced conclusion response leaked tool_calls; rejecting")
+        return ""
+
+    # Validate that content is not a tool-call block (heuristic check).
+    # Tool-call blocks typically contain "tool_calls", "function", "id", etc.
+    if content and ("tool_calls" in content.lower() or "function" in content.lower()):
+        if log:
+            log(f"[gw_agent] forced conclusion content looks like a tool-call block; rejecting")
+        return ""
+
+    return content
 
 
 def _finalize_result(

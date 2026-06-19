@@ -15,6 +15,7 @@ from agents_core.gw_agent import (
     call_gw_agent,
     DEFAULT_READONLY_TOOLS,
     _default_reviewer_system_prompt,
+    _force_conclusion,
 )
 
 
@@ -163,7 +164,7 @@ class TestCallGWAgent:
             assert transcript[0]["step"] == 1
 
     def test_max_steps_enforcement(self):
-        """Loop stops after max_steps."""
+        """Loop stops after max_steps, then attempts forced conclusion."""
         with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
              patch("requests.post") as mock_post:
 
@@ -193,7 +194,26 @@ class TestCallGWAgent:
                 "usage": {"total_tokens": 100},
             }
 
-            mock_post.return_value.json.return_value = infinite_response
+            # Forced conclusion fails (empty response) so falls back to marker
+            failed_conclusion = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 150},
+            }
+
+            mock_post.side_effect = [
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: failed_conclusion),
+            ]
 
             result = call_gw_agent(
                 prompt="Infinite loop test.",
@@ -201,11 +221,11 @@ class TestCallGWAgent:
             )
 
             assert "max_steps reached" in result
-            # Should have called GW 3 times (steps 1-3)
-            assert mock_post.call_count == 3
+            # Should have called GW 3 times (steps 1-3) + 1 (forced conclusion)
+            assert mock_post.call_count == 4
 
     def test_no_progress_detection_nudge_and_break(self):
-        """When same call repeats 4x, nudge once then break."""
+        """When same call repeats 4x, nudge once then break with forced conclusion."""
         with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
              patch("requests.post") as mock_post:
 
@@ -235,17 +255,37 @@ class TestCallGWAgent:
                 "usage": {"total_tokens": 100},
             }
 
-            mock_post.return_value.json.return_value = repeated_response
+            # Forced conclusion succeeds
+            verdict_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Analysis done.",
+                            "tool_calls": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 150},
+            }
+
+            # Loop: 1, 2, 3 (nudge), 4 (break + forced conclusion)
+            mock_post.side_effect = [
+                MagicMock(json=lambda: repeated_response),
+                MagicMock(json=lambda: repeated_response),
+                MagicMock(json=lambda: repeated_response),
+                MagicMock(json=lambda: verdict_response),
+            ]
 
             result = call_gw_agent(
                 prompt="Test no-progress detection.",
                 max_steps=10,  # More than enough to trigger the condition
             )
 
-            # Should break on the 4th repeat (after nudge on 3rd)
-            assert "max_steps reached" in result or len(result) > 0
-            # Calls: 1 (first), 2, 3 (nudge), 4 (break) = 4 calls max
-            assert mock_post.call_count <= 4
+            # Should break on the 4th repeat (after nudge on 3rd) and use forced conclusion
+            assert result == "Analysis done."
+            # Calls: 1 (first), 2, 3 (nudge), 4 (break + forced conclusion) = 4 calls
+            assert mock_post.call_count == 4
 
     def test_lease_released_on_exception(self):
         """Doorman lease is released even if GW request fails."""
@@ -549,3 +589,597 @@ class TestBackendURLAndAcquireLease:
             # Verify POST was to custom URL
             called_url = mock_post.call_args[0][0]
             assert called_url == f"{custom_url}/v1/chat/completions"
+
+
+class TestForcedConclusion:
+    def test_max_steps_exhaustion_concludes_with_forced_turn(self):
+        """When max_steps reached, forced conclusion emits a parseable verdict."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+
+            # GW always returns tool_calls (never concludes)
+            infinite_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Investigating...",
+                            "tool_calls": [
+                                {
+                                    "id": "call_x",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": json.dumps({"path": "file.txt"}),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+
+            # Forced conclusion returns a verdict
+            verdict_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"verdict": "good"}',
+                            "tool_calls": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 150},
+            }
+
+            # First max_steps calls return infinite_response, then forced conclusion returns verdict
+            mock_post.side_effect = [
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: verdict_response),
+            ]
+
+            result = call_gw_agent(
+                prompt="Infinite loop test.",
+                max_steps=3,
+            )
+
+            # Should return the forced verdict, not the exhaustion marker
+            assert '{"verdict": "good"}' in result
+            assert "max_steps reached — no verdict" not in result
+            # Should have called GW 3 times (loop) + 1 (forced conclusion)
+            assert mock_post.call_count == 4
+
+    def test_forced_conclusion_omits_tools_field(self):
+        """Forced conclusion POST must omit tools field entirely."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+
+            infinite_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Investigating...",
+                            "tool_calls": [
+                                {
+                                    "id": "call_x",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": json.dumps({"path": "file.txt"}),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+
+            verdict_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "The analysis is complete.",
+                            "tool_calls": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 150},
+            }
+
+            mock_post.side_effect = [
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: verdict_response),
+            ]
+
+            call_gw_agent(
+                prompt="Test.",
+                max_steps=2,
+            )
+
+            # The last POST (forced conclusion) must not have a tools field
+            last_call = mock_post.call_args_list[-1]
+            posted_json = last_call[1]["json"]
+            assert "tools" not in posted_json
+
+    def test_forced_conclusion_negative_constraints_forbid_tool_calls(self):
+        """Forced conclusion user message explicitly forbids tool calls."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+
+            infinite_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Investigating...",
+                            "tool_calls": [
+                                {
+                                    "id": "call_x",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": json.dumps({"path": "file.txt"}),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+
+            verdict_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Done.",
+                            "tool_calls": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 150},
+            }
+
+            mock_post.side_effect = [
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: verdict_response),
+            ]
+
+            call_gw_agent(
+                prompt="Test.",
+                max_steps=1,
+            )
+
+            # Check that the last POST's user message contains explicit no-tool constraints
+            last_call = mock_post.call_args_list[-1]
+            posted_json = last_call[1]["json"]
+            messages = posted_json["messages"]
+            user_msg = messages[-1]  # Should be the conclusion user message
+            assert user_msg["role"] == "user"
+            content = user_msg["content"]
+            assert "may NOT call any tools" in content
+            assert "MUST NOT emit a tool call" in content
+
+    def test_forced_conclusion_with_json_mode(self):
+        """Forced conclusion with json_mode=True includes JSON instruction."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+
+            infinite_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Investigating...",
+                            "tool_calls": [
+                                {
+                                    "id": "call_x",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": json.dumps({"path": "file.txt"}),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+
+            verdict_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"verdict": "analyzed"}',
+                            "tool_calls": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 150},
+            }
+
+            mock_post.side_effect = [
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: verdict_response),
+            ]
+
+            call_gw_agent(
+                prompt="Test.",
+                json_mode=True,
+                max_steps=1,
+            )
+
+            # Check that the forced conclusion user message mentions JSON
+            last_call = mock_post.call_args_list[-1]
+            posted_json = last_call[1]["json"]
+            messages = posted_json["messages"]
+            user_msg = messages[-1]
+            content = user_msg["content"]
+            assert "JSON" in content
+
+    def test_forced_conclusion_rejects_leaked_tool_calls(self):
+        """If forced conclusion response has tool_calls, it's rejected (leaked tool loop)."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+
+            infinite_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Investigating...",
+                            "tool_calls": [
+                                {
+                                    "id": "call_x",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": json.dumps({"path": "file.txt"}),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+
+            # Forced conclusion leaks a tool_call
+            leaked_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Investigating more...",
+                            "tool_calls": [
+                                {
+                                    "id": "call_y",
+                                    "function": {
+                                        "name": "grep",
+                                        "arguments": json.dumps({"pattern": "test"}),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"total_tokens": 150},
+            }
+
+            mock_post.side_effect = [
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: leaked_response),
+            ]
+
+            result = call_gw_agent(
+                prompt="Test.",
+                max_steps=1,
+            )
+
+            # Should fall back to exhaustion marker since forced conclusion was rejected
+            assert "max_steps reached" in result
+
+    def test_forced_conclusion_fallback_on_empty_response(self):
+        """If forced conclusion returns empty or fails, fall back to exhaustion marker."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+
+            infinite_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Investigating...",
+                            "tool_calls": [
+                                {
+                                    "id": "call_x",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": json.dumps({"path": "file.txt"}),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+
+            # Forced conclusion fails (empty response)
+            failed_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 150},
+            }
+
+            mock_post.side_effect = [
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: failed_response),
+            ]
+
+            result = call_gw_agent(
+                prompt="Test.",
+                max_steps=1,
+            )
+
+            # Should fall back to exhaustion marker
+            assert "max_steps reached" in result
+
+    def test_repeated_call_break_with_forced_conclusion(self):
+        """Repeated call break path uses forced conclusion and cleans trailing tool_calls."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+
+            # Same tool call every time (to trigger repeated-call detection)
+            repeated_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Checking something.",
+                            "tool_calls": [
+                                {
+                                    "id": "call_same",
+                                    "function": {
+                                        "name": "grep",
+                                        "arguments": json.dumps({"pattern": "test"}),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+
+            # Forced conclusion returns a verdict
+            verdict_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Analysis complete.",
+                            "tool_calls": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 150},
+            }
+
+            # 1st call (grep), 2nd call (grep), nudge, 3rd call (grep), forced conclusion
+            mock_post.side_effect = [
+                MagicMock(json=lambda: repeated_response),
+                MagicMock(json=lambda: repeated_response),
+                MagicMock(json=lambda: repeated_response),
+                MagicMock(json=lambda: verdict_response),
+            ]
+
+            result = call_gw_agent(
+                prompt="Test no-progress detection.",
+                max_steps=10,
+            )
+
+            # Should have forced conclusion verdict, not exhaustion marker
+            assert result == "Analysis complete."
+            # Verify that forced conclusion was called (4 POST calls)
+            assert mock_post.call_count == 4
+
+    def test_forced_conclusion_not_recorded_in_transcript(self):
+        """Forced conclusion turn is not recorded in the transcript."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+
+            infinite_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Investigating...",
+                            "tool_calls": [
+                                {
+                                    "id": "call_x",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": json.dumps({"path": "file.txt"}),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+
+            verdict_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Done.",
+                            "tool_calls": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 150},
+            }
+
+            mock_post.side_effect = [
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: verdict_response),
+            ]
+
+            _, transcript = call_gw_agent(
+                prompt="Test.",
+                max_steps=1,
+                return_transcript=True,
+            )
+
+            # Transcript should only have the tool execution (read_file), not the forced conclusion
+            assert len(transcript) == 1
+            assert transcript[0]["tool_name"] == "read_file"
+
+    def test_forced_conclusion_disables_think(self):
+        """Forced conclusion turn disables thinking (enable_thinking: False)."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+
+            infinite_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Investigating...",
+                            "tool_calls": [
+                                {
+                                    "id": "call_x",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": json.dumps({"path": "file.txt"}),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+
+            verdict_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Done.",
+                            "tool_calls": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 150},
+            }
+
+            mock_post.side_effect = [
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: verdict_response),
+            ]
+
+            call_gw_agent(
+                prompt="Test.",
+                think=True,  # Request thinking in the main loop
+                max_steps=1,
+            )
+
+            # The forced conclusion POST must have enable_thinking: False
+            last_call = mock_post.call_args_list[-1]
+            posted_json = last_call[1]["json"]
+            chat_template_kwargs = posted_json.get("chat_template_kwargs", {})
+            assert chat_template_kwargs.get("enable_thinking") is False
+
+    def test_default_max_steps_is_24(self):
+        """Default max_steps parameter is 24."""
+        from inspect import signature
+        sig = signature(call_gw_agent)
+        assert sig.parameters["max_steps"].default == 24
+
+    def test_clean_path_untouched(self):
+        """Clean path (agent concludes mid-budget) still works without forced turn."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+
+            # Agent concludes immediately
+            clean_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "The code is good.",
+                            "tool_calls": [],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+
+            mock_post.return_value.json.return_value = clean_response
+
+            result = call_gw_agent(
+                prompt="Review this.",
+                max_steps=10,
+            )
+
+            # Should return the conclusion without any exhaustion marker
+            assert result == "The code is good."
+            # Should only have called GW once (no forced conclusion turn needed)
+            assert mock_post.call_count == 1
