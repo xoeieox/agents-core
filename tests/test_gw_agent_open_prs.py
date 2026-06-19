@@ -423,3 +423,39 @@ def test_open_prs_executor_large_pr_list_no_output_cap_corruption(executor):
         assert len(pr["changed_files"]) == 51
         # Last entry should be the truncation marker
         assert "…(+5 more)" in pr["changed_files"][-1]
+
+
+def test_open_prs_executor_uses_default_owner_not_lapis_org(executor):
+    """Guard against namespace regression: executor must use default owner (None).
+
+    This test ensures get_open_prs is called with owner=None (which resolves to
+    the default OWNER="Erah" namespace), not owner=forgejo.LAPIS_ORG.
+    Repos live under Erah/ namespace, not lapis/. Using LAPIS_ORG causes 404s.
+    """
+    mock_prs = [
+        {
+            "number": 1,
+            "title": "Test",
+            "head": {"ref": "branch"},
+            "base": {"ref": "main"},
+            "body": "Test",
+            "updated_at": "2026-06-19T10:00:00Z",
+        },
+    ]
+
+    with patch("agents_core.forgejo.get_open_prs", return_value=mock_prs) as mock_get_prs:
+        result = executor.execute({"repo": "agents-core"})
+
+        # Verify get_open_prs was called with owner=None (default namespace)
+        mock_get_prs.assert_called_once()
+        call_args = mock_get_prs.call_args
+        # Check positional or keyword arguments
+        assert call_args[0][0] == "agents-core" or call_args[1].get("repo") == "agents-core"
+        assert call_args[1].get("owner") is None, \
+            f"get_open_prs must be called with owner=None, got owner={call_args[1].get('owner')}"
+
+        # Verify execution succeeded
+        assert isinstance(result, str)
+        prs = json.loads(result)
+        assert len(prs) == 1
+        assert prs[0]["number"] == 1
