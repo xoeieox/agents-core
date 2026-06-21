@@ -13,6 +13,8 @@ from agents_core.shared_deliberation.envelope import DeliberationRequest, Delibe
 from agents_core.shared_deliberation.orchestrator import (
     run_deliberation,
     init_facets_semaphore,
+    GroundingHandoffError,
+    _run_facets_subprocess,
 )
 from agents_core.shared_deliberation.client import SharedDeliberationClient
 from agents_core.shared_deliberation.compat import derive_spec_review_brief_compat
@@ -273,3 +275,124 @@ async def test_client_health_check(stub_facets, init_semaphore):
     response = client.get("/v0/health")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+# --- H5b grounding passthrough tests (AC1-AC4) ---
+
+# AC1: default parity — grounding_result_file unset, argv unchanged
+def test_ac1_default_parity_no_grounding_field(tmp_path):
+    """AC1: grounding_result_file=None produces identical argv (no --grounding-result-file)."""
+    from pathlib import Path
+    from unittest.mock import patch, MagicMock
+
+    facets_repo = tmp_path / "facets"
+    facets_repo.mkdir()
+    context_file_holder = []
+
+    def fake_run(argv, **kwargs):
+        context_file_holder.append(argv)
+        m = MagicMock()
+        m.returncode = 0
+        import json
+        m.stdout = json.dumps({"deliberation_id": "test-id"})
+        m.stderr = ""
+        return m
+
+    with patch("subprocess.run", side_effect=fake_run):
+        _run_facets_subprocess("text", {}, "gravitywell", facets_repo, grounding_result_file=None)
+
+    argv = context_file_holder[0]
+    assert "--grounding-result-file" not in argv
+    assert "--no-auto-ground" not in argv
+
+
+# AC2: injection — set + exists -> argv gains --grounding-result-file + --no-auto-ground
+def test_ac2_injection_set_and_exists(tmp_path):
+    """AC2: grounding_result_file pointing to an existing file injects argv flags."""
+    from unittest.mock import patch, MagicMock
+
+    grounding_file = tmp_path / "grounding.json"
+    grounding_file.write_text('{"result": "ok"}')
+    facets_repo = tmp_path / "facets"
+    facets_repo.mkdir()
+    captured = []
+
+    def fake_run(argv, **kwargs):
+        captured.append(argv)
+        m = MagicMock()
+        m.returncode = 0
+        import json
+        m.stdout = json.dumps({"deliberation_id": "test-id"})
+        m.stderr = ""
+        return m
+
+    with patch("subprocess.run", side_effect=fake_run):
+        _run_facets_subprocess(
+            "text", {}, "gravitywell", facets_repo,
+            grounding_result_file=str(grounding_file),
+        )
+
+    argv = captured[0]
+    assert "--grounding-result-file" in argv
+    assert str(grounding_file) in argv
+    assert "--no-auto-ground" in argv
+    # flags must be adjacent
+    idx = argv.index("--grounding-result-file")
+    assert argv[idx + 1] == str(grounding_file)
+
+
+# AC3: set-but-missing -> GroundingHandoffError, no subprocess spawned
+def test_ac3_set_but_missing_raises_handoff_error(tmp_path):
+    """AC3: grounding_result_file set to non-existent path raises GroundingHandoffError."""
+    from unittest.mock import patch
+
+    facets_repo = tmp_path / "facets"
+    facets_repo.mkdir()
+    missing_path = str(tmp_path / "does_not_exist.json")
+
+    with patch("subprocess.run") as mock_run:
+        with pytest.raises(GroundingHandoffError):
+            _run_facets_subprocess(
+                "text", {}, "gravitywell", facets_repo,
+                grounding_result_file=missing_path,
+            )
+        mock_run.assert_not_called()
+
+
+def test_ac3_set_but_empty_raises_handoff_error(tmp_path):
+    """AC3: grounding_result_file set to an empty file raises GroundingHandoffError."""
+    from unittest.mock import patch
+
+    facets_repo = tmp_path / "facets"
+    facets_repo.mkdir()
+    empty_file = tmp_path / "empty.json"
+    empty_file.write_text("")
+
+    with patch("subprocess.run") as mock_run:
+        with pytest.raises(GroundingHandoffError):
+            _run_facets_subprocess(
+                "text", {}, "gravitywell", facets_repo,
+                grounding_result_file=str(empty_file),
+            )
+        mock_run.assert_not_called()
+
+
+# AC4: serialization — grounding_result_file round-trips via to_dict()
+def test_ac4_serialization_round_trip():
+    """AC4: grounding_result_file is present in to_dict() output."""
+    req = DeliberationRequest(
+        text="test",
+        context={},
+        grounding_result_file="/tmp/grounding.json",
+    )
+    d = req.to_dict()
+    assert "grounding_result_file" in d
+    assert d["grounding_result_file"] == "/tmp/grounding.json"
+
+
+def test_ac4_serialization_none_default():
+    """AC4: grounding_result_file defaults to None and round-trips as None."""
+    req = DeliberationRequest(text="test", context={})
+    d = req.to_dict()
+    assert "grounding_result_file" in d
+    assert d["grounding_result_file"] is None

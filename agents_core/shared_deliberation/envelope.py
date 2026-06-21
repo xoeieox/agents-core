@@ -17,6 +17,7 @@ class DeliberationRequest:
     council_voicing: str = "gravitywell"
     facets_operator: str = "gravitywell"
     seam: Optional[dict] = None  # reserved for jagged-seam tap (v0: unused)
+    grounding_result_file: Optional[str] = None  # pre-computed grounding path (H5b producer passthrough)
 
     def to_dict(self) -> dict:
         return asdict(self)
