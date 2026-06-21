@@ -24,6 +24,15 @@ log = logging.getLogger("shared-deliberation")
 _COUNCIL_STATION_ID = "council/worker-fast-fail"
 
 
+class GroundingHandoffError(Exception):
+    """Raised when grounding_result_file is set but the file is absent or empty.
+
+    A producer that sets this field has promised a pre-computed grounding result.
+    Silently falling back to auto-grounding would mask the contract violation and
+    make any swarm:<id> provenance label a lie. Hard-fail instead.
+    """
+
+
 def _escalate_council_fast_fail(run_id: str, last_heartbeat, reason: str) -> None:
     """Fire the council fast-fail repair station (Leg 1 of repair-expert-v0).
 
@@ -75,6 +84,7 @@ async def _facets_subprocess(
     text: str,
     context: dict,
     operator: str = "gravitywell",
+    grounding_result_file: Optional[str] = None,
 ) -> tuple[bool, Optional[dict], Optional[str], Optional[str]]:
     """Invoke Facets via subprocess. Returns (ok, deliberation_dict, deliberation_id, errors).
 
@@ -95,7 +105,9 @@ async def _facets_subprocess(
         return (False, None, None, f"Facets repo not found at {facets_repo}")
 
     async with _facets_semaphore:
-        return await asyncio.to_thread(_run_facets_subprocess, text, context, operator, facets_repo)
+        return await asyncio.to_thread(
+            _run_facets_subprocess, text, context, operator, facets_repo, grounding_result_file
+        )
 
 
 def _run_facets_subprocess(
@@ -103,8 +115,24 @@ def _run_facets_subprocess(
     context: dict,
     operator: str,
     facets_repo: Path,
+    grounding_result_file: Optional[str] = None,
 ) -> tuple[bool, Optional[dict], Optional[str], Optional[str]]:
     """Synchronous subprocess invocation (runs in thread)."""
+    # Grounding handoff guard: validate before building argv.
+    if grounding_result_file is not None:
+        grf_path = Path(grounding_result_file)
+        if not grf_path.exists() or grf_path.stat().st_size == 0:
+            log.error(
+                "[shared-deliberation:grounding] GroundingHandoffError: "
+                "producer promised grounding_result_file=%s but it is absent "
+                "-- refusing to silently auto-ground",
+                grounding_result_file,
+            )
+            raise GroundingHandoffError(
+                f"grounding_result_file={grounding_result_file!r} is absent or empty; "
+                "refusing to silently auto-ground (producer contract violation)"
+            )
+
     try:
         # Create temp context file
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
@@ -126,6 +154,13 @@ def _run_facets_subprocess(
             ]
             if operator and operator != "haiku":
                 argv += ["--persona-operator", operator, "--synthesis-operator", operator]
+
+            if grounding_result_file is not None:
+                argv += ["--grounding-result-file", grounding_result_file, "--no-auto-ground"]
+                log.info(
+                    "[shared-deliberation:grounding] injected pre-computed grounding from %s",
+                    grounding_result_file,
+                )
 
             result = subprocess.run(
                 argv,
@@ -328,6 +363,7 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
             request.text,
             request.context,
             request.facets_operator,
+            request.grounding_result_file,
         )
 
     async def _council_leg():
