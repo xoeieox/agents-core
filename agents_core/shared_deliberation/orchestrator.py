@@ -21,6 +21,33 @@ from agents_core.shared_deliberation.envelope import DeliberationEnvelope, Delib
 
 log = logging.getLogger("shared-deliberation")
 
+_COUNCIL_STATION_ID = "council/worker-fast-fail"
+
+
+def _escalate_council_fast_fail(run_id: str, last_heartbeat, reason: str) -> None:
+    """Fire the council fast-fail repair station (Leg 1 of repair-expert-v0).
+
+    Imported lazily so the repair_station module is not loaded on every
+    orchestrator import — only on an actual fast-fail event.
+    """
+    try:
+        from agents_core.repair_station import escalate, Tier, first
+        escalate(
+            station_id=_COUNCIL_STATION_ID,
+            stable_pointer="agents_core/shared_deliberation/orchestrator.py",
+            error_signal={
+                "run_id": run_id,
+                "last_heartbeat": last_heartbeat,
+                "reason": reason,
+            },
+            author_intent="council worker died/stalled during deliberation",
+            escalation_policy=first(),
+            tier=Tier.HIGH,
+            owning_module="agents_core.shared_deliberation.orchestrator",
+        )
+    except Exception:
+        log.exception("repair-station escalation failed for council fast-fail — suppressed")
+
 # Bounded concurrency for Facets subprocesses (gate against GW lane stampede)
 _facets_semaphore: Optional[asyncio.Semaphore] = None
 
@@ -265,6 +292,7 @@ def _poll_council(run_id: str, timeout_s: int = 1800) -> tuple[Optional[dict], O
                         f"(run_id={run_id}, last_heartbeat={last_heartbeat!r}, reason={reason})"
                     )
                     log.error(error)
+                    _escalate_council_fast_fail(run_id, last_heartbeat, reason)
                     return (None, error)
 
             time.sleep(poll_interval)
