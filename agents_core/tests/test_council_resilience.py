@@ -133,6 +133,101 @@ def test_deliberation_hold_not_acquired_for_non_gw_voicing(monkeypatch):
     run_file.unlink(missing_ok=True)
 
 
+def test_no_per_voice_gw_rewake(monkeypatch):
+    """Single deliberation-spanning hold prevents per-voice GW re-wake.
+
+    Simulates NUM_STEPS engine turns via a fake Engine. DoormanClient.acquire
+    must be called exactly once (initial hold) + NUM_STEPS (heartbeat refreshes).
+    No additional per-voice re-wake calls — the deliberation-spanning hold keeps
+    GW warm across all voices without re-acquiring per turn.
+
+    AC1: 'a test asserts GW is not re-woken per-voice (single ensure_serving + held)'
+    """
+    import sys
+    from agents_core.council import cli
+
+    NUM_STEPS = 3
+    run_id = "2026-01-01-000000-norestart01"
+    run_data = {
+        "run_id": run_id,
+        "status": "deliberating",
+        "mode": "deliberation",
+        "decision": "test no per-voice re-wake",
+        "voicing": "gravitywell",
+        "turns_cap": NUM_STEPS,
+        "turns": [],
+        "selected_entities": [{"id": "char1"}, {"id": "char2"}],
+    }
+    cli.COUNCIL_DIR.mkdir(parents=True, exist_ok=True)
+    run_file = cli.COUNCIL_DIR / f"{run_id}.yaml"
+    run_file.write_text(yaml.safe_dump(run_data))
+
+    class _FakeEvent:
+        type = "deliberation_turn"
+
+    class _FakeStepData:
+        def __init__(self, n):
+            self.step = n
+            self.acting_entity_id = "char1"
+            self.response = f"turn {n} content"
+            self.events = [_FakeEvent()]
+
+    class _FakeEngine:
+        def run(self, director, entities, on_step):
+            for n in range(1, NUM_STEPS + 1):
+                on_step(_FakeStepData(n))
+
+    mock_client = MagicMock()
+    mock_client.acquire.return_value = {"status": "serving"}
+
+    fake_lapis_mod = MagicMock()
+    fake_lapis_mod.Engine.return_value = _FakeEngine()
+
+    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_client), \
+         patch("agents_core.doorman_client._gw_acquire_timeout", return_value=210.0), \
+         patch.dict(sys.modules, {
+             "lapis_engine": fake_lapis_mod,
+             "archetypes": MagicMock(),
+             "archetypes.engine": MagicMock(),
+             "archetypes.engine.character_entity": MagicMock(),
+             "agents_core.council.narrator_entity": MagicMock(),
+         }), \
+         patch.object(cli, "_build_adapter", return_value=MagicMock()), \
+         patch.object(cli, "_build_entity", return_value=MagicMock()), \
+         patch.object(cli, "_build_director", return_value=MagicMock()), \
+         patch.object(cli, "_apply_voicing_provenance"), \
+         patch.object(cli, "_emit_voicing_signal"), \
+         patch.object(cli, "_apply_position_cast_tail"), \
+         patch.object(cli, "_parse_synthesis", return_value={}), \
+         patch.object(cli, "_calculate_paid_spend", return_value=False):
+        cli.run_deliberation(run_id)
+
+    acquire_calls = mock_client.acquire.call_args_list
+    # 1 initial hold + NUM_STEPS heartbeat refreshes = NUM_STEPS + 1 total.
+    # Any higher count would indicate per-voice re-wake calls.
+    assert len(acquire_calls) == 1 + NUM_STEPS, (
+        f"Expected 1 initial hold + {NUM_STEPS} heartbeat-refresh acquires "
+        f"(={1 + NUM_STEPS} total), got {len(acquire_calls)}: {acquire_calls}"
+    )
+
+    # First call is the deliberation-level hold, not a per-voice re-wake
+    initial_reason = acquire_calls[0].kwargs.get("reason")
+    assert initial_reason == "council-deliberation-hold", (
+        f"Initial acquire should be deliberation hold, got reason={initial_reason!r}"
+    )
+
+    # All subsequent calls are heartbeat refreshes (per step, not per voice start)
+    for i, c in enumerate(acquire_calls[1:], 1):
+        reason = c.kwargs.get("reason")
+        assert reason == "council-deliberation-heartbeat", (
+            f"Acquire call {i + 1} should be heartbeat refresh (not per-voice re-wake), "
+            f"got reason={reason!r}"
+        )
+
+    mock_client.release.assert_called_once()
+    run_file.unlink(missing_ok=True)
+
+
 def test_deliberation_hold_failure_does_not_abort(monkeypatch):
     """A failed hold acquire logs a warning but does not abort the deliberation."""
     from agents_core.council import cli
@@ -255,7 +350,7 @@ def test_poll_council_does_not_fast_fail_with_fresh_heartbeat(tmp_path, monkeypa
 
     run_id = "2026-01-01-000000-fresh01"
     # heartbeat_at set to 'now' — should not trigger stall detection
-    fresh_ts = datetime.utcnow().isoformat(timespec="seconds")
+    fresh_ts = datetime.now().isoformat(timespec="seconds")
     run_data = {
         "run_id": run_id,
         "status": "deliberating",
@@ -295,7 +390,7 @@ def test_poll_council_returns_terminal_status(tmp_path, monkeypatch):
     run_data = {
         "run_id": run_id,
         "status": "resolved",
-        "created_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
         "voicing": "gravitywell",
         "selection_degraded": False,
         "synthesis": {

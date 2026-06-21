@@ -48,6 +48,7 @@ import random
 import re
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -812,6 +813,13 @@ def run_deliberation(run_id: str) -> None:
     mode = run.get("mode", DEFAULT_MODE)
     kernel_version = _cache.read_kernel_version()
 
+    # Stamp process-liveness heartbeat immediately so the poller does not use
+    # created_at as the stall clock reference while this process is alive but
+    # blocked in the doorman acquire (which can take up to _gw_acquire_timeout()
+    # ~210s on a cold GW wake — longer than COUNCIL_STALL_S).
+    run["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
+    save_run(run)
+
     # Deliberation-spanning GW keepawake hold (spec-review-council-keepawake-resilience-v0 §A).
     # Acquires a doorman lease for the full deliberation so GW stays warm across all voices.
     # on_step refreshes the lease (heartbeat-coupled). TTL = COUNCIL_STALL_S so a dead
@@ -819,6 +827,7 @@ def run_deliberation(run_id: str) -> None:
     _hold_work_id = f"council-delib-{run_id}"
     _doorman = None
     _hold_active = False
+    _refresh_threads: list = []  # fire-and-forget refresh threads, joined in finally
     if run.get("voicing") == "gravitywell":
         try:
             from agents_core.doorman_client import DoormanClient, _gw_acquire_timeout
@@ -829,7 +838,7 @@ def run_deliberation(run_id: str) -> None:
                 reason="council-deliberation-hold",
                 timeout=_gw_acquire_timeout(),
             )
-            _hold_active = _hold_res.get("status") in ("serving", "deferred")
+            _hold_active = _hold_res.get("status") == "serving"
             print(
                 f"[council] deliberation hold placed run_id={run_id} "
                 f"status={_hold_res.get('status')}",
@@ -930,21 +939,27 @@ def run_deliberation(run_id: str) -> None:
                 )
                 run["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
                 save_run(run)
-                # Heartbeat-coupled hold refresh: only refreshes while turns advance.
-                # If worker stalls, no refresh comes and the lease expires after COUNCIL_STALL_S.
+                # Heartbeat-coupled hold refresh: fire-and-forget thread so the engine
+                # turn loop is not blocked by doorman latency (5s timeout per call).
+                # Only refreshes while turns advance — stalled worker produces no refreshes
+                # and the lease expires after COUNCIL_STALL_S (zombie-hold guard).
                 if _hold_active and _doorman:
-                    try:
-                        _doorman.acquire(
-                            "gravitywell", _hold_work_id,
-                            ttl_sec=COUNCIL_STALL_S,
-                            reason="council-deliberation-heartbeat",
-                            timeout=5.0,
-                        )
-                    except Exception as _ref_err:
-                        print(
-                            f"[council] hold refresh failed step={sd.step}: {_ref_err}",
-                            flush=True,
-                        )
+                    def _refresh(_step=sd.step):
+                        try:
+                            _doorman.acquire(
+                                "gravitywell", _hold_work_id,
+                                ttl_sec=COUNCIL_STALL_S,
+                                reason="council-deliberation-heartbeat",
+                                timeout=5.0,
+                            )
+                        except Exception as _ref_err:
+                            print(
+                                f"[council] hold refresh failed step={_step}: {_ref_err}",
+                                flush=True,
+                            )
+                    _t = threading.Thread(target=_refresh, daemon=True)
+                    _refresh_threads.append(_t)
+                    _t.start()
 
             Engine().run(director=director, entities=entities, on_step=on_step)
 
@@ -975,6 +990,10 @@ def run_deliberation(run_id: str) -> None:
             save_run(run)
             raise
     finally:
+        # Join in-flight hold-refresh threads before releasing so the hold is not
+        # dropped while a refresh is still in-flight.
+        for _t in _refresh_threads:
+            _t.join(timeout=6.0)
         # Release deliberation-spanning hold on any exit path (success, error, or stub return).
         if _doorman:
             try:
