@@ -7,6 +7,7 @@ unifies results into a DeliberationEnvelope.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import json
 import logging
 import os
@@ -204,12 +205,18 @@ def _poll_council(run_id: str, timeout_s: int = 1800) -> tuple[Optional[dict], O
 
     Returns (council_data, error_message).
     council_data extracts status, landing, confidence, open_questions, positions.
+
+    COUNCIL_STALL_S (env, default 180s): fast-fail threshold. If heartbeat_at is
+    stale beyond this threshold while status is non-terminal, the worker is declared
+    dead/stalled and the function returns immediately with a legible error rather than
+    waiting for timeout_s. Fixes the 30-minute silent hang when the worker dies.
     """
     import yaml
 
     council_dir = Path("/srv/lapis/council")
     start_time = time.time()
     poll_interval = 5
+    stall_s = int(os.environ.get("COUNCIL_STALL_S", "180"))
 
     while time.time() - start_time < timeout_s:
         run_path = council_dir / f"{run_id}.yaml"
@@ -242,13 +249,31 @@ def _poll_council(run_id: str, timeout_s: int = 1800) -> tuple[Optional[dict], O
                     None,
                 )
 
+            # Liveness fast-fail: detect dead/stalled worker by heartbeat staleness.
+            # Use heartbeat_at if present; fall back to created_at for initial startup window.
+            last_heartbeat = run.get("heartbeat_at")
+            ref_str = last_heartbeat or run.get("created_at")
+            if ref_str:
+                try:
+                    ref_ts = datetime.fromisoformat(ref_str).timestamp()
+                except (ValueError, TypeError):
+                    ref_ts = None
+                if ref_ts is not None and time.time() - ref_ts > stall_s:
+                    reason = "heartbeat_stale" if last_heartbeat else "no_heartbeat_after_startup"
+                    error = (
+                        f"council worker died/stalled "
+                        f"(run_id={run_id}, last_heartbeat={last_heartbeat!r}, reason={reason})"
+                    )
+                    log.error(error)
+                    return (None, error)
+
             time.sleep(poll_interval)
         except Exception as e:
             error = f"Council poll error: {e}"
             log.error(error)
             return (None, error)
 
-    # Timeout
+    # Timeout (backstop — liveness fast-fail is the primary path for dead workers)
     error = f"Council poll timeout after {timeout_s}s"
     log.error(error)
     return (None, error)

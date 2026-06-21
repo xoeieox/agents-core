@@ -48,6 +48,7 @@ import random
 import re
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -67,6 +68,11 @@ DEFAULT_MODE = "deliberation"
 VALID_MODES = ("deliberation", "scene")
 SCENE_N_RANGE = (2, 3)
 RECENCY_LOOKBACK = 6
+# COUNCIL_STALL_S: poller fast-fail threshold and deliberation-hold lease TTL (seconds).
+# _poll_council declares worker dead when heartbeat_at is stale beyond this value.
+# run_deliberation uses this as the lease TTL for the deliberation-spanning GW hold so
+# a dead worker's hold auto-expires after COUNCIL_STALL_S (zombie-hold guard).
+COUNCIL_STALL_S = int(os.environ.get("COUNCIL_STALL_S", "180"))
 
 # Roles are recorded in the run YAML's `selected_entities` list so the
 # runtime subprocess can construct the right Entity type per slot.
@@ -799,6 +805,7 @@ def run_deliberation(run_id: str) -> None:
 
     COUNCIL_ENGINE_STUB=1: skip LLM calls entirely, write fixture turn/synthesis.
     COUNCIL_STUB_POSITIONS: comma-separated positions for stub cast (default: agree,agree).
+    COUNCIL_STALL_S: heartbeat hold lease TTL — see module-level constant.
     """
     from agents_core.council import cache as _cache
 
@@ -806,121 +813,197 @@ def run_deliberation(run_id: str) -> None:
     mode = run.get("mode", DEFAULT_MODE)
     kernel_version = _cache.read_kernel_version()
 
-    if os.environ.get("COUNCIL_ENGINE_STUB") == "1":
-        first_id = (run["selected_entities"][0]["id"]
-                    if run.get("selected_entities") else "stub-entity")
-        run["turns"].append(
-            {
-                "step": 1,
-                "speaker": first_id,
-                "type": "deliberation_turn",  # was "dialogue" — H1 fix per v3->v4
-                "content": "[STUB] turn output",
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-            }
-        )
-        if mode == "scene":
-            run["status"] = "closed"
-            run["completed_at"] = datetime.now().isoformat(timespec="seconds")
-            save_run(run)
-            return
-        # Deliberation stub: write synthesis turn, parse synthesis, then shared tail.
-        synth_content = (
-            "LANDING: stub-landing\n"
-            "OPEN QUESTIONS: -\n"
-            "CONFIDENCE: converged"
-        )
-        run["turns"].append(
-            {
-                "step": 2,
-                "speaker": "synthesis",
-                "type": "synthesis",
-                "content": synth_content,
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-            }
-        )
-        run["synthesis"] = _parse_synthesis(synth_content)
-        # Stub mode voicing provenance: set effective_voicing to match requested (no actual operation)
-        run["effective_voicing"] = run.get("voicing", "sonnet")
-        run["voicing_degraded"] = False
-        # Common deliberation tail — MUST run in stub mode too (H2 fix per v3->v4).
-        # entities=None is safe: _cast_positions uses env-var fast-path in stub mode.
-        _apply_position_cast_tail(
-            run, entities=None, adapter=None,
-            kernel_version=kernel_version, cache=_cache,
-        )
-        run["completed_at"] = datetime.now().isoformat(timespec="seconds")
-        run["paid_spend"] = _calculate_paid_spend(run)
-        save_run(run)
-        return
+    # Stamp process-liveness heartbeat immediately so the poller does not use
+    # created_at as the stall clock reference while this process is alive but
+    # blocked in the doorman acquire (which can take up to _gw_acquire_timeout()
+    # ~210s on a cold GW wake — longer than COUNCIL_STALL_S).
+    run["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
+    save_run(run)
 
-    # Late imports: keep lapis-engine load function-local so importing
-    # agents_core.council doesn't force-load lapis-engine at queue startup.
-    from lapis_engine import (  # type: ignore
-        ClaudeAdapter,
-        DeliberationDirector,
-        Engine,
-        LlamaAdapter,
-        SceneDirector,
-        StepData,
-    )
-    from archetypes.engine.character_entity import CharacterEntity  # type: ignore
-    from agents_core.council.narrator_entity import NarratorEntity
+    # Deliberation-spanning GW keepawake hold (spec-review-council-keepawake-resilience-v0 §A).
+    # Acquires a doorman lease for the full deliberation so GW stays warm across all voices.
+    # on_step refreshes the lease (heartbeat-coupled). TTL = COUNCIL_STALL_S so a dead
+    # worker's hold auto-expires — zombie-hold guard (no unconditional pinning).
+    _hold_work_id = f"council-delib-{run_id}"
+    _doorman = None
+    _hold_active = False
+    _refresh_threads: list = []  # fire-and-forget refresh threads, joined in finally
+    if run.get("voicing") == "gravitywell":
+        try:
+            from agents_core.doorman_client import DoormanClient, _gw_acquire_timeout
+            _doorman = DoormanClient()
+            _hold_res = _doorman.acquire(
+                "gravitywell", _hold_work_id,
+                ttl_sec=COUNCIL_STALL_S,
+                reason="council-deliberation-hold",
+                timeout=_gw_acquire_timeout(),
+            )
+            _hold_active = _hold_res.get("status") == "serving"
+            print(
+                f"[council] deliberation hold placed run_id={run_id} "
+                f"status={_hold_res.get('status')}",
+                flush=True,
+            )
+        except Exception as _hold_err:
+            print(
+                f"[council] deliberation-spanning hold failed (non-fatal): {_hold_err}",
+                flush=True,
+            )
 
     try:
-        adapter = _build_adapter(run["voicing"], ClaudeAdapter, LlamaAdapter)
-        entities = [
-            _build_entity(sel, adapter, CharacterEntity, NarratorEntity)
-            for sel in run["selected_entities"]
-        ]
-        director = _build_director(
-            mode=mode,
-            prompt=run["decision"],
-            turns=int(run["turns_cap"]),
-            DeliberationDirector=DeliberationDirector,
-            SceneDirector=SceneDirector,
-        )
-
-        def on_step(sd: "StepData") -> None:
-            event = sd.events[0] if sd.events else None
+        if os.environ.get("COUNCIL_ENGINE_STUB") == "1":
+            first_id = (run["selected_entities"][0]["id"]
+                        if run.get("selected_entities") else "stub-entity")
             run["turns"].append(
                 {
-                    "step": sd.step,
-                    "speaker": sd.acting_entity_id,
-                    "type": event.type if event else "unknown",
-                    "content": sd.response,
+                    "step": 1,
+                    "speaker": first_id,
+                    "type": "deliberation_turn",  # was "dialogue" — H1 fix per v3->v4
+                    "content": "[STUB] turn output",
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
                 }
             )
-            save_run(run)
-
-        Engine().run(director=director, entities=entities, on_step=on_step)
-
-        # Record effective voicing from adapter (gravitywell or fallback)
-        _apply_voicing_provenance(run, adapter)
-
-        # Emit in-stream voicing-degradation signal (Leg A of gw-voicing-stdout-signal-v0)
-        _emit_voicing_signal(run, adapter, run_id)
-
-        if mode == "scene":
-            run["status"] = "closed"
-        else:
-            synth_content = run["turns"][-1]["content"] if run["turns"] else ""
+            run["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
+            if mode == "scene":
+                run["status"] = "closed"
+                run["completed_at"] = datetime.now().isoformat(timespec="seconds")
+                save_run(run)
+                return
+            # Deliberation stub: write synthesis turn, parse synthesis, then shared tail.
+            synth_content = (
+                "LANDING: stub-landing\n"
+                "OPEN QUESTIONS: -\n"
+                "CONFIDENCE: converged"
+            )
+            run["turns"].append(
+                {
+                    "step": 2,
+                    "speaker": "synthesis",
+                    "type": "synthesis",
+                    "content": synth_content,
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
             run["synthesis"] = _parse_synthesis(synth_content)
-            # Common deliberation tail — runs in real mode.
+            # Stub mode voicing provenance: set effective_voicing to match requested (no actual operation)
+            run["effective_voicing"] = run.get("voicing", "sonnet")
+            run["voicing_degraded"] = False
+            # Common deliberation tail — MUST run in stub mode too (H2 fix per v3->v4).
+            # entities=None is safe: _cast_positions uses env-var fast-path in stub mode.
             _apply_position_cast_tail(
-                run, entities=entities, adapter=adapter,
+                run, entities=None, adapter=None,
                 kernel_version=kernel_version, cache=_cache,
             )
-        run["completed_at"] = datetime.now().isoformat(timespec="seconds")
-        run["paid_spend"] = _calculate_paid_spend(run)
-        save_run(run)
-    except Exception as e:
-        run["status"] = "failed"
-        run["error"] = f"{type(e).__name__}: {e}"
-        run["completed_at"] = datetime.now().isoformat(timespec="seconds")
-        run["paid_spend"] = _calculate_paid_spend(run)
-        save_run(run)
-        raise
+            run["completed_at"] = datetime.now().isoformat(timespec="seconds")
+            run["paid_spend"] = _calculate_paid_spend(run)
+            save_run(run)
+            return
+
+        # Late imports: keep lapis-engine load function-local so importing
+        # agents_core.council doesn't force-load lapis-engine at queue startup.
+        from lapis_engine import (  # type: ignore
+            ClaudeAdapter,
+            DeliberationDirector,
+            Engine,
+            LlamaAdapter,
+            SceneDirector,
+            StepData,
+        )
+        from archetypes.engine.character_entity import CharacterEntity  # type: ignore
+        from agents_core.council.narrator_entity import NarratorEntity
+
+        try:
+            adapter = _build_adapter(run["voicing"], ClaudeAdapter, LlamaAdapter)
+            entities = [
+                _build_entity(sel, adapter, CharacterEntity, NarratorEntity)
+                for sel in run["selected_entities"]
+            ]
+            director = _build_director(
+                mode=mode,
+                prompt=run["decision"],
+                turns=int(run["turns_cap"]),
+                DeliberationDirector=DeliberationDirector,
+                SceneDirector=SceneDirector,
+            )
+
+            def on_step(sd: "StepData") -> None:
+                event = sd.events[0] if sd.events else None
+                run["turns"].append(
+                    {
+                        "step": sd.step,
+                        "speaker": sd.acting_entity_id,
+                        "type": event.type if event else "unknown",
+                        "content": sd.response,
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    }
+                )
+                run["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
+                save_run(run)
+                # Heartbeat-coupled hold refresh: fire-and-forget thread so the engine
+                # turn loop is not blocked by doorman latency (5s timeout per call).
+                # Only refreshes while turns advance — stalled worker produces no refreshes
+                # and the lease expires after COUNCIL_STALL_S (zombie-hold guard).
+                if _hold_active and _doorman:
+                    def _refresh(_step=sd.step):
+                        try:
+                            _doorman.acquire(
+                                "gravitywell", _hold_work_id,
+                                ttl_sec=COUNCIL_STALL_S,
+                                reason="council-deliberation-heartbeat",
+                                timeout=5.0,
+                            )
+                        except Exception as _ref_err:
+                            print(
+                                f"[council] hold refresh failed step={_step}: {_ref_err}",
+                                flush=True,
+                            )
+                    _t = threading.Thread(target=_refresh, daemon=True)
+                    _refresh_threads.append(_t)
+                    _t.start()
+
+            Engine().run(director=director, entities=entities, on_step=on_step)
+
+            # Record effective voicing from adapter (gravitywell or fallback)
+            _apply_voicing_provenance(run, adapter)
+
+            # Emit in-stream voicing-degradation signal (Leg A of gw-voicing-stdout-signal-v0)
+            _emit_voicing_signal(run, adapter, run_id)
+
+            if mode == "scene":
+                run["status"] = "closed"
+            else:
+                synth_content = run["turns"][-1]["content"] if run["turns"] else ""
+                run["synthesis"] = _parse_synthesis(synth_content)
+                # Common deliberation tail — runs in real mode.
+                _apply_position_cast_tail(
+                    run, entities=entities, adapter=adapter,
+                    kernel_version=kernel_version, cache=_cache,
+                )
+            run["completed_at"] = datetime.now().isoformat(timespec="seconds")
+            run["paid_spend"] = _calculate_paid_spend(run)
+            save_run(run)
+        except Exception as e:
+            run["status"] = "failed"
+            run["error"] = f"{type(e).__name__}: {e}"
+            run["completed_at"] = datetime.now().isoformat(timespec="seconds")
+            run["paid_spend"] = _calculate_paid_spend(run)
+            save_run(run)
+            raise
+    finally:
+        # Join in-flight hold-refresh threads before releasing so the hold is not
+        # dropped while a refresh is still in-flight.
+        for _t in _refresh_threads:
+            _t.join(timeout=6.0)
+        # Release deliberation-spanning hold on any exit path (success, error, or stub return).
+        if _doorman:
+            try:
+                _doorman.release("gravitywell", _hold_work_id)
+            except Exception as _rel_err:
+                print(f"[council] deliberation hold release failed: {_rel_err}", flush=True)
+            try:
+                _doorman.close()
+            except Exception:
+                pass
 
 
 def _emit_voicing_signal(run: dict, adapter, run_id: str) -> None:
