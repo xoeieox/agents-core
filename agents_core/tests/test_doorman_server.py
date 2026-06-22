@@ -1290,3 +1290,399 @@ class TestOrphanReclaim:
 
         assert "worker-lease" in expired
         assert len(scar_events) == 0  # No scar for worker
+
+
+# ---------------------------------------------------------------------------
+# Mode-aware admission guard (doorman-mode-aware-serving-predicate-v0)
+# AC1-AC5, AC10-AC12
+# ---------------------------------------------------------------------------
+
+class TestModeAwareAdmission:
+    """Tests for DOORMAN_MODE_AWARE_ADMISSION flag: HOLE 1 fix, HOLE 2 fix, flag semantics."""
+
+    def test_ac1_flag_defaults_false(self):
+        """AC1: DOORMAN_MODE_AWARE_ADMISSION must be False when the env var is absent."""
+        import agents_core.doorman_server as ds
+        assert ds.DOORMAN_MODE_AWARE_ADMISSION is False
+
+    def test_ac2a_deference_before_is_serving_role_worker(self):
+        """AC2(a): flag ON, controller lease active, role='worker' -> DEFERRED before _is_serving."""
+        state = _make_state()
+        state.leases["flip-controller-gw"] = {
+            "acquired_at": time.time(), "ttl_sec": 240,
+            "reason": "mode control", "role": "mode-controller",
+        }
+        with patch.object(state, "_is_serving") as mock_serving, \
+             patch("subprocess.run") as mock_sub, \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            result = state.ensure_serving(role="worker")
+
+        assert result is DEFERRED
+        mock_serving.assert_not_called()   # fast path NOT reached
+        mock_sub.assert_not_called()       # wake-gravitywell NOT invoked
+
+    def test_ac2b_no_wake_gravitywell_on_deferred_path(self):
+        """AC2(b,c): wake-gravitywell subprocess NOT called when deferred-worker path taken."""
+        state = _make_state()
+        state.leases["flip-controller-gw"] = {
+            "acquired_at": time.time(), "ttl_sec": 240,
+            "reason": "mode control", "role": "mode-controller",
+        }
+        with patch("subprocess.run") as mock_sub, \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            result = state.ensure_serving(role="worker")
+
+        assert result is DEFERRED
+        wake_calls = [c for c in mock_sub.call_args_list if "wake-gravitywell" in str(c)]
+        assert len(wake_calls) == 0
+
+    def test_ac2d_acquire_lease_worker_not_registered_when_deferred(self):
+        """AC2(d): acquire_lease role='worker' returns DEFERRED; lease NOT in state.leases."""
+        state = _make_state()
+        state.leases["flip-controller-gw"] = {
+            "acquired_at": time.time(), "ttl_sec": 240,
+            "reason": "mode control", "role": "mode-controller",
+        }
+        with patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            result = state.acquire_lease(
+                "work-new", ttl_sec=120, reason="inference", role="worker"
+            )
+
+        assert result is DEFERRED
+        assert "work-new" not in state.leases
+
+    def test_ac2_is_serving_true_still_deferred_flag_on(self):
+        """AC2: _is_serving=True, controller lease, flag ON -> DEFERRED (not True)."""
+        state = _make_state()
+        state.leases["flip-controller-gw"] = {
+            "acquired_at": time.time(), "ttl_sec": 240,
+            "reason": "mode control", "role": "mode-controller",
+        }
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            result = state.ensure_serving(role="worker")
+
+        assert result is DEFERRED
+
+    def test_ac3_flag_off_preserves_fast_path(self):
+        """AC3: flag OFF, _is_serving=True, controller lease -> True (not DEFERRED)."""
+        state = _make_state()
+        state.leases["flip-controller-gw"] = {
+            "acquired_at": time.time(), "ttl_sec": 240,
+            "reason": "mode control", "role": "mode-controller",
+        }
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", False), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            result = state.ensure_serving(role="worker")
+
+        assert result is True  # legacy order: fast path fires first
+
+    def test_ac4_controller_renewal_registers_flag_on_is_serving_true(self):
+        """AC4: flag=True + worker lease + _is_serving=True, controller renewal registers and holds."""
+        state = _make_state()
+        state.leases["worker-1"] = {
+            "acquired_at": time.time(), "ttl_sec": 300,
+            "reason": "inference", "role": "worker",
+        }
+        hold_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "gw-keepawake" in str(cmd) and "hold" in str(cmd):
+                hold_calls.append(cmd)
+            return MagicMock(returncode=0, stderr="")
+
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            result = state.acquire_lease(
+                "flip-controller-gw", ttl_sec=240, reason="mode control",
+                role="mode-controller",
+            )
+
+        assert "flip-controller-gw" in state.leases
+        assert state.leases["flip-controller-gw"]["role"] == "mode-controller"
+        assert len(hold_calls) >= 1
+
+    def test_ac5a_serving_mode_deferred_controller_owns_flag_on(self):
+        """AC5(a) ON: _cached_serving=True, controller lease, flag ON -> serving_mode='deferred'."""
+        state = _make_state()
+        state._cached_serving = True
+        state._serving_checked_at = time.time()
+        state.leases["flip-controller-gw"] = {
+            "acquired_at": time.time(), "ttl_sec": 240,
+            "reason": "mode control", "role": "mode-controller",
+        }
+        with patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+            snapshot = state.status_snapshot()
+        assert snapshot["serving_mode"] == "deferred"
+
+    def test_ac5a_serving_mode_big_controller_owns_flag_off(self):
+        """AC5(a) OFF: _cached_serving=True, controller lease, flag OFF -> serving_mode='big' (legacy)."""
+        state = _make_state()
+        state._cached_serving = True
+        state._serving_checked_at = time.time()
+        state.leases["flip-controller-gw"] = {
+            "acquired_at": time.time(), "ttl_sec": 240,
+            "reason": "mode control", "role": "mode-controller",
+        }
+        with patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", False):
+            snapshot = state.status_snapshot()
+        assert snapshot["serving_mode"] == "big"
+
+    def test_ac5b_status_snapshot_no_network_call(self):
+        """AC5(b): status_snapshot must not issue any network call (reads cache only)."""
+        state = _make_state()
+        state._cached_serving = True
+        state._serving_checked_at = time.time()
+        with patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True), \
+             patch("agents_core.doorman_server.requests") as mock_requests:
+            snapshot = state.status_snapshot()
+        mock_requests.get.assert_not_called()
+
+    def test_ac10_http_deferred_end_to_end(self):
+        """AC10: POST /lease/acquire with controller lease, flag ON, _is_serving True -> deferred."""
+        with patch("agents_core.doorman_server._start_refresh_thread"):
+            app = create_app(gw_url=GW_URL_DEFAULT)
+        c = TestClient(app)
+
+        # Register a controller lease via mocked acquire_lease DEFERRED path
+        with patch.object(_NodeState, "ensure_serving", return_value=DEFERRED), \
+             patch.object(_NodeState, "_place_hold"):
+            c.post("/lease/acquire", json={
+                "node": "gravitywell",
+                "work_id": "flip-controller-gw",
+                "ttl_sec": 240,
+                "reason": "mode control",
+                "role": "mode-controller",
+            })
+
+        # Worker acquire with flag ON and _is_serving True
+        with patch.object(_NodeState, "_is_serving", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            r = c.post("/lease/acquire", json={
+                "node": "gravitywell",
+                "work_id": "worker-1",
+                "ttl_sec": 120,
+                "reason": "inference",
+                "role": "worker",
+            })
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "deferred"
+
+    def test_ac12_status_additive_contract(self):
+        """AC12: /status includes drain_count and serving_is_big; no existing key changes type."""
+        c = _client_no_auth()
+        with patch("agents_core.doorman_server._NodeState._is_serving", return_value=False):
+            r = c.get("/status")
+        assert r.status_code == 200
+        gw = r.json()["nodes"]["gravitywell"]
+        # New keys
+        assert "drain_count" in gw
+        assert "serving_is_big" in gw
+        assert "big_probe_state" in gw
+        # Existing keys unchanged
+        assert "serving" in gw
+        assert "serving_mode" in gw
+        assert "lease_count" in gw
+        assert "leases" in gw
+        assert "last_error" in gw
+        assert "service_stopped" in gw
+        assert "idle_since" in gw
+
+
+# ---------------------------------------------------------------------------
+# Three-state big-model probe (AC6, AC7, AC11)
+# ---------------------------------------------------------------------------
+
+class TestModeAwareBigPredicate:
+    """Tests for the /v1/models three-state probe and serving_is_big predicate."""
+
+    def test_ac7_gw_big_model_id_value(self):
+        """AC7: GW_BIG_MODEL_ID must equal 'gravitywell-122b' (matches OPERATOR_DEFAULTS)."""
+        import agents_core.doorman_server as ds
+        assert ds.GW_BIG_MODEL_ID == "gravitywell-122b"
+
+    def test_ac6a_confirmed_probe_serving_is_big_true(self):
+        """AC6(A): probe confirmed, no controller lease, cached_serving True -> serving_is_big=True."""
+        state = _make_state()
+
+        def mock_models(url, **kwargs):
+            m = MagicMock()
+            m.status_code = 200
+            m.json.return_value = {"data": [{"id": "gravitywell-122b"}]}
+            return m
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_models), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+            state._refresh_serving_cache()
+
+        assert state._serving_is_big is True
+        assert state._big_probe_state == "confirmed"
+
+    def test_ac6b_refuted_probe_serving_is_big_false(self):
+        """AC6(B): probe returns swarm id -> serving_is_big=False, big_probe_state='refuted'."""
+        state = _make_state()
+        get_calls = []
+
+        def mock_models(url, **kwargs):
+            get_calls.append(url)
+            m = MagicMock()
+            m.status_code = 200
+            m.json.return_value = {"data": [{"id": "swarm-coder-7b"}]}
+            return m
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_models), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+            state._refresh_serving_cache()
+
+        assert state._serving_is_big is False
+        assert state._big_probe_state == "refuted"
+        # Assert GET was actually issued (AC6-B: real split-brain scenario)
+        assert len(get_calls) >= 1
+        assert any("v1/models" in url for url in get_calls)
+
+    def test_ac6c_inconclusive_probe_fallback_to_legacy_no_raise(self):
+        """AC6(C): probe timeout, cached_serving True, no controller -> serving_is_big=True, no exception."""
+        state = _make_state()
+        import requests as req_lib
+
+        def mock_timeout(url, **kwargs):
+            raise req_lib.exceptions.Timeout("simulated probe timeout")
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_timeout), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+            state._refresh_serving_cache()  # must not raise
+
+        assert state._serving_is_big is True   # legacy: serving + no controller = True
+        assert state._big_probe_state == "inconclusive"
+
+    def test_ac6d_controller_wins_over_confirmed_probe(self):
+        """AC6(D): probe confirmed but controller lease present -> serving_is_big=False."""
+        state = _make_state()
+        state.leases["flip-controller-gw"] = {
+            "acquired_at": time.time(), "ttl_sec": 240,
+            "reason": "mode control", "role": "mode-controller",
+        }
+
+        def mock_models(url, **kwargs):
+            m = MagicMock()
+            m.status_code = 200
+            m.json.return_value = {"data": [{"id": "gravitywell-122b"}]}
+            return m
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_models), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+            state._refresh_serving_cache()
+
+        assert state._serving_is_big is False  # controller wins
+        assert state._big_probe_state == "confirmed"
+
+    def test_ac11_probe_runs_outside_lock(self):
+        """AC11: /v1/models probe is called with self.lock NOT held."""
+        state = _make_state()
+        lock_held_during_probe = {"yes": False}
+
+        def mock_models(url, **kwargs):
+            # Try to acquire the lock without blocking — must succeed (lock is free)
+            acquired = state.lock.acquire(blocking=False)
+            if not acquired:
+                lock_held_during_probe["yes"] = True
+            else:
+                state.lock.release()
+            m = MagicMock()
+            m.status_code = 200
+            m.json.return_value = {"data": [{"id": "gravitywell-122b"}]}
+            return m
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_models), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+            state._refresh_serving_cache()
+
+        assert lock_held_during_probe["yes"] is False
+
+
+# ---------------------------------------------------------------------------
+# Drain-count exposure (AC8, AC9)
+# ---------------------------------------------------------------------------
+
+class TestDrainCount:
+    """Tests for AC8 (drain_count field) and AC9 (endpoint + client method)."""
+
+    def test_ac8a_drain_count_worker_only(self):
+        """AC8(a): two worker + one controller -> drain_count=2, lease_count=3."""
+        state = _make_state()
+        now = time.time()
+        state.leases["w1"] = {"acquired_at": now, "ttl_sec": 300, "reason": "t", "role": "worker"}
+        state.leases["w2"] = {"acquired_at": now, "ttl_sec": 300, "reason": "t", "role": "worker"}
+        state.leases["ctrl"] = {"acquired_at": now, "ttl_sec": 300, "reason": "t", "role": "mode-controller"}
+
+        snapshot = state.status_snapshot()
+        assert snapshot["drain_count"] == 2
+        assert snapshot["worker_lease_count"] == 2
+        assert snapshot["lease_count"] == 3
+        # All prior keys present
+        for key in ("serving", "serving_mode", "leases", "last_error", "service_stopped"):
+            assert key in snapshot
+
+    def test_ac8b_drain_count_independent_of_probe(self):
+        """AC8(b): probe inconclusive -> drain_count still correct from registry."""
+        state = _make_state()
+        now = time.time()
+        state.leases["w1"] = {"acquired_at": now, "ttl_sec": 300, "reason": "t", "role": "worker"}
+        state.leases["w2"] = {"acquired_at": now, "ttl_sec": 300, "reason": "t", "role": "worker"}
+        state._big_probe_state = "inconclusive"
+
+        snapshot = state.status_snapshot()
+        assert snapshot["drain_count"] == 2
+
+    def test_ac9_drain_count_endpoint_two_workers(self):
+        """AC9: GET /v0/drain-count with two worker leases -> {drain_count: 2}."""
+        with patch("agents_core.doorman_server._start_refresh_thread"):
+            app = create_app(gw_url=GW_URL_DEFAULT)
+        c = TestClient(app, raise_server_exceptions=True)
+
+        with patch.object(_NodeState, "ensure_serving", return_value=True), \
+             patch.object(_NodeState, "_place_hold"):
+            c.post("/lease/acquire", json={
+                "node": "gravitywell", "work_id": "w1",
+                "ttl_sec": 300, "reason": "t", "role": "worker",
+            })
+            c.post("/lease/acquire", json={
+                "node": "gravitywell", "work_id": "w2",
+                "ttl_sec": 300, "reason": "t", "role": "worker",
+            })
+
+        r = c.get("/v0/drain-count?node=gravitywell")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["drain_count"] == 2
+        assert body["node"] == "gravitywell"
+
+    def test_ac9_drain_count_endpoint_unknown_node_400(self):
+        """AC9: unknown node -> 400."""
+        c = _client_no_auth()
+        r = c.get("/v0/drain-count?node=starhouse")
+        assert r.status_code == 400
+
+    def test_ac9_drain_count_endpoint_missing_token_401(self):
+        """AC9: missing bearer token when token configured -> 401."""
+        with patch("agents_core.doorman_server._start_refresh_thread"):
+            with patch.dict(__import__("os").environ, {"DOORMAN_BEARER_TOKEN": "secret"}):
+                app = create_app(gw_url=GW_URL_DEFAULT)
+        c_no_token = TestClient(app, raise_server_exceptions=True)
+        r = c_no_token.get("/v0/drain-count?node=gravitywell")
+        assert r.status_code == 401

@@ -149,6 +149,21 @@ class DoormanClient:
     def healthz(self) -> dict:
         return self._get("/healthz")
 
+    def drain_count(self, node: str = "gravitywell") -> int | None:
+        """Get the in-flight worker-lease count (drain-count) for node.
+
+        Returns int on success, None on 404 (pre-this-unit doormen) or unreachable.
+        """
+        try:
+            data = self._get(f"/v0/drain-count?node={node}")
+            return data.get("drain_count")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
+        except DoormanUnreachable:
+            return None
+
     def mode_owner(self, node: str = "gravitywell") -> dict | None:
         """Get the /v0/mode-owner deference-liveness probe.
 

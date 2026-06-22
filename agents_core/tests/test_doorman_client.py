@@ -403,3 +403,47 @@ def test_healthz_uses_short_default_timeout():
     c = _client_with([(200, {"ok": True})])
     result = c.healthz()
     assert result["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# drain_count (doorman-mode-aware-serving-predicate-v0, AC9)
+# ---------------------------------------------------------------------------
+
+def test_drain_count_returns_int_on_200():
+    """drain_count() must return int on 200 response."""
+    c = _client_with([(200, {"node": "gravitywell", "drain_count": 2})])
+    result = c.drain_count("gravitywell")
+    assert result == 2
+
+
+def test_drain_count_returns_none_on_404():
+    """drain_count() must return None on 404 (pre-this-unit doormen)."""
+    class _NotFoundTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"error": "not found"})
+
+    c = DoormanClient(base_url="http://doorman.test")
+    c._client = httpx.Client(
+        base_url="http://doorman.test",
+        transport=_NotFoundTransport(),
+    )
+    result = c.drain_count("gravitywell")
+    assert result is None
+
+
+def test_drain_count_returns_none_on_unreachable():
+    """drain_count() must return None when doorman is unreachable."""
+    c = DoormanClient(base_url="http://doorman.test")
+    c._client = httpx.Client(
+        base_url="http://doorman.test",
+        transport=_ErrorTransport(),
+    )
+    result = c.drain_count("gravitywell")
+    assert result is None
+
+
+def test_drain_count_defaults_to_gravitywell():
+    """drain_count() must default to node='gravitywell'."""
+    c = _client_with([(200, {"node": "gravitywell", "drain_count": 0})])
+    result = c.drain_count()  # no node arg
+    assert result == 0
