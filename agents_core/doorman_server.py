@@ -188,7 +188,11 @@ class _NodeState:
                 model_ids = [m.get("id", "") for m in resp.json().get("data", [])]
                 if GW_BIG_MODEL_ID in model_ids:
                     return True, "confirmed"
-                return False, "refuted"
+                if model_ids:
+                    # non-empty list without our model — a competing model is resident
+                    return False, "refuted"
+                # empty list — registry not yet populated during startup
+                return None, "inconclusive"
             return None, "inconclusive"
         except Exception as exc:
             log.debug(f"[{self.node_name}] big-model probe inconclusive: {exc}")
@@ -211,10 +215,9 @@ class _NodeState:
         serving = self._is_serving(timeout=2.0)
 
         # Optional big-model probe — outside the lock (blocking HTTP, AC11)
-        big_probe_raw: bool | None = None
         big_probe_state: str | None = None
         if DOORMAN_MODE_AWARE_ADMISSION:
-            big_probe_raw, big_probe_state = self._probe_big_model()
+            _, big_probe_state = self._probe_big_model()
 
         with self.lock:
             self._cached_serving = serving
@@ -265,8 +268,6 @@ class _NodeState:
                 short-circuits to DEFERRED without needing a pre-registered lease.
 
         Flow (gravitywell-doorman-clean-stop-v0 + doorman-mode-deference-v0):
-          1. Fast-path: _is_serving() → return True (service already up).
-          2. wake-gravitywell: idempotent host-wake (no-op if already up).
           0. Mode-aware deference (HOLE 1 fix, flag ON only): if controller owns the
              mode, return DEFERRED immediately — before _is_serving() or wake-gravitywell.
              This prevents wrong-model leases when a controller-owned swarm is up.
