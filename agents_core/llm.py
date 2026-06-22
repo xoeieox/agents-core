@@ -382,8 +382,8 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                 "gravitywell", work_id, ttl_sec=timeout + 60, reason="call_operator",
                 timeout=_gw_acquire_timeout()
             )
-            if res.get("status") == "deferred":
-                # GW is serving a controller-owned swarm mode — mode-miss, not a wake failure
+            if DoormanClient.is_deferred(res):
+                # GW is serving a controller-owned swarm mode - mode-miss, not a wake failure
                 if _provenance_out is not None:
                     _provenance_out.append(("gw_deferred_swarm", "gravitywell"))
                 return _apply_wake_fail(on_wake_fail, operator_class, prompt,
