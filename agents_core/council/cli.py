@@ -41,6 +41,7 @@ Internal subcommands:
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import os
@@ -146,6 +147,30 @@ def find_card_path(character_id: str) -> Path | None:
         candidate = pool_dir / f"{character_id}.yaml"
         if candidate.exists():
             return candidate
+    return None
+
+
+def _resolve_character_id(sid, canonical_ids, resolution):
+    """Resolve a selected id to a canonical roster id, or None.
+    Order: exact card file -> suffix-resolution map -> fuzzy edit-distance (unique near-miss)."""
+    if not isinstance(sid, str):
+        return None
+    if find_card_path(sid):
+        return sid
+    if sid in resolution and find_card_path(resolution[sid]):
+        return resolution[sid]
+    # Fuzzy fallback: nearest canonical id within a high similarity cutoff.
+    # 0.92: above the highest real-roster near-tie pair (0.912 at time of test) so the
+    # roster-ambiguity test passes, yet below scheherazada->scheherazade (ratio ~0.954).
+    matches = difflib.get_close_matches(sid, list(canonical_ids), n=2, cutoff=0.92)
+    if matches:
+        best = matches[0]
+        # Only auto-correct when top match is clearly unique best AND resolves to a real card.
+        if (len(matches) == 1 or
+            difflib.SequenceMatcher(None, sid, matches[0]).ratio()
+              - difflib.SequenceMatcher(None, sid, matches[1]).ratio() >= 0.10) \
+           and find_card_path(best):
+            return best
     return None
 
 
@@ -471,16 +496,13 @@ Respond with ONLY a JSON object:
 
     # Step 2: fuzzy-resolve before raising
     for sid in selected:
-        if not isinstance(sid, str):
+        r = _resolve_character_id(sid, _canonical_ids, _resolution)
+        if r is None:
             unresolved.append(sid)
-            continue
-        if find_card_path(sid):
-            resolved.append(sid)
-            continue
-        if sid in _resolution and find_card_path(_resolution[sid]):
-            resolved.append(_resolution[sid])
-            continue
-        unresolved.append(sid)
+        else:
+            if r != sid and log:
+                log(f"[council:selector] fuzzy-corrected {sid!r} -> {r!r}")
+            resolved.append(r)
 
     # Step 3: retry-once if any ids are still unresolvable
     if unresolved:
@@ -506,15 +528,15 @@ Respond with ONLY a JSON object:
         selected2 = data2.get("selected") or []
         resolved = []
         for sid in selected2:
-            if isinstance(sid, str) and find_card_path(sid):
-                resolved.append(sid)
-            elif isinstance(sid, str) and sid in _resolution and find_card_path(_resolution[sid]):
-                resolved.append(_resolution[sid])
-            else:
+            r = _resolve_character_id(sid, _canonical_ids, _resolution)
+            if r is None:
                 raise RuntimeError(
                     f"Selected unknown character_id after retry: {sid!r} "
                     f"(original unresolvable: {unresolved!r})"
                 )
+            if r != sid and log:
+                log(f"[council:selector] fuzzy-corrected {sid!r} -> {r!r}")
+            resolved.append(r)
         if len(resolved) != n:
             raise RuntimeError(
                 f"Retry returned {len(resolved)} entities, expected {n}: {resolved!r}"
