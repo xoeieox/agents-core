@@ -26,6 +26,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -309,6 +310,9 @@ def startup_sweep(queue: ClaudeQueue) -> None:
             except Exception as exc:
                 log.warning(f"council orphan recovery: could not write {run_yaml}: {exc}")
 
+    # Layer 2: reap lapis-fixer-*.scope units left behind by a prior crash.
+    _reap_orphan_scopes(queue)
+
 
 # ---------------------------------------------------------------------------
 # Runner failure classification
@@ -367,9 +371,50 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
 
     log.info(f"claim {task_id} model={task.get('model')} timeout={timeout}s")
 
+    # Cgroup isolation: wrap in a user-manager scope (fail-closed).
+    _orig_argv = [sys.executable, "-m", RUNNER_SCRIPT_MODULE, spec_path]
+    _cage_ok, _cage_reason = _cage_buildable()
+    if _cage_ok:
+        if not _check_slice_has_cpu_quota():
+            log.warning(
+                "cgroup-isolation: %s has no CPUQuota — task %s runs "
+                "unbounded-aggregate; install a persistent slice unit to "
+                "enforce the aggregate cap",
+                _FIXER_SLICE, task_id,
+            )
+        _launch_argv = _build_scope_argv(task_id, _orig_argv)
+    elif os.environ.get("CLAUDE_QUEUE_ALLOW_UNBOUNDED", "0") == "1":
+        log.warning(
+            "cgroup-isolation: cage unavailable (%s); "
+            "CLAUDE_QUEUE_ALLOW_UNBOUNDED=1 — launching %s unbounded",
+            _cage_reason, task_id,
+        )
+        _launch_argv = _orig_argv
+    else:
+        global _cage_alert_last_ts
+        _now = time.monotonic()
+        _requeue_to_pending(queue, task_id)
+        if _now - _cage_alert_last_ts >= _CAGE_ALERT_COOLDOWN_S:
+            _cage_alert_last_ts = _now
+            send_notification(
+                message=(
+                    f"claude-queue cage build failed ({_cage_reason}): "
+                    f"jobs are held until the user bus is restored or "
+                    f"CLAUDE_QUEUE_ALLOW_UNBOUNDED=1 is set."
+                ),
+                title="claude-queue",
+                priority=PushoverPriority.HIGH,
+            )
+        log.error(
+            "cgroup-isolation: cage unavailable (%s) — task %s requeued "
+            "(fail-closed; set CLAUDE_QUEUE_ALLOW_UNBOUNDED=1 to override)",
+            _cage_reason, task_id,
+        )
+        return
+
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", RUNNER_SCRIPT_MODULE, spec_path,
+            *_launch_argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -670,6 +715,137 @@ def _spawn_freeze_guard_block_reason() -> str | None:
     if swap_free_gb < SPAWN_MIN_SWAP_FREE_GB:
         return f"swap free {swap_free_gb:.1f} GB < {SPAWN_MIN_SWAP_FREE_GB:.1f} GB headroom"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Cgroup isolation: user-manager scope + slice (Layer 1)
+# ---------------------------------------------------------------------------
+
+_FIXER_SLICE = "lapis-fixer.slice"
+_CAGE_ALERT_COOLDOWN_S = 300.0
+_cage_alert_last_ts: float = 0.0
+
+
+def _cage_buildable() -> tuple[bool, str]:
+    """Check whether a systemd-run user scope cage can be built.
+
+    Returns (ok, reason). Synchronous; uses no subprocess — binary existence
+    and socket path checks only (negligible latency).
+    """
+    if not shutil.which("systemd-run"):
+        return False, "systemd-run not in PATH"
+    uid = os.getuid()
+    bus = f"/run/user/{uid}/bus"
+    if not os.path.exists(bus):
+        return False, f"user bus socket not found: {bus}"
+    return True, ""
+
+
+def _check_slice_has_cpu_quota() -> bool:
+    """Return True if lapis-fixer.slice has a finite CPUQuota (persistent
+    slice unit installed). False means transient / uncapped aggregate.
+
+    Fails open (returns True) on any error so warnings are never spurious.
+    """
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "show", _FIXER_SLICE,
+             "--property=CPUQuota,LoadState", "--no-pager"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        out = r.stdout
+        if "LoadState=not-found" in out:
+            return False
+        for line in out.splitlines():
+            if line.startswith("CPUQuota="):
+                val = line.split("=", 1)[1].strip()
+                return "infinity" not in val and val not in ("", "0")
+        return True  # key absent — fail open
+    except Exception:
+        return True
+
+
+def _build_scope_argv(task_id: str, orig_argv: list) -> list:
+    """Return the systemd-run-wrapped argv for task_id.
+
+    Per-job quota read from env at launch time so tuning needs no redeploy.
+    """
+    cpu_quota = os.environ.get("CLAUDE_QUEUE_JOB_CPUQUOTA", "300%")
+    mem_max = os.environ.get("CLAUDE_QUEUE_JOB_MEMMAX", "6G")
+    return [
+        "systemd-run", "--user", "--scope", "--collect",
+        f"--unit=lapis-fixer-{task_id}.scope",
+        f"--slice={_FIXER_SLICE}",
+        "-p", f"CPUQuota={cpu_quota}",
+        "-p", f"MemoryMax={mem_max}",
+        "--",
+        *orig_argv,
+    ]
+
+
+def _requeue_to_pending(queue: ClaudeQueue, task_id: str) -> None:
+    """Move an already-claimed task back to pending (cage unavailable, hold).
+
+    Atomically renames the active YAML to pending so the next poll picks it
+    up without data loss. status/started_at are stale but harmless — claim()
+    overwrites them on the next acquisition.
+    """
+    active_path = queue.active_dir / f"{task_id}.yaml"
+    pending_path = queue.pending_dir / f"{task_id}.yaml"
+    try:
+        active_path.rename(pending_path)
+        log.info("scope-cage: task %s requeued to pending", task_id)
+    except OSError as e:
+        log.warning("scope-cage: requeue %s failed: %s", task_id, e)
+
+
+# ---------------------------------------------------------------------------
+# Scope reaper (Layer 2) — called from startup_sweep
+# ---------------------------------------------------------------------------
+
+def _reap_orphan_scopes(queue: ClaudeQueue) -> None:
+    """Stop lapis-fixer-*.scope units with no matching active queue task.
+
+    Runs once at startup to reap scopes left by a prior crash or hard restart.
+    Best-effort: any error is logged and swallowed; startup is never aborted.
+    """
+    if not shutil.which("systemctl"):
+        return
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "list-units", "--no-pager", "--no-legend",
+             "--plain", "lapis-fixer-*.scope"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except Exception as e:
+        log.warning("scope-reaper: list-units error: %s", e)
+        return
+
+    if r.returncode != 0:
+        log.warning("scope-reaper: systemctl list-units rc=%d — skipping", r.returncode)
+        return
+
+    active_ids = {p.stem for p in queue.active_dir.glob("*.yaml")}
+
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        unit_name = parts[0]
+        if not (unit_name.startswith("lapis-fixer-") and unit_name.endswith(".scope")):
+            continue
+        task_id = unit_name[len("lapis-fixer-"):-len(".scope")]
+        if task_id in active_ids:
+            continue
+        log.warning("scope-reaper: orphan scope %s (task %s not active) — stopping",
+                    unit_name, task_id)
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "stop", unit_name],
+                capture_output=True, timeout=15, check=False,
+            )
+        except Exception as e:
+            log.warning("scope-reaper: stop %s failed: %s", unit_name, e)
 
 
 # ---------------------------------------------------------------------------
