@@ -29,6 +29,10 @@ Environment variables:
                            issues gw-serve stop (default 600; machine-economics
                            boundary that amortizes the ~25s cold-load against burst
                            gaps — not a human-rhythm value)
+  DOORMAN_MODE_AWARE_ADMISSION — enable mode-aware deference before the _is_serving()
+                                  fast path (HOLE 1), controller-lease-aware serving_mode
+                                  (HOLE 2), and the three-state /v1/models big-model probe.
+                                  Default false (lands dark). Set "true" or "1" to activate.
 
 Safety properties (gravitywell-doorman-clean-stop-v0):
   - Doorman crash → GW stays POWERED, not suspended. The host-side guard
@@ -78,6 +82,17 @@ GW_STOP_GRACE_SEC = int(os.environ.get("GW_STOP_GRACE_SEC", "600"))
 
 DOORMAN_DEFER_TO_CONTROLLER = os.environ.get("DOORMAN_DEFER_TO_CONTROLLER", "true").lower() == "true"
 DOORMAN_CONTROLLER_NAME = os.environ.get("DOORMAN_CONTROLLER_NAME", "flip-controller")
+
+# Mode-aware admission guard — dark / default-OFF. When True:
+#   ensure_serving checks deference BEFORE _is_serving() (HOLE 1 fix);
+#   status_snapshot.serving_mode is controller-lease-aware (HOLE 2 fix);
+#   _refresh_serving_cache probes /v1/models for the three-state serving_is_big predicate.
+DOORMAN_MODE_AWARE_ADMISSION = os.environ.get(
+    "DOORMAN_MODE_AWARE_ADMISSION", ""
+).lower() in ("1", "true", "yes")
+
+# Must match OPERATOR_DEFAULTS['gravitywell'] in agents_core.llm (verified: llm.py:58).
+GW_BIG_MODEL_ID = "gravitywell-122b"
 
 HOLD_NAME = "doorman"
 DOORMAN_IDLE_LOG = os.environ.get("DOORMAN_IDLE_LOG", "/var/log/doorman-idle.jsonl")
@@ -142,6 +157,9 @@ class _NodeState:
         # Cached serving state (doorman-status-cached-serving-v0)
         self._cached_serving: bool | None = None   # None until first refresh
         self._serving_checked_at: float = 0.0      # walltime of last successful probe
+        # Mode-aware big predicate (populated only when DOORMAN_MODE_AWARE_ADMISSION is True)
+        self._serving_is_big: bool | None = None   # None until first refresh with flag ON
+        self._big_probe_state: str | None = None   # 'confirmed'|'refuted'|'inconclusive'
 
     # ------------------------------------------------------------------
     # Health poll (lock-free — read-only HTTP, safe to call outside lock)
@@ -154,6 +172,28 @@ class _NodeState:
         except Exception:
             return False
 
+    def _probe_big_model(self) -> tuple[bool | None, str]:
+        """Probe /v1/models to determine whether the big model is resident.
+
+        Returns (big_probe_raw, big_probe_state):
+          confirmed    — GW_BIG_MODEL_ID in model list
+          refuted      — a different model id is served (fail-closed: real split-brain)
+          inconclusive — timeout / network error (caller degrades to legacy judgment)
+
+        Must be called OUTSIDE self.lock (blocking HTTP, ~2.5s timeout).
+        """
+        try:
+            resp = requests.get(f"{self.gw_url}/v1/models", timeout=2.5)
+            if resp.status_code == 200:
+                model_ids = [m.get("id", "") for m in resp.json().get("data", [])]
+                if GW_BIG_MODEL_ID in model_ids:
+                    return True, "confirmed"
+                return False, "refuted"
+            return None, "inconclusive"
+        except Exception as exc:
+            log.debug(f"[{self.node_name}] big-model probe inconclusive: {exc}")
+            return None, "inconclusive"
+
     def _refresh_serving_cache(self) -> None:
         """Refresh the serving cache by probing _is_serving outside the lock.
 
@@ -164,11 +204,36 @@ class _NodeState:
         WARNING: This method is non-reentrant — it MUST NOT be called from
         within an already-held self.lock context or it will deadlock
         (threading.Lock is non-reentrant).
+
+        When DOORMAN_MODE_AWARE_ADMISSION is True, also probes /v1/models for
+        the three-state serving_is_big predicate (outside the lock, AC11).
         """
         serving = self._is_serving(timeout=2.0)
+
+        # Optional big-model probe — outside the lock (blocking HTTP, AC11)
+        big_probe_raw: bool | None = None
+        big_probe_state: str | None = None
+        if DOORMAN_MODE_AWARE_ADMISSION:
+            big_probe_raw, big_probe_state = self._probe_big_model()
+
         with self.lock:
             self._cached_serving = serving
             self._serving_checked_at = time.time()
+            if DOORMAN_MODE_AWARE_ADMISSION:
+                self._big_probe_state = big_probe_state
+                controller_owns = self._controller_lease_active()
+                if big_probe_state == "refuted":
+                    self._serving_is_big = False
+                elif big_probe_state == "confirmed":
+                    # Controller win takes precedence over probe confirmation (AC6-D)
+                    self._serving_is_big = bool(serving and not controller_owns)
+                else:  # inconclusive — fall back to legacy controller-lease judgment
+                    self._serving_is_big = bool(serving and not controller_owns)
+                    log.warning(
+                        f"[{self.node_name}] big-model probe inconclusive — "
+                        f"falling back to legacy controller-lease judgment "
+                        f"(serving_is_big={self._serving_is_big}); probe_inconclusive"
+                    )
 
     def _controller_lease_active(self) -> bool:
         """Check if a mode-controller lease is currently active (non-expired).
@@ -202,12 +267,30 @@ class _NodeState:
         Flow (gravitywell-doorman-clean-stop-v0 + doorman-mode-deference-v0):
           1. Fast-path: _is_serving() → return True (service already up).
           2. wake-gravitywell: idempotent host-wake (no-op if already up).
+          0. Mode-aware deference (HOLE 1 fix, flag ON only): if controller owns the
+             mode, return DEFERRED immediately — before _is_serving() or wake-gravitywell.
+             This prevents wrong-model leases when a controller-owned swarm is up.
+             Mode-controller's own acquire skips this check and always proceeds.
+          1. Fast-path: _is_serving() → return True (service already up).
+          2. wake-gravitywell: idempotent host-wake (no-op if already up).
           3. Check deference: if DOORMAN_DEFER_TO_CONTROLLER and (role=="mode-controller"
              or an active mode-controller lease exists), return DEFERRED (no gw-serve big).
           4. gw-serve big: start llama-server.service if stopped (idempotent).
           5. Poll /health until serving or GW_WAKE_DEADLINE_SEC (covers ~25s
              cold-load after gw-serve big).
         """
+        # HOLE 1 fix (AC2): mode-aware deference before _is_serving() fast path.
+        # Worker acquires return DEFERRED immediately when the controller owns the mode,
+        # even when _is_serving() would return True (avoids wrong-model leases on a live swarm).
+        # Mode-controller's own acquire (role='mode-controller') skips this and always proceeds.
+        if DOORMAN_MODE_AWARE_ADMISSION and DOORMAN_DEFER_TO_CONTROLLER:
+            if role != "mode-controller" and self._controller_lease_active():
+                log.info(
+                    f"[{self.node_name}] mode-aware: controller owns mode — "
+                    f"deferring before is_serving check (role={role!r})"
+                )
+                return DEFERRED
+
         # Fast path: already awake and serving
         if self._is_serving():
             self.last_error = None
@@ -410,15 +493,30 @@ class _NodeState:
             serving = self._cached_serving
             # Check if controller owns the mode
             controller_owns = self._controller_lease_active()
-            # Derive serving_mode without an extra ssh gw-serve status round-trip
-            if serving:
-                serving_mode = "big"
-            elif controller_owns:
-                serving_mode = "deferred"
-            elif self.service_stopped:
-                serving_mode = "stopped"
+            # HOLE 2 fix (AC5): when flag ON, controller-lease check precedes serving-wins.
+            # When flag OFF, preserve today's order (serving wins) for byte-identical behavior.
+            if DOORMAN_MODE_AWARE_ADMISSION:
+                if controller_owns:
+                    serving_mode = "deferred"
+                elif serving:
+                    serving_mode = "big"
+                elif self.service_stopped:
+                    serving_mode = "stopped"
+                else:
+                    serving_mode = "unknown"
             else:
-                serving_mode = "unknown"
+                if serving:
+                    serving_mode = "big"
+                elif controller_owns:
+                    serving_mode = "deferred"
+                elif self.service_stopped:
+                    serving_mode = "stopped"
+                else:
+                    serving_mode = "unknown"
+            # drain_count: worker leases only (mode-controller excluded), AC8
+            drain_count = sum(
+                1 for info in self.leases.values() if info.get("role") == "worker"
+            )
             return {
                 "serving": serving,
                 "serving_mode": serving_mode,
@@ -434,6 +532,10 @@ class _NodeState:
                 "last_wake_at": self.last_wake_at,
                 "last_error": self.last_error,
                 "mode_owner": DOORMAN_CONTROLLER_NAME if controller_owns else None,
+                "drain_count": drain_count,
+                "worker_lease_count": drain_count,
+                "serving_is_big": self._serving_is_big,
+                "big_probe_state": self._big_probe_state,
             }
 
 
@@ -647,6 +749,27 @@ def create_app(gw_url: str | None = None) -> FastAPI:
             "owner_lease_age_sec": owner_lease_age_sec,
             "owner_lease_stale": owner_lease_stale,
         }
+
+    # ------------------------------------------------------------------
+    # GET /v0/drain-count — in-flight worker-lease count for drain-gate (AC9)
+    # ------------------------------------------------------------------
+
+    @app.get("/v0/drain-count")
+    def drain_count_endpoint(node: str = "gravitywell"):
+        if node not in nodes:
+            return JSONResponse(
+                status_code=400,
+                content=_error("bad_node", f"unknown node {node!r}"),
+            )
+
+        state = nodes[node]
+        with state.lock:
+            state._gc_stale()
+            count = sum(
+                1 for info in state.leases.values()
+                if info.get("role") == "worker"
+            )
+        return {"node": node, "drain_count": count}
 
     # ------------------------------------------------------------------
     # POST /lease/acquire
