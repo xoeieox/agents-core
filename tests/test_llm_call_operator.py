@@ -86,6 +86,20 @@ def _gw_mock_client(status="serving"):
     return mock
 
 
+def _gw_dc(status="serving"):
+    """Return (DoormanClient class mock, instance mock).
+
+    Use as: dc, mock_client = _gw_dc(status); patch("...DoormanClient", dc)
+
+    The class mock has is_deferred wired to the real static logic so that
+    patch("...DoormanClient", dc) doesn't make every status look deferred.
+    """
+    instance = _gw_mock_client(status)
+    dc = MagicMock(return_value=instance)
+    dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    return dc, instance
+
+
 def test_gravitywell_default_think_off():
     """Default call injects enable_thinking=False into the payload."""
     captured = {}
@@ -99,8 +113,8 @@ def test_gravitywell_default_think_off():
         }
         return resp
 
-    mock_client = _gw_mock_client()
-    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_client), \
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
          patch("requests.post", side_effect=fake_post):
         result = call_operator("gravitywell", prompt="test", json_mode=True)
 
@@ -121,8 +135,8 @@ def test_gravitywell_think_true():
         }
         return resp
 
-    mock_client = _gw_mock_client()
-    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_client), \
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
          patch("requests.post", side_effect=fake_post):
         result = call_operator("gravitywell", prompt="test", think=True)
 
@@ -135,7 +149,7 @@ def test_gravitywell_think_true():
 
 def test_gravitywell_bundle_ids_discarded_no_typeerror():
     """bundle_ids kwarg is discarded before reaching _call_gravitywell_backend."""
-    mock_client = _gw_mock_client()
+    dc, _mock_client = _gw_dc()
 
     def fake_post(url, json=None, timeout=None):
         resp = MagicMock()
@@ -145,7 +159,7 @@ def test_gravitywell_bundle_ids_discarded_no_typeerror():
         }
         return resp
 
-    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_client), \
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
          patch("requests.post", side_effect=fake_post):
         # Must not raise TypeError
         result = call_operator("gravitywell", prompt="test", bundle_ids=["some/bundle"])
@@ -157,23 +171,23 @@ def test_gravitywell_bundle_ids_discarded_no_typeerror():
 # ---------------------------------------------------------------------------
 
 def test_gravitywell_wake_failed_skip_returns_none():
-    mock_client = _gw_mock_client(status="wake_failed")
-    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_client):
+    dc, _mock_client = _gw_dc(status="wake_failed")
+    with patch("agents_core.doorman_client.DoormanClient", dc):
         result = call_operator("gravitywell", prompt="test", on_wake_fail="skip")
     assert result is None
 
 
 def test_gravitywell_wake_failed_error_raises():
-    mock_client = _gw_mock_client(status="wake_failed")
-    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_client):
+    dc, _mock_client = _gw_dc(status="wake_failed")
+    with patch("agents_core.doorman_client.DoormanClient", dc):
         with pytest.raises(OperatorUnreachableError):
             call_operator("gravitywell", prompt="test", on_wake_fail="error")
 
 
 def test_gravitywell_wake_failed_haiku_logs_and_falls_back():
     """on_wake_fail='haiku' emits a loud warning then falls back to haiku operator."""
-    mock_client = _gw_mock_client(status="wake_failed")
-    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_client), \
+    dc, _mock_client = _gw_dc(status="wake_failed")
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
          patch("agents_core.claude_queue_sync.submit_and_wait", return_value="haiku-reply") as mock_saw, \
          warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
@@ -188,19 +202,21 @@ def test_gravitywell_wake_failed_haiku_logs_and_falls_back():
 def test_gravitywell_doorman_unreachable_applies_wake_fail():
     """DoormanUnreachable is treated like wake_failed."""
     from agents_core.doorman_client import DoormanUnreachable
-    mock_client = MagicMock()
-    mock_client.acquire.side_effect = DoormanUnreachable("can't reach doorman")
-    mock_client.__enter__ = MagicMock(return_value=mock_client)
-    mock_client.__exit__ = MagicMock(return_value=False)
-    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_client):
+    instance = MagicMock()
+    instance.acquire.side_effect = DoormanUnreachable("can't reach doorman")
+    instance.__enter__ = MagicMock(return_value=instance)
+    instance.__exit__ = MagicMock(return_value=False)
+    dc = MagicMock(return_value=instance)
+    dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    with patch("agents_core.doorman_client.DoormanClient", dc):
         result = call_operator("gravitywell", prompt="test", on_wake_fail="skip")
     assert result is None
 
 
 def test_gravitywell_haiku_fallback_raises_propagates():
     """If the fallback call_operator raises, it propagates (not suppressed to None)."""
-    mock_client = _gw_mock_client(status="wake_failed")
-    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_client), \
+    dc, _mock_client = _gw_dc(status="wake_failed")
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
          patch("agents_core.claude_queue_sync.submit_and_wait",
                side_effect=RuntimeError("ClaudeQueue down")):
         with pytest.raises(RuntimeError, match="ClaudeQueue down"):
@@ -213,8 +229,8 @@ def test_gravitywell_haiku_fallback_raises_propagates():
 
 def test_gravitywell_release_called_on_backend_error():
     """client.release is called in the finally block even when the backend raises."""
-    mock_client = _gw_mock_client(status="serving")
-    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_client), \
+    dc, mock_client = _gw_dc(status="serving")
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
          patch("requests.post", side_effect=Exception("backend exploded")):
         result = call_operator("gravitywell", prompt="test")
     assert mock_client.release.call_count == 1
@@ -229,8 +245,8 @@ def test_gravitywell_release_called_on_backend_error():
 def test_gravitywell_operator_unreachable_fallback_skip():
     """When GW is serving then HTTP exhausts retries (OperatorUnreachableError),
     on_wake_fail='skip' returns None (no crash)."""
-    mock_client = _gw_mock_client(status="serving")
-    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_client), \
+    dc, mock_client = _gw_dc(status="serving")
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
          patch("agents_core.llm._call_gravitywell_backend",
                side_effect=OperatorUnreachableError("http://gw", Exception("retries exhausted"))):
         result = call_operator("gravitywell", prompt="test", on_wake_fail="skip")
@@ -243,8 +259,8 @@ def test_gravitywell_operator_unreachable_fallback_skip():
 def test_gravitywell_operator_unreachable_fallback_sonnet():
     """When GW is serving then HTTP exhausts retries (OperatorUnreachableError),
     on_wake_fail='sonnet' falls back to paid Sonnet (never raises)."""
-    mock_client = _gw_mock_client(status="serving")
-    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_client), \
+    dc, mock_client = _gw_dc(status="serving")
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
          patch("agents_core.llm._call_gravitywell_backend",
                side_effect=OperatorUnreachableError("http://gw", Exception("retries exhausted"))), \
          patch("agents_core.claude_queue_sync.submit_and_wait",
@@ -261,3 +277,58 @@ def test_gravitywell_operator_unreachable_fallback_sonnet():
                for warning in w)
     # Verify release was called
     assert mock_client.release.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# gravitywell: deferred (mode-miss) — AC1/AC2/AC3 from gw-waist-deferred-provenance-v0
+# ---------------------------------------------------------------------------
+
+def test_gravitywell_deferred_appends_gw_deferred_swarm():
+    """AC1/AC2: status='deferred' appends gw_deferred_swarm, not gw_not_serving."""
+    dc, _mock_client = _gw_dc(status="deferred")
+    prov = []
+    with patch("agents_core.doorman_client.DoormanClient", dc):
+        result = call_operator("gravitywell", prompt="test", on_wake_fail="skip",
+                               _provenance_out=prov)
+    assert result is None
+    assert ("gw_deferred_swarm", "gravitywell") in prov
+    assert all(r != "gw_not_serving" for r, _ in prov)
+
+
+def test_gravitywell_deferred_never_mislabeled():
+    """AC2: deferred result never produces a gw_not_serving tuple."""
+    dc, _mock_client = _gw_dc(status="deferred")
+    prov = []
+    with patch("agents_core.doorman_client.DoormanClient", dc):
+        call_operator("gravitywell", prompt="test", on_wake_fail="skip", _provenance_out=prov)
+    assert not any(r == "gw_not_serving" for r, _ in prov)
+
+
+def test_gravitywell_deferred_skip_returns_none():
+    """AC3: deferred + on_wake_fail='skip' returns None (identical behavior to today)."""
+    dc, _mock_client = _gw_dc(status="deferred")
+    with patch("agents_core.doorman_client.DoormanClient", dc):
+        result = call_operator("gravitywell", prompt="test", on_wake_fail="skip")
+    assert result is None
+
+
+def test_gravitywell_deferred_fallback_runs():
+    """AC3: deferred + on_wake_fail='haiku' executes the paid fallback."""
+    dc, _mock_client = _gw_dc(status="deferred")
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.claude_queue_sync.submit_and_wait", return_value="haiku-reply") as mock_saw, \
+         warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        result = call_operator("gravitywell", prompt="test", on_wake_fail="haiku")
+    assert result == "haiku-reply"
+    assert mock_saw.call_count >= 1
+
+
+def test_gravitywell_wake_failed_appends_gw_not_serving():
+    """AC4: explicit wake_failed status still yields gw_not_serving (regression guard)."""
+    dc, _mock_client = _gw_dc(status="wake_failed")
+    prov = []
+    with patch("agents_core.doorman_client.DoormanClient", dc):
+        call_operator("gravitywell", prompt="test", on_wake_fail="skip", _provenance_out=prov)
+    assert ("gw_not_serving", "gravitywell") in prov
+    assert not any(r == "gw_deferred_swarm" for r, _ in prov)
