@@ -164,20 +164,23 @@ def _fake_run_slice(stdout_text, rc=0):
 
 
 def test_check_slice_not_found_returns_false(monkeypatch):
+    # Real systemctl output when slice unit is not installed.
     monkeypatch.setattr(subprocess, "run",
-                        _fake_run_slice("LoadState=not-found\nCPUQuota=infinity\n"))
+                        _fake_run_slice("LoadState=not-found\nCPUQuotaPerSecUSec=infinity\n"))
     assert runner_mod._check_slice_has_cpu_quota() is False
 
 
 def test_check_slice_infinity_returns_false(monkeypatch):
+    # Real systemctl output when slice exists but has no CPUQuota (transient).
     monkeypatch.setattr(subprocess, "run",
-                        _fake_run_slice("LoadState=loaded\nCPUQuota=infinity\n"))
+                        _fake_run_slice("LoadState=loaded\nCPUQuotaPerSecUSec=infinity\n"))
     assert runner_mod._check_slice_has_cpu_quota() is False
 
 
 def test_check_slice_quota_set_returns_true(monkeypatch):
+    # Real systemctl output: CPUQuotaPerSecUSec=10s means CPUQuota=1000%.
     monkeypatch.setattr(subprocess, "run",
-                        _fake_run_slice("LoadState=loaded\nCPUQuota=10000ms 10s\n"))
+                        _fake_run_slice("LoadState=loaded\nCPUQuotaPerSecUSec=10s\n"))
     assert runner_mod._check_slice_has_cpu_quota() is True
 
 
@@ -187,6 +190,28 @@ def test_check_slice_error_fails_open(monkeypatch):
     monkeypatch.setattr(subprocess, "run", boom)
     # Fail open: returns True so no spurious warning is emitted.
     assert runner_mod._check_slice_has_cpu_quota() is True
+
+
+def test_check_slice_regression_reads_cpuquotaperusec():
+    """Regression: detector must read CPUQuotaPerSecUSec, not CPUQuota=.
+
+    systemd never emits a CPUQuota= show property. Any grep for CPUQuota=
+    (without PerSecUSec) silently never matches and the detector is dead.
+    This test fails if that v0 bug is reintroduced.
+    """
+    import inspect
+    src = inspect.getsource(runner_mod._check_slice_has_cpu_quota)
+    assert "CPUQuotaPerSecUSec" in src, (
+        "_check_slice_has_cpu_quota must read CPUQuotaPerSecUSec "
+        "(the actual systemd property; systemd never emits CPUQuota=)"
+    )
+    bad_lines = [
+        line for line in src.splitlines()
+        if "CPUQuota=" in line and "PerSecUSec" not in line and not line.strip().startswith("#")
+    ]
+    assert not bad_lines, (
+        f"_check_slice_has_cpu_quota greps for 'CPUQuota=' (the v0 dead-signal bug): {bad_lines}"
+    )
 
 
 # ---------------------------------------------------------------------------

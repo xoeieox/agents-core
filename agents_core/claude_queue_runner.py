@@ -375,7 +375,7 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
     _orig_argv = [sys.executable, "-m", RUNNER_SCRIPT_MODULE, spec_path]
     _cage_ok, _cage_reason = _cage_buildable()
     if _cage_ok:
-        if not _check_slice_has_cpu_quota():
+        if not await asyncio.to_thread(_check_slice_has_cpu_quota):
             log.warning(
                 "cgroup-isolation: %s has no CPUQuota — task %s runs "
                 "unbounded-aggregate; install a persistent slice unit to "
@@ -745,22 +745,25 @@ def _check_slice_has_cpu_quota() -> bool:
     """Return True if lapis-fixer.slice has a finite CPUQuota (persistent
     slice unit installed). False means transient / uncapped aggregate.
 
-    Fails open (returns True) on any error so warnings are never spurious.
+    systemd exposes the quota as CPUQuotaPerSecUSec= (e.g. "10s" for 1000%),
+    never as "CPUQuota=". Treat LoadState=not-found, CPUQuotaPerSecUSec=infinity,
+    or the property absent as uncapped (return False). Fail open (return True)
+    only on subprocess error so warnings are never spurious on transient errors.
     """
     try:
         r = subprocess.run(
             ["systemctl", "--user", "show", _FIXER_SLICE,
-             "--property=CPUQuota,LoadState", "--no-pager"],
+             "--property=CPUQuotaPerSecUSec,LoadState", "--no-pager"],
             capture_output=True, text=True, timeout=5, check=False,
         )
         out = r.stdout
         if "LoadState=not-found" in out:
             return False
         for line in out.splitlines():
-            if line.startswith("CPUQuota="):
+            if line.startswith("CPUQuotaPerSecUSec="):
                 val = line.split("=", 1)[1].strip()
-                return "infinity" not in val and val not in ("", "0")
-        return True  # key absent — fail open
+                return val not in ("infinity", "", "0")
+        return True  # property absent — fail open
     except Exception:
         return True
 
