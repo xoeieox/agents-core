@@ -47,11 +47,16 @@ class GravityWellAdapter:
     Per-call doorman lease keeps GW warm across a deliberation's voices.
 
     Tracks effective operator per turn in voicing_events for observability.
+
+    principal: when set, all voices in one council run share one GW admission
+    group (ride-along). Distinct runs stay distinct. None = per-call group
+    (legacy; adds admission latency under GW_ADMISSION_MODE=enforce).
     """
     temperature: float = 0.8
     timeout: int = 300
     on_wake_fail: str = "sonnet"
     voicing_events: list = None
+    principal: str | None = None
 
     def __post_init__(self):
         if self.voicing_events is None:
@@ -79,6 +84,7 @@ class GravityWellAdapter:
             temperature=self.temperature,
             timeout=self.timeout,
             on_wake_fail=self.on_wake_fail,
+            principal=self.principal,
             _provenance_out=provenance,
         )
         # provenance is a list of (reason, operator) tuples.

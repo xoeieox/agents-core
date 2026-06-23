@@ -257,3 +257,88 @@ def test_gravitywell_adapter_no_lapis_engine_import():
     # Check for actual imports
     assert not re.search(r"^\s*(from|import)\s+lapis_engine", code, re.MULTILINE), \
         "GravityWellAdapter must not import from lapis_engine"
+
+
+# ---------------------------------------------------------------------------
+# Test 8: gw-gate-shared-principal-council-v0 — all voices share one principal
+# ---------------------------------------------------------------------------
+
+def test_all_voices_in_one_run_share_principal():
+    """AC2: across a multi-voice council run all GW voice calls share one principal
+    equal to the run id (council-delib-<run_id>)."""
+    from agents_core.council.gravitywell_adapter import GravityWellAdapter
+
+    run_id = "2026-06-23-120000-abc123"
+    expected_principal = f"council-delib-{run_id}"
+
+    captured_principals = []
+
+    def mock_call_operator(*args, **kwargs):
+        captured_principals.append(kwargs.get("principal"))
+        return "voiced"
+
+    with patch("agents_core.council.gravitywell_adapter.call_operator", side_effect=mock_call_operator):
+        adapter = GravityWellAdapter(temperature=0.8, principal=expected_principal)
+        for _ in range(3):
+            adapter.chat("system", [MagicMock(role="user", content=f"voice {_}")])
+
+    assert len(captured_principals) == 3
+    assert all(p == expected_principal for p in captured_principals), (
+        f"Expected all calls to share principal={expected_principal!r}, got {captured_principals!r}"
+    )
+
+
+def test_distinct_runs_produce_distinct_principals():
+    """AC3: distinct council runs produce distinct principals."""
+    from agents_core.council.cli import _build_adapter
+
+    claude_stub = MagicMock()
+    llama_stub = MagicMock()
+
+    adapter_a = _build_adapter("gravitywell", claude_stub, llama_stub, run_id="run-aaa")
+    adapter_b = _build_adapter("gravitywell", claude_stub, llama_stub, run_id="run-bbb")
+
+    assert adapter_a.principal != adapter_b.principal
+    assert "run-aaa" in adapter_a.principal
+    assert "run-bbb" in adapter_b.principal
+
+
+def test_build_adapter_gravitywell_sets_principal():
+    """AC1: _build_adapter with run_id sets principal=council-delib-<run_id> on adapter."""
+    from agents_core.council.cli import _build_adapter
+    from agents_core.council.gravitywell_adapter import GravityWellAdapter
+
+    run_id = "2026-06-23-120000-abc123"
+    adapter = _build_adapter("gravitywell", MagicMock(), MagicMock(), run_id=run_id)
+
+    assert isinstance(adapter, GravityWellAdapter)
+    assert adapter.principal == f"council-delib-{run_id}"
+
+
+def test_build_adapter_no_run_id_principal_is_none():
+    """AC4 (default off): _build_adapter without run_id leaves principal=None (legacy behavior)."""
+    from agents_core.council.cli import _build_adapter
+    from agents_core.council.gravitywell_adapter import GravityWellAdapter
+
+    adapter = _build_adapter("gravitywell", MagicMock(), MagicMock())
+    assert isinstance(adapter, GravityWellAdapter)
+    assert adapter.principal is None
+
+
+def test_principal_none_does_not_appear_in_call_operator_when_none():
+    """AC4/AC5: when principal=None, call_operator receives principal=None (no injection into
+    provenance loop — admission_shadow tuples only appear under shadow/enforce)."""
+    from agents_core.council.gravitywell_adapter import GravityWellAdapter
+
+    captured_kwargs = {}
+
+    def mock_call_operator(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return "voiced"
+
+    with patch("agents_core.council.gravitywell_adapter.call_operator", side_effect=mock_call_operator):
+        adapter = GravityWellAdapter(temperature=0.8, principal=None)
+        adapter.chat("system", [MagicMock(role="user", content="test")])
+
+    assert "principal" in captured_kwargs
+    assert captured_kwargs["principal"] is None
