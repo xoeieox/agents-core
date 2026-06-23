@@ -99,12 +99,15 @@ def serve_interactive_baton(item: dict) -> bool:
         provenance: list[tuple[str, str]] = []
 
         # Call GravityWell with on_wake_fail="skip" (no paid fallback).
+        # _admission_bypass=True: the interactive worker's claimed baton IS its admission;
+        # re-entering the elevator would self-deadlock.
         result = call_operator(
             "gravitywell",
             prompt=prompt,
             system=system,
             on_wake_fail="skip",
             _provenance_out=provenance,
+            _admission_bypass=True,
         )
 
         if result is not None:

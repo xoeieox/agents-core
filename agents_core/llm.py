@@ -10,6 +10,7 @@ All conductor/agent scripts should import from here.
 """
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -29,6 +30,25 @@ PACIFIC = ZoneInfo("America/Los_Angeles")
 GW_URL = os.environ.get("GW_URL", "http://203.0.113.11:8081")
 SWARM_URL = os.environ.get("SWARM_URL", GW_URL)
 SWARM_MAX_CONCURRENT = int(os.environ.get("SWARM_MAX_CONCURRENT", "4"))
+
+# GW admission provenance ladder: most-specific/most-transient first (AC11).
+GW_PROVENANCE_PRECEDENCE = (
+    "gw_deferred_swarm",
+    "slot_queued_timeout",
+    "slot_pool_down",
+    "gw_not_serving",
+)
+
+_log = logging.getLogger(__name__)
+
+
+def gw_highest_precedence_reason(provenance: list) -> str | None:
+    """Return the highest-precedence GW reason from a provenance list (AC11)."""
+    reasons = {p[0] if isinstance(p, (tuple, list)) else p for p in provenance}
+    for reason in GW_PROVENANCE_PRECEDENCE:
+        if reason in reasons:
+            return reason
+    return None
 
 
 class OperatorUnreachableError(Exception):
@@ -293,6 +313,8 @@ def _apply_wake_fail(
 
 def call_operator(operator_class: str, prompt: str, model: str = None,
                   _provenance_out: list | None = None,
+                  principal: str | None = None,
+                  _admission_bypass: bool = False,
                   **kwargs) -> str | None:
     """Route a completion request to the appropriate backend operator.
 
@@ -357,7 +379,6 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                 "not a per-call parameter. Either pass model=None to use the "
                 "default, or do the model swap out-of-band first."
             )
-        # Extract GW-specific kwargs; discard bundle_ids and other qwen-specific keys
         gw_kwargs = {
             k: kwargs[k] for k in (
                 "system", "timeout", "json_mode", "temperature", "log"
@@ -367,15 +388,199 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         on_wake_fail = kwargs.get("on_wake_fail", "skip")
         timeout = int(kwargs.get("timeout", 300))
         work_id = f"op-gravitywell-{uuid.uuid4().hex}"
-
-        # kwargs forwarded to _apply_wake_fail must not include on_wake_fail
-        # (it's a positional arg there) or gravitywell-internal keys.
         wake_fail_kwargs = {
             k: v for k, v in kwargs.items()
             if k not in ("on_wake_fail", "think", "bundle_ids", "_provenance_out")
         }
 
         from agents_core.doorman_client import DoormanClient, DoormanUnreachable, _gw_acquire_timeout
+
+        admission_mode = os.environ.get("GW_ADMISSION_MODE", "off")
+        effective_principal = principal or work_id
+        is_unique_work_id_principal = (principal is None)
+
+        # --- SHADOW MODE (AC10): dry-run admission decision, dispatch directly ---
+        if admission_mode == "shadow" and not _admission_bypass:
+            _shadow_claimed: set = set()
+            try:
+                from agents_core.elevator import ElevatorStore as _ES, DB_DIR as _ELEV_DB_DIR_S
+                from pathlib import Path as _Path_S
+                _elev_db_s = _Path_S(os.environ.get(
+                    "ELEVATOR_DB_PATH", str(_ELEV_DB_DIR_S / "queue.db")
+                ))
+                _ss = _ES(_elev_db_s)
+                _shadow_claimed = _ss._claimed_principals_on_lane("deliberation")
+                _ss.close()
+            except Exception:
+                pass
+            other_claimed = _shadow_claimed - {effective_principal}
+            decision = "would-wait" if other_claimed else "would-admit"
+            _log.info(
+                "[gw-admission] shadow: %s principal=%r%s",
+                decision, effective_principal,
+                " [collision_risk]" if is_unique_work_id_principal else "",
+            )
+            if _provenance_out is not None:
+                _provenance_out.append((f"admission_shadow:{decision}", "gravitywell"))
+                if is_unique_work_id_principal:
+                    _provenance_out.append(
+                        ("admission_shadow:principal_group_collision_risk", "gravitywell")
+                    )
+            # Fall through to direct dispatch below.
+
+        # --- ENFORCE MODE (AC2-AC9): self-serve admission loop ---
+        if admission_mode == "enforce" and not _admission_bypass:
+            from agents_core.elevator import IS_MASTER as _ELEV_IS_MASTER
+            if not _ELEV_IS_MASTER:
+                # AC9: off-master passthrough - no enqueue, no deadlock
+                _log.warning(
+                    "[gw-admission] enforce mode but not IS_MASTER - passthrough work_id=%s", work_id
+                )
+                if _provenance_out is not None:
+                    _provenance_out.append(("admission_off_master_passthrough", "gravitywell"))
+                # Fall through to direct dispatch below.
+            else:
+                from agents_core.elevator import ElevatorStore, DB_DIR as _ELEV_DB_DIR
+                _max_wait = int(os.environ.get("GW_ADMISSION_MAX_WAIT_SEC", "900"))
+                _claim_ttl = _max_wait + 60
+                _poll = float(os.environ.get("GW_ADMISSION_POLL_INTERVAL_SEC", "1.5"))
+                _max_wf = int(os.environ.get("MAX_WAKE_FAIL_RETRIES", "5"))
+
+                from pathlib import Path as _Path
+                _elev_db = _Path(os.environ.get("ELEVATOR_DB_PATH",
+                                                 str(_ELEV_DB_DIR / "queue.db")))
+                elevator = ElevatorStore(db_path=_elev_db)
+                ticket = elevator.enqueue(
+                    lane="deliberation",
+                    kind="gw-admission",
+                    payload={"work_id": work_id},
+                    principal=effective_principal,
+                    latency_class="batch",
+                )
+                admitted = False
+                is_ride_along = False
+                wf_retries = 0
+                deadline = time.monotonic() + _max_wait
+                client = DoormanClient()
+                try:
+                    while True:
+                        if time.monotonic() >= deadline:
+                            _log.warning(
+                                "[gw-admission] slot_queued_timeout principal=%r max_wait=%ss",
+                                effective_principal, _max_wait,
+                            )
+                            if _provenance_out is not None:
+                                _provenance_out.append(("slot_queued_timeout", "gravitywell"))
+                            elevator.fail(ticket)
+                            return _apply_wake_fail(
+                                on_wake_fail, operator_class, prompt,
+                                _provenance_out=_provenance_out, **wake_fail_kwargs,
+                            )
+
+                        if not admitted:
+                            ok, is_ride_along = elevator.try_admit(
+                                ticket, "deliberation", effective_principal, claim_ttl_sec=_claim_ttl
+                            )
+                            if ok:
+                                admitted = True
+                            else:
+                                time.sleep(_poll)
+                                continue
+
+                        # Admitted. Fresh group: wait for drain_count==0.
+                        if not is_ride_along:
+                            dc_val = client.drain_count()
+                            if dc_val is None:
+                                # AC12: proceed loud on unavailable drain_count
+                                _log.warning(
+                                    "[gw-admission] drain_count_unavailable - proceeding on "
+                                    "elevator gate alone work_id=%s", work_id,
+                                )
+                                if _provenance_out is not None:
+                                    _provenance_out.append(
+                                        ("drain_count_unavailable", "gravitywell")
+                                    )
+                                # proceed
+                            elif dc_val > 0:
+                                time.sleep(_poll)
+                                continue
+
+                        # Acquire doorman lease.
+                        try:
+                            res = client.acquire(
+                                "gravitywell", work_id, ttl_sec=timeout + 60,
+                                reason="call_operator", timeout=_gw_acquire_timeout(),
+                            )
+                        except DoormanUnreachable:
+                            if _provenance_out is not None:
+                                _provenance_out.append(("doorman_unreachable", "gravitywell"))
+                            elevator.fail(ticket)
+                            return _apply_wake_fail(
+                                on_wake_fail, operator_class, prompt,
+                                _provenance_out=_provenance_out, **wake_fail_kwargs,
+                            )
+
+                        if DoormanClient.is_deferred(res):
+                            # AC6: requeue and continue waiting
+                            elevator.requeue(ticket)
+                            admitted = False
+                            is_ride_along = False
+                            if _provenance_out is not None:
+                                _provenance_out.append(("gw_deferred_swarm", "gravitywell"))
+                            time.sleep(_poll)
+                            continue
+
+                        elif res.get("status") != "serving":
+                            # AC8: wake_failed - bounded backoff requeue
+                            if _provenance_out is not None:
+                                _provenance_out.append(("gw_not_serving", "gravitywell"))
+                            if wf_retries >= _max_wf:
+                                elevator.fail(ticket)
+                                return _apply_wake_fail(
+                                    on_wake_fail, operator_class, prompt,
+                                    _provenance_out=_provenance_out, **wake_fail_kwargs,
+                                )
+                            backoff = min(2 ** wf_retries, 16)
+                            wf_retries += 1
+                            elevator.requeue(ticket)
+                            admitted = False
+                            is_ride_along = False
+                            time.sleep(backoff)
+                            continue
+
+                        else:
+                            # serving: run backend
+                            try:
+                                result = _call_gravitywell_backend(
+                                    prompt=prompt, think=think, **gw_kwargs
+                                )
+                                if _provenance_out is not None:
+                                    _provenance_out.append(("success", "gravitywell"))
+                                elevator.ack(
+                                    ticket,
+                                    provenance={
+                                        "gw_provenance": [
+                                            {"reason": p[0], "operator": p[1]}
+                                            for p in (_provenance_out or [])
+                                        ]
+                                    },
+                                )
+                                return result
+                            except OperatorUnreachableError:
+                                if _provenance_out is not None:
+                                    _provenance_out.append(("serving_http_error", "gravitywell"))
+                                elevator.fail(ticket)
+                                return _apply_wake_fail(
+                                    on_wake_fail, operator_class, prompt,
+                                    _provenance_out=_provenance_out, **wake_fail_kwargs,
+                                )
+                            finally:
+                                client.release("gravitywell", work_id)
+                finally:
+                    client.close()
+                    elevator.close()
+
+        # --- DIRECT DISPATCH (off, shadow, bypass, off-master) ---
         client = DoormanClient()
         try:
             res = client.acquire(
@@ -383,13 +588,11 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                 timeout=_gw_acquire_timeout()
             )
             if DoormanClient.is_deferred(res):
-                # GW is serving a controller-owned swarm mode - mode-miss, not a wake failure
                 if _provenance_out is not None:
                     _provenance_out.append(("gw_deferred_swarm", "gravitywell"))
                 return _apply_wake_fail(on_wake_fail, operator_class, prompt,
                                        _provenance_out=_provenance_out, **wake_fail_kwargs)
             elif res.get("status") != "serving":
-                # GW not serving (wake_failed or other) - explicit degrade
                 if _provenance_out is not None:
                     _provenance_out.append(("gw_not_serving", "gravitywell"))
                 return _apply_wake_fail(on_wake_fail, operator_class, prompt,
@@ -402,13 +605,11 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
             finally:
                 client.release("gravitywell", work_id)
         except DoormanUnreachable:
-            # Doorman unreachable - cannot check GW status
             if _provenance_out is not None:
                 _provenance_out.append(("doorman_unreachable", "gravitywell"))
             return _apply_wake_fail(on_wake_fail, operator_class, prompt,
                                    _provenance_out=_provenance_out, **wake_fail_kwargs)
         except OperatorUnreachableError:
-            # GW unreachable - HTTP/network failure after doorman says serving
             if _provenance_out is not None:
                 _provenance_out.append(("serving_http_error", "gravitywell"))
             return _apply_wake_fail(on_wake_fail, operator_class, prompt,

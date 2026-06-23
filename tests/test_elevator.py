@@ -464,3 +464,106 @@ def test_serving_worker_only_claims_interactive(elevator_store):
 
     # Verify only interactive was claimed
     assert ["interactive"] in claimed_lanes
+
+
+# ---------------------------------------------------------------------------
+# try_admit — AC3 principal-group concurrency
+# ---------------------------------------------------------------------------
+
+def test_try_admit_different_principal_blocks(tmp_path):
+    """AC3(a): principal A claimed -> B's try_admit returns False."""
+    store = ElevatorStore(db_path=tmp_path / "q.db")
+    # Enqueue and claim an item for principal A
+    a1 = store.enqueue(lane="deliberation", kind="gw-admission", payload={},
+                       principal="principal-a", latency_class="batch")
+    store.claim(lanes=["deliberation"], owner="test", claim_ttl_sec=300)
+
+    # Enqueue an item for principal B
+    b1 = store.enqueue(lane="deliberation", kind="gw-admission", payload={},
+                       principal="principal-b", latency_class="batch")
+
+    admitted, _ = store.try_admit(b1, "deliberation", "principal-b")
+    assert admitted is False
+    item = store.get(b1)
+    assert item["status"] == "pending"
+    store.close()
+
+
+def test_try_admit_same_principal_ride_along(tmp_path):
+    """AC3(b): principal A claimed -> second A ticket try_admit returns True (ride-along)."""
+    store = ElevatorStore(db_path=tmp_path / "q.db")
+    a1 = store.enqueue(lane="deliberation", kind="gw-admission", payload={},
+                       principal="principal-a", latency_class="batch")
+    store.claim(lanes=["deliberation"], owner="test", claim_ttl_sec=300)
+
+    a2 = store.enqueue(lane="deliberation", kind="gw-admission", payload={},
+                       principal="principal-a", latency_class="batch")
+    admitted, is_ride_along = store.try_admit(a2, "deliberation", "principal-a")
+    assert admitted is True
+    assert is_ride_along is True
+    item = store.get(a2)
+    assert item["status"] == "claimed"
+    store.close()
+
+
+def test_try_admit_fifo_head_of_line(tmp_path):
+    """AC3(c): lane idle, A(older) and B(newer) -> only A's try_admit succeeds (FIFO)."""
+    store = ElevatorStore(db_path=tmp_path / "q.db")
+    a1 = store.enqueue(lane="deliberation", kind="gw-admission", payload={},
+                       principal="principal-a", latency_class="batch")
+    b1 = store.enqueue(lane="deliberation", kind="gw-admission", payload={},
+                       principal="principal-b", latency_class="batch")
+
+    # B's try_admit should fail (A is older = head-of-line)
+    b_admitted, _ = store.try_admit(b1, "deliberation", "principal-b")
+    assert b_admitted is False
+
+    # A's try_admit should succeed (head-of-line)
+    a_admitted, a_ride = store.try_admit(a1, "deliberation", "principal-a")
+    assert a_admitted is True
+    assert a_ride is False  # fresh group, not ride-along
+    assert store.get(a1)["status"] == "claimed"
+    assert store.get(b1)["status"] == "pending"
+    store.close()
+
+
+def test_try_admit_max_groups_two(tmp_path):
+    """AC3(d): max_groups=2 admits two distinct principals."""
+    store = ElevatorStore(db_path=tmp_path / "q.db")
+    a1 = store.enqueue(lane="deliberation", kind="gw-admission", payload={},
+                       principal="principal-a", latency_class="batch")
+    b1 = store.enqueue(lane="deliberation", kind="gw-admission", payload={},
+                       principal="principal-b", latency_class="batch")
+
+    # A is head-of-line; admit with max_groups=2
+    a_admitted, _ = store.try_admit(a1, "deliberation", "principal-a", max_groups=2)
+    assert a_admitted is True
+
+    # B can now also be admitted since only 1 other group (A) holds the lane and max_groups=2
+    b_admitted, _ = store.try_admit(b1, "deliberation", "principal-b", max_groups=2)
+    assert b_admitted is True
+    assert store.get(a1)["status"] == "claimed"
+    assert store.get(b1)["status"] == "claimed"
+    store.close()
+
+
+def test_try_admit_claim_ttl_sec_above_max_wait(tmp_path):
+    """AC13: try_admit sets claim_ttl_sec >= max_wait; reap does not reclaim the ticket."""
+    store = ElevatorStore(db_path=tmp_path / "q.db")
+    max_wait = 900
+    claim_ttl = max_wait + 60  # 960
+
+    a1 = store.enqueue(lane="deliberation", kind="gw-admission", payload={},
+                       principal="principal-a", latency_class="batch")
+    admitted, _ = store.try_admit(a1, "deliberation", "principal-a", claim_ttl_sec=claim_ttl)
+    assert admitted is True
+
+    item = store.get(a1)
+    assert item["status"] == "claimed"
+    assert item["claim_ttl_sec"] >= max_wait
+
+    # Inline reap should NOT reclaim this ticket (TTL hasn't expired)
+    store._reap_inline()
+    item_after = store.get(a1)
+    assert item_after["status"] == "claimed"
+    store.close()
