@@ -373,8 +373,15 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
 
     # Cgroup isolation: wrap in a user-manager scope (fail-closed).
     _orig_argv = [sys.executable, "-m", RUNNER_SCRIPT_MODULE, spec_path]
-    _cage_ok, _cage_reason = _cage_buildable()
+    global _cage_alert_last_ts, _cage_unavail_consecutive, _cage_unavail_hold_until, _cage_critical_sent
+    _cage_ok, _cage_reason = await asyncio.to_thread(_cage_buildable)
     if _cage_ok:
+        if _cage_unavail_consecutive:
+            log.info("cgroup-isolation: cage restored after %d consecutive failures",
+                     _cage_unavail_consecutive)
+            _cage_unavail_consecutive = 0
+            _cage_unavail_hold_until = 0.0
+            _cage_critical_sent = False
         if not await asyncio.to_thread(_check_slice_has_cpu_quota):
             log.warning(
                 "cgroup-isolation: %s has no CPUQuota — task %s runs "
@@ -391,10 +398,44 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
         )
         _launch_argv = _orig_argv
     else:
-        global _cage_alert_last_ts
         _now = time.monotonic()
+        _cage_unavail_consecutive += 1
+        _backoff_s = _CAGE_UNAVAIL_BACKOFF_CAPS_S[
+            min(_cage_unavail_consecutive - 1, len(_CAGE_UNAVAIL_BACKOFF_CAPS_S) - 1)
+        ]
+        _cage_unavail_hold_until = _now + _backoff_s
+        _is_critical = _cage_unavail_consecutive >= _CAGE_ESCALATION_THRESHOLD
         _requeue_to_pending(queue, task_id)
-        if _now - _cage_alert_last_ts >= _CAGE_ALERT_COOLDOWN_S:
+        if _is_critical:
+            log.critical(
+                "cgroup-isolation: user bus PERSISTENTLY unreachable (%s) — "
+                "fixer cage down, queue effectively stalled; consecutive=%d; "
+                "host/config intervention required",
+                _cage_reason, _cage_unavail_consecutive,
+            )
+        else:
+            log.warning(
+                "cgroup-isolation: cage unavailable (%s) — task %s requeued "
+                "(fail-closed; backoff %ds; consecutive=%d; "
+                "set CLAUDE_QUEUE_ALLOW_UNBOUNDED=1 to override)",
+                _cage_reason, task_id, _backoff_s, _cage_unavail_consecutive,
+            )
+        # Notification fires exactly once when first crossing the threshold (not
+        # subject to the normal cooldown - a systemic break needs to be loud).
+        # log.critical() above fires on every post-threshold claim; only the
+        # push notification is gated by _cage_critical_sent.
+        if _is_critical and not _cage_critical_sent:
+            _cage_critical_sent = True
+            send_notification(
+                message=(
+                    f"CRITICAL: user bus persistently unreachable ({_cage_reason}); "
+                    f"fixer cage down — queue stalled after {_cage_unavail_consecutive} "
+                    f"consecutive failures. Host/config intervention required."
+                ),
+                title="claude-queue CRITICAL",
+                priority=PushoverPriority.HIGH,
+            )
+        elif not _is_critical and _now - _cage_alert_last_ts >= _CAGE_ALERT_COOLDOWN_S:
             _cage_alert_last_ts = _now
             send_notification(
                 message=(
@@ -405,11 +446,6 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
                 title="claude-queue",
                 priority=PushoverPriority.HIGH,
             )
-        log.error(
-            "cgroup-isolation: cage unavailable (%s) — task %s requeued "
-            "(fail-closed; set CLAUDE_QUEUE_ALLOW_UNBOUNDED=1 to override)",
-            _cage_reason, task_id,
-        )
         return
 
     try:
@@ -725,12 +761,31 @@ _FIXER_SLICE = "lapis-fixer.slice"
 _CAGE_ALERT_COOLDOWN_S = 300.0
 _cage_alert_last_ts: float = 0.0
 
+# Anti-spin backoff for persistent cage-unavailable (Facets trickster requirement).
+# Escalating seconds: 5 → 30 → 120, capped at 120s.
+_CAGE_UNAVAIL_BACKOFF_CAPS_S: tuple = (5, 30, 120)
+# Consecutive cage-unavailable count before escalating to CRITICAL severity.
+_CAGE_ESCALATION_THRESHOLD: int = 5
+_cage_unavail_consecutive: int = 0
+_cage_unavail_hold_until: float = 0.0
+
+# Set once at startup if the runner self-heals XDG_RUNTIME_DIR (queryable
+# without re-logging; True means the systemd unit/drop-in has a config gap).
+_LAPIS_RUNNER_SELF_HEALED: bool = False
+
+# Tracks whether the CRITICAL escalation notification has been sent for the
+# current cage-unavailable episode; resets when the cage restores.
+_cage_critical_sent: bool = False
+
 
 def _cage_buildable() -> tuple[bool, str]:
     """Check whether a systemd-run user scope cage can be built.
 
-    Returns (ok, reason). Synchronous; uses no subprocess — binary existence
-    and socket path checks only (negligible latency).
+    Returns (ok, reason). Runs a real connectivity probe via `systemctl --user
+    show` (≤5s timeout) to verify the user bus is actually reachable - not
+    just that the socket file exists. The probe runs in the same env as the
+    eventual launch (after the XDG_RUNTIME_DIR self-heal fires at startup),
+    so True ⇒ a systemd-run --user call will actually connect.
     """
     if not shutil.which("systemd-run"):
         return False, "systemd-run not in PATH"
@@ -738,6 +793,20 @@ def _cage_buildable() -> tuple[bool, str]:
     bus = f"/run/user/{uid}/bus"
     if not os.path.exists(bus):
         return False, f"user bus socket not found: {bus}"
+    # Connectivity probe: the socket file alone is not sufficient (system
+    # services can have the socket present via linger but lack XDG_RUNTIME_DIR
+    # in their env, making systemd-run --user fail with "No medium found").
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "--no-pager", "show", "-p", "Version"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if r.returncode != 0:
+            return False, f"user bus not reachable: systemctl --user rc={r.returncode}"
+    except subprocess.TimeoutExpired:
+        return False, "user bus not reachable: probe timed out"
+    except Exception as e:
+        return False, f"user bus not reachable: {e}"
     return True, ""
 
 
@@ -909,6 +978,11 @@ class Daemon:
                     _guard_blocking = False
                     log.warning("claude-queue freeze-guard CLEARED: resuming claims")
 
+            # Anti-spin: suppress claims during a cage-unavailable backoff window.
+            if time.monotonic() < _cage_unavail_hold_until:
+                await asyncio.sleep(POLL_INTERVAL_S)
+                continue
+
             task = self.queue.claim()
             if task is None:
                 await asyncio.sleep(POLL_INTERVAL_S)
@@ -960,8 +1034,38 @@ async def _amain():
     log.info("claude-queue-runner exited")
 
 
+def _self_heal_user_bus_env() -> None:
+    """Set XDG_RUNTIME_DIR at runner startup if the unit/drop-in failed to set it.
+
+    Live drop-in: /etc/systemd/system/claude-queue-runner.service.d/10-user-bus-env.conf
+    sets Environment=XDG_RUNTIME_DIR=/run/user/1000. This self-heal makes the runner
+    correct even without that drop-in - surviving host rebuilds or unit reinstalls.
+
+    Emits WARNING exactly once at startup (friction-as-signal: keeps the config gap
+    visible without spamming per-launch). Sets _LAPIS_RUNNER_SELF_HEALED so the
+    healed state is queryable without re-logging.
+    """
+    global _LAPIS_RUNNER_SELF_HEALED
+    if os.environ.get("XDG_RUNTIME_DIR"):
+        return
+    uid = os.getuid()
+    cand = f"/run/user/{uid}"
+    if os.path.isdir(cand):
+        os.environ["XDG_RUNTIME_DIR"] = cand
+        _LAPIS_RUNNER_SELF_HEALED = True
+        log.warning(
+            "self-heal: XDG_RUNTIME_DIR was unset; set to %s — "
+            "the systemd unit/drop-in SHOULD set this (config gap)", cand
+        )
+    else:
+        log.warning(
+            "self-heal: /run/user/%d absent; user-scope cage will be unavailable", uid
+        )
+
+
 def main():
     _setup_logging()
+    _self_heal_user_bus_env()
     asyncio.run(_amain())
 
 

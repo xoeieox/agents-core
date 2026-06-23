@@ -29,11 +29,19 @@ from agents_core import claude_queue_runner as runner_mod
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def _reset_cage_alert_ts():
-    """Reset cage-alert cooldown state before/after each test."""
+def _reset_cage_state():
+    """Reset all cage module-level state before/after each test."""
     runner_mod._cage_alert_last_ts = 0.0
+    runner_mod._cage_unavail_consecutive = 0
+    runner_mod._cage_unavail_hold_until = 0.0
+    runner_mod._cage_critical_sent = False
+    runner_mod._LAPIS_RUNNER_SELF_HEALED = False
     yield
     runner_mod._cage_alert_last_ts = 0.0
+    runner_mod._cage_unavail_consecutive = 0
+    runner_mod._cage_unavail_hold_until = 0.0
+    runner_mod._cage_critical_sent = False
+    runner_mod._LAPIS_RUNNER_SELF_HEALED = False
 
 
 def _fake_queue(tmp_path):
@@ -141,12 +149,46 @@ def test_cage_buildable_no_bus(monkeypatch):
 
 
 def test_cage_buildable_ok(monkeypatch):
-    """(True, '') when binary + socket are present."""
+    """(True, '') when binary, socket present, and probe connects (rc=0)."""
     monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/systemd-run")
     monkeypatch.setattr(os.path, "exists", lambda p: True)
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="Version=251\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
     ok, reason = runner_mod._cage_buildable()
     assert ok
     assert reason == ""
+
+
+def test_cage_buildable_bus_unreachable(monkeypatch):
+    """(False, reason) when socket exists but bus probe returns nonzero rc."""
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/systemd-run")
+    monkeypatch.setattr(os.path, "exists", lambda p: True)
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No medium found")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ok, reason = runner_mod._cage_buildable()
+    assert not ok
+    assert "not reachable" in reason
+    assert "rc=1" in reason
+
+
+def test_cage_buildable_probe_timeout(monkeypatch):
+    """(False, reason) when the connectivity probe times out."""
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/systemd-run")
+    monkeypatch.setattr(os.path, "exists", lambda p: True)
+
+    def fake_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, 5)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ok, reason = runner_mod._cage_buildable()
+    assert not ok
+    assert "timed out" in reason
 
 
 # ---------------------------------------------------------------------------
@@ -538,3 +580,227 @@ def test_reap_orphan_scopes_list_units_nonzero_rc_skips(monkeypatch, tmp_path):
     runner_mod._reap_orphan_scopes(_fake_queue(tmp_path))
 
     assert not stop_calls, "no stop calls when list-units fails"
+
+
+# ---------------------------------------------------------------------------
+# _self_heal_user_bus_env — startup XDG_RUNTIME_DIR self-heal
+# ---------------------------------------------------------------------------
+
+def test_self_heal_sets_xdg_when_unset(monkeypatch, tmp_path):
+    """With XDG_RUNTIME_DIR unset and /run/user/<uid> present, runner sets it."""
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(os, "getuid", lambda: 1000)
+    monkeypatch.setattr(os.path, "isdir", lambda p: p == "/run/user/1000")
+
+    runner_mod._self_heal_user_bus_env()
+
+    assert os.environ.get("XDG_RUNTIME_DIR") == "/run/user/1000"
+    assert runner_mod._LAPIS_RUNNER_SELF_HEALED is True
+
+
+def test_self_heal_leaves_existing_xdg_unchanged(monkeypatch):
+    """With XDG_RUNTIME_DIR already set, self-heal is a no-op."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/9999")
+    monkeypatch.setattr(os, "getuid", lambda: 1000)
+
+    runner_mod._self_heal_user_bus_env()
+
+    assert os.environ["XDG_RUNTIME_DIR"] == "/run/user/9999"
+    assert runner_mod._LAPIS_RUNNER_SELF_HEALED is False
+
+
+def test_self_heal_absent_dir_logs_warning_leaves_unset(monkeypatch, caplog):
+    """With /run/user/<uid> absent, XDG_RUNTIME_DIR stays unset; warning logged."""
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(os, "getuid", lambda: 1000)
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+
+    with caplog.at_level(logging.WARNING, logger="claude-queue-runner"):
+        runner_mod._self_heal_user_bus_env()
+
+    assert "XDG_RUNTIME_DIR" not in os.environ
+    assert runner_mod._LAPIS_RUNNER_SELF_HEALED is False
+    assert any("absent" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Prod-shaped env regression — the test that would have caught the incident
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_prod_shaped_env_requeues_not_exit1(monkeypatch, tmp_path):
+    """Core acceptance test: prod-service env (no XDG_RUNTIME_DIR, unreachable bus)
+    must produce fail-closed requeue, NOT hard EXIT 1 / queue.fail().
+
+    Simulates the exact failure mode: socket file present (linger on), but
+    systemctl --user probe returns nonzero (bus env missing).
+    """
+    monkeypatch.setattr(runner_mod, "OUTPUT_DIR", tmp_path)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_QUEUE_ALLOW_UNBOUNDED", raising=False)
+
+    # Socket present (linger keeps /run/user/<uid>/bus) but probe fails.
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/systemd-run")
+    monkeypatch.setattr(os.path, "exists", lambda p: "/bus" in p)
+
+    def probe_fails(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No medium found")
+
+    monkeypatch.setattr(subprocess, "run", probe_fails)
+    monkeypatch.setattr(runner_mod, "send_notification", lambda **kw: None)
+
+    failed_tasks = []
+    spawned = []
+
+    async def fail_if_spawned(*a, **kw):
+        spawned.append(a)
+        raise AssertionError("subprocess must NOT be spawned — cage should fail-closed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_if_spawned)
+
+    q = _fake_queue(tmp_path)
+    q_orig_fail = q.fail
+
+    def recording_fail(task_id, **kw):
+        failed_tasks.append(task_id)
+        q_orig_fail(task_id, **kw)
+
+    q.fail = recording_fail
+
+    task_id = "prod-shaped-001"
+    task = {"id": task_id, "payload": {"spec_path": "/spec.md"},
+            "timeout_seconds": 30, "notify": False}
+    _write_active_task(q, task_id)
+
+    await runner_mod._run_shaped_task(q, task)
+
+    # Fail-closed: task requeued to pending, never failed or spawned.
+    assert not spawned, "no subprocess spawned in fail-closed mode"
+    assert not failed_tasks, "task must be requeued, not hard-failed with EXIT 1"
+    assert (q.pending_dir / f"{task_id}.yaml").exists(), "task must land in pending"
+    assert not (q.active_dir / f"{task_id}.yaml").exists(), "task must leave active"
+
+
+# ---------------------------------------------------------------------------
+# Anti-spin: backoff hold suppresses re-claims after cage-unavailable
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cage_unavail_sets_backoff_hold(monkeypatch, tmp_path):
+    """Each cage-unavailable event sets _cage_unavail_hold_until in the future."""
+    monkeypatch.setattr(runner_mod, "_cage_buildable",
+                        lambda: (False, "user bus not reachable: rc=1"))
+    monkeypatch.delenv("CLAUDE_QUEUE_ALLOW_UNBOUNDED", raising=False)
+    monkeypatch.setattr(runner_mod, "send_notification", lambda **kw: None)
+
+    q = _fake_queue(tmp_path)
+    task_id = "spin-001"
+    _write_active_task(q, task_id)
+    task = {"id": task_id, "payload": {"spec_path": "/spec.md"},
+            "timeout_seconds": 30, "notify": False}
+
+    import time as time_mod
+    before = time_mod.monotonic()
+    await runner_mod._run_shaped_task(q, task)
+
+    assert runner_mod._cage_unavail_hold_until > before, (
+        "_cage_unavail_hold_until must be set to a future time after cage-unavailable"
+    )
+    assert runner_mod._cage_unavail_consecutive == 1
+
+
+@pytest.mark.asyncio
+async def test_cage_unavail_backoff_escalates(monkeypatch, tmp_path):
+    """Consecutive cage-unavailable events escalate the backoff hold duration."""
+    monkeypatch.setattr(runner_mod, "_cage_buildable",
+                        lambda: (False, "user bus not reachable: rc=1"))
+    monkeypatch.delenv("CLAUDE_QUEUE_ALLOW_UNBOUNDED", raising=False)
+    monkeypatch.setattr(runner_mod, "send_notification", lambda **kw: None)
+    # Pre-silence the cooldown so repeat notifications don't block.
+    runner_mod._cage_alert_last_ts = 10.0 ** 9
+
+    q = _fake_queue(tmp_path)
+
+    holds = []
+    for i in range(3):
+        task_id = f"spin-esc-{i:03d}"
+        _write_active_task(q, task_id)
+        task = {"id": task_id, "payload": {"spec_path": "/spec.md"},
+                "timeout_seconds": 30, "notify": False}
+        await runner_mod._run_shaped_task(q, task)
+        holds.append(runner_mod._cage_unavail_hold_until)
+        (q.pending_dir / f"{task_id}.yaml").unlink(missing_ok=True)
+
+    # Each successive hold must be at least as far in the future as the prior one.
+    caps = runner_mod._CAGE_UNAVAIL_BACKOFF_CAPS_S
+    assert runner_mod._cage_unavail_consecutive == 3
+    # Backoff steps through caps (5s, 30s, 120s); just verify monotonic increase.
+    for prev, curr in zip(holds, holds[1:]):
+        assert curr >= prev, "hold deadline must not shrink across consecutive failures"
+
+
+@pytest.mark.asyncio
+async def test_cage_unavail_critical_alert_after_threshold(monkeypatch, tmp_path, caplog):
+    """After _CAGE_ESCALATION_THRESHOLD consecutive failures, log escalates to CRITICAL."""
+    monkeypatch.setattr(runner_mod, "_cage_buildable",
+                        lambda: (False, "user bus not reachable: rc=1"))
+    monkeypatch.delenv("CLAUDE_QUEUE_ALLOW_UNBOUNDED", raising=False)
+
+    critical_notifs = []
+
+    def capture_notif(**kw):
+        if "CRITICAL" in kw.get("title", ""):
+            critical_notifs.append(kw)
+
+    monkeypatch.setattr(runner_mod, "send_notification", capture_notif)
+
+    q = _fake_queue(tmp_path)
+    threshold = runner_mod._CAGE_ESCALATION_THRESHOLD
+
+    with caplog.at_level(logging.CRITICAL, logger="claude-queue-runner"):
+        for i in range(threshold):
+            task_id = f"esc-crit-{i:03d}"
+            _write_active_task(q, task_id)
+            task = {"id": task_id, "payload": {"spec_path": "/spec.md"},
+                    "timeout_seconds": 30, "notify": False}
+            await runner_mod._run_shaped_task(q, task)
+            (q.pending_dir / f"{task_id}.yaml").unlink(missing_ok=True)
+
+    critical_logs = [r for r in caplog.records if r.levelno >= logging.CRITICAL]
+    assert critical_logs, (
+        f"CRITICAL log must fire after {threshold} consecutive cage-unavailable failures"
+    )
+    assert any("persistently" in r.message.lower() for r in critical_logs)
+    assert critical_notifs, "CRITICAL push notification must be sent at threshold"
+
+
+@pytest.mark.asyncio
+async def test_cage_restored_resets_consecutive_count(monkeypatch, tmp_path):
+    """After consecutive failures, a successful cage-buildable resets the counter."""
+    monkeypatch.setattr(runner_mod, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(runner_mod, "_extract_ops_primitives", lambda *a, **kw: None)
+    monkeypatch.setattr(runner_mod, "send_notification", lambda **kw: None)
+    monkeypatch.delenv("CLAUDE_QUEUE_ALLOW_UNBOUNDED", raising=False)
+
+    # Set up pre-existing failure state.
+    runner_mod._cage_unavail_consecutive = 3
+    runner_mod._cage_unavail_hold_until = 0.0  # hold already expired
+
+    monkeypatch.setattr(runner_mod, "_cage_buildable", lambda: (True, ""))
+    monkeypatch.setattr(runner_mod, "_check_slice_has_cpu_quota", lambda: True)
+
+    async def fake_spawn(*args, **kwargs):
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+
+    q = _fake_queue(tmp_path)
+    task = {"id": "restored-001", "payload": {"spec_path": "/spec.md"},
+            "timeout_seconds": 30, "notify": False}
+
+    await runner_mod._run_shaped_task(q, task)
+
+    assert runner_mod._cage_unavail_consecutive == 0, (
+        "consecutive counter must reset when cage becomes available again"
+    )
+    assert runner_mod._cage_unavail_hold_until == 0.0
