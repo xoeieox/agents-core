@@ -734,9 +734,7 @@ async def test_cage_unavail_backoff_escalates(monkeypatch, tmp_path):
     # Each successive hold must be at least as far in the future as the prior one.
     caps = runner_mod._CAGE_UNAVAIL_BACKOFF_CAPS_S
     assert runner_mod._cage_unavail_consecutive == 3
-    # Backoff should step through the caps (5s, 30s, 120s).
-    # The third hold uses the second cap (30s) since len(caps)==3 and index=2 → 120s.
-    # Just verify they are monotonically increasing (each is >= prior).
+    # Backoff steps through caps (5s, 30s, 120s); just verify monotonic increase.
     for prev, curr in zip(holds, holds[1:]):
         assert curr >= prev, "hold deadline must not shrink across consecutive failures"
 

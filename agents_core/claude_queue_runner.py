@@ -374,7 +374,7 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
     # Cgroup isolation: wrap in a user-manager scope (fail-closed).
     _orig_argv = [sys.executable, "-m", RUNNER_SCRIPT_MODULE, spec_path]
     global _cage_alert_last_ts, _cage_unavail_consecutive, _cage_unavail_hold_until, _cage_critical_sent
-    _cage_ok, _cage_reason = _cage_buildable()
+    _cage_ok, _cage_reason = await asyncio.to_thread(_cage_buildable)
     if _cage_ok:
         if _cage_unavail_consecutive:
             log.info("cgroup-isolation: cage restored after %d consecutive failures",
@@ -420,8 +420,10 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
                 "set CLAUDE_QUEUE_ALLOW_UNBOUNDED=1 to override)",
                 _cage_reason, task_id, _backoff_s, _cage_unavail_consecutive,
             )
-        # CRITICAL fires exactly once when first crossing the threshold (not
+        # Notification fires exactly once when first crossing the threshold (not
         # subject to the normal cooldown - a systemic break needs to be loud).
+        # log.critical() above fires on every post-threshold claim; only the
+        # push notification is gated by _cage_critical_sent.
         if _is_critical and not _cage_critical_sent:
             _cage_critical_sent = True
             send_notification(
