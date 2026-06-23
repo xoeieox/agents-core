@@ -472,6 +472,10 @@ def test_worker_loop_cold_start_peek_fail_bounded_backoff():
             raise KeyboardInterrupt
 
     with mock.patch("agents_core.elevator_interactive_worker.ElevatorStore", return_value=fake_elevator), \
+         mock.patch(
+             "agents_core.elevator_interactive_worker.serve_interactive_baton",
+             side_effect=lambda item: False,
+         ), \
          mock.patch("agents_core.elevator_interactive_worker.time") as mock_time:
         mock_time.sleep.side_effect = fake_sleep
         mock_time.monotonic = time.monotonic
@@ -487,8 +491,7 @@ def test_worker_loop_cold_start_peek_fail_bounded_backoff():
     assert sleep_calls[0] == 1
     assert sleep_calls[1] == 2
     assert sleep_calls[2] == 4
-    # After cap is reached, claim should be attempted (not a sleep but a claim)
-    # The loop should have allowed a claim at some point after the cap
-    # (fake_elevator.claim may or may not be called depending on when interrupt fires)
-    # Key: claim is never called in the FIRST 2 cycles (before cap)
-    assert fake_elevator.claim.call_count <= loop_count["n"]
+    # After the cap is reached, claim MUST be attempted — this is the anti-starvation
+    # guarantee. The previous assertion (call_count <= n) was trivially true and gave
+    # a false green; >= 1 actually verifies the property.
+    assert fake_elevator.claim.call_count >= 1

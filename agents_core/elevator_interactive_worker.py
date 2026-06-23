@@ -248,9 +248,11 @@ def worker_loop(
                 peek_state.record_success(serve_big)
             except (DoormanUnreachable, Exception) as exc:
                 if peek_state.is_fresh():
-                    # Use the last-known state to decide, then record the failure.
+                    # Use the last-known state to decide. Do NOT record a failure
+                    # here — _fail_count drives the stale-case backoff ramp and must
+                    # start from 0 when freshness expires; incrementing during the
+                    # fresh window would bypass the 1→2→4→...→cap ramp at transition.
                     serve_big = peek_state.last_known_serve_big()
-                    peek_state.record_failure()
                     logger.debug(
                         f"Peek failed ({exc!r}); using last-known serve_big={serve_big}"
                     )
