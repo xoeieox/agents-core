@@ -515,6 +515,44 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
 # Council task handler
 # ---------------------------------------------------------------------------
 
+
+def _force_council_run_failed(run_yaml_path: Path, task_id: str, worker_error: str) -> None:
+    """Best-effort: stamp status:failed + worker_error on a council run YAML.
+
+    Called by the parent watchdog when the child exits non-zero (AC3).
+    Never raises — failures are logged and suppressed.
+    """
+    import tempfile as _tempfile
+    import yaml as _yaml
+    try:
+        data = _yaml.safe_load(run_yaml_path.read_text())
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        data = {"run_id": task_id}
+    if data.get("status") in ("resolved", "open", "laid-down", "closed"):
+        return
+    if data.get("status") == "failed" and data.get("worker_error"):
+        return  # self-captured traceback takes priority; parent's generic message is fallback only
+    data["status"] = "failed"
+    data["worker_error"] = worker_error
+    content = _yaml.safe_dump(data, sort_keys=False, width=100, allow_unicode=True)
+    try:
+        fd, tmp = _tempfile.mkstemp(dir=run_yaml_path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(content)
+            os.replace(tmp, run_yaml_path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as e:
+        log.error(f"_force_council_run_failed: could not write {run_yaml_path}: {e}")
+
+
 async def _run_council_task(queue: ClaudeQueue, task: dict) -> None:
     """Spawn `python -m agents_core.council run <run_id>`, read terminal status,
     mark queue complete/failed.
@@ -562,6 +600,7 @@ async def _run_council_task(queue: ClaudeQueue, task: dict) -> None:
             pass
         await proc.wait()
         msg = f"timeout after {timeout}s"
+        _force_council_run_failed(run_yaml_path, task_id, f"council worker {msg}")
         queue.fail(task_id, error=msg)
         notify_failure(task, msg)
         return
@@ -570,12 +609,14 @@ async def _run_council_task(queue: ClaudeQueue, task: dict) -> None:
 
     if rc is not None and rc < 0:
         msg = f"interrupted signal {-rc}"
+        _force_council_run_failed(run_yaml_path, task_id, f"council worker {msg}")
         queue.fail(task_id, error=msg)
         notify_failure(task, msg)
         return
 
     if rc != 0:
         msg = f"EXIT {rc}: subprocess failed before terminal status"
+        _force_council_run_failed(run_yaml_path, task_id, f"council worker exited code={rc}")
         queue.fail(task_id, error=msg)
         notify_failure(task, msg)
         return
