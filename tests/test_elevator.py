@@ -482,8 +482,8 @@ def test_try_admit_different_principal_blocks(tmp_path):
     b1 = store.enqueue(lane="deliberation", kind="gw-admission", payload={},
                        principal="principal-b", latency_class="batch")
 
-    result = store.try_admit(b1, "deliberation", "principal-b")
-    assert result is False
+    admitted, _ = store.try_admit(b1, "deliberation", "principal-b")
+    assert admitted is False
     item = store.get(b1)
     assert item["status"] == "pending"
     store.close()
@@ -498,8 +498,9 @@ def test_try_admit_same_principal_ride_along(tmp_path):
 
     a2 = store.enqueue(lane="deliberation", kind="gw-admission", payload={},
                        principal="principal-a", latency_class="batch")
-    result = store.try_admit(a2, "deliberation", "principal-a")
-    assert result is True
+    admitted, is_ride_along = store.try_admit(a2, "deliberation", "principal-a")
+    assert admitted is True
+    assert is_ride_along is True
     item = store.get(a2)
     assert item["status"] == "claimed"
     store.close()
@@ -514,12 +515,13 @@ def test_try_admit_fifo_head_of_line(tmp_path):
                        principal="principal-b", latency_class="batch")
 
     # B's try_admit should fail (A is older = head-of-line)
-    b_result = store.try_admit(b1, "deliberation", "principal-b")
-    assert b_result is False
+    b_admitted, _ = store.try_admit(b1, "deliberation", "principal-b")
+    assert b_admitted is False
 
     # A's try_admit should succeed (head-of-line)
-    a_result = store.try_admit(a1, "deliberation", "principal-a")
-    assert a_result is True
+    a_admitted, a_ride = store.try_admit(a1, "deliberation", "principal-a")
+    assert a_admitted is True
+    assert a_ride is False  # fresh group, not ride-along
     assert store.get(a1)["status"] == "claimed"
     assert store.get(b1)["status"] == "pending"
     store.close()
@@ -534,12 +536,12 @@ def test_try_admit_max_groups_two(tmp_path):
                        principal="principal-b", latency_class="batch")
 
     # A is head-of-line; admit with max_groups=2
-    a_result = store.try_admit(a1, "deliberation", "principal-a", max_groups=2)
-    assert a_result is True
+    a_admitted, _ = store.try_admit(a1, "deliberation", "principal-a", max_groups=2)
+    assert a_admitted is True
 
     # B can now also be admitted since only 1 other group (A) holds the lane and max_groups=2
-    b_result = store.try_admit(b1, "deliberation", "principal-b", max_groups=2)
-    assert b_result is True
+    b_admitted, _ = store.try_admit(b1, "deliberation", "principal-b", max_groups=2)
+    assert b_admitted is True
     assert store.get(a1)["status"] == "claimed"
     assert store.get(b1)["status"] == "claimed"
     store.close()
@@ -553,8 +555,8 @@ def test_try_admit_claim_ttl_sec_above_max_wait(tmp_path):
 
     a1 = store.enqueue(lane="deliberation", kind="gw-admission", payload={},
                        principal="principal-a", latency_class="batch")
-    result = store.try_admit(a1, "deliberation", "principal-a", claim_ttl_sec=claim_ttl)
-    assert result is True
+    admitted, _ = store.try_admit(a1, "deliberation", "principal-a", claim_ttl_sec=claim_ttl)
+    assert admitted is True
 
     item = store.get(a1)
     assert item["status"] == "claimed"

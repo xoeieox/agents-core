@@ -356,7 +356,7 @@ class ElevatorStore:
         principal: str,
         max_groups: int = 1,
         claim_ttl_sec: int = 960,
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         """Atomically admit item_id on lane per principal-group concurrency policy.
 
         Admits iff:
@@ -365,7 +365,9 @@ class ElevatorStore:
           oldest pending head-of-line on lane (FIFO fairness for fresh groups).
 
         Sets status='claimed', claim_owner=principal, claimed_at, claim_ttl_sec on admit.
-        Returns True if admitted, False otherwise. Requires IS_MASTER.
+        Returns (admitted, is_ride_along). Both determinations are atomic within the
+        store lock so callers don't need a separate _has_claimed_on_lane check. Requires
+        IS_MASTER.
         """
         self._check_writable()
         now = _now()
@@ -378,7 +380,7 @@ class ElevatorStore:
             other_principals = claimed_principals - {principal}
 
             if len(other_principals) >= max_groups:
-                return False  # Different group(s) hold all available slots.
+                return False, False  # Different group(s) hold all available slots.
 
             if principal in claimed_principals:
                 # Ride-along: same-group item already in-flight; admit immediately.
@@ -388,9 +390,9 @@ class ElevatorStore:
                     (principal, claim_ttl_sec, now, item_id),
                 )
                 if cursor.rowcount == 0:
-                    return False
+                    return False, False
                 self._conn.commit()
-                return True
+                return True, True  # admitted as ride-along
 
             # Fresh group or lane idle: FIFO head-of-line check.
             head = self._conn.execute(
@@ -403,17 +405,17 @@ class ElevatorStore:
                 (lane,),
             ).fetchone()
             if not head or head["item_id"] != item_id or head["principal"] != principal:
-                return False
+                return False, False
 
             cursor = self._conn.execute(
                 "UPDATE queue_items SET status='claimed', claim_owner=?, "
-                "claim_ttl_sec=?, claimed_at=? WHERE item_id=?",
+                "claim_ttl_sec=?, claimed_at=? WHERE item_id=? AND status='pending'",
                 (principal, claim_ttl_sec, now, item_id),
             )
             if cursor.rowcount == 0:
-                return False
+                return False, False
             self._conn.commit()
-            return True
+            return True, False  # admitted as fresh group
 
     # -- reader (HTTP) ----------------------------------------------------
 

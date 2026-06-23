@@ -400,11 +400,15 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         is_unique_work_id_principal = (principal is None)
 
         # --- SHADOW MODE (AC10): dry-run admission decision, dispatch directly ---
-        if admission_mode == "shadow":
+        if admission_mode == "shadow" and not _admission_bypass:
             _shadow_claimed: set = set()
             try:
-                from agents_core.elevator import ElevatorStore as _ES
-                _ss = _ES()
+                from agents_core.elevator import ElevatorStore as _ES, DB_DIR as _ELEV_DB_DIR_S
+                from pathlib import Path as _Path_S
+                _elev_db_s = _Path_S(os.environ.get(
+                    "ELEVATOR_DB_PATH", str(_ELEV_DB_DIR_S / "queue.db")
+                ))
+                _ss = _ES(_elev_db_s)
                 _shadow_claimed = _ss._claimed_principals_on_lane("deliberation")
                 _ss.close()
             except Exception:
@@ -474,13 +478,11 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                             )
 
                         if not admitted:
-                            _prior = elevator._has_claimed_on_lane("deliberation", effective_principal)
-                            ok = elevator.try_admit(
+                            ok, is_ride_along = elevator.try_admit(
                                 ticket, "deliberation", effective_principal, claim_ttl_sec=_claim_ttl
                             )
                             if ok:
                                 admitted = True
-                                is_ride_along = _prior
                             else:
                                 time.sleep(_poll)
                                 continue

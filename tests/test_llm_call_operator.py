@@ -398,6 +398,74 @@ def test_ac2_enforce_enqueues_and_serves(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# AC4: drain_count gates fresh group; ride-along skips drain_count
+# ---------------------------------------------------------------------------
+
+def test_ac4_fresh_group_waits_for_drain_count(tmp_path, monkeypatch):
+    """AC4: fresh principal-group holds until drain_count==0; dispatches once it clears."""
+    monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+    monkeypatch.setenv("GW_ADMISSION_POLL_INTERVAL_SEC", "0.01")
+
+    dc = MagicMock()
+    instance = MagicMock()
+    # drain_count returns 1 on first call, then 0 (clears)
+    instance.drain_count.side_effect = [1, 0]
+    instance.acquire.return_value = {"status": "serving"}
+    dc.return_value = instance
+    dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="ok"):
+        prov = []
+        result = call_operator("gravitywell", prompt="test", _provenance_out=prov,
+                                principal="fresh-gate")
+
+    assert result == "ok"
+    assert ("success", "gravitywell") in prov
+    # drain_count must have been polled at least twice (1 then 0)
+    assert instance.drain_count.call_count >= 2
+
+
+def test_ac4_ride_along_skips_drain_count(tmp_path, monkeypatch):
+    """AC4: same-principal ride-along dispatches immediately, drain_count not checked."""
+    monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+    monkeypatch.setenv("GW_ADMISSION_POLL_INTERVAL_SEC", "0.01")
+
+    # Pre-plant a claimed ticket for the same principal so the second call is a ride-along.
+    from agents_core.elevator import ElevatorStore
+    store = ElevatorStore(tmp_path / "q.db")
+    anchor = store.enqueue(
+        lane="deliberation", kind="gw-admission", payload={},
+        principal="shared-gate", latency_class="batch",
+    )
+    store.claim(lanes=["deliberation"], owner="anchor", claim_ttl_sec=999)
+    store.close()
+
+    dc = MagicMock()
+    instance = MagicMock()
+    # drain_count returns non-zero; ride-along must NOT block on it
+    instance.drain_count.return_value = 5
+    instance.acquire.return_value = {"status": "serving"}
+    dc.return_value = instance
+    dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="ok"):
+        prov = []
+        result = call_operator("gravitywell", prompt="test", _provenance_out=prov,
+                                principal="shared-gate")
+
+    assert result == "ok"
+    assert ("success", "gravitywell") in prov
+    # drain_count must NOT have been called (ride-along skips the gate)
+    instance.drain_count.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # AC5: bypass — no enqueue even under enforce
 # ---------------------------------------------------------------------------
 
