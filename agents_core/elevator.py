@@ -329,6 +329,92 @@ class ElevatorStore:
             self._conn.commit()
         return True
 
+    # -- admission (self-serve) -------------------------------------------
+
+    def _has_claimed_on_lane(self, lane: str, principal: str) -> bool:
+        """Return True if any claimed item with this principal exists on lane (read-only)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM queue_items WHERE lane=? AND status='claimed' AND principal=? LIMIT 1",
+                (lane, principal),
+            ).fetchone()
+            return row is not None
+
+    def _claimed_principals_on_lane(self, lane: str) -> set:
+        """Return the set of distinct principals with claimed items on lane (read-only)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT principal FROM queue_items WHERE lane=? AND status='claimed'",
+                (lane,),
+            ).fetchall()
+            return {row[0] for row in rows}
+
+    def try_admit(
+        self,
+        item_id: str,
+        lane: str,
+        principal: str,
+        max_groups: int = 1,
+        claim_ttl_sec: int = 960,
+    ) -> bool:
+        """Atomically admit item_id on lane per principal-group concurrency policy.
+
+        Admits iff:
+        - Same-principal item already claimed (ride-along): admit immediately, skip FIFO.
+        - No other-principal group holds >= max_groups slots: this item is the
+          oldest pending head-of-line on lane (FIFO fairness for fresh groups).
+
+        Sets status='claimed', claim_owner=principal, claimed_at, claim_ttl_sec on admit.
+        Returns True if admitted, False otherwise. Requires IS_MASTER.
+        """
+        self._check_writable()
+        now = _now()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT principal FROM queue_items WHERE lane=? AND status='claimed'",
+                (lane,),
+            ).fetchall()
+            claimed_principals = {row[0] for row in rows}
+            other_principals = claimed_principals - {principal}
+
+            if len(other_principals) >= max_groups:
+                return False  # Different group(s) hold all available slots.
+
+            if principal in claimed_principals:
+                # Ride-along: same-group item already in-flight; admit immediately.
+                cursor = self._conn.execute(
+                    "UPDATE queue_items SET status='claimed', claim_owner=?, "
+                    "claim_ttl_sec=?, claimed_at=? WHERE item_id=? AND status='pending'",
+                    (principal, claim_ttl_sec, now, item_id),
+                )
+                if cursor.rowcount == 0:
+                    return False
+                self._conn.commit()
+                return True
+
+            # Fresh group or lane idle: FIFO head-of-line check.
+            head = self._conn.execute(
+                "SELECT item_id, principal FROM queue_items "
+                "WHERE lane=? AND status='pending' "
+                "AND (depends_on IS NULL "
+                "  OR EXISTS (SELECT 1 FROM queue_items p "
+                "             WHERE p.item_id = queue_items.depends_on AND p.status='served')) "
+                "ORDER BY created_at ASC LIMIT 1",
+                (lane,),
+            ).fetchone()
+            if not head or head["item_id"] != item_id or head["principal"] != principal:
+                return False
+
+            cursor = self._conn.execute(
+                "UPDATE queue_items SET status='claimed', claim_owner=?, "
+                "claim_ttl_sec=?, claimed_at=? WHERE item_id=?",
+                (principal, claim_ttl_sec, now, item_id),
+            )
+            if cursor.rowcount == 0:
+                return False
+            self._conn.commit()
+            return True
+
     # -- reader (HTTP) ----------------------------------------------------
 
     def get(self, item_id: str) -> dict[str, Any] | None:
