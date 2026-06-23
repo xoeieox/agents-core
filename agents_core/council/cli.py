@@ -49,7 +49,10 @@ import random
 import re
 import subprocess
 import sys
+import tempfile
 import threading
+import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -83,6 +86,10 @@ LOG_DIR = Path("/srv/lapis/council/logs")
 DASHBOARD_BASE = "http://203.0.113.12:8400"
 
 
+class CouncilRunParseError(Exception):
+    """Raised by load_run when the YAML is empty or not a dict."""
+
+
 # ---------------------------------------------------------------------------
 # Run file I/O
 # ---------------------------------------------------------------------------
@@ -93,13 +100,58 @@ def run_path(run_id: str) -> Path:
 
 
 def load_run(run_id: str) -> dict:
-    return yaml.safe_load(run_path(run_id).read_text())
+    data = yaml.safe_load(run_path(run_id).read_text())
+    if not isinstance(data, dict):
+        raise CouncilRunParseError(
+            f"run YAML for {run_id!r} parsed to {type(data).__name__!r} (expected dict)"
+        )
+    return data
 
 
 def save_run(run: dict) -> None:
-    run_path(run["run_id"]).write_text(
-        yaml.safe_dump(run, sort_keys=False, width=100, allow_unicode=True)
-    )
+    p = run_path(run["run_id"])
+    content = yaml.safe_dump(run, sort_keys=False, width=100, allow_unicode=True)
+    fd, tmp = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, p)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _mark_run_failed(run_id: str, worker_error: str) -> None:
+    """Force run YAML to status:failed and record worker_error. Never raises."""
+    p = run_path(run_id)
+    try:
+        data = yaml.safe_load(p.read_text())
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        data = {"run_id": run_id}
+    if data.get("status") in ("resolved", "open", "laid-down", "closed"):
+        return
+    data["status"] = "failed"
+    data["worker_error"] = worker_error
+    content = yaml.safe_dump(data, sort_keys=False, width=100, allow_unicode=True)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(content)
+            os.replace(tmp, p)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as e:
+        print(f"[council] _mark_run_failed: could not write {p}: {e}", file=sys.stderr, flush=True)
 
 
 def new_run_id() -> str:
@@ -829,18 +881,30 @@ def run_deliberation(run_id: str) -> None:
     COUNCIL_STUB_POSITIONS: comma-separated positions for stub cast (default: agree,agree).
     COUNCIL_STALL_S: heartbeat hold lease TTL — see module-level constant.
     """
-    from agents_core.council import cache as _cache
-
-    run = load_run(run_id)
-    mode = run.get("mode", DEFAULT_MODE)
-    kernel_version = _cache.read_kernel_version()
-
-    # Stamp process-liveness heartbeat immediately so the poller does not use
-    # created_at as the stall clock reference while this process is alive but
-    # blocked in the doorman acquire (which can take up to _gw_acquire_timeout()
-    # ~210s on a cold GW wake — longer than COUNCIL_STALL_S).
-    run["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
-    save_run(run)
+    # Wrap startup so any crash before the first heartbeat is self-captured
+    # rather than leaving the run stuck at status:deliberating.
+    try:
+        from agents_core.council import cache as _cache
+        run = load_run(run_id)
+        mode = run.get("mode", DEFAULT_MODE)
+        kernel_version = _cache.read_kernel_version()
+        # Stamp process-liveness heartbeat immediately so the poller does not use
+        # created_at as the stall clock reference while this process is alive but
+        # blocked in the doorman acquire (which can take up to _gw_acquire_timeout()
+        # ~210s on a cold GW wake — longer than COUNCIL_STALL_S).
+        run["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
+        save_run(run)
+    except Exception as _startup_exc:
+        _tb = traceback.format_exc()
+        print(f"[council] startup error run_id={run_id}: {_startup_exc}", file=sys.stderr, flush=True)
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            with (LOG_DIR / f"{run_id}.log").open("a") as _lf:
+                _lf.write(f"STARTUP ERROR:\n{_tb}\n")
+        except Exception:
+            pass
+        _mark_run_failed(run_id, _tb)
+        raise
 
     # Deliberation-spanning GW keepawake hold (spec-review-council-keepawake-resilience-v0 §A).
     # Acquires a doorman lease for the full deliberation so GW stays warm across all voices.
@@ -1410,9 +1474,10 @@ def cmd_submit(args: argparse.Namespace) -> int:
         print(
             f"[council] forking deliberation subprocess (log: {log_file})", flush=True
         )
-        _fork_runtime(run_id, log_file)
+        proc = _fork_runtime(run_id, log_file)
+        _watch_startup(proc, run_id, log_file)
         print(
-            f"[council] fire-and-forget. Watch: {DASHBOARD_BASE}/council/{run_id}",
+            f"[council] Watch: {DASHBOARD_BASE}/council/{run_id}",
             flush=True,
         )
         return 0
@@ -1445,10 +1510,14 @@ def cmd_submit(args: argparse.Namespace) -> int:
     return 0
 
 
-def _fork_runtime(run_id: str, log_file: Path) -> None:
-    """Detached subprocess: `python -m agents_core.council run <run-id>`."""
+def _fork_runtime(run_id: str, log_file: Path) -> subprocess.Popen:
+    """Detached subprocess: `python -m agents_core.council run <run-id>`.
+
+    Returns the Popen handle so the caller can reap the exit status via
+    _watch_startup (AC3: parent-process watchdog).
+    """
     with open(log_file, "ab") as f:
-        subprocess.Popen(
+        return subprocess.Popen(
             [sys.executable, "-m", "agents_core.council", "run", run_id],
             stdout=f,
             stderr=subprocess.STDOUT,
@@ -1456,6 +1525,45 @@ def _fork_runtime(run_id: str, log_file: Path) -> None:
             start_new_session=True,
             close_fds=True,
         )
+
+
+def _watch_startup(proc: subprocess.Popen, run_id: str, log_file: Path, timeout: float = 30.0) -> None:
+    """Poll until worker emits its first heartbeat, dies, or timeout expires.
+
+    If the child exits without a heartbeat, forces status:failed on the run YAML
+    (AC3 watchdog guarantee: no run left deliberating after worker process exits).
+    Timeout is a fallback safety — the poller handles stalls beyond this window.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        rc = proc.poll()
+        if rc is not None:
+            try:
+                data = yaml.safe_load(run_path(run_id).read_text())
+                has_hb = isinstance(data, dict) and bool(data.get("heartbeat_at"))
+            except Exception:
+                has_hb = False
+            if not has_hb:
+                worker_error = f"worker exited code={rc} before first heartbeat"
+                try:
+                    tail = log_file.read_text()[-2000:]
+                    if tail.strip():
+                        worker_error += f"\n\nlog tail:\n{tail}"
+                except Exception:
+                    pass
+                _mark_run_failed(run_id, worker_error)
+                print(
+                    f"[council watchdog] run_id={run_id} forced status:failed (exit_code={rc})",
+                    flush=True,
+                )
+            return
+        try:
+            data = yaml.safe_load(run_path(run_id).read_text())
+            if isinstance(data, dict) and data.get("heartbeat_at"):
+                return
+        except Exception:
+            pass
 
 
 def cmd_run(args: argparse.Namespace) -> int:

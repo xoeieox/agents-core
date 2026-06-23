@@ -83,7 +83,8 @@ def test_cmd_submit_no_queue_path_forks_not_queues(tmp_path, monkeypatch):
     monkeypatch.setattr(council_cli, "gather_mem_context", lambda d: {"terms": [], "hits": []})
     monkeypatch.setattr(council_cli, "build_roster", lambda: [])
     monkeypatch.setattr(council_cli, "select_entities", lambda **kw: mock_selection)
-    monkeypatch.setattr(council_cli, "_fork_runtime", lambda run_id, log_file: forked.append(run_id))
+    monkeypatch.setattr(council_cli, "_fork_runtime", lambda run_id, log_file: forked.append(run_id) or object())
+    monkeypatch.setattr(council_cli, "_watch_startup", lambda proc, run_id, log_file, **kw: None)
 
     args = _make_submit_args(no_queue=True)
     rc = council_cli.cmd_submit(args)

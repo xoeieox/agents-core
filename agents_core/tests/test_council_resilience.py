@@ -568,3 +568,224 @@ def test_stub_deliberation_stamps_heartbeat_at(monkeypatch):
     assert ts is not None
 
     run_file.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# AC1 — Atomic save_run and typed load_run parse error
+# ---------------------------------------------------------------------------
+
+def test_save_run_is_atomic(tmp_path):
+    """Concurrent reads during a large save_run never observe a partial/empty YAML.
+
+    Simulates the write side of the save_run → load_run fork race: writes a
+    large YAML repeatedly while a reader thread reads concurrently; asserts
+    that every successful read is a complete, parseable dict.
+    """
+    import threading
+    import yaml as _yaml
+    from agents_core.council import cli
+
+    run_id = "2026-01-01-000000-atomic01"
+    run_file = tmp_path / f"{run_id}.yaml"
+    orig_dir = cli.COUNCIL_DIR
+    cli.COUNCIL_DIR = tmp_path
+
+    run = {
+        "run_id": run_id,
+        "status": "deliberating",
+        "decision": "x" * 60_000,
+        "turns": [],
+    }
+    cli.save_run(run)
+
+    errors = []
+    stop = threading.Event()
+
+    def reader():
+        while not stop.is_set():
+            try:
+                data = _yaml.safe_load(run_file.read_text())
+                if not isinstance(data, dict):
+                    errors.append(f"got non-dict: {type(data).__name__}")
+            except Exception as e:
+                errors.append(f"parse error: {e}")
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+
+    for _ in range(20):
+        cli.save_run(run)
+
+    stop.set()
+    t.join(timeout=2)
+    cli.COUNCIL_DIR = orig_dir
+    run_file.unlink(missing_ok=True)
+
+    assert not errors, f"Observed partial/corrupt reads during atomic writes: {errors[:3]}"
+
+
+def test_load_run_raises_on_corrupt_yaml(tmp_path):
+    """load_run raises CouncilRunParseError (not None) when YAML is empty or non-dict."""
+    from agents_core.council import cli
+
+    orig_dir = cli.COUNCIL_DIR
+    cli.COUNCIL_DIR = tmp_path
+    run_id = "2026-01-01-000000-parse01"
+    run_file = tmp_path / f"{run_id}.yaml"
+
+    run_file.write_text("")
+    with pytest.raises(cli.CouncilRunParseError):
+        cli.load_run(run_id)
+
+    run_file.write_text("just a string\n")
+    with pytest.raises(cli.CouncilRunParseError):
+        cli.load_run(run_id)
+
+    cli.COUNCIL_DIR = orig_dir
+    run_file.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# AC2 — Worker self-capture of startup exceptions
+# ---------------------------------------------------------------------------
+
+def test_run_deliberation_captures_load_run_failure(tmp_path):
+    """A CouncilRunParseError during startup is written to the run YAML as status:failed."""
+    from agents_core.council import cli
+
+    orig_dir = cli.COUNCIL_DIR
+    cli.COUNCIL_DIR = tmp_path
+
+    run_id = "2026-01-01-000000-capture01"
+    (tmp_path / f"{run_id}.yaml").write_text("")
+
+    with pytest.raises(cli.CouncilRunParseError):
+        cli.run_deliberation(run_id)
+
+    run = yaml.safe_load((tmp_path / f"{run_id}.yaml").read_text())
+    assert isinstance(run, dict), "run YAML should be a dict after watchdog write"
+    assert run.get("status") == "failed", f"Expected status:failed, got {run.get('status')!r}"
+    assert "worker_error" in run, "worker_error field missing"
+
+    cli.COUNCIL_DIR = orig_dir
+
+
+def test_run_deliberation_self_capture_does_not_swallow_exception(tmp_path):
+    """After self-capture, run_deliberation still re-raises so callers see the error."""
+    from agents_core.council import cli
+
+    orig_dir = cli.COUNCIL_DIR
+    cli.COUNCIL_DIR = tmp_path
+    run_id = "2026-01-01-000000-reraise01"
+    (tmp_path / f"{run_id}.yaml").write_text("")
+
+    with pytest.raises(Exception):
+        cli.run_deliberation(run_id)
+
+    cli.COUNCIL_DIR = orig_dir
+
+
+# ---------------------------------------------------------------------------
+# AC3 — Watchdog forces status:failed on pre-heartbeat worker death
+# ---------------------------------------------------------------------------
+
+def test_watch_startup_forces_failed_on_early_death(tmp_path):
+    """_watch_startup writes status:failed when the child exits without a heartbeat."""
+    import subprocess
+    from unittest.mock import MagicMock
+    from agents_core.council import cli
+
+    orig_dir = cli.COUNCIL_DIR
+    cli.COUNCIL_DIR = tmp_path
+
+    run_id = "2026-01-01-000000-watchdog01"
+    run_data = {
+        "run_id": run_id,
+        "status": "deliberating",
+        "decision": "test watchdog",
+    }
+    run_file = tmp_path / f"{run_id}.yaml"
+    run_file.write_text(yaml.safe_dump(run_data))
+    log_file = tmp_path / f"{run_id}.log"
+    log_file.write_text("crash output here\n")
+
+    mock_proc = MagicMock(spec=subprocess.Popen)
+    mock_proc.poll.return_value = 1
+
+    cli._watch_startup(mock_proc, run_id, log_file, timeout=5.0)
+
+    run = yaml.safe_load(run_file.read_text())
+    assert run.get("status") == "failed", f"Expected status:failed, got {run.get('status')!r}"
+    assert "worker_error" in run
+    assert "code=1" in run["worker_error"]
+
+    cli.COUNCIL_DIR = orig_dir
+    run_file.unlink(missing_ok=True)
+
+
+def test_watch_startup_does_not_override_if_heartbeat_present(tmp_path):
+    """_watch_startup does NOT write status:failed if the child wrote a heartbeat."""
+    import subprocess
+    from unittest.mock import MagicMock
+    from agents_core.council import cli
+    from datetime import datetime as _dt
+
+    orig_dir = cli.COUNCIL_DIR
+    cli.COUNCIL_DIR = tmp_path
+
+    run_id = "2026-01-01-000000-watchdog02"
+    run_data = {
+        "run_id": run_id,
+        "status": "deliberating",
+        "decision": "test",
+        "heartbeat_at": _dt.now().isoformat(timespec="seconds"),
+    }
+    run_file = tmp_path / f"{run_id}.yaml"
+    run_file.write_text(yaml.safe_dump(run_data))
+    log_file = tmp_path / f"{run_id}.log"
+
+    mock_proc = MagicMock(spec=subprocess.Popen)
+    mock_proc.poll.return_value = 0
+
+    cli._watch_startup(mock_proc, run_id, log_file, timeout=5.0)
+
+    run = yaml.safe_load(run_file.read_text())
+    assert run.get("status") == "deliberating", (
+        f"Expected deliberating (heartbeat present), got {run.get('status')!r}"
+    )
+
+    cli.COUNCIL_DIR = orig_dir
+    run_file.unlink(missing_ok=True)
+
+
+def test_queue_runner_watchdog_forces_failed_on_nonzero_exit(tmp_path):
+    """_force_council_run_failed writes status:failed + worker_error atomically."""
+    from agents_core.claude_queue_runner import _force_council_run_failed
+
+    run_id = "2026-01-01-000000-qwatchdog01"
+    run_file = tmp_path / f"{run_id}.yaml"
+    run_data = {"run_id": run_id, "status": "deliberating", "decision": "test"}
+    run_file.write_text(yaml.safe_dump(run_data))
+
+    _force_council_run_failed(run_file, run_id, "council worker exited code=1")
+
+    result = yaml.safe_load(run_file.read_text())
+    assert result.get("status") == "failed"
+    assert "worker_error" in result
+    assert "code=1" in result["worker_error"]
+
+
+def test_queue_runner_watchdog_does_not_override_terminal_status(tmp_path):
+    """_force_council_run_failed skips if status is already terminal."""
+    from agents_core.claude_queue_runner import _force_council_run_failed
+
+    run_id = "2026-01-01-000000-qwatchdog02"
+    run_file = tmp_path / f"{run_id}.yaml"
+    run_data = {"run_id": run_id, "status": "resolved", "decision": "test"}
+    run_file.write_text(yaml.safe_dump(run_data))
+
+    _force_council_run_failed(run_file, run_id, "should be ignored")
+
+    result = yaml.safe_load(run_file.read_text())
+    assert result.get("status") == "resolved", "Must not overwrite a terminal status"
+    assert "worker_error" not in result
