@@ -532,6 +532,8 @@ def _force_council_run_failed(run_yaml_path: Path, task_id: str, worker_error: s
         data = {"run_id": task_id}
     if data.get("status") in ("resolved", "open", "laid-down", "closed"):
         return
+    if data.get("status") == "failed" and data.get("worker_error"):
+        return  # self-captured traceback takes priority; parent's generic message is fallback only
     data["status"] = "failed"
     data["worker_error"] = worker_error
     content = _yaml.safe_dump(data, sort_keys=False, width=100, allow_unicode=True)

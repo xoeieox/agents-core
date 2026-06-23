@@ -600,3 +600,136 @@ async def test_council_concurrency_cap_one_at_a_time():
     assert concurrent_peak[0] == 1, (
         f"Expected at most 1 concurrent council task, got peak={concurrent_peak[0]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# AC5 — Watchdog end-to-end: _run_council_task exit branches write run YAML
+#
+# These tests drive _run_council_task's actual exit-branch wiring (non-zero,
+# signal, timeout) and assert the run YAML lands status:failed — not just that
+# queue.fail() was called.  AC3 guarantee: no run left deliberating after the
+# worker process exits, verified via the run file itself.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_council_task_nonzero_exit_writes_run_yaml_failed(tmp_path, monkeypatch):
+    """Non-zero exit: _run_council_task writes status:failed + worker_error to run YAML."""
+    import agents_core.claude_queue_runner as runner_mod
+    monkeypatch.setattr(runner_mod, "_COUNCIL_DIR", tmp_path)
+    monkeypatch.setattr(runner_mod, "_COUNCIL_LOG_DIR", tmp_path / "logs")
+
+    run_id = "2026-06-23-000000-e2e-nz01"
+    run_file = tmp_path / f"{run_id}.yaml"
+    run_file.write_text(yaml.safe_dump({"run_id": run_id, "status": "deliberating"}))
+
+    task = _make_task(task_type="council.run", task_id=run_id, mode="deliberation")
+    queue = MagicMock()
+
+    with patch("asyncio.create_subprocess_exec") as mock_exec:
+        mock_proc = AsyncMock()
+        mock_proc.wait = AsyncMock(return_value=2)
+        mock_proc.returncode = 2
+        mock_exec.return_value = mock_proc
+        await runner_mod._run_council_task(queue, task)
+
+    queue.fail.assert_called_once()
+    result = yaml.safe_load(run_file.read_text())
+    assert result.get("status") == "failed", f"Expected status:failed, got {result.get('status')!r}"
+    assert "worker_error" in result, "worker_error field must be written to run YAML"
+    assert "code=2" in result["worker_error"]
+
+
+@pytest.mark.asyncio
+async def test_run_council_task_signal_exit_writes_run_yaml_failed(tmp_path, monkeypatch):
+    """Signal exit (negative rc): _run_council_task writes status:failed with signal info."""
+    import agents_core.claude_queue_runner as runner_mod
+    monkeypatch.setattr(runner_mod, "_COUNCIL_DIR", tmp_path)
+    monkeypatch.setattr(runner_mod, "_COUNCIL_LOG_DIR", tmp_path / "logs")
+
+    run_id = "2026-06-23-000000-e2e-sig01"
+    run_file = tmp_path / f"{run_id}.yaml"
+    run_file.write_text(yaml.safe_dump({"run_id": run_id, "status": "deliberating"}))
+
+    task = _make_task(task_type="council.run", task_id=run_id, mode="deliberation")
+    queue = MagicMock()
+
+    with patch("asyncio.create_subprocess_exec") as mock_exec:
+        mock_proc = AsyncMock()
+        mock_proc.wait = AsyncMock(return_value=-9)
+        mock_proc.returncode = -9
+        mock_exec.return_value = mock_proc
+        await runner_mod._run_council_task(queue, task)
+
+    queue.fail.assert_called_once()
+    result = yaml.safe_load(run_file.read_text())
+    assert result.get("status") == "failed", f"Expected status:failed, got {result.get('status')!r}"
+    assert "worker_error" in result, "worker_error field must be written to run YAML"
+    assert "signal 9" in result["worker_error"]
+
+
+@pytest.mark.asyncio
+async def test_run_council_task_timeout_writes_run_yaml_failed(tmp_path, monkeypatch):
+    """Timeout: _run_council_task drives watchdog and writes status:failed to run YAML."""
+    import agents_core.claude_queue_runner as runner_mod
+    monkeypatch.setattr(runner_mod, "_COUNCIL_DIR", tmp_path)
+    monkeypatch.setattr(runner_mod, "_COUNCIL_LOG_DIR", tmp_path / "logs")
+
+    run_id = "2026-06-23-000000-e2e-to01"
+    run_file = tmp_path / f"{run_id}.yaml"
+    run_file.write_text(yaml.safe_dump({"run_id": run_id, "status": "deliberating"}))
+
+    task = _make_task(task_type="council.run", task_id=run_id, mode="deliberation", timeout=300)
+    queue = MagicMock()
+
+    with patch("asyncio.create_subprocess_exec") as mock_exec, \
+         patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
+        mock_proc = AsyncMock()
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock(return_value=None)
+        mock_exec.return_value = mock_proc
+        await runner_mod._run_council_task(queue, task)
+
+    queue.fail.assert_called_once()
+    result = yaml.safe_load(run_file.read_text())
+    assert result.get("status") == "failed", f"Expected status:failed, got {result.get('status')!r}"
+    assert "worker_error" in result, "worker_error field must be written to run YAML"
+    assert "timeout" in result["worker_error"]
+
+
+@pytest.mark.asyncio
+async def test_run_council_task_nonzero_preserves_self_captured_traceback(tmp_path, monkeypatch):
+    """Watchdog does NOT overwrite self-captured traceback when child exits non-zero.
+
+    AC3: if the child ran its own error handler and wrote worker_error before dying,
+    _force_council_run_failed must preserve the diagnostic traceback, not clobber it
+    with the generic 'council worker exited code=N' fallback.
+    """
+    import agents_core.claude_queue_runner as runner_mod
+    monkeypatch.setattr(runner_mod, "_COUNCIL_DIR", tmp_path)
+    monkeypatch.setattr(runner_mod, "_COUNCIL_LOG_DIR", tmp_path / "logs")
+
+    run_id = "2026-06-23-000000-e2e-tb01"
+    run_file = tmp_path / f"{run_id}.yaml"
+    captured_tb = "Traceback (most recent call last):\n  File cli.py\nValueError: bad yaml"
+    run_file.write_text(yaml.safe_dump({
+        "run_id": run_id,
+        "status": "failed",
+        "worker_error": captured_tb,
+    }))
+
+    task = _make_task(task_type="council.run", task_id=run_id, mode="deliberation")
+    queue = MagicMock()
+
+    with patch("asyncio.create_subprocess_exec") as mock_exec:
+        mock_proc = AsyncMock()
+        mock_proc.wait = AsyncMock(return_value=1)
+        mock_proc.returncode = 1
+        mock_exec.return_value = mock_proc
+        await runner_mod._run_council_task(queue, task)
+
+    result = yaml.safe_load(run_file.read_text())
+    assert result.get("status") == "failed"
+    assert result.get("worker_error") == captured_tb, (
+        f"Self-captured traceback was overwritten by watchdog. "
+        f"Got: {result.get('worker_error')!r}"
+    )

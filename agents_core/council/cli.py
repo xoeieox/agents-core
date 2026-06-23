@@ -135,6 +135,8 @@ def _mark_run_failed(run_id: str, worker_error: str) -> None:
         data = {"run_id": run_id}
     if data.get("status") in ("resolved", "open", "laid-down", "closed"):
         return
+    if data.get("status") == "failed" and data.get("worker_error"):
+        return  # self-captured traceback takes priority; parent's generic message is fallback only
     data["status"] = "failed"
     data["worker_error"] = worker_error
     content = yaml.safe_dump(data, sort_keys=False, width=100, allow_unicode=True)

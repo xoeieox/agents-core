@@ -789,3 +789,70 @@ def test_queue_runner_watchdog_does_not_override_terminal_status(tmp_path):
     result = yaml.safe_load(run_file.read_text())
     assert result.get("status") == "resolved", "Must not overwrite a terminal status"
     assert "worker_error" not in result
+
+
+def test_watch_startup_preserves_self_captured_traceback(tmp_path):
+    """_watch_startup does NOT overwrite a self-captured traceback (status:failed + worker_error).
+
+    AC3: if the worker ran its own error handler and wrote worker_error before dying,
+    the parent watchdog's generic 'exited code=N' string must not clobber it.
+    """
+    import subprocess
+    from unittest.mock import MagicMock
+    from agents_core.council import cli
+
+    orig_dir = cli.COUNCIL_DIR
+    cli.COUNCIL_DIR = tmp_path
+
+    run_id = "2026-01-01-000000-preserve01"
+    captured_tb = "Traceback (most recent call last):\n  File cli.py line 3\nRuntimeError: engine exploded"
+    run_data = {
+        "run_id": run_id,
+        "status": "failed",
+        "worker_error": captured_tb,
+    }
+    run_file = tmp_path / f"{run_id}.yaml"
+    run_file.write_text(yaml.safe_dump(run_data))
+    log_file = tmp_path / f"{run_id}.log"
+
+    mock_proc = MagicMock(spec=subprocess.Popen)
+    mock_proc.poll.return_value = 1
+
+    cli._watch_startup(mock_proc, run_id, log_file, timeout=5.0)
+
+    result = yaml.safe_load(run_file.read_text())
+    assert result.get("status") == "failed"
+    assert result.get("worker_error") == captured_tb, (
+        f"Self-captured traceback was overwritten by parent watchdog. "
+        f"Got: {result.get('worker_error')!r}"
+    )
+
+    cli.COUNCIL_DIR = orig_dir
+    run_file.unlink(missing_ok=True)
+
+
+def test_queue_runner_watchdog_preserves_self_captured_traceback(tmp_path):
+    """_force_council_run_failed does NOT overwrite a self-captured traceback.
+
+    AC3: when the child already wrote status:failed + worker_error (self-capture),
+    the parent's generic fallback message must not clobber the diagnostic traceback.
+    """
+    from agents_core.claude_queue_runner import _force_council_run_failed
+
+    run_id = "2026-01-01-000000-preserve02"
+    run_file = tmp_path / f"{run_id}.yaml"
+    captured_tb = "Traceback (most recent call last):\n  File bar.py line 5\nValueError: bad yaml"
+    run_data = {
+        "run_id": run_id,
+        "status": "failed",
+        "worker_error": captured_tb,
+    }
+    run_file.write_text(yaml.safe_dump(run_data))
+
+    _force_council_run_failed(run_file, run_id, "council worker exited code=1")
+
+    result = yaml.safe_load(run_file.read_text())
+    assert result.get("status") == "failed"
+    assert result.get("worker_error") == captured_tb, (
+        f"Self-captured traceback was overwritten. Got: {result.get('worker_error')!r}"
+    )
