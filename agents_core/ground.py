@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_SCOPE = ["mem", "vault-rag", "chub"]
 _PM_TIMEOUT_S = 0.2  # hard non-blocking guard for MemoryStore/TargetStore reads
+_MEM_BIAS_NAMESPACES = {"decision", "project", "architecture"}
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +118,25 @@ def ground(
 # Half 1 — RAG / decision substrate
 # ---------------------------------------------------------------------------
 
+def _mem_biased_score(hit) -> float:
+    """Return a biased sort key for mem hits in preferred namespaces.
+
+    Adds 0.1 to the score of mem hits whose key starts with a preferred
+    namespace (decision/, project/, architecture/) or whose tags include
+    one of those terms. Capped at 1.0. All other hits are unchanged.
+    """
+    if hit.source != "mem":
+        return hit.score
+    key = hit.metadata.get("key", "")
+    if not key and hit.id.startswith("mem:"):
+        key = hit.id[4:]
+    key_ns = key.split("/")[0] if "/" in key else key
+    tags = {t.strip() for t in hit.metadata.get("tags", "").split(",") if t.strip()}
+    if key_ns in _MEM_BIAS_NAMESPACES or bool(tags & _MEM_BIAS_NAMESPACES):
+        return min(1.0, hit.score + 0.1)
+    return hit.score
+
+
 def _assemble_rag(
     query: str,
     scope: list[str],
@@ -125,22 +145,18 @@ def _assemble_rag(
     """Query retrieve() with per-backend fail-soft; return (block, provenance, truncated)."""
     provenance: list[dict] = []
 
-    # Bias mem hits toward decision/project/architecture namespaces
-    mem_filters: dict = {"tags": ["decision"]}
-    # We ask retrieve() for all in scope; but mem uses the tag filter to prefer
-    # decision/project/architecture content. retrieve() handles the bias internally
-    # via the tags filter on the mem backend.
+    # No hard tag filter — retrieve mem unfiltered so project/architecture/decision
+    # entries all reach the ranking step. Rank-bias applied post-retrieval via
+    # _mem_biased_score().
     try:
         hits = retrieve(
             query,
             scope=scope,
-            filters=mem_filters,
             top_k=40,
             min_score=0.0,
         )
     except Exception as exc:
         log.warning("ground: retrieve() raised: %s", exc)
-        # Mark each backend as ungrounded
         for src in scope:
             provenance.append({
                 "tag": "ungrounded",
@@ -149,15 +165,9 @@ def _assemble_rag(
             })
         return "", provenance, False
 
-    # If retrieve returned zero from mem (no decision-tagged hits), retry without
-    # the tag filter so we don't starve the bundle of any mem substrate.
-    if not any(h.source == "mem" for h in hits):
-        try:
-            mem_hits = retrieve(query, scope=["mem"], top_k=20, min_score=0.0)
-            hits = list({h.id: h for h in (mem_hits + hits)}.values())
-            hits.sort(key=lambda h: h.score, reverse=True)
-        except Exception:
-            pass
+    # Rank-bias: boost mem hits in decision/project/architecture namespaces so they
+    # float to the top without hard-excluding anything else.
+    hits = sorted(hits, key=_mem_biased_score, reverse=True)
 
     # Check which backends came back empty and record ungrounded markers
     returned_sources = {h.source for h in hits}

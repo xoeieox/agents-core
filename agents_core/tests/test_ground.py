@@ -318,3 +318,37 @@ def test_budget_reservation_pm_state_not_starved():
     assert "pm:test-target" in bundle.context_block, \
         "PM-state block should be present even with flood of RAG hits"
     assert bundle.token_estimate <= 500
+
+
+# ---------------------------------------------------------------------------
+# 8. mem is retrieved UNFILTERED; decision AND project entries both appear
+# ---------------------------------------------------------------------------
+
+def test_mem_unfiltered_decision_and_project_both_appear():
+    """retrieve() is called without a hard tag filter; decision AND project mem hits both appear."""
+    decision_hit = _make_hit("mem", "decision/arch-v0", "architecture decision content", 0.85)
+    project_hit = _make_hit("mem", "project/ground-call", "project planning content", 0.75)
+    other_hit = _make_hit("mem", "notes/random", "random note", 0.60)
+    all_hits = [decision_hit, project_hit, other_hit]
+
+    captured_calls: list[dict] = []
+
+    def fake_retrieve(query, scope, filters=None, top_k=10, min_score=0.0, **kwargs):
+        captured_calls.append({"filters": filters})
+        return all_hits
+
+    with patch("agents_core.ground.retrieve", side_effect=fake_retrieve), \
+         patch("agents_core.ground._assemble_pm_state", return_value=("", [], False)):
+        bundle = ground("architecture query", pm_state=False, token_budget=5000)
+
+    # retrieve() must NOT have been called with a hard tag filter on mem
+    for call in captured_calls:
+        f = call.get("filters") or {}
+        assert not f.get("tags"), \
+            f"retrieve() called with hard tag filter tags={f.get('tags')} — must be unfiltered"
+
+    # Both decision-namespace AND project-namespace entries must appear in the bundle
+    assert "decision/arch-v0" in bundle.context_block, \
+        "decision namespace entry must appear in context_block"
+    assert "project/ground-call" in bundle.context_block, \
+        "project namespace entry must appear in context_block"
