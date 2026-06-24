@@ -396,3 +396,207 @@ def test_ac4_serialization_none_default():
     d = req.to_dict()
     assert "grounding_result_file" in d
     assert d["grounding_result_file"] is None
+
+
+# --- GW span hold tests (shared-deliberation-gate-spanning-keepawake-v0) ---
+
+def _make_mock_doorman():
+    """Return a mock DoormanClient with acquire returning serving."""
+    m = Mock()
+    m.acquire = Mock(return_value={"status": "serving"})
+    m.release = Mock()
+    m.close = Mock()
+    return m
+
+
+@pytest.mark.asyncio
+async def test_span_hold_acquire_before_facets_and_release_after(
+    monkeypatch, init_semaphore
+):
+    """GW span hold: acquire fires before Facets dispatch; work_id spans the call; released in finally."""
+    monkeypatch.setenv("SHARED_DELIBERATION_FACETS_STUB", "1")
+    monkeypatch.setenv("SHARED_DELIBERATION_COUNCIL_STUB", "1")
+
+    import agents_core.shared_deliberation.orchestrator as orch
+
+    call_order = []
+
+    orig_facets = orch._facets_subprocess
+    async def tracked_facets(*a, **kw):
+        call_order.append("facets")
+        return await orig_facets(*a, **kw)
+    monkeypatch.setattr(orch, "_facets_subprocess", tracked_facets)
+
+    mock_doorman = _make_mock_doorman()
+    def tracked_acquire(*a, **kw):
+        call_order.append("acquire")
+        return {"status": "serving"}
+    mock_doorman.acquire = tracked_acquire
+
+    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_doorman), \
+         patch("agents_core.doorman_client._gw_acquire_timeout", return_value=10.0):
+        request = DeliberationRequest(
+            text="test", context={}, council_voicing="gravitywell"
+        )
+        await run_deliberation(request)
+
+    assert "acquire" in call_order
+    assert "facets" in call_order
+    assert call_order.index("acquire") < call_order.index("facets"), (
+        f"acquire must precede facets dispatch; got order: {call_order}"
+    )
+    mock_doorman.release.assert_called_once()
+    release_args = mock_doorman.release.call_args
+    work_id_used = release_args.args[1] if release_args.args else release_args.kwargs.get("work_id", "")
+    assert work_id_used.startswith("shared-delib-"), (
+        f"span hold work_id must start with 'shared-delib-', got: {work_id_used!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_span_hold_released_on_facets_error(monkeypatch, init_semaphore):
+    """Span hold is released in finally even when the Facets leg errors."""
+    monkeypatch.setenv("SHARED_DELIBERATION_COUNCIL_STUB", "1")
+
+    import agents_core.shared_deliberation.orchestrator as orch
+
+    async def failing_facets(*a, **kw):
+        raise RuntimeError("facets exploded")
+    monkeypatch.setattr(orch, "_facets_subprocess", failing_facets)
+
+    mock_doorman = _make_mock_doorman()
+    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_doorman), \
+         patch("agents_core.doorman_client._gw_acquire_timeout", return_value=10.0):
+        request = DeliberationRequest(
+            text="test", context={}, council_voicing="gravitywell"
+        )
+        with pytest.raises(RuntimeError, match="facets exploded"):
+            await run_deliberation(request)
+
+    mock_doorman.release.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_span_hold_released_on_council_error(monkeypatch, init_semaphore):
+    """Span hold is released in finally even when the Council leg errors."""
+    monkeypatch.setenv("SHARED_DELIBERATION_FACETS_STUB", "1")
+
+    import agents_core.shared_deliberation.orchestrator as orch
+
+    async def failing_council(*a, **kw):
+        raise RuntimeError("council exploded")
+    monkeypatch.setattr(orch, "_council_subprocess", failing_council)
+
+    mock_doorman = _make_mock_doorman()
+    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_doorman), \
+         patch("agents_core.doorman_client._gw_acquire_timeout", return_value=10.0):
+        request = DeliberationRequest(
+            text="test", context={}, council_voicing="gravitywell"
+        )
+        with pytest.raises(RuntimeError, match="council exploded"):
+            await run_deliberation(request)
+
+    mock_doorman.release.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_council_worker_death_no_span_hold_drop(monkeypatch, init_semaphore):
+    """Simulated council-worker death (heartbeat stale) does NOT release the orchestrator span hold.
+
+    The span hold is the orchestrator's own lease; it stays active until run_deliberation
+    returns, independent of the council worker's own hold. Specifically: when council_subprocess
+    returns early with a heartbeat_stale error, the span hold is not released mid-flight.
+    """
+    monkeypatch.setenv("SHARED_DELIBERATION_FACETS_STUB", "1")
+
+    import agents_core.shared_deliberation.orchestrator as orch
+
+    release_count = [0]
+    span_released_during_council = [False]
+
+    mock_doorman = _make_mock_doorman()
+
+    def tracked_release(*a, **kw):
+        release_count[0] += 1
+
+    mock_doorman.release = tracked_release
+
+    # Simulate worker death: council checks that release has NOT been called yet,
+    # then returns an error (like heartbeat_stale)
+    async def dead_worker_council(*a, **kw):
+        span_released_during_council[0] = release_count[0] > 0
+        return (False, "council-run-dead", None, "council worker died/stalled (heartbeat_stale)")
+    monkeypatch.setattr(orch, "_council_subprocess", dead_worker_council)
+
+    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_doorman), \
+         patch("agents_core.doorman_client._gw_acquire_timeout", return_value=10.0):
+        request = DeliberationRequest(
+            text="test", context={}, council_voicing="gravitywell"
+        )
+        envelope = await run_deliberation(request)
+
+    # council_ok=False (worker died) but span hold release happens exactly once in finally
+    assert envelope.council_ok is False
+    assert envelope.council_run_id == "council-run-dead"
+    assert release_count[0] == 1, (
+        f"Expected exactly one release call (in finally), got {release_count[0]}"
+    )
+    assert not span_released_during_council[0], (
+        "Span hold must not be released while council_subprocess is still executing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_gw_voicing_no_span_hold(monkeypatch, init_semaphore):
+    """Non-GW voicing (local/sonnet) does NOT acquire a GW span hold."""
+    monkeypatch.setenv("SHARED_DELIBERATION_FACETS_STUB", "1")
+    monkeypatch.setenv("SHARED_DELIBERATION_COUNCIL_STUB", "1")
+
+    mock_doorman = _make_mock_doorman()
+    mock_class = Mock(return_value=mock_doorman)
+
+    with patch("agents_core.doorman_client.DoormanClient", mock_class), \
+         patch("agents_core.doorman_client._gw_acquire_timeout", return_value=10.0):
+        request = DeliberationRequest(
+            text="test", context={},
+            council_voicing="sonnet",
+            facets_operator="haiku",
+        )
+        await run_deliberation(request)
+
+    mock_class.assert_not_called()
+    mock_doorman.acquire.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_span_hold_refresh_fires(monkeypatch, init_semaphore):
+    """Span hold refresh thread fires at least once during a long deliberation."""
+    monkeypatch.setenv("SHARED_DELIBERATION_COUNCIL_STUB", "1")
+    monkeypatch.setenv("SHARED_DELIB_SPAN_REFRESH_S", "1")
+
+    import agents_core.shared_deliberation.orchestrator as orch
+
+    async def slow_facets(*a, **kw):
+        await asyncio.sleep(1.5)
+        return (True, {"stub": True, "methodology": {"synthesis_operator": "gravitywell"}}, "stub-id", None)
+    monkeypatch.setattr(orch, "_facets_subprocess", slow_facets)
+
+    acquire_count = [0]
+    mock_doorman = Mock()
+    def count_acquire(*a, **kw):
+        acquire_count[0] += 1
+        return {"status": "serving"}
+    mock_doorman.acquire = count_acquire
+    mock_doorman.release = Mock()
+    mock_doorman.close = Mock()
+
+    with patch("agents_core.doorman_client.DoormanClient", return_value=mock_doorman), \
+         patch("agents_core.doorman_client._gw_acquire_timeout", return_value=10.0):
+        request = DeliberationRequest(
+            text="test", context={}, council_voicing="gravitywell"
+        )
+        await run_deliberation(request)
+
+    assert acquire_count[0] >= 2, (
+        f"Expected initial acquire + at least one refresh, got {acquire_count[0]} acquire calls"
+    )

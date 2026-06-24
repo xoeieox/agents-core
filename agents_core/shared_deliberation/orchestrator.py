@@ -13,6 +13,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -357,93 +358,183 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
     triage_escalated = False
     triage_reason = "caller-requested"
 
-    # Run both legs concurrently via asyncio.gather
-    async def _facets_leg():
-        return await _facets_subprocess(
-            request.text,
-            request.context,
-            request.facets_operator,
-            request.grounding_result_file,
+    # Deliberation-spanning GW keepawake hold (shared-deliberation-gate-spanning-keepawake-v0).
+    # Placed BEFORE Facets dispatch so GW stays warm across the full Facets + Council window.
+    # This is the primary guarantee; the council leg's own hold (council/cli.py) remains as
+    # defense-in-depth but is independent of this one — a dead council worker drops its own
+    # lease but does NOT affect this orchestrator hold.
+    # TTL covers the max deliberation duration; refreshed periodically via background thread.
+    # Auto-expires if the orchestrator process dies (no unconditional pinning).
+    _gw_in_play = (
+        request.council_voicing == "gravitywell"
+        or request.facets_operator == "gravitywell"
+    )
+    _span_work_id = f"shared-delib-{request_id}"
+    _span_doorman = None
+    _span_stop = threading.Event()
+    _span_refresh_thread = None
+
+    if _gw_in_play:
+        try:
+            from agents_core.doorman_client import DoormanClient, _gw_acquire_timeout
+            _span_doorman = DoormanClient()
+            # TTL comfortably covers max deliberation: council_timeout + facets_timeout + margin.
+            _span_ttl = (
+                int(os.environ.get("SHARED_DELIBERATION_COUNCIL_TIMEOUT_S", "1800")) + 600
+            )
+            _hold_res = await asyncio.to_thread(
+                _span_doorman.acquire,
+                "gravitywell", _span_work_id, _span_ttl,
+                "shared-deliberation-span-hold",
+                timeout=_gw_acquire_timeout(),
+            )
+            log.info(
+                "[shared-deliberation] span hold placed request_id=%s status=%s",
+                request_id, _hold_res.get("status"),
+            )
+            if _hold_res.get("status") == "serving":
+                _refresh_interval = int(
+                    os.environ.get("SHARED_DELIB_SPAN_REFRESH_S", "300")
+                )
+
+                def _span_refresh_loop(
+                    _dc=_span_doorman,
+                    _wid=_span_work_id,
+                    _ttl=_span_ttl,
+                    _stop=_span_stop,
+                    _iv=_refresh_interval,
+                ):
+                    while not _stop.wait(_iv):
+                        try:
+                            _dc.acquire(
+                                "gravitywell", _wid, _ttl,
+                                "shared-deliberation-span-refresh",
+                                timeout=10.0,
+                            )
+                        except Exception as _ref_err:
+                            log.warning(
+                                "[shared-deliberation] span hold refresh failed: %s",
+                                _ref_err,
+                            )
+
+                _span_refresh_thread = threading.Thread(
+                    target=_span_refresh_loop,
+                    daemon=True,
+                    name=f"span-hold-refresh-{request_id}",
+                )
+                _span_refresh_thread.start()
+        except Exception as _hold_err:
+            log.warning(
+                "[shared-deliberation] span hold acquire failed (non-fatal): %s",
+                _hold_err,
+            )
+
+    try:
+        # Run both legs concurrently via asyncio.gather
+        async def _facets_leg():
+            return await _facets_subprocess(
+                request.text,
+                request.context,
+                request.facets_operator,
+                request.grounding_result_file,
+            )
+
+        async def _council_leg():
+            # Council only runs if triage == "full"; otherwise return (False, None, None, None)
+            if triage != "full":
+                return (False, None, None, None)
+            return await _council_subprocess(
+                request.text,
+                request.council_voicing,
+            )
+
+        facets_result, council_result = await asyncio.gather(
+            _facets_leg(),
+            _council_leg(),
         )
 
-    async def _council_leg():
-        # Council only runs if triage == "full"; otherwise return (False, None, None, None)
-        if triage != "full":
-            return (False, None, None, None)
-        return await _council_subprocess(
-            request.text,
-            request.council_voicing,
+        facets_ok, facets_dict, facets_id, facets_error = facets_result
+        council_ok, council_run_id, council_data, council_error = council_result
+
+        # Extract operator info from Facets
+        operator_requested = None
+        operator_effective = None
+        if facets_dict:
+            methodology = facets_dict.get("methodology", {})
+            operator_requested = methodology.get("operator_requested", request.facets_operator)
+            operator_effective = methodology.get("synthesis_operator", request.facets_operator)
+
+        # Extract council info
+        council_status = None
+        council_landing = None
+        council_confidence = None
+        council_open_questions = []
+        council_positions = []
+        council_voicing_effective = None
+        council_voicing_degraded = False
+        council_voicing_degraded_reason = None
+
+        if council_data and council_ok:
+            council_status = council_data.get("status")
+            council_landing = council_data.get("landing")
+            council_confidence = council_data.get("confidence")
+            council_open_questions = council_data.get("open_questions", [])
+            council_positions = council_data.get("positions", [])
+            council_voicing_effective = council_data.get("voicing_effective")
+            council_voicing_degraded = council_data.get("voicing_degraded", False)
+            council_voicing_degraded_reason = council_data.get("voicing_degraded_reason")
+
+        # Collect errors
+        errors = {}
+        if facets_error:
+            errors["facets"] = facets_error
+        if council_error:
+            errors["council"] = council_error
+
+        envelope = DeliberationEnvelope(
+            deliberation_request_id=request_id,
+            triage=triage,
+            triage_reason=triage_reason,
+            triage_escalated=triage_escalated,
+            # Facets
+            facets_ok=facets_ok,
+            facets=facets_dict,
+            facets_deliberation_id=facets_id,
+            operator_requested=operator_requested,
+            operator_effective=operator_effective,
+            # Council
+            council_ok=council_ok,
+            council_run_id=council_run_id,
+            council_status=council_status,
+            council_landing=council_landing,
+            council_confidence=council_confidence,
+            council_open_questions=council_open_questions,
+            council_positions=council_positions,
+            council_voicing_requested=request.council_voicing,
+            council_voicing_effective=council_voicing_effective,
+            council_voicing_degraded=council_voicing_degraded,
+            council_voicing_degraded_reason=council_voicing_degraded_reason,
+            # Extensions and errors
+            extra_modes=[],  # Reserved for jagged-seam tap (v0: empty)
+            errors=errors,
         )
 
-    facets_result, council_result = await asyncio.gather(
-        _facets_leg(),
-        _council_leg(),
-    )
-
-    facets_ok, facets_dict, facets_id, facets_error = facets_result
-    council_ok, council_run_id, council_data, council_error = council_result
-
-    # Extract operator info from Facets
-    operator_requested = None
-    operator_effective = None
-    if facets_dict:
-        methodology = facets_dict.get("methodology", {})
-        operator_requested = methodology.get("operator_requested", request.facets_operator)
-        operator_effective = methodology.get("synthesis_operator", request.facets_operator)
-
-    # Extract council info
-    council_status = None
-    council_landing = None
-    council_confidence = None
-    council_open_questions = []
-    council_positions = []
-    council_voicing_effective = None
-    council_voicing_degraded = False
-    council_voicing_degraded_reason = None
-
-    if council_data and council_ok:
-        council_status = council_data.get("status")
-        council_landing = council_data.get("landing")
-        council_confidence = council_data.get("confidence")
-        council_open_questions = council_data.get("open_questions", [])
-        council_positions = council_data.get("positions", [])
-        council_voicing_effective = council_data.get("voicing_effective")
-        council_voicing_degraded = council_data.get("voicing_degraded", False)
-        council_voicing_degraded_reason = council_data.get("voicing_degraded_reason")
-
-    # Collect errors
-    errors = {}
-    if facets_error:
-        errors["facets"] = facets_error
-    if council_error:
-        errors["council"] = council_error
-
-    envelope = DeliberationEnvelope(
-        deliberation_request_id=request_id,
-        triage=triage,
-        triage_reason=triage_reason,
-        triage_escalated=triage_escalated,
-        # Facets
-        facets_ok=facets_ok,
-        facets=facets_dict,
-        facets_deliberation_id=facets_id,
-        operator_requested=operator_requested,
-        operator_effective=operator_effective,
-        # Council
-        council_ok=council_ok,
-        council_run_id=council_run_id,
-        council_status=council_status,
-        council_landing=council_landing,
-        council_confidence=council_confidence,
-        council_open_questions=council_open_questions,
-        council_positions=council_positions,
-        council_voicing_requested=request.council_voicing,
-        council_voicing_effective=council_voicing_effective,
-        council_voicing_degraded=council_voicing_degraded,
-        council_voicing_degraded_reason=council_voicing_degraded_reason,
-        # Extensions and errors
-        extra_modes=[],  # Reserved for jagged-seam tap (v0: empty)
-        errors=errors,
-    )
-
-    return envelope
+        return envelope
+    finally:
+        # Stop the refresh thread and release the span hold on any exit path.
+        _span_stop.set()
+        if _span_refresh_thread is not None:
+            _span_refresh_thread.join(timeout=15.0)
+        if _span_doorman is not None:
+            try:
+                await asyncio.to_thread(
+                    _span_doorman.release, "gravitywell", _span_work_id
+                )
+            except Exception as _rel_err:
+                log.warning(
+                    "[shared-deliberation] span hold release failed: %s", _rel_err
+                )
+            try:
+                _span_doorman.close()
+            except Exception:
+                pass
