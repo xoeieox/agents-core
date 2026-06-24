@@ -221,7 +221,7 @@ def test_pm_state_surfaces_active_target(tmp_path):
         fake_target.status = "active"
         fake_target.pm_bound = True
         fake_target.urgency = "high"
-        mock_ts_cls.return_value.load_all.return_value = [fake_target]
+        mock_ts_cls.return_value.active_targets.return_value = [fake_target]
 
         bundle = ground("PM loop query", pm_state=True, token_budget=3000)
 
@@ -352,3 +352,156 @@ def test_mem_unfiltered_decision_and_project_both_appear():
         "decision namespace entry must appear in context_block"
     assert "project/ground-call" in bundle.context_block, \
         "project namespace entry must appear in context_block"
+
+
+# ---------------------------------------------------------------------------
+# 9. PM-state read completes under guard with real stores (regression gate)
+# ---------------------------------------------------------------------------
+
+def test_pm_state_read_completes_under_guard(tmp_path):
+    """ground(pm_state=True) returns stale=False with real MemoryStore/TargetStore.
+
+    This is the regression test that would have caught the 200ms-guard defect:
+    the old guard was below the healthy read time so stale was always True.
+    """
+    from agents_core.mem import MemoryStore as RealMemoryStore
+    from agents_core.targets import TargetStore as RealTargetStore
+
+    targets_dir = _make_target_yaml(tmp_path, "alpha-v0", "Alpha Target", pm_bound=True)
+    _make_target_yaml(tmp_path, "beta-v0", "Beta Target", pm_bound=True)
+    _make_target_yaml(tmp_path, "gamma-v0", "Gamma Target", pm_bound=False)
+
+    db = _make_mem_db(tmp_path, [
+        {
+            "key": "router/lapis-pm/decisions/evt-alpha-001",
+            "content": json.dumps({
+                "freshness_stamp": "2026-06-24T10:00:00Z",
+                "verdict": "proposed",
+                "expert_chosen": "fixer",
+                "intent_summary": "implement the PM-state guard fix",
+                "target_id": "alpha-v0",
+            }),
+            "tags": "lapis-pm,router-portfolio,target:alpha-v0",
+        },
+        {
+            "key": "router/lapis-pm/decisions/evt-beta-001",
+            "content": json.dumps({
+                "freshness_stamp": "2026-06-24T09:00:00Z",
+                "verdict": "dispatched",
+                "expert_chosen": "fixer",
+                "intent_summary": "beta work in progress",
+                "target_id": "beta-v0",
+            }),
+            "tags": "lapis-pm,router-portfolio,target:beta-v0",
+        },
+    ])
+
+    with patch("agents_core.ground.MemoryStore", side_effect=lambda: RealMemoryStore(db)), \
+         patch("agents_core.ground.TargetStore", side_effect=lambda: RealTargetStore(targets_dir)), \
+         patch("agents_core.ground.retrieve", return_value=[]):
+        bundle = ground("PM state query", pm_state=True, token_budget=3000)
+
+    assert bundle.stale is False, "healthy PM-state read must not set stale=True"
+    assert "pm:alpha-v0" in bundle.context_block, "active pm_bound target must appear"
+    assert "pm:beta-v0" in bundle.context_block, "second pm_bound target must appear"
+    ungrounded_pm = [
+        p for p in bundle.provenance
+        if p.get("tag") == "ungrounded" and p.get("source") == "pm_state"
+    ]
+    assert len(ungrounded_pm) == 0, "no ungrounded pm_state marker on healthy read"
+
+
+# ---------------------------------------------------------------------------
+# 10. GROUND_PM_TIMEOUT_S env override is honored
+# ---------------------------------------------------------------------------
+
+def test_pm_timeout_env_override(monkeypatch):
+    """GROUND_PM_TIMEOUT_S env var is read at import time and sets _PM_TIMEOUT_S."""
+    import importlib
+    import agents_core.ground as gmod
+
+    monkeypatch.setenv("GROUND_PM_TIMEOUT_S", "3.7")
+    importlib.reload(gmod)
+    try:
+        assert gmod._PM_TIMEOUT_S == pytest.approx(3.7), \
+            f"Expected _PM_TIMEOUT_S=3.7 after reload with env var, got {gmod._PM_TIMEOUT_S}"
+    finally:
+        monkeypatch.delenv("GROUND_PM_TIMEOUT_S", raising=False)
+        importlib.reload(gmod)  # restore default for subsequent tests
+
+
+# ---------------------------------------------------------------------------
+# 11. Bounded read: semantic regression — active targets + decisions + briefs
+# ---------------------------------------------------------------------------
+
+def test_bounded_read_surfaces_active_targets_and_decisions(tmp_path):
+    """Bounded _do_pm_state_read still surfaces active targets + latest decision + brief."""
+    from agents_core.mem import MemoryStore as RealMemoryStore
+    from agents_core.targets import TargetStore as RealTargetStore
+
+    targets_dir = _make_target_yaml(tmp_path, "foo-v0", "Foo Target", pm_bound=True)
+
+    db = _make_mem_db(tmp_path, [
+        {
+            "key": "router/lapis-pm/decisions/evt-foo-001",
+            "content": json.dumps({
+                "freshness_stamp": "2026-06-24T08:00:00Z",
+                "verdict": "proposed",
+                "expert_chosen": "fixer",
+                "intent_summary": "do the foo thing",
+                "target_id": "foo-v0",
+            }),
+            "tags": "lapis-pm,router-portfolio,target:foo-v0",
+        },
+        {
+            "key": "pm/outstanding-brief/foo-v0",
+            "content": "Awaiting Erah review of the fixer PR.",
+            "tags": "lapis-pm,target:foo-v0",
+        },
+    ])
+
+    with patch("agents_core.ground.MemoryStore", side_effect=lambda: RealMemoryStore(db)), \
+         patch("agents_core.ground.TargetStore", side_effect=lambda: RealTargetStore(targets_dir)), \
+         patch("agents_core.ground.retrieve", return_value=[]):
+        bundle = ground("foo query", pm_state=True, token_budget=3000)
+
+    assert bundle.stale is False
+    assert "pm:foo-v0" in bundle.context_block
+    assert "proposed" in bundle.context_block, "latest decision verdict must appear"
+    assert "fixer" in bundle.context_block, "expert_chosen must appear"
+    assert "do the foo thing" in bundle.context_block, "intent_summary must appear"
+    assert "Awaiting Erah review" in bundle.context_block, "outstanding brief must appear"
+
+
+# ---------------------------------------------------------------------------
+# 12. Slow-leak warning fires for reads above soft threshold but under guard
+# ---------------------------------------------------------------------------
+
+def test_slow_leak_warning_fires(caplog):
+    """A healthy read >= 60% of the guard emits log.warning; stale stays False."""
+    import logging
+    import time
+    import agents_core.ground as gmod
+
+    orig_timeout = gmod._PM_TIMEOUT_S
+    gmod._PM_TIMEOUT_S = 0.5  # guard = 500ms; threshold = 300ms
+
+    def _slow_but_ok():
+        time.sleep(0.35)  # 70% of guard — above threshold, below guard
+        return (
+            "[pm:slow-target]\ntarget:slow-target (Slow) [low]",
+            [{"tag": "pm:slow-target", "source": "pm_state", "score": None, "why": "active-target"}],
+        )
+
+    try:
+        with patch("agents_core.ground._do_pm_state_read", side_effect=_slow_but_ok), \
+             patch("agents_core.ground.retrieve", return_value=[]), \
+             caplog.at_level(logging.WARNING, logger="agents_core.ground"):
+            bundle = ground("q", pm_state=True)
+    finally:
+        gmod._PM_TIMEOUT_S = orig_timeout
+
+    assert bundle.stale is False, "slow-but-healthy read must not set stale=True"
+    slow_warnings = [r for r in caplog.records if "slow" in r.message.lower()]
+    assert len(slow_warnings) >= 1, "warning must be emitted for read above soft threshold"
+    assert "pm_state read failed" not in caplog.text, "must not emit failure message"

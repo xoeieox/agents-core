@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
+import time
 from dataclasses import dataclass
 
 from agents_core.mem import MemoryStore
@@ -23,7 +25,11 @@ from agents_core.targets import TargetStore
 log = logging.getLogger(__name__)
 
 _DEFAULT_SCOPE = ["mem", "vault-rag", "chub"]
-_PM_TIMEOUT_S = 0.2  # hard non-blocking guard for MemoryStore/TargetStore reads
+# Hard wall-clock guard for PM-state read. Widened from 200ms (which was below
+# the measured ~412ms healthy read on BRIX) to 1.5s to catch only pathological
+# lock/hang cases. Override without a code change via GROUND_PM_TIMEOUT_S env var.
+_PM_TIMEOUT_S: float = float(os.environ.get("GROUND_PM_TIMEOUT_S", "1.5"))
+_PM_WARN_FRACTION = 0.6  # emit warning when healthy read >= this fraction of the guard
 _MEM_BIAS_NAMESPACES = {"decision", "project", "architecture"}
 
 
@@ -240,8 +246,10 @@ def _assemble_pm_state() -> tuple[str, list[dict], bool]:
             exc_holder[0] = exc
 
     t = threading.Thread(target=_read, daemon=True)
+    t_start = time.monotonic()
     t.start()
     t.join(timeout=_PM_TIMEOUT_S)
+    elapsed = time.monotonic() - t_start
 
     if t.is_alive() or result[0] is None:
         why = "timeout" if t.is_alive() else (
@@ -249,6 +257,16 @@ def _assemble_pm_state() -> tuple[str, list[dict], bool]:
         )
         log.warning("ground: PM-state read failed (%s); continuing substrate-only", why)
         return "", [{"tag": "ungrounded", "source": "pm_state", "why": why}], True
+
+    warn_threshold = _PM_TIMEOUT_S * _PM_WARN_FRACTION
+    if elapsed >= warn_threshold:
+        log.warning(
+            "ground: PM-state read slow (%.0fms >= %.0fms soft threshold); "
+            "approaching guard (%.0fms) - portfolio growth may cross the bound",
+            elapsed * 1000,
+            warn_threshold * 1000,
+            _PM_TIMEOUT_S * 1000,
+        )
 
     block, prov = result[0]
     return block, prov, False
@@ -258,7 +276,7 @@ def _do_pm_state_read() -> tuple[str, list[dict]]:
     """Inner PM-state read — runs inside the timeout thread.
 
     Reads:
-      - TargetStore.load_all() -> active + pm_bound targets (YAML, no mem)
+      - TargetStore.active_targets() -> active + pm_bound targets (YAML, no mem)
       - router/lapis-pm/decisions/* (via mem key tag target:<id>)
       - pm/outstanding-brief/<id> (via direct mem get)
     """
@@ -266,11 +284,11 @@ def _do_pm_state_read() -> tuple[str, list[dict]]:
     mem = MemoryStore()
     try:
         ts = TargetStore()
-        targets = ts.load_all()
+        active = ts.active_targets()  # skip archived/dead targets; sorted by urgency
 
-        active_bound = [t for t in targets if t.status == "active" and t.pm_bound]
+        active_bound = [t for t in active if t.pm_bound]
         if not active_bound:
-            active_bound = [t for t in targets if t.status == "active"]
+            active_bound = active
 
         lines: list[str] = []
         provenance: list[dict] = []
@@ -312,7 +330,7 @@ def _do_pm_state_read() -> tuple[str, list[dict]]:
 
 def _find_latest_decision_via_mem(mem: MemoryStore, target_id: str) -> dict | None:
     """Replicate router_portfolio.find_latest_decision without importing lapis_pm."""
-    rows = mem.list_all(tags=["lapis-pm", f"target:{target_id}"], limit=200)
+    rows = mem.list_all(tags=["lapis-pm", f"target:{target_id}"], limit=20)
     best: dict | None = None
     best_stamp = ""
     for row in rows:
