@@ -14,7 +14,7 @@ from __future__ import annotations
 import importlib
 import subprocess
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -76,24 +76,29 @@ def test_unreachable_rag_backend_returns_others_hits():
 
 
 def test_unreachable_rag_wall_clock_bounded():
-    """retrieve() with a slow-connect RAG backend completes within fast-fail bound + slack."""
-    # Simulate a backend that hangs for longer than RAG_HTTP_TIMEOUT
-    slow_timeout = RAG_HTTP_TIMEOUT + 0.5  # slightly over bound
+    """retrieve() with slow RAG backends completes within fast-fail bound + slack.
+
+    All three RAG backends sleep for RAG_HTTP_TIMEOUT before failing.  With
+    parallel fan-out elapsed should be ~RAG_HTTP_TIMEOUT; serial would be
+    ~3*RAG_HTTP_TIMEOUT, which would fail the assertion.
+    """
+    sim_delay = RAG_HTTP_TIMEOUT  # each backend consumes the full timeout
 
     def fake_search_rag(source, query, filters):
-        # httpx.post will raise ReadTimeout after RAG_HTTP_TIMEOUT; simulate it cheaply
-        raise httpx.ReadTimeout(f"timed out after {RAG_HTTP_TIMEOUT}s")
+        time.sleep(sim_delay)
+        raise httpx.ReadTimeout(f"timed out after {sim_delay}s")
 
     with patch.object(retrieval_mod, "_search_mem", return_value=[]), \
          patch.object(retrieval_mod, "_search_chub", return_value=[]), \
          patch.object(retrieval_mod, "_search_rag", side_effect=fake_search_rag):
         t0 = time.monotonic()
-        hits = retrieve("query", scope=["mem", "chub", "vault-rag"])
+        hits = retrieve("query", scope=["mem", "chub", "vault-rag", "room-rag", "code-rag"])
         elapsed = time.monotonic() - t0
 
-    slack = 2.0  # generous CI slack
-    assert elapsed < RAG_HTTP_TIMEOUT + slack, (
-        f"retrieve() took {elapsed:.2f}s — exceeded bound {RAG_HTTP_TIMEOUT}s + {slack}s slack"
+    slack = 2.0  # generous CI slack; serial execution would produce ~4.5s, catching the bug
+    assert elapsed < sim_delay + slack, (
+        f"retrieve() took {elapsed:.2f}s with {sim_delay}s per backend "
+        f"— parallel fan-out appears broken (serial would take ~{3 * sim_delay:.1f}s)"
     )
     assert hits == []
 

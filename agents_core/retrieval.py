@@ -17,7 +17,7 @@ Default RAG_HOST is 203.0.113.10. Override via env:
   ROOM_RAG_URL    — full base URL for room-rag
   CODE_RAG_URL    — full base URL for code-rag
   RAG_HTTP_TIMEOUT — per-call wall-clock limit for RAG HTTP (default 1.5 s)
-  CHUB_TIMEOUT    — subprocess wall-clock limit for chub (default 2.0 s)
+  CHUB_TIMEOUT    — subprocess wall-clock limit for chub (default 1.5 s)
 
 Filter dict
 ===========
@@ -77,7 +77,7 @@ _RAG_BASE_URLS: dict[str, str] = {
 }
 
 RAG_HTTP_TIMEOUT: float = float(os.environ.get("RAG_HTTP_TIMEOUT", "1.5"))
-CHUB_TIMEOUT: float = float(os.environ.get("CHUB_TIMEOUT", "2.0"))
+CHUB_TIMEOUT: float = float(os.environ.get("CHUB_TIMEOUT", "1.5"))
 
 
 @dataclass(frozen=True)

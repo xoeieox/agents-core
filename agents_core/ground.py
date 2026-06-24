@@ -68,7 +68,7 @@ def ground(
 
     Note:
         RAG backend timeouts are controlled by retrieve() and are env-overridable:
-        RAG_HTTP_TIMEOUT (default 1.5 s) and CHUB_TIMEOUT (default 2.0 s).
+        RAG_HTTP_TIMEOUT (default 1.5 s) and CHUB_TIMEOUT (default 1.5 s).
 
     Returns:
         GroundBundle (never raises).
