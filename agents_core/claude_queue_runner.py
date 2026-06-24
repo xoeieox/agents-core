@@ -465,6 +465,7 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
         stdout_b, stderr_b = await asyncio.wait_for(
             proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
+        killed_pid = proc.pid
         try:
             proc.kill()
         except ProcessLookupError:
@@ -475,6 +476,15 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
         Path(output_path).write_text(result)
         queue.fail(task_id, error=f"timeout after {timeout}s")
         notify_failure(task, result)
+        # D4: best-effort fail outstanding gw-admission tickets from the killed subprocess.
+        try:
+            import socket as _socket
+            from agents_core.elevator import ElevatorStore as _ES, DB_DIR as _EDB, DB_PATH as _EDBP
+            _estore = _ES(db_path=_EDBP)
+            _estore.fail_pending_by_pid(_socket.gethostname(), killed_pid)
+            _estore.close()
+        except Exception:
+            pass
         return
 
     combined = (stdout_b + stderr_b).decode(errors="replace").strip()
@@ -594,6 +604,7 @@ async def _run_council_task(queue: ClaudeQueue, task: dict) -> None:
     try:
         await asyncio.wait_for(proc.wait(), timeout=timeout)
     except asyncio.TimeoutError:
+        council_killed_pid = proc.pid
         try:
             proc.kill()
         except ProcessLookupError:
@@ -603,6 +614,15 @@ async def _run_council_task(queue: ClaudeQueue, task: dict) -> None:
         _force_council_run_failed(run_yaml_path, task_id, f"council worker {msg}")
         queue.fail(task_id, error=msg)
         notify_failure(task, msg)
+        # D4: best-effort fail outstanding gw-admission tickets from the killed council process.
+        try:
+            import socket as _socket
+            from agents_core.elevator import ElevatorStore as _ES, DB_PATH as _EDBP
+            _estore = _ES(db_path=_EDBP)
+            _estore.fail_pending_by_pid(_socket.gethostname(), council_killed_pid)
+            _estore.close()
+        except Exception:
+            pass
         return
 
     rc = proc.returncode

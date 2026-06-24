@@ -478,6 +478,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                 admitted = False
                 is_ride_along = False
                 wf_retries = 0
+                _loop_ticket_settled = False
                 deadline = time.monotonic() + _max_wait
                 client = DoormanClient()
                 try:
@@ -490,6 +491,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                             if _provenance_out is not None:
                                 _provenance_out.append(("slot_queued_timeout", "gravitywell"))
                             elevator.fail(ticket)
+                            _loop_ticket_settled = True
                             return _apply_wake_fail(
                                 on_wake_fail, operator_class, prompt,
                                 _provenance_out=_provenance_out, **wake_fail_kwargs,
@@ -534,6 +536,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                             if _provenance_out is not None:
                                 _provenance_out.append(("doorman_unreachable", "gravitywell"))
                             elevator.fail(ticket)
+                            _loop_ticket_settled = True
                             return _apply_wake_fail(
                                 on_wake_fail, operator_class, prompt,
                                 _provenance_out=_provenance_out, **wake_fail_kwargs,
@@ -555,6 +558,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                                 _provenance_out.append(("gw_not_serving", "gravitywell"))
                             if wf_retries >= _max_wf:
                                 elevator.fail(ticket)
+                                _loop_ticket_settled = True
                                 return _apply_wake_fail(
                                     on_wake_fail, operator_class, prompt,
                                     _provenance_out=_provenance_out, **wake_fail_kwargs,
@@ -590,6 +594,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                                         _provenance_out.append(("gw_member_deadline", "gravitywell"))
                                     elevator.fail(ticket)
                                     ticket_settled = True
+                                    _loop_ticket_settled = True
                                     client.release("gravitywell", work_id)
                                     lease_released = True
                                     return _apply_wake_fail(
@@ -601,6 +606,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                                         _provenance_out.append(("serving_http_error", "gravitywell"))
                                     elevator.fail(ticket)
                                     ticket_settled = True
+                                    _loop_ticket_settled = True
                                     return _apply_wake_fail(
                                         on_wake_fail, operator_class, prompt,
                                         _provenance_out=_provenance_out, **wake_fail_kwargs,
@@ -612,6 +618,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                                     if not ticket_settled:
                                         elevator.fail(ticket)
                                         ticket_settled = True
+                                        _loop_ticket_settled = True
                                     raise
                                 if _provenance_out is not None:
                                     _provenance_out.append(("success", "gravitywell"))
@@ -625,12 +632,23 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                                     },
                                 )
                                 ticket_settled = True
+                                _loop_ticket_settled = True
                                 return result
                             finally:
                                 _executor.shutdown(wait=False)
                                 if not lease_released:
                                     client.release("gravitywell", work_id)
                 finally:
+                    # AC3: guarantee no pending-wait ticket leaks on any catchable exit.
+                    if not _loop_ticket_settled:
+                        try:
+                            if _provenance_out is not None:
+                                _provenance_out.append(
+                                    ("gw_admission_loop_aborted", "gravitywell")
+                                )
+                            elevator.fail(ticket)
+                        except Exception:
+                            pass
                     client.close()
                     elevator.close()
 

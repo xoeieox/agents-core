@@ -55,6 +55,13 @@ ELEVATOR_MASTER_URL = os.environ.get("ELEVATOR_MASTER_URL", "http://203.0.113.10
 # Reaper tuning: pending items expire after this many seconds (U1 conservative default; tune with data).
 ELEVATOR_PENDING_MAX_AGE_SEC = 3600
 
+# Pending-orphan reaper tuning (gw-admission-pending-orphan-reclaim-v0).
+# Grace period before a freshly-enqueued ticket can be reaped (enqueuer may be mid-startup).
+GW_ADMISSION_ORPHAN_GRACE_SEC = int(os.environ.get("GW_ADMISSION_ORPHAN_GRACE_SEC", "60"))
+# Presumed-dead backstop: any pending gw-admission ticket older than this is reaped regardless
+# of liveness probe result (any live enqueuer would have timed out itself by then).
+GW_ADMISSION_MAX_WAIT_SEC = int(os.environ.get("GW_ADMISSION_MAX_WAIT_SEC", "900"))
+
 # Lane order (priority for claim): interactive first, then deliberation, then execution.
 LANES = ("interactive", "deliberation", "execution")
 VALID_LANES = frozenset(LANES)
@@ -97,6 +104,15 @@ CREATE INDEX IF NOT EXISTS queue_items_status_claimed
 def _now() -> str:
     """ISO-8601 UTC timestamp."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _get_process_start_time(pid: int) -> float | None:
+    """Return psutil create_time() for pid, or None on any error (including NoSuchProcess)."""
+    try:
+        import psutil
+        return psutil.Process(pid).create_time()
+    except Exception:
+        return None
 
 
 class QueueError(Exception):
@@ -186,6 +202,17 @@ class ElevatorStore:
         if depends_on is not None:
             if depends_on == iid:
                 raise ValueError(f"self-reference: item cannot depend on itself")
+
+        # Stamp enqueuer identity (host + pid + process-start-time triple) for the
+        # pending-orphan reaper. Stored in payload to avoid a schema migration.
+        # Backward-compatible: existing code that reads payload ignores unknown keys.
+        enqueuer_pid = os.getpid()
+        enqueuer_id: dict[str, Any] = {"host": HOSTNAME, "pid": enqueuer_pid}
+        st = _get_process_start_time(enqueuer_pid)
+        if st is not None:
+            enqueuer_id["start_time"] = st
+        payload = dict(payload)
+        payload["_enqueuer_id"] = enqueuer_id
 
         with self._lock:
             exists = self._conn.execute(
@@ -551,10 +578,10 @@ class ElevatorStore:
         return self._reap_inline()
 
     def _reap_inline(self) -> dict[str, int]:
-        """Inline reap: expire pending items and reclaim stale claims per lane.
+        """Inline reap: expire pending items, reclaim stale claims, and reap dead-enqueuer orphans.
 
-        Expire + reclaim run as a single atomic transaction under the store lock.
-        Returns {"expired": count, "reclaimed": count}."""
+        All operations run as a single atomic transaction under the store lock.
+        Returns {"expired": count, "reclaimed": count, "orphan_reaped": count}."""
         now = datetime.now(timezone.utc)
         max_age = timedelta(seconds=ELEVATOR_PENDING_MAX_AGE_SEC)
         now_str = now.isoformat()
@@ -567,11 +594,141 @@ class ElevatorStore:
                 (cutoff,),
             )
             expired = cursor.rowcount
+            # Reap dead-enqueuer pending orphans (fast path; before absolute TTL).
+            orphan_reaped = self._reap_pending_orphans_locked(now)
             # Reclaim stale claims on all lanes in the same transaction.
             reclaimed = sum(self._reclaim_stale_locked(lane, now_str) for lane in LANES)
             self._conn.commit()
 
-        return {"expired": expired, "reclaimed": reclaimed}
+        return {"expired": expired, "reclaimed": reclaimed, "orphan_reaped": orphan_reaped}
+
+    def _reap_pending_orphans_locked(self, now: datetime) -> int:
+        """Reap pending gw-admission tickets whose enqueuer process is provably dead.
+
+        Caller MUST hold self._lock and must call self._conn.commit() after.
+
+        Liveness ladder (per spec gw-admission-pending-orphan-reclaim-v0 D2):
+        1. Grace period: tickets younger than GW_ADMISSION_ORPHAN_GRACE_SEC are spared.
+        2. Precise liveness (primary): if stamped host matches, probe pid. Reap if:
+           - pid is dead (ESRCH), OR
+           - pid is alive but start_time mismatches (PID recycled; original enqueuer dead).
+        3. Presumed-dead backstop: any pending gw-admission ticket older than
+           GW_ADMISSION_MAX_WAIT_SEC is reaped regardless of liveness result.
+        4. Absolute TTL: handled by the caller's cutoff sweep (ELEVATOR_PENDING_MAX_AGE_SEC).
+
+        Returns count of tickets transitioned to failed."""
+        rows = self._conn.execute(
+            "SELECT item_id, payload, created_at FROM queue_items "
+            "WHERE status='pending' AND kind='gw-admission'"
+        ).fetchall()
+
+        reaped = 0
+        for row in rows:
+            item_id = row["item_id"]
+            try:
+                created = datetime.fromisoformat(row["created_at"])
+                # Ensure both datetimes are tz-aware for comparison.
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                age_sec = (now - created).total_seconds()
+            except Exception:
+                continue
+
+            # 1. Grace period: never reap a freshly-enqueued ticket.
+            if age_sec < GW_ADMISSION_ORPHAN_GRACE_SEC:
+                continue
+
+            # 3. Presumed-dead backstop: any live enqueuer would have timed out by now.
+            if age_sec >= GW_ADMISSION_MAX_WAIT_SEC:
+                self._conn.execute(
+                    "UPDATE queue_items SET status='failed', provenance=? WHERE item_id=?",
+                    (json.dumps({"orphan_reap": "presumed_dead_backstop",
+                                 "age_sec": int(age_sec)}), item_id),
+                )
+                reaped += 1
+                continue
+
+            # 2. Precise liveness: only probes same-host tickets with a valid stamp.
+            try:
+                payload = json.loads(row["payload"]) if row["payload"] else {}
+            except Exception:
+                payload = {}
+
+            enqueuer_id = payload.get("_enqueuer_id")
+            if not enqueuer_id:
+                continue  # no stamp: fall through to absolute TTL
+
+            enqueuer_host = enqueuer_id.get("host")
+            enqueuer_pid = enqueuer_id.get("pid")
+            enqueuer_start_time = enqueuer_id.get("start_time")
+
+            if enqueuer_host != HOSTNAME or enqueuer_pid is None:
+                continue  # cross-host or missing pid: fall through to absolute TTL
+
+            # Probe pid liveness.
+            try:
+                os.kill(enqueuer_pid, 0)
+                pid_alive = True
+            except OSError:
+                pid_alive = False
+
+            if not pid_alive:
+                self._conn.execute(
+                    "UPDATE queue_items SET status='failed', provenance=? WHERE item_id=?",
+                    (json.dumps({"orphan_reap": "pid_dead",
+                                 "enqueuer_pid": enqueuer_pid}), item_id),
+                )
+                reaped += 1
+                continue
+
+            # PID is alive — check start_time to guard against PID recycling.
+            if enqueuer_start_time is not None:
+                current_start = _get_process_start_time(enqueuer_pid)
+                if current_start is not None and abs(current_start - enqueuer_start_time) > 1.0:
+                    # Start-time mismatch: PID was recycled; original enqueuer is dead.
+                    self._conn.execute(
+                        "UPDATE queue_items SET status='failed', provenance=? WHERE item_id=?",
+                        (json.dumps({"orphan_reap": "pid_recycled",
+                                     "enqueuer_pid": enqueuer_pid}), item_id),
+                    )
+                    reaped += 1
+                    continue
+                # start_time matches: enqueuer is alive — spare this ticket.
+
+        return reaped
+
+    def fail_pending_by_pid(self, host: str, pid: int) -> int:
+        """Best-effort: fail all pending/claimed gw-admission tickets stamped with host+pid.
+
+        Used by parent-kill cleanup (D4) after proc.kill() to immediately unblock the
+        FIFO lane without waiting for the next reaper cycle. Never raises.
+        Returns count of tickets failed."""
+        try:
+            self._check_writable()
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT item_id, payload FROM queue_items "
+                    "WHERE status IN ('pending', 'claimed') AND kind='gw-admission'"
+                ).fetchall()
+                count = 0
+                for row in rows:
+                    try:
+                        payload = json.loads(row["payload"]) if row["payload"] else {}
+                    except Exception:
+                        continue
+                    eid = payload.get("_enqueuer_id", {})
+                    if eid.get("host") == host and eid.get("pid") == pid:
+                        self._conn.execute(
+                            "UPDATE queue_items SET status='failed', provenance=? WHERE item_id=?",
+                            (json.dumps({"orphan_reap": "parent_kill",
+                                         "enqueuer_pid": pid}), row["item_id"]),
+                        )
+                        count += 1
+                if count:
+                    self._conn.commit()
+                return count
+        except Exception:
+            return 0
 
     def _cascade_fail_dependents(self) -> None:
         """Cascade-fail pending items whose precursors are in terminal states.
