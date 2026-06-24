@@ -519,6 +519,26 @@ class ElevatorStore:
                 # Swallow exceptions to keep reaper alive.
                 pass
 
+    def reclaim_stale(self, lane: str) -> int:
+        """Reclaim stale claimed items on lane past their claim_ttl_sec.
+
+        Atomic under the store lock. Only touches items genuinely past their
+        claim_ttl_sec. Returns the count of reclaimed rows."""
+        self._check_writable()
+        now_str = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE queue_items SET status='pending', attempts=attempts+1, "
+                "claimed_at=NULL, claim_owner=NULL, claim_ttl_sec=NULL "
+                "WHERE lane=? AND status='claimed' AND claim_ttl_sec IS NOT NULL "
+                "AND claimed_at IS NOT NULL "
+                "AND datetime(claimed_at) < datetime(?, '-' || claim_ttl_sec || ' seconds')",
+                (lane, now_str),
+            )
+            reclaimed = cursor.rowcount
+            self._conn.commit()
+        return reclaimed
+
     def reap(self) -> dict[str, int]:
         """Expire aged pending items and reclaim stale claims.
 
@@ -527,11 +547,10 @@ class ElevatorStore:
         return self._reap_inline()
 
     def _reap_inline(self) -> dict[str, int]:
-        """Inline reap: expire pending items and reclaim stale claims.
+        """Inline reap: expire pending items and reclaim stale claims per lane.
 
         Returns {"expired": count, "reclaimed": count}."""
         now = datetime.now(timezone.utc)
-        now_str = now.isoformat()
         max_age = timedelta(seconds=ELEVATOR_PENDING_MAX_AGE_SEC)
 
         with self._lock:
@@ -543,18 +562,9 @@ class ElevatorStore:
                 (cutoff,),
             )
             expired = cursor.rowcount
-
-            # Reclaim stale claims: claimed items past their claim_ttl_sec.
-            cursor = self._conn.execute(
-                "UPDATE queue_items SET status='pending', attempts=attempts+1, "
-                "claimed_at=NULL, claim_owner=NULL, claim_ttl_sec=NULL "
-                "WHERE status='claimed' AND claim_ttl_sec IS NOT NULL "
-                "AND claimed_at IS NOT NULL "
-                "AND datetime(claimed_at) < datetime(?, '-' || claim_ttl_sec || ' seconds')",
-                (now_str,),
-            )
-            reclaimed = cursor.rowcount
             self._conn.commit()
+
+        reclaimed = sum(self.reclaim_stale(lane) for lane in LANES)
 
         return {"expired": expired, "reclaimed": reclaimed}
 
