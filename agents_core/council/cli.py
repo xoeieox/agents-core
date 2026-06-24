@@ -925,6 +925,7 @@ def run_deliberation(run_id: str) -> None:
                 ttl_sec=COUNCIL_STALL_S,
                 reason="council-deliberation-hold",
                 timeout=_gw_acquire_timeout(),
+                principal=_hold_work_id,
             )
             _hold_active = _hold_res.get("status") == "serving"
             print(
@@ -1039,6 +1040,7 @@ def run_deliberation(run_id: str) -> None:
                                 ttl_sec=COUNCIL_STALL_S,
                                 reason="council-deliberation-heartbeat",
                                 timeout=5.0,
+                                principal=_hold_work_id,
                             )
                         except Exception as _ref_err:
                             print(

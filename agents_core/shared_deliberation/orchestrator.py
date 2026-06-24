@@ -387,6 +387,7 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
                 "gravitywell", _span_work_id, _span_ttl,
                 "shared-deliberation-span-hold",
                 timeout=_gw_acquire_timeout(),
+                principal=_span_work_id,
             )
             _hold_status = _hold_res.get("status")
             if _hold_status == "serving":
@@ -418,6 +419,7 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
                                 "gravitywell", _wid, _ttl,
                                 "shared-deliberation-span-refresh",
                                 timeout=10.0,
+                                principal=_wid,
                             )
                         except Exception as _ref_err:
                             log.warning(

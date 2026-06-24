@@ -100,6 +100,10 @@ DOORMAN_IDLE_LOG = os.environ.get("DOORMAN_IDLE_LOG", "/var/log/doorman-idle.jso
 # Sentinel for deferred acquire (controller owns the mode)
 DEFERRED = object()
 
+# Sentinel principal for worker leases acquired without an explicit principal.
+# Never excluded from drain_count — makes a forgotten-principal diagnosable instead of invisible.
+GHOST_PRINCIPAL = "__GHOST_LEASE__"
+
 
 def _error(code: str, message: str) -> dict:
     return {"error": {"code": code, "message": message}}
@@ -429,7 +433,7 @@ class _NodeState:
             del self.leases[wid]
         return expired
 
-    def acquire_lease(self, work_id: str, ttl_sec: int, reason: str, role: str = "worker") -> bool | object:
+    def acquire_lease(self, work_id: str, ttl_sec: int, reason: str, role: str = "worker", principal: str | None = None) -> bool | object:
         """Try to ensure GW is serving, then register the lease.
 
         Returns True on success, DEFERRED if a foreign caller acquires during controller
@@ -439,6 +443,10 @@ class _NodeState:
           role: optional role descriptor (default "worker"). E.g., "mode-controller"
                 for the flip-controller's keepawake lease. Stored on the lease dict
                 for later ownership checks.
+          principal: logical admission group for drain-gate exclusion. Worker leases
+                     without a principal are stamped GHOST_PRINCIPAL — always counted,
+                     never excluded, emits critical log when counted in a drain decision.
+                     Non-worker leases are drain-gate-exempt; principal is ignored.
         """
         # Clear idle tracking: an arriving lease means the node is no longer idle
         was_idle = self.idle_since is not None
@@ -466,12 +474,15 @@ class _NodeState:
                 return DEFERRED
         if not ok:
             return False
-        self.leases[work_id] = {
+        lease_entry: dict = {
             "acquired_at": time.time(),
             "ttl_sec": ttl_sec,
             "reason": reason,
             "role": role,
         }
+        if role == "worker":
+            lease_entry["principal"] = principal if principal is not None else GHOST_PRINCIPAL
+        self.leases[work_id] = lease_entry
         self._place_hold()
         return True
 
@@ -756,7 +767,7 @@ def create_app(gw_url: str | None = None) -> FastAPI:
     # ------------------------------------------------------------------
 
     @app.get("/v0/drain-count")
-    def drain_count_endpoint(node: str = "gravitywell"):
+    def drain_count_endpoint(node: str = "gravitywell", exclude_principal: str | None = None):
         if node not in nodes:
             return JSONResponse(
                 status_code=400,
@@ -764,12 +775,27 @@ def create_app(gw_url: str | None = None) -> FastAPI:
             )
 
         state = nodes[node]
+        count = 0
         with state.lock:
             state._gc_stale()
-            count = sum(
-                1 for info in state.leases.values()
-                if info.get("role") == "worker"
-            )
+            for wid, info in state.leases.items():
+                if info.get("role") != "worker":
+                    continue
+                p = info.get("principal", GHOST_PRINCIPAL)
+                if p == GHOST_PRINCIPAL:
+                    # Ghost leases are always counted; emit critical log when counted in a drain decision
+                    if exclude_principal is not None:
+                        log.critical(
+                            "[doorman] drain_count ghost_lease_counted work_id=%s - "
+                            "role=worker lease has no principal; add principal= to "
+                            "acquire() call to prevent drain-gate freeze",
+                            wid,
+                        )
+                    count += 1
+                elif exclude_principal is not None and p == exclude_principal:
+                    continue  # same admission group — exclude from drain count
+                else:
+                    count += 1
         return {"node": node, "drain_count": count}
 
     # ------------------------------------------------------------------
@@ -783,6 +809,7 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         ttl_sec = int(body.get("ttl_sec", 300))
         reason = body.get("reason", "")
         role = body.get("role", "worker")
+        principal = body.get("principal") or None  # empty string → None → ghost
 
         if node not in nodes:
             return JSONResponse(
@@ -797,7 +824,7 @@ def create_app(gw_url: str | None = None) -> FastAPI:
 
         state = nodes[node]
         with state.lock:
-            ok = state.acquire_lease(work_id, ttl_sec, reason, role=role)
+            ok = state.acquire_lease(work_id, ttl_sec, reason, role=role, principal=principal)
 
         if ok is DEFERRED:
             return {

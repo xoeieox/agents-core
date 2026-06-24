@@ -412,6 +412,11 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         from agents_core.doorman_client import DoormanClient, DoormanUnreachable, _gw_acquire_timeout
 
         admission_mode = os.environ.get("GW_ADMISSION_MODE", "off")
+        if principal is not None and not principal:
+            raise ValueError(
+                "[gw-admission] empty-string principal is rejected; pass None to auto-group "
+                "by work_id, or pass a concrete non-empty principal"
+            )
         effective_principal = principal or work_id
         is_unique_work_id_principal = (principal is None)
 
@@ -508,9 +513,9 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                                 time.sleep(_poll)
                                 continue
 
-                        # Admitted. Fresh group: wait for drain_count==0.
+                        # Admitted. Fresh group: wait for drain_count==0 excluding own group.
                         if not is_ride_along:
-                            dc_val = client.drain_count()
+                            dc_val = client.drain_count(exclude_principal=effective_principal)
                             if dc_val is None:
                                 # AC12: proceed loud on unavailable drain_count
                                 _log.warning(
@@ -526,11 +531,12 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                                 time.sleep(_poll)
                                 continue
 
-                        # Acquire doorman lease.
+                        # Acquire doorman lease attributed to the admission group.
                         try:
                             res = client.acquire(
                                 "gravitywell", work_id, ttl_sec=timeout + 60,
                                 reason="call_operator", timeout=_gw_acquire_timeout(),
+                                principal=effective_principal,
                             )
                         except DoormanUnreachable:
                             if _provenance_out is not None:

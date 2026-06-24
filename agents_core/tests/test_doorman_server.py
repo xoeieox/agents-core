@@ -39,6 +39,7 @@ from agents_core.doorman_server import (
     DEFERRED,
     DOORMAN_DEFER_TO_CONTROLLER,
     DOORMAN_CONTROLLER_NAME,
+    GHOST_PRINCIPAL,
     _NodeState,
     _write_idle_log,
     create_app,
@@ -1686,3 +1687,130 @@ class TestDrainCount:
         c_no_token = TestClient(app, raise_server_exceptions=True)
         r = c_no_token.get("/v0/drain-count?node=gravitywell")
         assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Principal-aware drain-gate tests (gw-admission-drain-count-self-count-v0)
+# ---------------------------------------------------------------------------
+
+class TestPrincipalAwareDrainGate:
+    """AC1-AC6 from spec gw-admission-drain-count-self-count-v0."""
+
+    def _tc(self):
+        with patch("agents_core.doorman_server._start_refresh_thread"):
+            app = create_app(gw_url=GW_URL_DEFAULT)
+        return TestClient(app, raise_server_exceptions=True)
+
+    def _acquire(self, c, work_id, *, principal=None, role="worker"):
+        body = {
+            "node": "gravitywell",
+            "work_id": work_id,
+            "ttl_sec": 300,
+            "reason": "test",
+            "role": role,
+        }
+        if principal is not None:
+            body["principal"] = principal
+        with patch.object(_NodeState, "ensure_serving", return_value=True), \
+             patch.object(_NodeState, "_place_hold"):
+            return c.post("/lease/acquire", json=body)
+
+    # AC1: self-deadlock fix — own group's hold is excluded
+    def test_ac1_self_group_excluded_from_drain_count(self):
+        c = self._tc()
+        self._acquire(c, "hold-1", principal="council-delib-run42")
+        r = c.get("/v0/drain-count?node=gravitywell&exclude_principal=council-delib-run42")
+        assert r.status_code == 200
+        assert r.json()["drain_count"] == 0
+
+    # AC2: flip-protection — unfiltered query still counts the hold
+    def test_ac2_unfiltered_counts_hold(self):
+        c = self._tc()
+        self._acquire(c, "hold-1", principal="council-delib-run42")
+        r = c.get("/v0/drain-count?node=gravitywell")
+        assert r.json()["drain_count"] == 1
+
+    # AC3: real cross-group contention still gates
+    def test_ac3_different_principal_still_counted(self):
+        c = self._tc()
+        self._acquire(c, "other-worker", principal="council-delib-runXX")
+        r = c.get("/v0/drain-count?node=gravitywell&exclude_principal=council-delib-run42")
+        assert r.json()["drain_count"] == 1
+
+    # AC4: ghost marker
+    def test_ac4_no_principal_stamped_as_ghost(self):
+        c = self._tc()
+        self._acquire(c, "w-ghost")  # no principal
+        state = create_app.__wrapped__ if hasattr(create_app, "__wrapped__") else None
+        # Verify via state inspection: acquire_lease stamps ghost
+        s = _make_state()
+        with patch.object(s, "ensure_serving", return_value=True), \
+             patch.object(s, "_place_hold"):
+            s.acquire_lease("w-ghost", 300, "test", role="worker", principal=None)
+        assert s.leases["w-ghost"]["principal"] == GHOST_PRINCIPAL
+
+    def test_ac4_ghost_always_counted_not_excluded(self):
+        c = self._tc()
+        self._acquire(c, "w-ghost")  # no principal → ghost
+        r = c.get("/v0/drain-count?node=gravitywell&exclude_principal=council-delib-run42")
+        assert r.json()["drain_count"] == 1
+
+    def test_ac4_ghost_critical_log_emitted(self, caplog):
+        import logging
+        c = self._tc()
+        self._acquire(c, "w-ghost")  # no principal → ghost
+        with caplog.at_level(logging.CRITICAL, logger="doorman-server"):
+            r = c.get("/v0/drain-count?node=gravitywell&exclude_principal=real-principal")
+        assert r.json()["drain_count"] == 1
+        assert any("ghost_lease_counted" in rec.message for rec in caplog.records)
+        assert any("w-ghost" in rec.message for rec in caplog.records)
+
+    def test_ac4_ghost_no_critical_log_without_exclude(self, caplog):
+        """Ghost counted without exclude_principal must NOT log critical (unfiltered path)."""
+        import logging
+        c = self._tc()
+        self._acquire(c, "w-ghost")
+        with caplog.at_level(logging.CRITICAL, logger="doorman-server"):
+            c.get("/v0/drain-count?node=gravitywell")
+        assert not any("ghost_lease_counted" in rec.message for rec in caplog.records)
+
+    # AC4: ghost path does not raise
+    def test_ac4_ghost_does_not_raise(self):
+        c = self._tc()
+        self._acquire(c, "w-ghost")
+        r = c.get("/v0/drain-count?node=gravitywell&exclude_principal=real-principal")
+        assert r.status_code == 200
+
+    # AC6: backward compat — no exclude_principal = prior behavior
+    def test_ac6_backward_compat_no_exclude_param(self):
+        c = self._tc()
+        self._acquire(c, "w1", principal="p1")
+        self._acquire(c, "w2", principal="p2")
+        r = c.get("/v0/drain-count?node=gravitywell")
+        assert r.json()["drain_count"] == 2
+
+    def test_ac6_legacy_acquire_without_principal_succeeds(self):
+        """Legacy callers omitting principal= still succeed (stamped as ghost, not rejected)."""
+        s = _make_state()
+        with patch.object(s, "ensure_serving", return_value=True), \
+             patch.object(s, "_place_hold"):
+            result = s.acquire_lease("w-legacy", 300, "test")
+        assert result is True
+        assert s.leases["w-legacy"]["principal"] == GHOST_PRINCIPAL
+
+    def test_ac6_non_worker_role_no_principal_field(self):
+        """Non-worker leases (mode-controller) get no principal field."""
+        s = _make_state()
+        with patch.object(s, "ensure_serving", return_value=True), \
+             patch.object(s, "_place_hold"):
+            s.acquire_lease("ctrl", 300, "test", role="mode-controller")
+        assert "principal" not in s.leases["ctrl"]
+
+    # Multiple workers, some same group, some different
+    def test_mixed_principals_partial_exclusion(self):
+        c = self._tc()
+        self._acquire(c, "w-own1", principal="group-A")
+        self._acquire(c, "w-own2", principal="group-A")
+        self._acquire(c, "w-other", principal="group-B")
+        r = c.get("/v0/drain-count?node=gravitywell&exclude_principal=group-A")
+        assert r.json()["drain_count"] == 1  # only group-B counts
