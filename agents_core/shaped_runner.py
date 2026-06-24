@@ -150,6 +150,142 @@ def _build_meta(result: str | None, envelope: dict | None) -> dict:
     }
 
 
+def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
+    """Deterministic git/PR tail for the local-fixer engine.
+
+    Manages its own worktree (shaper doesn't set worktree_required for GPU-routed
+    agents). Returns a PR URL on success, "" on any failure — never raises.
+    """
+    import json as _json
+    import subprocess
+
+    from agents_core.gw_agent import call_gw_agent
+    from agents_core.worktree import setup_worktree, teardown_worktree
+    import agents_core.forgejo as _forgejo
+
+    task_id = spec.get("task_id") or spec.get("slot_id") or "lf-unknown"
+    target_id = spec.get("target_id", "unknown")
+    repo = spec.get("repo", "")
+    base_branch = spec.get("base_branch", "main")
+    slug = spec.get("slug", "local")
+    branch = f"lapis/{target_id}/{slug}"
+    bare_repo = repo.rsplit("/", 1)[-1] if repo else "agents-core"
+    effective_cwd = base_cwd or "/srv/agents"
+
+    _ARTIFACT_DIR = Path("/srv/lapis/gpu-queue/shaped")
+    transcript_path = _ARTIFACT_DIR / f"{task_id}-gw-transcript.json"
+
+    worktree_path = None
+    try:
+        handle = setup_worktree(task_id, effective_cwd, base_branch)
+        worktree_path = handle.path
+        cwd = str(worktree_path)
+
+        fixer_result, transcript = call_gw_agent(
+            prompt=spec["prompt"],
+            system=spec.get("system", ""),
+            cwd=cwd,
+            writeable=True,
+            timeout=int(spec.get("timeout_s", 1800)),
+            think=False,
+            on_wake_fail="skip",
+            work_id=task_id,
+        )
+
+        # Persist transcript regardless of outcome
+        try:
+            _ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+            transcript_path.write_text(
+                _json.dumps(transcript, ensure_ascii=False, default=str)
+            )
+        except OSError as exc:
+            print(f"WARN: local-fixer: transcript write failed: {exc}", file=sys.stderr)
+
+        final_diff = fixer_result.get("final_diff") or ""
+        concluded = fixer_result.get("concluded", False)
+        last_test_outcome = fixer_result.get("last_test_outcome")
+
+        if not concluded:
+            print("WARN: local-fixer: run not concluded (doorman unreachable or timeout)", file=sys.stderr)
+            return ""
+        if not final_diff.strip():
+            print("WARN: local-fixer: empty diff — no PR", file=sys.stderr)
+            return ""
+        if last_test_outcome is not None:
+            passed = int(last_test_outcome.get("passed") or 0)
+            if passed == 0:
+                print("WARN: local-fixer: zero passing tests — no PR", file=sys.stderr)
+                return ""
+
+        # Deterministic git (model never touches git)
+        def _git(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["git", "-C", cwd, *args],
+                capture_output=True, text=True,
+            )
+
+        r = _git("checkout", "-b", branch)
+        if r.returncode != 0:
+            print(f"WARN: local-fixer: git checkout -b failed: {r.stderr.strip()}", file=sys.stderr)
+            return ""
+        r = _git("add", "-A")
+        if r.returncode != 0:
+            print(f"WARN: local-fixer: git add failed: {r.stderr.strip()}", file=sys.stderr)
+            return ""
+        r = _git("commit", "-m", f"fix({target_id}): local-fixer harness")
+        if r.returncode != 0:
+            print(f"WARN: local-fixer: git commit failed: {r.stderr.strip()}", file=sys.stderr)
+            return ""
+        r = _git("push", "origin", f"HEAD:{branch}")
+        if r.returncode != 0:
+            print(f"WARN: local-fixer: git push failed: {r.stderr.strip()}", file=sys.stderr)
+            return ""
+
+        # Provenance PR body — factual only
+        diff_lines = [l for l in final_diff.splitlines()
+                      if l.startswith(("diff --git", "---", "+++", "@@", " ")) or l[:1] in ("+", "-")]
+        diffstat = "\n".join(diff_lines[:40]) or "(no changes)"
+
+        if last_test_outcome:
+            passed_c = int(last_test_outcome.get("passed") or 0)
+            failed_c = int(last_test_outcome.get("failed") or 0)
+            test_summary = f"{passed_c} passed, {failed_c} failed"
+        else:
+            test_summary = "no test outcome recorded"
+
+        step_count = len(fixer_result.get("steps") or [])
+
+        pr_body = (
+            f"Implemented by the local 122B fixer harness, not paid Claude.\n\n"
+            f"## Diff summary\n\n```diff\n{diffstat}\n```\n\n"
+            f"## Test outcome\n\n{test_summary}\n\n"
+            f"## Steps\n\n{step_count} tool-call step(s) executed.\n\n"
+            f"## Transcript\n\n`{transcript_path}`\n\n"
+            f"<!-- lapis-gpu-id: {task_id} -->\n"
+            f"<!-- lapis-tid: {target_id} -->"
+        )
+
+        pr = _forgejo.create_pr(
+            repo=bare_repo,
+            title=f"fix({target_id}): local-fixer",
+            head=branch,
+            base="main",
+            body=pr_body,
+        )
+        return pr.get("html_url", "")
+
+    except Exception as exc:
+        print(f"WARN: local-fixer: unexpected error: {exc}", file=sys.stderr)
+        return ""
+
+    finally:
+        if worktree_path is not None:
+            try:
+                teardown_worktree(task_id, effective_cwd)
+            except Exception as exc:
+                print(f"WARN: local-fixer: worktree teardown failed: {exc}", file=sys.stderr)
+
+
 def main():
     if len(sys.argv) != 2:
         print("ERROR: usage: python3 -m agents_core.shaped_runner <spec.json>", file=sys.stderr)
@@ -175,6 +311,18 @@ def main():
     # by shaper). Without it, `claude -p` cannot grant Write/Edit in a
     # non-cached-trust workspace and returns a "please allow writes" message.
     permission_mode = spec.get("permission_mode") or None
+
+    # Engine dispatch — local-fixer bypasses the claude -p path entirely and
+    # runs the deterministic git/PR tail around the GW 122B harness.
+    engine = spec.get("engine", "claude")
+    if engine == "local-fixer":
+        pr_url = _run_local_fixer(spec, base_cwd)
+        try:
+            spec_path.unlink()
+        except OSError:
+            pass
+        print(pr_url)
+        return
 
     # Per-task git worktree isolation for shaped agents (2026-04-23). When
     # the shaper routes to ClaudeQueue it sets worktree_required=True;
