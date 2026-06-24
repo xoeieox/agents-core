@@ -78,7 +78,6 @@ def _drain_count_from_state(doorman_state, exclude_principal: str | None = None)
     """
     count = 0
     with doorman_state.lock:
-        doorman_state._gc_stale()
         for wid, info in doorman_state.leases.items():
             if info.get("role") != "worker":
                 continue
@@ -483,7 +482,7 @@ from agents_core.elevator import ElevatorStore
 store = ElevatorStore()
 ticket = store.enqueue(
     lane='deliberation', kind='gw-admission',
-    payload={{'work_id': 'orphan-test'}},
+    payload={'work_id': 'orphan-test'},
     principal=principal, latency_class='batch',
 )
 print(ticket, flush=True)
@@ -808,10 +807,16 @@ def run_s4(
                 ok, is_ride_along = elevator.try_admit(ticket, "deliberation", principal)
                 if ok:
                     if not is_ride_along:
-                        dc = doorman.drain_count(exclude_principal=principal)
-                        if dc > 0:
+                        # Ticket is now 'claimed'; do NOT re-call try_admit.
+                        # Poll until concurrent workers drain, then proceed.
+                        while time.monotonic() < deadline:
+                            if doorman.drain_count(exclude_principal=principal) == 0:
+                                break
                             time.sleep(0.05)
-                            continue
+                        else:
+                            elevator.fail(ticket)
+                            failures.append(f"{label}_timeout")
+                            return False
                     doorman.acquire(work_id, principal=principal, role="worker")
                     try:
                         if friction:
