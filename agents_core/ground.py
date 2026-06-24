@@ -10,13 +10,11 @@ ground() makes NO model call and references no ANTHROPIC_API_KEY.
 
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import logging
 import re
 import threading
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 from agents_core.mem import MemoryStore
 from agents_core.retrieval import retrieve
@@ -52,7 +50,6 @@ def ground(
     pm_state: bool = True,
     token_budget: int = 3000,
     scope: list[str] | None = None,
-    timeout_s: float = 4.0,
 ) -> GroundBundle:
     """Assemble a cited, token-bounded context bundle.
 
@@ -61,7 +58,10 @@ def ground(
         pm_state:     Include live PM-state snapshot when True.
         token_budget: Rough upper bound on output tokens (chars / 4 estimate).
         scope:        RAG/mem backends to query. Default: ["mem","vault-rag","chub"].
-        timeout_s:    Per-backend HTTP timeout for RAG calls.
+
+    Note:
+        RAG backend timeouts are controlled by retrieve() (HTTP_TIMEOUT=5.0) and
+        are not configurable from this surface.
 
     Returns:
         GroundBundle (never raises).
@@ -88,7 +88,7 @@ def ground(
     # Half 1: retrieval substrate
     # -------------------------------------------------------------------------
     rag_block, rag_provenance, truncated = _assemble_rag(
-        query, effective_scope, rag_budget, timeout_s
+        query, effective_scope, rag_budget
     )
     provenance.extend(rag_provenance)
 
@@ -121,7 +121,6 @@ def _assemble_rag(
     query: str,
     scope: list[str],
     char_budget: int,
-    timeout_s: float,
 ) -> tuple[str, list[dict], bool]:
     """Query retrieve() with per-backend fail-soft; return (block, provenance, truncated)."""
     provenance: list[dict] = []
