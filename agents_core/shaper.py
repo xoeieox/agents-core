@@ -108,6 +108,7 @@ class ShapedAgent:
     capture_meta: bool = False
     notify: bool = False
     notify_policy: str = "always"
+    engine: str = "claude"
 
 
 @dataclass
@@ -158,6 +159,7 @@ class Shaper:
                 capture_meta=bool(body.get("capture_meta", False)),
                 notify=bool(body.get("notify", False)),
                 notify_policy=str(body.get("notify_policy", "always")),
+                engine=str(body.get("engine", "claude")),
             )
         self._registry = registry
 
@@ -232,6 +234,8 @@ class Shaper:
         spec = {
             "agent_type": agent.name,
             "target_id": target_id,
+            "repo": vars_.get("repo", ""),
+            "engine": agent.engine,
             "model": agent.model,
             "timeout_s": agent.timeout_s,
             "system": system,
@@ -313,6 +317,11 @@ class Shaper:
             }, task_id=task_id)
             output_path = f"/srv/lapis/claude-queue/completed/{task_id}-output.md"
         else:
+            # local-fixer needs task_id in the spec for worktree isolation;
+            # GPU-route doesn't pre-generate one so we inject spec_id as the id.
+            if agent.engine == "local-fixer":
+                spec["task_id"] = spec_id
+                spec["base_branch"] = "main"
             spec_path.write_text(json.dumps(spec, ensure_ascii=False))
             queue = GPUQueue()
             task_id = queue.submit({
