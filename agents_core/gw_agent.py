@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -29,6 +30,7 @@ from agents_core.doorman_client import DoormanClient, DoormanUnreachable
 
 GW_URL = os.environ.get("GW_URL", "http://203.0.113.11:8081")
 GW_AGENT_TOOL_OUTPUT_CAP = 8192
+GW_AGENT_TOOL_INPUT_CAP = 65536
 GW_AGENT_CTX_CAP = 120000
 
 logger = logging.getLogger(__name__)
@@ -317,6 +319,191 @@ class OpenPrsExecutor(ToolExecutor):
         return list(dict.fromkeys(paths))  # Remove duplicates while preserving order
 
 
+class WriteFileExecutor(ToolExecutor):
+    """Execute write_file(path, content): create/overwrite a file under cwd."""
+
+    def __init__(self, cwd: str | None = None):
+        self.cwd = Path(cwd or "/srv/agents").resolve()
+
+    def execute(self, arguments: dict) -> str | dict:
+        try:
+            path_arg = arguments["path"]
+            content = arguments["content"]
+
+            path = (self.cwd / path_arg).resolve()
+            if not str(path).startswith(str(self.cwd)):
+                return {"error": f"path outside cwd: {path}"}
+
+            if len(content) > GW_AGENT_TOOL_INPUT_CAP:
+                return {"error": f"content too large: {len(content)} bytes > {GW_AGENT_TOOL_INPUT_CAP}"}
+
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+            return f"wrote {len(content)} bytes to {path_arg}"
+        except Exception as e:
+            return {"error": f"write_file failed: {e}"}
+
+
+class ApplyEditExecutor(ToolExecutor):
+    """Execute apply_edit(path, old_string, new_string): exact-string unique replace."""
+
+    def __init__(self, cwd: str | None = None):
+        self.cwd = Path(cwd or "/srv/agents").resolve()
+
+    def execute(self, arguments: dict) -> str | dict:
+        try:
+            path_arg = arguments["path"]
+            old_string = arguments["old_string"]
+            new_string = arguments["new_string"]
+
+            path = (self.cwd / path_arg).resolve()
+            if not str(path).startswith(str(self.cwd)):
+                return {"error": f"path outside cwd: {path}"}
+
+            try:
+                content = path.read_text()
+            except FileNotFoundError:
+                return {"error": f"file not found: {path_arg}"}
+
+            count = content.count(old_string)
+            if count == 0:
+                return {"error": f"old_string not found in {path_arg}"}
+            if count > 1:
+                return {"error": f"old_string not unique in {path_arg}: found {count} occurrences"}
+
+            new_content = content.replace(old_string, new_string, 1)
+            path.write_text(new_content)
+            return f"applied edit to {path_arg}"
+        except Exception as e:
+            return {"error": f"apply_edit failed: {e}"}
+
+
+class RunTestsExecutor(ToolExecutor):
+    """Execute run_tests(target?, k_expr?): run pytest in cwd."""
+
+    _SHELL_METACHARS = set(";|&$()`\n\r")
+
+    def __init__(self, cwd: str | None = None, run_timeout: int = 180):
+        self.cwd = Path(cwd or "/srv/agents").resolve()
+        self.run_timeout = run_timeout
+
+    def execute(self, arguments: dict) -> str | dict:
+        try:
+            target = arguments.get("target")
+            k_expr = arguments.get("k_expr")
+
+            for val in [target, k_expr]:
+                if val and any(c in val for c in self._SHELL_METACHARS):
+                    return {"error": "shell metacharacters not allowed in test args"}
+
+            cmd = [sys.executable, "-m", "pytest"]
+            if target:
+                cmd.append(target)
+            if k_expr:
+                cmd.extend(["-k", k_expr])
+            cmd.append("-q")
+
+            timed_out = False
+            returncode = -1
+            output = ""
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.run_timeout,
+                    cwd=str(self.cwd),
+                    shell=False,
+                )
+                output = result.stdout + result.stderr
+                returncode = result.returncode
+            except subprocess.TimeoutExpired as e:
+                output = (
+                    (e.stdout or b"").decode(errors="replace")
+                    + (e.stderr or b"").decode(errors="replace")
+                    + f"\n[TIMEOUT after {self.run_timeout}s]"
+                )
+                timed_out = True
+
+            if len(output) > GW_AGENT_TOOL_OUTPUT_CAP:
+                output = output[:GW_AGENT_TOOL_OUTPUT_CAP] + "\n…[truncated]"
+
+            return _parse_pytest_outcome(output, returncode, timed_out)
+        except Exception as e:
+            return {"error": f"run_tests failed: {e}"}
+
+
+def _parse_pytest_outcome(output: str, returncode: int, timed_out: bool) -> dict:
+    """Parse pytest -q output into a structured outcome dict."""
+    lines = output.strip().splitlines()
+    summary = lines[-1] if lines else ""
+
+    passed = 0
+    failed = 0
+    errors = 0
+
+    passed_m = re.search(r"(\d+) passed", summary)
+    failed_m = re.search(r"(\d+) failed", summary)
+    error_m = re.search(r"(\d+) error", summary)
+    if passed_m:
+        passed = int(passed_m.group(1))
+    if failed_m:
+        failed = int(failed_m.group(1))
+    if error_m:
+        errors = int(error_m.group(1))
+
+    tail_lines = lines[-20:] if len(lines) > 20 else lines
+
+    return {
+        "passed": passed,
+        "failed": failed,
+        "errors": errors,
+        "timed_out": timed_out,
+        "returncode": returncode,
+        "summary": summary,
+        "output_tail": "\n".join(tail_lines),
+    }
+
+
+# FixerResult is the structured return value of a writeable call_gw_agent run.
+# final_diff: git diff output (empty string if no changes).
+# last_test_outcome: last run_tests structured dict, or None if never called.
+# concluded: True iff the run ended on finish_reason=="stop".
+# steps: per-step transcript list (same entries as return_transcript mode).
+FixerResult = dict  # alias for documentation; shape enforced by _build_fixer_result
+
+
+def _build_fixer_result(
+    cwd: str,
+    transcript: list[dict],
+    concluded: bool,
+) -> dict:
+    """Build a FixerResult dict from the completed writeable run."""
+    diff_result = subprocess.run(
+        ["git", "-C", cwd, "diff"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    final_diff = diff_result.stdout if diff_result.returncode == 0 else ""
+
+    last_test_outcome = None
+    for entry in reversed(transcript):
+        if entry.get("tool_name") == "run_tests" and entry.get("error") is None:
+            try:
+                last_test_outcome = json.loads(entry["result"])
+            except (json.JSONDecodeError, KeyError):
+                pass
+            break
+
+    return {
+        "final_diff": final_diff,
+        "last_test_outcome": last_test_outcome,
+        "concluded": concluded,
+        "steps": transcript,
+    }
+
+
 DEFAULT_READONLY_TOOLS: dict[str, dict[str, Any]] = {
     "read_file": {
         "type": "function",
@@ -426,16 +613,71 @@ DEFAULT_READONLY_TOOLS: dict[str, dict[str, Any]] = {
     },
 }
 
+DEFAULT_FIXER_TOOLS: dict[str, dict[str, Any]] = {
+    **DEFAULT_READONLY_TOOLS,
+    "write_file": {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Create or overwrite a file under cwd. Creates parent dirs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    "apply_edit": {
+        "type": "function",
+        "function": {
+            "name": "apply_edit",
+            "description": "Replace an exact, unique old_string with new_string in a file under cwd.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+    "run_tests": {
+        "type": "function",
+        "function": {
+            "name": "run_tests",
+            "description": "Run pytest in cwd. Optional target (path/node-id) and k_expr (-k filter).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string"},
+                    "k_expr": {"type": "string"},
+                },
+                "required": [],
+            },
+        },
+    },
+}
 
-def _get_tool_executors(cwd: str | None = None) -> dict[str, ToolExecutor]:
-    """Instantiate all default tool executors with a given cwd."""
-    return {
+
+def _get_tool_executors(cwd: str | None = None, writeable: bool = False) -> dict[str, ToolExecutor]:
+    """Instantiate tool executors with a given cwd. When writeable=True adds write executors."""
+    result: dict[str, ToolExecutor] = {
         "read_file": ReadFileExecutor(cwd),
         "grep": GrepExecutor(cwd),
         "git": GitExecutor(cwd),
         "mem": MemExecutor(cwd),
         "list_open_prs": OpenPrsExecutor(cwd),
     }
+    if writeable:
+        result["write_file"] = WriteFileExecutor(cwd)
+        result["apply_edit"] = ApplyEditExecutor(cwd)
+        result["run_tests"] = RunTestsExecutor(cwd)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +700,8 @@ def call_gw_agent(
     log: Callable[[str], None] | None = None,
     backend_url: str | None = None,
     acquire_lease: bool = True,
-) -> str | None | tuple[str | None, list[dict]]:
+    writeable: bool = False,
+) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Run a multi-step read-only tool-loop on GravityWell.
 
     The agent conducts adaptive archaeology via tools (read_file, grep, git, mem),
@@ -485,17 +728,22 @@ def call_gw_agent(
         return_transcript: If True, return (text, transcript) tuple instead of just text.
         log: Optional logging function for progress/debug output.
         backend_url: Optional backend URL override (default None → GW_URL). Used by
-                     swarm consumers (U4b-ii) to post to a different endpoint.
+                     swarm consumers to post to a different endpoint.
         acquire_lease: If False, skip doorman lease acquisition entirely (default True).
                        With defaults (True), behavior is byte-identical: acquire/release
                        are called, POST is to GW_URL. Only set both backend_url and
                        acquire_lease=False when running on swarm.
+        writeable: If True, add write tools (write_file, apply_edit, run_tests) and return
+                   (FixerResult, transcript). Default False keeps behavior byte-identical to
+                   read-only callers. The return_transcript argument is ignored for writeable
+                   runs — the tuple form is always used.
 
     Returns:
         - str or None (or (str|None, list) when return_transcript=True).
         - None means "did not run" (only on on_wake_fail="skip" + doorman failure).
         - Non-None with "[gw_agent: max_steps reached ...]" suffix means loop exhausted.
         - Transcript (if return_transcript) is a list of dicts with tool execution details.
+        - When writeable=True: always (FixerResult, transcript) regardless of return_transcript.
 
     The doorman lease is acquired once and held for the entire run; released in finally
     (unless acquire_lease=False). Tool errors are recovered gracefully: a malformed call
@@ -513,8 +761,12 @@ def call_gw_agent(
     if work_id is None:
         work_id = uuid.uuid4().hex[:8]
 
+    # Capture swarm flag BEFORE backend_url is reassigned to GW_URL.
+    # After the reassignment backend_url is never None, so testing it downstream is useless.
+    _is_swarm = (backend_url is not None) and (not acquire_lease)
+
     if tools is None:
-        tools = DEFAULT_READONLY_TOOLS
+        tools = DEFAULT_FIXER_TOOLS if writeable else DEFAULT_READONLY_TOOLS
 
     if backend_url is None:
         backend_url = GW_URL
@@ -525,7 +777,7 @@ def call_gw_agent(
     messages.append({"role": "user", "content": prompt})
 
     transcript: list[dict] = []
-    tool_executors = _get_tool_executors(cwd)
+    tool_executors = _get_tool_executors(cwd, writeable=writeable)
     repeated_calls: dict[str, int] = {}
     ctx_tokens = 0
 
@@ -547,6 +799,8 @@ def call_gw_agent(
                 if log:
                     log(f"[gw_agent] doorman unreachable: {e}")
                 if on_wake_fail == "skip":
+                    if writeable:
+                        return (_build_fixer_result(cwd, transcript, concluded=False), transcript)
                     return (None, transcript) if return_transcript else None
                 elif on_wake_fail == "error":
                     raise
@@ -561,6 +815,8 @@ def call_gw_agent(
                 if log:
                     log(f"[gw_agent] GW not serving: {res.get('status')}")
                 if on_wake_fail == "skip":
+                    if writeable:
+                        return (_build_fixer_result(cwd, transcript, concluded=False), transcript)
                     return (None, transcript) if return_transcript else None
                 elif on_wake_fail == "error":
                     raise Exception(f"GW not serving: {res.get('status')}")
@@ -585,7 +841,7 @@ def call_gw_agent(
                         "tools": list(tools.values()),
                         "tool_choice": "auto",
                         "temperature": 0.7,
-                        "chat_template_kwargs": {"enable_thinking": think},
+                        **({} if _is_swarm else {"chat_template_kwargs": {"enable_thinking": think}}),
                     },
                     timeout=timeout,
                 )
@@ -595,13 +851,17 @@ def call_gw_agent(
                 if log:
                     log(f"[gw_agent] GW request failed: {e}")
                 # Return best-effort content accumulated so far
-                return _finalize_result(messages, "", return_transcript, transcript)
+                return _finalize_writeable_or_readonly(
+                    messages, "", return_transcript, transcript, writeable, cwd, concluded=False
+                )
 
             # Extract response.
             if "choices" not in data or not data["choices"]:
                 if log:
                     log(f"[gw_agent] GW returned no choices")
-                return _finalize_result(messages, "", return_transcript, transcript)
+                return _finalize_writeable_or_readonly(
+                    messages, "", return_transcript, transcript, writeable, cwd, concluded=False
+                )
 
             choice = data["choices"][0]
             assistant_message = choice.get("message", {})
@@ -649,22 +909,17 @@ def call_gw_agent(
                         if log:
                             log(f"[gw_agent] breaking due to repeated call (4x): {tool_name}")
                         forced_content = _force_conclusion(
-                            messages, backend_url, timeout, json_mode, log
+                            messages, backend_url, timeout, json_mode, log, _is_swarm
                         )
                         if forced_content:
-                            return _finalize_result(
-                                messages,
-                                forced_content,
-                                return_transcript,
-                                transcript,
+                            return _finalize_writeable_or_readonly(
+                                messages, forced_content, return_transcript, transcript,
+                                writeable, cwd, concluded=True,
                             )
                         # Forced conclusion failed; fall back to exhaustion marker.
-                        return _finalize_result(
-                            messages,
-                            content,
-                            return_transcript,
-                            transcript,
-                            max_steps_reached=True,
+                        return _finalize_writeable_or_readonly(
+                            messages, content, return_transcript, transcript,
+                            writeable, cwd, concluded=False, max_steps_reached=True,
                         )
 
                     # Execute tool.
@@ -718,7 +973,9 @@ def call_gw_agent(
                 # Agent concluded (no tool_calls, just content).
                 if log:
                     log(f"[gw_agent] agent concluded at step {step_num + 1}")
-                return _finalize_result(messages, content, return_transcript, transcript)
+                return _finalize_writeable_or_readonly(
+                    messages, content, return_transcript, transcript, writeable, cwd, concluded=True
+                )
             else:
                 # finish_reason is neither tool_calls nor stop; treat as stop.
                 if log:
@@ -726,7 +983,9 @@ def call_gw_agent(
                         f"[gw_agent] agent ended with finish_reason={finish_reason} "
                         f"(expected stop or tool_calls)"
                     )
-                return _finalize_result(messages, content, return_transcript, transcript)
+                return _finalize_writeable_or_readonly(
+                    messages, content, return_transcript, transcript, writeable, cwd, concluded=True
+                )
 
         # Exhausted max_steps without conclusion; try forced conclusion.
         if log:
@@ -737,21 +996,15 @@ def call_gw_agent(
             if msg.get("role") == "assistant" and msg.get("content"):
                 last_content = msg.get("content", "")
                 break
-        forced_content = _force_conclusion(messages, backend_url, timeout, json_mode, log)
+        forced_content = _force_conclusion(messages, backend_url, timeout, json_mode, log, _is_swarm)
         if forced_content:
-            return _finalize_result(
-                messages,
-                forced_content,
-                return_transcript,
-                transcript,
+            return _finalize_writeable_or_readonly(
+                messages, forced_content, return_transcript, transcript, writeable, cwd, concluded=False
             )
         # Forced conclusion failed; fall back to exhaustion marker.
-        return _finalize_result(
-            messages,
-            last_content,
-            return_transcript,
-            transcript,
-            max_steps_reached=True,
+        return _finalize_writeable_or_readonly(
+            messages, last_content, return_transcript, transcript,
+            writeable, cwd, concluded=False, max_steps_reached=True,
         )
 
     finally:
@@ -834,6 +1087,7 @@ def _force_conclusion(
     timeout: int,
     json_mode: bool,
     log: Callable[[str], None] | None,
+    is_swarm: bool = False,
 ) -> str:
     """Emit a forced conclusion when the agent exhausts its tool budget.
 
@@ -870,7 +1124,7 @@ def _force_conclusion(
             json={
                 "messages": messages,
                 "temperature": 0.3,
-                "chat_template_kwargs": {"enable_thinking": False},
+                **({} if is_swarm else {"chat_template_kwargs": {"enable_thinking": False}}),
             },
             timeout=timeout,
         )
@@ -899,6 +1153,23 @@ def _force_conclusion(
         return ""
 
     return content
+
+
+def _finalize_writeable_or_readonly(
+    messages: list[dict],
+    content: str,
+    return_transcript: bool,
+    transcript: list[dict],
+    writeable: bool,
+    cwd: str,
+    concluded: bool,
+    max_steps_reached: bool = False,
+) -> str | None | tuple:
+    """Route to FixerResult or plain result based on writeable flag."""
+    if writeable:
+        fixer = _build_fixer_result(cwd, transcript, concluded=concluded and not max_steps_reached)
+        return (fixer, transcript)
+    return _finalize_result(messages, content, return_transcript, transcript, max_steps_reached)
 
 
 def _finalize_result(
