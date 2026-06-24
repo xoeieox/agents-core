@@ -289,9 +289,14 @@ class Shaper:
                 )
                 self._force_gpu_warned = True
 
+        # local-fixer does remote HTTP work via GravityWell — it has no local-GPU
+        # dependency and no GPU-queue consumer on BRIX. Route it to ClaudeQueue so
+        # the live claude-queue-runner executes it and lapis-pm can reconcile the
+        # dispatch record via ClaudeQueue.get_recent_failed/completed.
+        # force_gpu does not apply to local-fixer (there is no GPU path to fall back to).
         route_to_claude = (
-            agent.model in {"sonnet", "haiku", "opus"}
-            and not force_gpu
+            agent.engine == "local-fixer"
+            or (agent.model in {"sonnet", "haiku", "opus"} and not force_gpu)
         )
 
         if route_to_claude:
@@ -302,7 +307,10 @@ class Shaper:
             task_id = queue._generate_id(slug=f"{agent.name}-{target_id}")
             spec["task_id"] = task_id
             spec["base_branch"] = "main"
-            spec["worktree_required"] = True
+            # local-fixer manages its own worktree inside _run_local_fixer;
+            # setting worktree_required=True would cause the runner to set up a
+            # competing worktree before the engine even starts.
+            spec["worktree_required"] = agent.engine != "local-fixer"
             spec_path.write_text(json.dumps(spec, ensure_ascii=False))
             queue.submit({
                 "task_type": "subprocess",
@@ -317,11 +325,6 @@ class Shaper:
             }, task_id=task_id)
             output_path = f"/srv/lapis/claude-queue/completed/{task_id}-output.md"
         else:
-            # local-fixer needs task_id in the spec for worktree isolation;
-            # GPU-route doesn't pre-generate one so we inject spec_id as the id.
-            if agent.engine == "local-fixer":
-                spec["task_id"] = spec_id
-                spec["base_branch"] = "main"
             spec_path.write_text(json.dumps(spec, ensure_ascii=False))
             queue = GPUQueue()
             task_id = queue.submit({
