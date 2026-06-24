@@ -1001,7 +1001,7 @@ def run_deliberation(run_id: str) -> None:
         from agents_core.council.narrator_entity import NarratorEntity
 
         try:
-            adapter = _build_adapter(run["voicing"], ClaudeAdapter, LlamaAdapter)
+            adapter = _build_adapter(run["voicing"], ClaudeAdapter, LlamaAdapter, run_id=run_id)
             entities = [
                 _build_entity(sel, adapter, CharacterEntity, NarratorEntity)
                 for sel in run["selected_entities"]
@@ -1248,11 +1248,12 @@ def _build_director(mode: str, prompt: str, turns: int,
     raise ValueError(f"Unknown mode: {mode!r}")
 
 
-def _build_adapter(voicing: str, ClaudeAdapter, LlamaAdapter):
+def _build_adapter(voicing: str, ClaudeAdapter, LlamaAdapter, run_id: str | None = None):
     if voicing == "local":
         return LlamaAdapter(temperature=0.8, max_tokens=900)
     if voicing == "gravitywell":
-        return GravityWellAdapter(temperature=0.8)
+        principal = f"council-delib-{run_id}" if run_id else None
+        return GravityWellAdapter(temperature=0.8, principal=principal)
     if voicing in ("haiku", "sonnet", "opus"):
         raise ValueError(
             f"Paid-model voicing {voicing!r} is not available via the council CLI. "
