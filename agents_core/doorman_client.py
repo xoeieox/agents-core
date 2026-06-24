@@ -115,7 +115,7 @@ class DoormanClient:
         except httpx.TimeoutException as e:
             raise DoormanUnreachable(f"doorman timeout at {self._base_url}: {e}") from e
 
-    def acquire(self, node: str, work_id: str, ttl_sec: int, reason: str, role: str = "worker", timeout: float | None = None) -> dict:
+    def acquire(self, node: str, work_id: str, ttl_sec: int, reason: str, role: str = "worker", timeout: float | None = None, principal: str | None = None) -> dict:
         """Acquire a lease for node.
 
         Args:
@@ -125,19 +125,26 @@ class DoormanClient:
           timeout: optional per-request timeout override (default uses client timeout).
                    For GW acquire, pass _gw_acquire_timeout() to ensure the HTTP
                    timeout outlives the server's GW_WAKE_DEADLINE_SEC.
+          principal: logical admission group for drain-gate exclusion. Worker leases
+                     without a principal are stamped __GHOST_LEASE__ on the server —
+                     always counted, never excluded. Pass the group's shared identifier
+                     (e.g. council-delib-<run_id>) so sibling calls can self-exclude.
 
         Returns dict with status field:
           "serving" — GW is serving; lease registered and keepawake hold placed
           "deferred" — GW is serving a controller-owned non-big mode; no lease registered
           "wake_failed" — GW failed to wake
         """
-        return self._post("/lease/acquire", {
+        body: dict = {
             "node": node,
             "work_id": work_id,
             "ttl_sec": ttl_sec,
             "reason": reason,
             "role": role,
-        }, timeout=timeout)
+        }
+        if principal is not None:
+            body["principal"] = principal
+        return self._post("/lease/acquire", body, timeout=timeout)
 
     def release(self, node: str, work_id: str) -> None:
         """Release a lease. Idempotent — unknown work_id is a no-op."""
@@ -149,13 +156,23 @@ class DoormanClient:
     def healthz(self) -> dict:
         return self._get("/healthz")
 
-    def drain_count(self, node: str = "gravitywell") -> int | None:
+    def drain_count(self, node: str = "gravitywell", exclude_principal: str | None = None) -> int | None:
         """Get the in-flight worker-lease count (drain-count) for node.
+
+        Args:
+          exclude_principal: when set, leases whose principal equals this value are
+                             excluded from the count (same-group self-exclusion).
+                             Ghost leases (__GHOST_LEASE__) are never excluded.
+                             Without this param the endpoint behaves as before
+                             (counts all workers) — flip-controller unaffected.
 
         Returns int on success, None on 404 (pre-this-unit doormen) or unreachable.
         """
+        url = f"/v0/drain-count?node={node}"
+        if exclude_principal is not None:
+            url += f"&exclude_principal={exclude_principal}"
         try:
-            data = self._get(f"/v0/drain-count?node={node}")
+            data = self._get(url)
             return data.get("drain_count")
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
