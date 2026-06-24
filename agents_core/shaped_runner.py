@@ -159,10 +159,6 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
     import json as _json
     import subprocess
 
-    from agents_core.gw_agent import call_gw_agent
-    from agents_core.worktree import setup_worktree, teardown_worktree
-    import agents_core.forgejo as _forgejo
-
     task_id = spec.get("task_id") or spec.get("slot_id") or "lf-unknown"
     target_id = spec.get("target_id", "unknown")
     repo = spec.get("repo", "")
@@ -177,6 +173,10 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
 
     worktree_path = None
     try:
+        from agents_core.gw_agent import call_gw_agent
+        from agents_core.worktree import setup_worktree, teardown_worktree
+        import agents_core.forgejo as _forgejo
+
         handle = setup_worktree(task_id, effective_cwd, base_branch)
         worktree_path = handle.path
         cwd = str(worktree_path)
@@ -219,10 +219,14 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
 
         # Deterministic git (model never touches git)
         def _git(*args: str) -> subprocess.CompletedProcess:
-            return subprocess.run(
-                ["git", "-C", cwd, *args],
-                capture_output=True, text=True,
-            )
+            try:
+                return subprocess.run(
+                    ["git", "-C", cwd, *args],
+                    capture_output=True, text=True, timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                print(f"WARN: local-fixer: git {args[0]} timed out", file=sys.stderr)
+                return subprocess.CompletedProcess(["git", "-C", cwd, *args], 1, "", "timeout")
 
         r = _git("checkout", "-b", branch)
         if r.returncode != 0:
