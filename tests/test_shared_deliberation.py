@@ -4,6 +4,7 @@ Fixtures stub Facets and Council via env vars, avoiding live GW/Council/Facets c
 """
 
 import os
+import threading
 import pytest
 import asyncio
 from unittest.mock import Mock, AsyncMock, patch
@@ -576,19 +577,27 @@ async def test_span_hold_refresh_fires(monkeypatch, init_semaphore):
 
     import agents_core.shared_deliberation.orchestrator as orch
 
-    async def slow_facets(*a, **kw):
-        await asyncio.sleep(1.5)
-        return (True, {"stub": True, "methodology": {"synthesis_operator": "gravitywell"}}, "stub-id", None)
-    monkeypatch.setattr(orch, "_facets_subprocess", slow_facets)
-
     acquire_count = [0]
+    # Signaled by the second acquire call (first refresh), so slow_facets can
+    # unblock deterministically instead of relying on a wall-clock sleep.
+    refresh_fired = threading.Event()
     mock_doorman = Mock()
     def count_acquire(*a, **kw):
         acquire_count[0] += 1
+        if acquire_count[0] >= 2:
+            refresh_fired.set()
         return {"status": "serving"}
     mock_doorman.acquire = count_acquire
     mock_doorman.release = Mock()
     mock_doorman.close = Mock()
+
+    async def slow_facets(*a, **kw):
+        # Wait until the refresh thread fires rather than sleeping a fixed duration.
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: refresh_fired.wait(timeout=10)
+        )
+        return (True, {"stub": True, "methodology": {"synthesis_operator": "gravitywell"}}, "stub-id", None)
+    monkeypatch.setattr(orch, "_facets_subprocess", slow_facets)
 
     with patch("agents_core.doorman_client.DoormanClient", return_value=mock_doorman), \
          patch("agents_core.doorman_client._gw_acquire_timeout", return_value=10.0):

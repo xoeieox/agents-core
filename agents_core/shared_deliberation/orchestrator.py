@@ -361,7 +361,7 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
     # Deliberation-spanning GW keepawake hold (shared-deliberation-gate-spanning-keepawake-v0).
     # Placed BEFORE Facets dispatch so GW stays warm across the full Facets + Council window.
     # This is the primary guarantee; the council leg's own hold (council/cli.py) remains as
-    # defense-in-depth but is independent of this one — a dead council worker drops its own
+    # defense-in-depth but is independent of this one; a dead council worker drops its own
     # lease but does NOT affect this orchestrator hold.
     # TTL covers the max deliberation duration; refreshed periodically via background thread.
     # Auto-expires if the orchestrator process dies (no unconditional pinning).
@@ -388,11 +388,19 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
                 "shared-deliberation-span-hold",
                 timeout=_gw_acquire_timeout(),
             )
-            log.info(
-                "[shared-deliberation] span hold placed request_id=%s status=%s",
-                request_id, _hold_res.get("status"),
-            )
-            if _hold_res.get("status") == "serving":
+            _hold_status = _hold_res.get("status")
+            if _hold_status == "serving":
+                log.info(
+                    "[shared-deliberation] span hold placed request_id=%s status=%s",
+                    request_id, _hold_status,
+                )
+            else:
+                log.warning(
+                    "[shared-deliberation] span hold NOT placed request_id=%s status=%s"
+                    " - GW may idle-suspend during deliberation",
+                    request_id, _hold_status,
+                )
+            if _hold_status == "serving":
                 _refresh_interval = int(
                     os.environ.get("SHARED_DELIB_SPAN_REFRESH_S", "300")
                 )
