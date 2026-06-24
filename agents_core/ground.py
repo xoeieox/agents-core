@@ -67,8 +67,8 @@ def ground(
         scope:        RAG/mem backends to query. Default: ["mem","vault-rag","chub"].
 
     Note:
-        RAG backend timeouts are controlled by retrieve() (HTTP_TIMEOUT=5.0) and
-        are not configurable from this surface.
+        RAG backend timeouts are controlled by retrieve() and are env-overridable:
+        RAG_HTTP_TIMEOUT (default 1.5 s) and CHUB_TIMEOUT (default 2.0 s).
 
     Returns:
         GroundBundle (never raises).

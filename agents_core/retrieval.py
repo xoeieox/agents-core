@@ -7,9 +7,17 @@ Scope tokens and backend endpoints
 ===================================
   mem        — agents_core.mem.MemoryStore.search (SQLite FTS5, local DB)
   chub       — ``chub search <query> --json`` CLI (BM25-ish; honors filter key: ``type``)
-  vault-rag  — POST http://203.0.113.12:8200/search (cosine sim; honors filter key: ``path_prefix``)
-  room-rag   — POST http://203.0.113.12:8201/search (cosine sim; honors filter key: ``path_prefix``)
-  code-rag   — POST http://203.0.113.12:8100/search (cosine sim; honors filter key: ``path_prefix``)
+  vault-rag  — POST http://<RAG_HOST>:8200/search (cosine sim; honors filter key: ``path_prefix``)
+  room-rag   — POST http://<RAG_HOST>:8201/search (cosine sim; honors filter key: ``path_prefix``)
+  code-rag   — POST http://<RAG_HOST>:8100/search (cosine sim; honors filter key: ``path_prefix``)
+
+Default RAG_HOST is 203.0.113.10. Override via env:
+  RAG_HOST        — shared host for all three RAG backends
+  VAULT_RAG_URL   — full base URL for vault-rag (overrides RAG_HOST for this backend)
+  ROOM_RAG_URL    — full base URL for room-rag
+  CODE_RAG_URL    — full base URL for code-rag
+  RAG_HTTP_TIMEOUT — per-call wall-clock limit for RAG HTTP (default 1.5 s)
+  CHUB_TIMEOUT    — subprocess wall-clock limit for chub (default 2.0 s)
 
 Filter dict
 ===========
@@ -32,17 +40,25 @@ gets a normalised score of 1.0.
 
 Fail-soft HTTP
 ==============
-vault-rag, room-rag, and code-rag use a 5 s connect + read timeout. Any network
-error or non-2xx response logs a warning and contributes [] to the merged result —
-the engine never raises for HTTP failures. A degraded engine is better than a
-failing engine.
+vault-rag, room-rag, and code-rag use a short connect + read timeout (RAG_HTTP_TIMEOUT,
+default 1.5 s; connect timeout 0.5 s). Any network error or non-2xx response logs a
+warning and contributes [] to the merged result — the engine never raises for HTTP
+failures. A degraded engine is better than a failing engine.
+
+Parallel fan-out
+================
+All backends are queried concurrently (ThreadPoolExecutor). retrieve() latency is
+~max(backend), not the sum. A slow or dead backend degrades to [] without blocking
+the others.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 import httpx
@@ -53,13 +69,15 @@ log = logging.getLogger(__name__)
 
 KNOWN_SCOPE: frozenset[str] = frozenset({"mem", "chub", "vault-rag", "room-rag", "code-rag"})
 
+_RAG_HOST: str = os.environ.get("RAG_HOST", "203.0.113.10")
 _RAG_BASE_URLS: dict[str, str] = {
-    "vault-rag": "http://203.0.113.12:8200",
-    "room-rag":  "http://203.0.113.12:8201",
-    "code-rag":  "http://203.0.113.12:8100",
+    "vault-rag": os.environ.get("VAULT_RAG_URL", f"http://{_RAG_HOST}:8200"),
+    "room-rag":  os.environ.get("ROOM_RAG_URL",  f"http://{_RAG_HOST}:8201"),
+    "code-rag":  os.environ.get("CODE_RAG_URL",  f"http://{_RAG_HOST}:8100"),
 }
 
-HTTP_TIMEOUT = 5.0  # seconds
+RAG_HTTP_TIMEOUT: float = float(os.environ.get("RAG_HTTP_TIMEOUT", "1.5"))
+CHUB_TIMEOUT: float = float(os.environ.get("CHUB_TIMEOUT", "2.0"))
 
 
 @dataclass(frozen=True)
@@ -80,6 +98,9 @@ def retrieve(
     exclude: set[str] | None = None,
 ) -> list[Hit]:
     """Return up to top_k hits across the requested scope, sorted by score desc.
+
+    All backends are queried concurrently. A slow or dead backend degrades to []
+    without blocking the others.
 
     Args:
         query:     Free-text search query.
@@ -110,14 +131,25 @@ def retrieve(
     filters = filters or {}
     exclude = exclude or set()
 
+    sources = list(dict.fromkeys(scope))  # deduplicated, preserve order
+
+    def _query_source(src: str) -> list[Hit]:
+        try:
+            if src == "mem":
+                return _search_mem(query, filters)
+            elif src == "chub":
+                return _search_chub(query, filters)
+            else:
+                return _search_rag(src, query, filters)
+        except Exception as exc:
+            log.warning("retrieval: %s raised unexpectedly: %s", src, exc)
+            return []
+
     all_hits: list[Hit] = []
-    for source in dict.fromkeys(scope):  # deduplicate, preserve order
-        if source == "mem":
-            all_hits.extend(_search_mem(query, filters))
-        elif source == "chub":
-            all_hits.extend(_search_chub(query, filters))
-        else:
-            all_hits.extend(_search_rag(source, query, filters))
+    with ThreadPoolExecutor(max_workers=max(len(sources), 1)) as ex:
+        fut_to_src = {ex.submit(_query_source, src): src for src in sources}
+        for fut in as_completed(fut_to_src):
+            all_hits.extend(fut.result())
 
     # post-retrieval filtering
     if exclude:
@@ -203,13 +235,16 @@ def _search_chub(query: str, filters: dict) -> list[Hit]:
             ["chub", "search", "--json", query],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=CHUB_TIMEOUT,
         )
         if result.returncode != 0:
             log.warning("retrieval: chub exited %d: %s", result.returncode, result.stderr[:200])
             return []
         data = json.loads(result.stdout)
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as exc:
+    except subprocess.TimeoutExpired:
+        log.warning("retrieval: chub timed out after %.1fs (killed)", CHUB_TIMEOUT)
+        return []
+    except (json.JSONDecodeError, FileNotFoundError) as exc:
         log.warning("retrieval: chub search failed: %s", exc)
         return []
 
@@ -255,8 +290,9 @@ def _search_rag(source: str, query: str, filters: dict) -> list[Hit]:
     if "path_prefix" in filters:
         payload["path_prefix"] = filters["path_prefix"]
 
+    timeout = httpx.Timeout(RAG_HTTP_TIMEOUT, connect=min(0.5, RAG_HTTP_TIMEOUT))
     try:
-        resp = httpx.post(f"{base_url}/search", json=payload, timeout=HTTP_TIMEOUT)
+        resp = httpx.post(f"{base_url}/search", json=payload, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
     except httpx.HTTPError as exc:
