@@ -262,7 +262,7 @@ def _assemble_pm_state() -> tuple[str, list[dict], bool]:
     if elapsed >= warn_threshold:
         log.warning(
             "ground: PM-state read slow (%.0fms >= %.0fms soft threshold); "
-            "approaching guard (%.0fms) — portfolio growth may cross the bound",
+            "approaching guard (%.0fms) - portfolio growth may cross the bound",
             elapsed * 1000,
             warn_threshold * 1000,
             _PM_TIMEOUT_S * 1000,
@@ -276,7 +276,7 @@ def _do_pm_state_read() -> tuple[str, list[dict]]:
     """Inner PM-state read — runs inside the timeout thread.
 
     Reads:
-      - TargetStore.load_all() -> active + pm_bound targets (YAML, no mem)
+      - TargetStore.active_targets() -> active + pm_bound targets (YAML, no mem)
       - router/lapis-pm/decisions/* (via mem key tag target:<id>)
       - pm/outstanding-brief/<id> (via direct mem get)
     """
