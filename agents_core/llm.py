@@ -31,7 +31,23 @@ GW_URL = os.environ.get("GW_URL", "http://203.0.113.11:8081")
 SWARM_URL = os.environ.get("SWARM_URL", GW_URL)
 SWARM_MAX_CONCURRENT = int(os.environ.get("SWARM_MAX_CONCURRENT", "4"))
 
-# GW admission provenance ladder: most-specific/most-transient first (AC11).
+# GW admission provenance vocabulary — all known tuples appended to _provenance_out.
+#
+#   admission_off_master_passthrough — enforce mode on a non-master node; request passed through.
+#   admission_shadow:<decision>      — shadow mode dry-run result ("would-admit" or "would-wait").
+#   admission_shadow:principal_group_collision_risk — shadow mode: unique work_id principal used.
+#   drain_count_unavailable          — doorman drain_count call failed; proceeding on elevator gate alone.
+#   doorman_unreachable              — doorman acquire failed; routed to wake_fail.
+#   gw_deferred_swarm                — doorman deferred to swarm; requeueing (precedence ladder).
+#   gw_member_deadline               — per-member watchdog fired (AC2); ticket failed, lease released.
+#   gw_member_error                  — unexpected exception from backend dispatch (AC1); ticket failed.
+#   gw_not_serving                   — doorman responded not-serving; bounded backoff requeue (precedence ladder).
+#   serving_http_error               — OperatorUnreachableError from backend HTTP layer.
+#   slot_pool_down                   — GW slot pool unavailable (precedence ladder).
+#   slot_queued_timeout              — wait deadline expired before admission (precedence ladder).
+#   success                          — backend returned successfully; ticket ack'd.
+#
+# GW_PROVENANCE_PRECEDENCE orders the gating reasons for gw_highest_precedence_reason (AC11).
 GW_PROVENANCE_PRECEDENCE = (
     "gw_deferred_swarm",
     "slot_queued_timeout",
@@ -440,9 +456,11 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                     _provenance_out.append(("admission_off_master_passthrough", "gravitywell"))
                 # Fall through to direct dispatch below.
             else:
+                import concurrent.futures as _cf
                 from agents_core.elevator import ElevatorStore, DB_DIR as _ELEV_DB_DIR
                 _max_wait = int(os.environ.get("GW_ADMISSION_MAX_WAIT_SEC", "900"))
-                _claim_ttl = _max_wait + 60
+                # AC4: claim TTL aligned to the member's backend timeout, not _max_wait.
+                _claim_ttl = timeout + 90
                 _poll = float(os.environ.get("GW_ADMISSION_POLL_INTERVAL_SEC", "1.5"))
                 _max_wf = int(os.environ.get("MAX_WAKE_FAIL_RETRIES", "5"))
 
@@ -478,6 +496,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                             )
 
                         if not admitted:
+                            elevator.reclaim_stale("deliberation")  # AC3a: opportunistic reclaim
                             ok, is_ride_along = elevator.try_admit(
                                 ticket, "deliberation", effective_principal, claim_ttl_sec=_claim_ttl
                             )
@@ -549,11 +568,51 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                             continue
 
                         else:
-                            # serving: run backend
+                            # serving: run backend via thread watchdog (AC2)
+                            # _call_gravitywell_backend is a GIL-releasing HTTP socket read.
+                            # ASSUMPTION: if this ever does CPU-bound/GIL-holding work, escalate to multiprocessing.
+                            ticket_settled = False
+                            lease_released = False
+                            _member_deadline = timeout
+                            _executor = _cf.ThreadPoolExecutor(max_workers=1)
                             try:
-                                result = _call_gravitywell_backend(
-                                    prompt=prompt, think=think, **gw_kwargs
+                                _future = _executor.submit(
+                                    _call_gravitywell_backend,
+                                    prompt=prompt, think=think, **gw_kwargs,
                                 )
+                                try:
+                                    result = _future.result(timeout=_member_deadline)
+                                except _cf.TimeoutError:
+                                    # AC2/AC2a: self-triggered cleanup on member deadline.
+                                    # The abandoned thread is parked in a GIL-free socket wait;
+                                    # the underlying request timeout will reap it eventually.
+                                    if _provenance_out is not None:
+                                        _provenance_out.append(("gw_member_deadline", "gravitywell"))
+                                    elevator.fail(ticket)
+                                    ticket_settled = True
+                                    client.release("gravitywell", work_id)
+                                    lease_released = True
+                                    return _apply_wake_fail(
+                                        on_wake_fail, operator_class, prompt,
+                                        _provenance_out=_provenance_out, **wake_fail_kwargs,
+                                    )
+                                except OperatorUnreachableError:
+                                    if _provenance_out is not None:
+                                        _provenance_out.append(("serving_http_error", "gravitywell"))
+                                    elevator.fail(ticket)
+                                    ticket_settled = True
+                                    return _apply_wake_fail(
+                                        on_wake_fail, operator_class, prompt,
+                                        _provenance_out=_provenance_out, **wake_fail_kwargs,
+                                    )
+                                except Exception:
+                                    # AC1: universal ticket release on unexpected backend error.
+                                    if _provenance_out is not None:
+                                        _provenance_out.append(("gw_member_error", "gravitywell"))
+                                    if not ticket_settled:
+                                        elevator.fail(ticket)
+                                        ticket_settled = True
+                                    raise
                                 if _provenance_out is not None:
                                     _provenance_out.append(("success", "gravitywell"))
                                 elevator.ack(
@@ -565,17 +624,12 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                                         ]
                                     },
                                 )
+                                ticket_settled = True
                                 return result
-                            except OperatorUnreachableError:
-                                if _provenance_out is not None:
-                                    _provenance_out.append(("serving_http_error", "gravitywell"))
-                                elevator.fail(ticket)
-                                return _apply_wake_fail(
-                                    on_wake_fail, operator_class, prompt,
-                                    _provenance_out=_provenance_out, **wake_fail_kwargs,
-                                )
                             finally:
-                                client.release("gravitywell", work_id)
+                                _executor.shutdown(wait=False)
+                                if not lease_released:
+                                    client.release("gravitywell", work_id)
                 finally:
                     client.close()
                     elevator.close()

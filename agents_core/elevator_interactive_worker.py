@@ -284,6 +284,10 @@ def worker_loop(
                 continue
 
             # --- Claim + serve ---
+            # AC3b: deterministic deliberation-lane stale-claim sweep on each worker tick.
+            # Runs independent of GW admission traffic; this loop already ticks on a timer
+            # and holds no GW resources — safe host for the sweep.
+            elevator.reclaim_stale("deliberation")
             item = elevator.claim(
                 lanes=["interactive"],
                 owner="elevator-interactive-worker",
