@@ -31,7 +31,23 @@ GW_URL = os.environ.get("GW_URL", "http://203.0.113.11:8081")
 SWARM_URL = os.environ.get("SWARM_URL", GW_URL)
 SWARM_MAX_CONCURRENT = int(os.environ.get("SWARM_MAX_CONCURRENT", "4"))
 
-# GW admission provenance ladder: most-specific/most-transient first (AC11).
+# GW admission provenance vocabulary — all known tuples appended to _provenance_out.
+#
+#   admission_off_master_passthrough — enforce mode on a non-master node; request passed through.
+#   admission_shadow:<decision>      — shadow mode dry-run result ("would-admit" or "would-wait").
+#   admission_shadow:principal_group_collision_risk — shadow mode: unique work_id principal used.
+#   drain_count_unavailable          — doorman drain_count call failed; proceeding on elevator gate alone.
+#   doorman_unreachable              — doorman acquire failed; routed to wake_fail.
+#   gw_deferred_swarm                — doorman deferred to swarm; requeueing (precedence ladder).
+#   gw_member_deadline               — per-member watchdog fired (AC2); ticket failed, lease released.
+#   gw_member_error                  — unexpected exception from backend dispatch (AC1); ticket failed.
+#   gw_not_serving                   — doorman responded not-serving; bounded backoff requeue (precedence ladder).
+#   serving_http_error               — OperatorUnreachableError from backend HTTP layer.
+#   slot_pool_down                   — GW slot pool unavailable (precedence ladder).
+#   slot_queued_timeout              — wait deadline expired before admission (precedence ladder).
+#   success                          — backend returned successfully; ticket ack'd.
+#
+# GW_PROVENANCE_PRECEDENCE orders the gating reasons for gw_highest_precedence_reason (AC11).
 GW_PROVENANCE_PRECEDENCE = (
     "gw_deferred_swarm",
     "slot_queued_timeout",

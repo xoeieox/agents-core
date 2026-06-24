@@ -238,6 +238,39 @@ def test_ac4_claim_ttl_aligned_to_timeout(db):
     assert item["claim_ttl_sec"] == 390
 
 
+def test_ac4_call_operator_derives_claim_ttl_from_timeout(tmp_path, monkeypatch):
+    """AC4 integration: call_operator passes claim_ttl_sec = timeout + 90 to try_admit."""
+    _enforce_env(monkeypatch)
+    db_path = tmp_path / "q.db"
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(db_path))
+
+    dc, _ = _gw_dc_serving()
+    captured_ttls = []
+
+    original_try_admit = ElevatorStore.try_admit
+
+    def tracking_try_admit(self, item_id, lane, principal, max_groups=1, claim_ttl_sec=960):
+        captured_ttls.append(claim_ttl_sec)
+        return original_try_admit(self, item_id, lane, principal,
+                                  max_groups=max_groups, claim_ttl_sec=claim_ttl_sec)
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="ok"), \
+         patch.object(ElevatorStore, "try_admit", tracking_try_admit):
+        call_operator(
+            "gravitywell", "hello",
+            principal="p",
+            timeout=300,
+            _admission_bypass=False,
+        )
+
+    assert captured_ttls, "try_admit was never called"
+    assert captured_ttls[0] == 390, (
+        f"expected claim_ttl_sec=390 (timeout=300 + 90), got {captured_ttls[0]}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # AC2 + AC2a — thread watchdog (simulated via monkeypatched future timeout)
 # ---------------------------------------------------------------------------
@@ -532,15 +565,60 @@ def test_ac7_off_master_passthrough_no_queue(tmp_path, monkeypatch):
 # AC8 — provenance vocabulary
 # ---------------------------------------------------------------------------
 
-def test_ac8_provenance_tuples_only_when_provenance_out_set(db):
-    """AC8: gw_member_error/gw_member_deadline tuples are only appended when _provenance_out is not None."""
-    # This is implicitly tested in AC1/AC2 tests; here we verify None _provenance_out is safe.
-    t = db.enqueue(lane="deliberation", kind="gw-admission", payload={},
-                   principal="p1", latency_class="batch")
-    db.try_admit(t, "deliberation", "p1", claim_ttl_sec=300)
-    db.fail(t)
-    # No assertion — just ensure no AttributeError when _provenance_out is None.
-    assert db.get(t)["status"] == "failed"
+def test_ac8_member_error_none_provenance_no_crash(tmp_path, monkeypatch):
+    """AC8: gw_member_error None guard — no AttributeError when _provenance_out=None on unexpected exception."""
+    _enforce_env(monkeypatch)
+    db_path = tmp_path / "q.db"
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(db_path))
+
+    dc, _ = _gw_dc_serving()
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", side_effect=RuntimeError("bang")):
+        with pytest.raises(RuntimeError, match="bang"):
+            call_operator(
+                "gravitywell", "hello",
+                principal="test-principal",
+                _provenance_out=None,  # None guard under test: must not AttributeError
+                _admission_bypass=False,
+            )
+
+
+def test_ac8_member_deadline_none_provenance_no_crash(tmp_path, monkeypatch):
+    """AC8: gw_member_deadline None guard — no AttributeError when _provenance_out=None on watchdog timeout."""
+    _enforce_env(monkeypatch)
+    db_path = tmp_path / "q.db"
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(db_path))
+
+    dc, _ = _gw_dc_serving()
+
+    import concurrent.futures as _cf
+    original_executor = _cf.ThreadPoolExecutor
+
+    class _ImmediateTimeoutExecutor:
+        def __init__(self, *a, **kw):
+            self._inner = original_executor(*a, **kw)
+
+        def submit(self, fn, *a, **kw):
+            wrapper = MagicMock(spec=_cf.Future)
+            wrapper.result.side_effect = _cf.TimeoutError()
+            return wrapper
+
+        def shutdown(self, wait=True):
+            self._inner.shutdown(wait=False)
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value=None), \
+         patch("concurrent.futures.ThreadPoolExecutor", _ImmediateTimeoutExecutor):
+        result = call_operator(
+            "gravitywell", "hello",
+            principal="test-principal",
+            on_wake_fail="skip",
+            _provenance_out=None,  # None guard under test: must not AttributeError
+            _admission_bypass=False,
+        )
+    assert result is None  # on_wake_fail=skip → None
 
 
 # ---------------------------------------------------------------------------
