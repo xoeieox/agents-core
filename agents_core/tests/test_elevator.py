@@ -1112,3 +1112,140 @@ def test_depends_on_immutable_no_update_path(temp_db):
     # Check that depends_on is still the original precursor.
     item_after = temp_db.get(item2_with_dep)
     assert item_after["depends_on"] == item1
+
+
+# --- AC1-AC3, AC5, AC7: exclude_kinds and gw_admission state counts ---
+
+
+def _enqueue(store, lane, kind, principal="test"):
+    return store.enqueue(
+        lane=lane,
+        kind=kind,
+        payload={},
+        principal=principal,
+        latency_class="batch",
+    )
+
+
+def test_claim_exclude_kinds_none_unchanged(temp_db):
+    """AC1: claim(exclude_kinds=None) is byte-identical to claim() with no param."""
+    iid = _enqueue(temp_db, "deliberation", "sample")
+    result = temp_db.claim(
+        lanes=["deliberation"], owner="broker", claim_ttl_sec=30, exclude_kinds=None
+    )
+    assert result is not None
+    assert result["item_id"] == iid
+    assert result["status"] == "claimed"
+
+
+def test_claim_exclude_kinds_omitted_unchanged(temp_db):
+    """AC1: claim() with param omitted still claims the item."""
+    iid = _enqueue(temp_db, "deliberation", "sample")
+    result = temp_db.claim(lanes=["deliberation"], owner="broker", claim_ttl_sec=30)
+    assert result is not None
+    assert result["item_id"] == iid
+
+
+def test_claim_exclude_kinds_skips_excluded_returns_other(temp_db):
+    """AC2: exclude=['gw-admission'] skips the older gw-admission, returns newer sample."""
+    import time
+
+    iid_gw = _enqueue(temp_db, "deliberation", "gw-admission")
+    time.sleep(0.01)
+    iid_sample = _enqueue(temp_db, "deliberation", "sample")
+
+    result = temp_db.claim(
+        lanes=["deliberation"],
+        owner="broker",
+        claim_ttl_sec=30,
+        exclude_kinds=["gw-admission"],
+    )
+    assert result is not None
+    assert result["item_id"] == iid_sample
+    assert result["kind"] == "sample"
+
+    # The gw-admission ticket must still be pending (AC7 — no mutation).
+    gw_item = temp_db.get(iid_gw)
+    assert gw_item["status"] == "pending"
+
+
+def test_claim_exclude_kinds_only_excluded_returns_none(temp_db):
+    """AC2: with only a gw-admission ticket present, returns None."""
+    _enqueue(temp_db, "deliberation", "gw-admission")
+    result = temp_db.claim(
+        lanes=["deliberation"],
+        owner="broker",
+        claim_ttl_sec=30,
+        exclude_kinds=["gw-admission"],
+    )
+    assert result is None
+
+
+def test_claim_exclude_kinds_sql_injection_safe(temp_db):
+    """AC3: a kind string with SQL metacharacters cannot alter the query."""
+    iid = _enqueue(temp_db, "deliberation", "safe-kind")
+    # Attempt injection in the exclusion list.
+    result = temp_db.claim(
+        lanes=["deliberation"],
+        owner="broker",
+        claim_ttl_sec=30,
+        exclude_kinds=["' OR '1'='1"],
+    )
+    # The safe-kind ticket should still be claimable (injection did not affect query).
+    assert result is not None
+    assert result["item_id"] == iid
+
+
+def test_state_gw_admission_counts_zero_when_empty(temp_db):
+    """AC5: gw_admission_pending/claimed are 0 when no such tickets exist."""
+    s = temp_db.state()
+    for lane_data in s["queue"].values():
+        assert lane_data["gw_admission_pending"] == 0
+        assert lane_data["gw_admission_claimed"] == 0
+        # Existing keys still present.
+        assert "pending" in lane_data
+        assert "claimed" in lane_data
+        assert "oldest_age_sec" in lane_data
+
+
+def test_state_gw_admission_counts_reflect_kind(temp_db):
+    """AC5: gw_admission_pending/claimed reflect true filtered counts."""
+    _enqueue(temp_db, "deliberation", "gw-admission")
+    _enqueue(temp_db, "deliberation", "gw-admission")
+    _enqueue(temp_db, "deliberation", "sample")
+
+    s = temp_db.state()
+    delib = s["queue"]["deliberation"]
+    assert delib["gw_admission_pending"] == 2
+    assert delib["gw_admission_claimed"] == 0
+    assert delib["pending"] == 3  # all three pending
+
+    # Claim one gw-admission ticket.
+    temp_db.claim(lanes=["deliberation"], owner="broker", claim_ttl_sec=30)
+
+    s2 = temp_db.state()
+    delib2 = s2["queue"]["deliberation"]
+    assert delib2["gw_admission_pending"] == 1
+    assert delib2["gw_admission_claimed"] == 1
+
+
+def test_claim_exclude_leaves_ticket_pending_and_countable(temp_db):
+    """AC7: excluded ticket stays pending and is reflected in gw_admission_pending."""
+    iid = _enqueue(temp_db, "deliberation", "gw-admission")
+
+    result = temp_db.claim(
+        lanes=["deliberation"],
+        owner="broker",
+        claim_ttl_sec=30,
+        exclude_kinds=["gw-admission"],
+    )
+    assert result is None
+
+    # Ticket must be pending, not claimed/deleted/mutated.
+    item = temp_db.get(iid)
+    assert item["status"] == "pending"
+
+    # Must be countable via state().
+    s = temp_db.state()
+    assert s["queue"]["deliberation"]["gw_admission_pending"] == 1
+    assert s["queue"]["deliberation"]["gw_admission_claimed"] == 0

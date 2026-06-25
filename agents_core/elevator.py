@@ -245,13 +245,20 @@ class ElevatorStore:
     # -- broker operations ------------------------------------------------
 
     def claim(
-        self, lanes: list[str], owner: str, claim_ttl_sec: int
+        self,
+        lanes: list[str],
+        owner: str,
+        claim_ttl_sec: int,
+        exclude_kinds: list[str] | None = None,
     ) -> dict[str, Any] | None:
         """Atomically claim the head-of-line pending item across ordered lanes.
 
         Returns the claimed item (as a dict) with status='claimed', or None if no
         pending items exist in the given lanes. Skips rows with unserved dependencies.
-        Inline reaps stale claims and cascade-fails dependents of terminal precursors first."""
+        Inline reaps stale claims and cascade-fails dependents of terminal precursors first.
+
+        exclude_kinds: if non-empty, tickets whose kind is in the list are skipped
+        (left pending, never claimed). Bound as SQL parameters — never interpolated."""
         self._check_writable()
         self._reap_inline()
         self._cascade_fail_dependents()
@@ -260,14 +267,27 @@ class ElevatorStore:
         with self._lock:
             # Claim head-of-line across lanes in order.
             for lane in lanes:
-                row = self._conn.execute(
-                    "SELECT * FROM queue_items WHERE lane=? AND status='pending' "
-                    "AND (depends_on IS NULL "
-                    "  OR EXISTS (SELECT 1 FROM queue_items p "
-                    "             WHERE p.item_id = queue_items.depends_on AND p.status='served')) "
-                    "ORDER BY created_at ASC LIMIT 1",
-                    (lane,),
-                ).fetchone()
+                if exclude_kinds:
+                    placeholders = ",".join("?" * len(exclude_kinds))
+                    sql = (
+                        f"SELECT * FROM queue_items WHERE lane=? AND status='pending' "
+                        f"AND kind NOT IN ({placeholders}) "
+                        "AND (depends_on IS NULL "
+                        "  OR EXISTS (SELECT 1 FROM queue_items p "
+                        "             WHERE p.item_id = queue_items.depends_on AND p.status='served')) "
+                        "ORDER BY created_at ASC LIMIT 1"
+                    )
+                    params = (lane, *exclude_kinds)
+                else:
+                    sql = (
+                        "SELECT * FROM queue_items WHERE lane=? AND status='pending' "
+                        "AND (depends_on IS NULL "
+                        "  OR EXISTS (SELECT 1 FROM queue_items p "
+                        "             WHERE p.item_id = queue_items.depends_on AND p.status='served')) "
+                        "ORDER BY created_at ASC LIMIT 1"
+                    )
+                    params = (lane,)
+                row = self._conn.execute(sql, params).fetchone()
                 if row:
                     iid = row["item_id"]
                     self._conn.execute(
@@ -481,10 +501,23 @@ class ElevatorStore:
                     now = datetime.now(timezone.utc)
                     oldest_age = int((now - created).total_seconds())
 
+                gw_adm_pending = self._conn.execute(
+                    "SELECT COUNT(*) FROM queue_items "
+                    "WHERE lane=? AND kind='gw-admission' AND status='pending'",
+                    (lane,),
+                ).fetchone()[0]
+                gw_adm_claimed = self._conn.execute(
+                    "SELECT COUNT(*) FROM queue_items "
+                    "WHERE lane=? AND kind='gw-admission' AND status='claimed'",
+                    (lane,),
+                ).fetchone()[0]
+
                 queue_state[lane] = {
                     "pending": pending,
                     "claimed": claimed,
                     "oldest_age_sec": oldest_age,
+                    "gw_admission_pending": gw_adm_pending,
+                    "gw_admission_claimed": gw_adm_claimed,
                 }
 
         # Best-effort GW status from flip-controller + doorman (reads only, no error).
