@@ -115,7 +115,7 @@ class DoormanClient:
         except httpx.TimeoutException as e:
             raise DoormanUnreachable(f"doorman timeout at {self._base_url}: {e}") from e
 
-    def acquire(self, node: str, work_id: str, ttl_sec: int, reason: str, role: str = "worker", timeout: float | None = None, principal: str | None = None) -> dict:
+    def acquire(self, node: str, work_id: str, ttl_sec: int, reason: str, role: str = "worker", timeout: float | None = None, principal: str | None = None, require_drain_clear: bool = False) -> dict:
         """Acquire a lease for node.
 
         Args:
@@ -129,11 +129,18 @@ class DoormanClient:
                      without a principal are stamped __GHOST_LEASE__ on the server —
                      always counted, never excluded. Pass the group's shared identifier
                      (e.g. council-delib-<run_id>) so sibling calls can self-exclude.
+          require_drain_clear: when True, requests an atomic drain-gate check — the
+                               server counts cross-group worker leases and registers
+                               this lease only if none exist, all within one lock.
+                               Returns {"ok": False, "contended": True} if gated.
+                               Use is_contended() to detect this outcome.
+                               Defaults False — all existing callers unchanged.
 
-        Returns dict with status field:
+        Returns dict with status field (or contended sentinel):
           "serving" — GW is serving; lease registered and keepawake hold placed
           "deferred" — GW is serving a controller-owned non-big mode; no lease registered
           "wake_failed" — GW failed to wake
+          {"ok": False, "contended": True} — drain gate active; another group holds a lease
         """
         body: dict = {
             "node": node,
@@ -144,6 +151,8 @@ class DoormanClient:
         }
         if principal is not None:
             body["principal"] = principal
+        if require_drain_clear:
+            body["require_drain_clear"] = True
         return self._post("/lease/acquire", body, timeout=timeout)
 
     def release(self, node: str, work_id: str) -> None:
@@ -207,6 +216,16 @@ class DoormanClient:
         Returns True iff resp["status"] == "deferred", False otherwise.
         """
         return resp.get("status") == "deferred"
+
+    @staticmethod
+    def is_contended(resp: dict) -> bool:
+        """Convenience predicate: is this acquire response a CONTENDED outcome?
+
+        Returns True iff the server's atomic drain-gate check found another-principal
+        worker lease active. Distinct from deferred (controller owns mode) and
+        wake_failed (GW not serving). Caller should retry within its deadline.
+        """
+        return bool(resp.get("contended"))
 
     def close(self):
         self._client.close()

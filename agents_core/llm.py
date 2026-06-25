@@ -36,7 +36,7 @@ SWARM_MAX_CONCURRENT = int(os.environ.get("SWARM_MAX_CONCURRENT", "4"))
 #   admission_off_master_passthrough — enforce mode on a non-master node; request passed through.
 #   admission_shadow:<decision>      — shadow mode dry-run result ("would-admit" or "would-wait").
 #   admission_shadow:principal_group_collision_risk — shadow mode: unique work_id principal used.
-#   drain_count_unavailable          — doorman drain_count call failed; proceeding on elevator gate alone.
+#   drain_count_unavailable          — doorman honored acquire but drain_cleared absent (pre-atomic doorman); proceeding on elevator gate alone.
 #   doorman_unreachable              — doorman acquire failed; routed to wake_fail.
 #   gw_deferred_swarm                — doorman deferred to swarm; requeueing (precedence ladder).
 #   gw_member_deadline               — per-member watchdog fired (AC2); ticket failed, lease released.
@@ -513,32 +513,21 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                                 time.sleep(_poll)
                                 continue
 
-                        # Admitted. Fresh group: wait for drain_count==0 excluding own group.
-                        if not is_ride_along:
-                            dc_val = client.drain_count(exclude_principal=effective_principal)
-                            if dc_val is None:
-                                # AC12: proceed loud on unavailable drain_count
-                                _log.warning(
-                                    "[gw-admission] drain_count_unavailable - proceeding on "
-                                    "elevator gate alone work_id=%s", work_id,
-                                )
-                                if _provenance_out is not None:
-                                    _provenance_out.append(
-                                        ("drain_count_unavailable", "gravitywell")
-                                    )
-                                # proceed
-                            elif dc_val > 0:
-                                time.sleep(_poll)
-                                continue
-
-                        # Acquire doorman lease attributed to the admission group.
+                        # Acquire doorman lease with atomic drain-gate check for fresh groups.
+                        # require_drain_clear=True collapses the old two-step drain_count() +
+                        # acquire() into one server-side critical section, closing the TOCTOU
+                        # where concurrent distinct-principal callers all observed drain=0 before
+                        # any registered. Ride-alongs share the admitted group's slot — no drain
+                        # wait, unconditional acquire (require_drain_clear=False).
                         try:
                             res = client.acquire(
                                 "gravitywell", work_id, ttl_sec=timeout + 60,
                                 reason="call_operator", timeout=_gw_acquire_timeout(),
                                 principal=effective_principal,
+                                require_drain_clear=(not is_ride_along),
                             )
                         except DoormanUnreachable:
+                            # AC5b: transport failure — fail-ticket, not loud-proceed (would reopen race).
                             if _provenance_out is not None:
                                 _provenance_out.append(("doorman_unreachable", "gravitywell"))
                             elevator.fail(ticket)
@@ -547,6 +536,19 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                                 on_wake_fail, operator_class, prompt,
                                 _provenance_out=_provenance_out, **wake_fail_kwargs,
                             )
+                        except Exception as _acquire_err:
+                            # AC5b: soft-error (e.g. HTTP 5xx) — treat as not-drain-clear, retry.
+                            _log.warning(
+                                "[gw-admission] acquire_soft_error work_id=%s: %s",
+                                work_id, _acquire_err,
+                            )
+                            time.sleep(_poll)
+                            continue
+
+                        if DoormanClient.is_contended(res):
+                            # Drain-gate: another group holds a worker lease. Retry within deadline.
+                            time.sleep(_poll)
+                            continue
 
                         if DoormanClient.is_deferred(res):
                             # AC6: requeue and continue waiting
@@ -578,6 +580,19 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                             continue
 
                         else:
+                            # AC5a: older doorman ignores require_drain_clear and serves
+                            # without drain_cleared (transient deploy window only; same PR lands both).
+                            if not is_ride_along and not res.get("drain_cleared"):
+                                _log.warning(
+                                    "[gw-admission] drain_count_unavailable - doorman did not "
+                                    "confirm drain check (pre-atomic-acquire doorman?); proceeding "
+                                    "on elevator gate alone work_id=%s", work_id,
+                                )
+                                if _provenance_out is not None:
+                                    _provenance_out.append(
+                                        ("drain_count_unavailable", "gravitywell")
+                                    )
+
                             # serving: run backend via thread watchdog (AC2)
                             # _call_gravitywell_backend is a GIL-releasing HTTP socket read.
                             # ASSUMPTION: if this ever does CPU-bound/GIL-holding work, escalate to multiprocessing.

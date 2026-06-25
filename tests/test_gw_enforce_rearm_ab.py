@@ -538,3 +538,108 @@ class TestS3HardTimeoutKill:
         # Cleanup: release ghost
         _release_worker(node, ghost_wid)
         assert _drain_count_from_state(node) == 0
+
+
+# ---------------------------------------------------------------------------
+# S4 — atomic drain-gate: concurrent distinct-principal burst peak ≤ 1
+# ---------------------------------------------------------------------------
+
+class TestS4AtomicDrainGate:
+    """AC1/AC4: peak in-flight distinct-principal workers ≤ 1 under concurrent burst.
+
+    Uses the mock doorman (_NodeState with ensure_serving=True) and the
+    require_drain_clear=True path directly so the CI guard is meaningful —
+    it exercises the same code path that the live harness S4 exercises.
+    """
+
+    @pytest.mark.parametrize("seed,n_groups", [
+        (42, 7),   # mirrors harness S4 seed=42: council shared + 3 facets + gate + fixer + dead-enqueuer
+        (137, 7),  # mirrors harness S4 seed=137
+    ])
+    def test_peak_in_flight_le_1_distinct_principals(self, node, seed, n_groups):
+        """N distinct-principal workers burst with require_drain_clear=True → peak ≤ 1 active."""
+        import random
+        rng = random.Random(seed)
+
+        results = [None] * n_groups
+        peak_in_flight = [0]
+        active_count = [0]
+        peak_lock = threading.Lock()
+        barrier = threading.Barrier(n_groups)
+
+        def _worker(idx):
+            principal = f"s4-group-{idx}-{rng.randint(0, 9999)}"
+            work_id = f"s4-wid-{idx}-{uuid.uuid4().hex[:4]}"
+
+            barrier.wait()  # burst: all start simultaneously
+
+            with node.lock:
+                ok = node.acquire_lease(
+                    work_id, 60, "call_operator", role="worker",
+                    principal=principal, require_drain_clear=True,
+                )
+
+            results[idx] = ok
+
+            if ok is True:
+                with peak_lock:
+                    active_count[0] += 1
+                    if active_count[0] > peak_in_flight[0]:
+                        peak_in_flight[0] = active_count[0]
+
+                # Simulate brief work then release
+                time.sleep(rng.uniform(0.001, 0.005))
+
+                with node.lock:
+                    node.leases.pop(work_id, None)
+
+                with peak_lock:
+                    active_count[0] -= 1
+
+        threads = [threading.Thread(target=_worker, args=(i,)) for i in range(n_groups)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert peak_in_flight[0] <= 1, (
+            f"seed={seed}: peak_in_flight={peak_in_flight[0]} must be ≤ 1 "
+            f"results={results}"
+        )
+        from agents_core.doorman_server import CONTENDED
+        true_count = sum(1 for r in results if r is True)
+        contended_count = sum(1 for r in results if r is CONTENDED)
+        assert true_count == 1, f"seed={seed}: exactly 1 must succeed; got {true_count}"
+        assert contended_count == n_groups - 1, (
+            f"seed={seed}: rest must be CONTENDED; got {contended_count}"
+        )
+
+    def test_ride_along_does_not_count_toward_peak(self, node):
+        """Ride-alongs (same principal, no require_drain_clear) share the slot — not extra in-flight."""
+        P = f"s4-shared-{uuid.uuid4().hex[:6]}"
+        wid_main = f"s4-main-{uuid.uuid4().hex[:6]}"
+        wid_ride = f"s4-ride-{uuid.uuid4().hex[:6]}"
+
+        # Main group member acquires (no drain flag — it's first)
+        with node.lock:
+            ok_main = node.acquire_lease(wid_main, 60, "test", role="worker", principal=P)
+        assert ok_main is True
+
+        # Ride-along (same principal, require_drain_clear=False) succeeds
+        with node.lock:
+            ok_ride = node.acquire_lease(wid_ride, 60, "test", role="worker", principal=P)
+        assert ok_ride is True, "same-principal ride-along must succeed alongside the main member"
+
+        # Distinct group is still blocked
+        with node.lock:
+            from agents_core.doorman_server import CONTENDED
+            ok_other = node.acquire_lease(
+                "other-wid", 60, "test", role="worker", principal="other-group",
+                require_drain_clear=True,
+            )
+        assert ok_other is CONTENDED, "distinct group must still be CONTENDED while P holds leases"
+
+        # Cleanup
+        with node.lock:
+            node.leases.pop(wid_main, None)
+            node.leases.pop(wid_ride, None)

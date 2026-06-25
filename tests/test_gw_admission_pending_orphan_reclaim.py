@@ -259,18 +259,21 @@ def test_enforce_loop_abort_fails_ticket(tmp_path, monkeypatch):
     db_path = tmp_path / "q.db"
     monkeypatch.setenv("ELEVATOR_DB_PATH", str(db_path))
 
-    # DoormanClient.drain_count raises after admission to trigger the finally abort path.
+    # _call_gravitywell_backend raises after lease acquisition to trigger the finally abort path.
+    # (drain_count is no longer called; the atomic acquire path replaced the two-step check.)
     fake_client = MagicMock()
-    fake_client.acquire.return_value = {"status": "serving"}
-    fake_client.drain_count.side_effect = RuntimeError("probe exploded")
+    fake_client.acquire.return_value = {"status": "serving", "drain_cleared": True}
     fake_client.release = MagicMock()
     fake_client.close = MagicMock()
     fake_dc = MagicMock(return_value=fake_client)
     fake_dc.is_deferred = lambda r: r.get("status") == "deferred"
+    fake_dc.is_contended = lambda r: bool(r.get("contended"))
 
     # IS_MASTER is lazy-imported from agents_core.elevator inside call_operator.
     with patch("agents_core.elevator.IS_MASTER", True), \
-         patch("agents_core.doorman_client.DoormanClient", fake_dc):
+         patch("agents_core.doorman_client.DoormanClient", fake_dc), \
+         patch("agents_core.llm._call_gravitywell_backend",
+               side_effect=RuntimeError("probe exploded")):
         with pytest.raises(RuntimeError, match="probe exploded"):
             call_operator("gravitywell", "test prompt",
                           principal="test-principal",
@@ -345,6 +348,7 @@ def test_off_mode_no_elevator(monkeypatch):
     fake_client.close = MagicMock()
     fake_dc = MagicMock(return_value=fake_client)
     fake_dc.is_deferred = lambda r: r.get("status") == "deferred"
+    fake_dc.is_contended = lambda r: bool(r.get("contended"))
 
     elevator_instantiated = []
 
