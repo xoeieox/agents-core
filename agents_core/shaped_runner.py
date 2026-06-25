@@ -181,6 +181,13 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         worktree_path = handle.path
         cwd = str(worktree_path)
 
+        # Resolve max_steps: spec JSON > env GW_AGENT_MAX_STEPS > local-fixer default 60.
+        _max_steps = int(
+            spec.get("max_steps")
+            or os.environ.get("GW_AGENT_MAX_STEPS")
+            or 60
+        )
+
         fixer_result, transcript = call_gw_agent(
             prompt=spec["prompt"],
             system=spec.get("system", ""),
@@ -190,6 +197,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             think=False,
             on_wake_fail="skip",
             work_id=task_id,
+            max_steps=_max_steps,
         )
 
         # Persist transcript regardless of outcome
@@ -204,18 +212,51 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         final_diff = fixer_result.get("final_diff") or ""
         concluded = fixer_result.get("concluded", False)
         last_test_outcome = fixer_result.get("last_test_outcome")
+        max_steps_hit = fixer_result.get("max_steps_reached", False)
+        no_progress_hit = fixer_result.get("no_progress", False)
 
+        def _tests_passed(outcome: dict | None) -> bool:
+            if not outcome:
+                return False
+            return (
+                int(outcome.get("passed") or 0) > 0
+                and int(outcome.get("failed") or 0) == 0
+                and int(outcome.get("errors") or 0) == 0
+            )
+
+        salvaged = False
         if not concluded:
-            print("WARN: local-fixer: run not concluded (doorman unreachable or timeout)", file=sys.stderr)
-            return ""
-        if not final_diff.strip():
-            print("WARN: local-fixer: empty diff — no PR", file=sys.stderr)
-            return ""
-        if last_test_outcome is not None:
-            passed = int(last_test_outcome.get("passed") or 0)
-            if passed == 0:
-                print("WARN: local-fixer: zero passing tests — no PR", file=sys.stderr)
+            if max_steps_hit and final_diff.strip() and _tests_passed(last_test_outcome):
+                # Step ceiling hit but diff is clean and tests pass — salvage as PR.
+                salvaged = True
+            elif no_progress_hit:
+                print(
+                    "WARN: local-fixer: run aborted — no semantic progress after consecutive idle steps (spinning wheels)",
+                    file=sys.stderr,
+                )
                 return ""
+            elif max_steps_hit:
+                print(
+                    "WARN: local-fixer: run not concluded — max_steps ceiling reached (no passing tests or empty diff)",
+                    file=sys.stderr,
+                )
+                return ""
+            else:
+                print(
+                    "WARN: local-fixer: run not concluded — DoormanUnreachable or wake timeout",
+                    file=sys.stderr,
+                )
+                return ""
+
+        if not salvaged:
+            if not final_diff.strip():
+                print("WARN: local-fixer: empty diff — no PR", file=sys.stderr)
+                return ""
+            if last_test_outcome is not None:
+                passed = int(last_test_outcome.get("passed") or 0)
+                if passed == 0:
+                    print("WARN: local-fixer: zero passing tests — no PR", file=sys.stderr)
+                    return ""
 
         # Deterministic git (model never touches git)
         def _git(*args: str) -> subprocess.CompletedProcess:
@@ -258,9 +299,14 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             test_summary = "no test outcome recorded"
 
         step_count = len(fixer_result.get("steps") or [])
+        salvage_note = (
+            "**harness-salvaged: max_steps_reached** — loop hit the step ceiling but diff and tests were clean.\n\n"
+            if salvaged else ""
+        )
 
         pr_body = (
             f"Implemented by the local 122B fixer harness, not paid Claude.\n\n"
+            f"{salvage_note}"
             f"## Diff summary\n\n```diff\n{diffstat}\n```\n\n"
             f"## Test outcome\n\n{test_summary}\n\n"
             f"## Steps\n\n{step_count} tool-call step(s) executed.\n\n"
