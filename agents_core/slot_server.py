@@ -379,13 +379,7 @@ def create_app(db_path: Path, elevator_db_path: Path | None = None) -> FastAPI:
             lanes = body.get("lanes", ["interactive", "deliberation", "execution"])
             owner = body["owner"]
             claim_ttl_sec = body.get("claim_ttl_sec", 30)
-            exclude_kinds = body.get("exclude_kinds")
-            item = elevator.claim(
-                lanes=lanes,
-                owner=owner,
-                claim_ttl_sec=claim_ttl_sec,
-                exclude_kinds=exclude_kinds,
-            )
+            item = elevator.claim(lanes=lanes, owner=owner, claim_ttl_sec=claim_ttl_sec)
         except KeyError as e:
             raise HTTPException(
                 status_code=400, detail=_error("bad_request", f"missing field {e}")

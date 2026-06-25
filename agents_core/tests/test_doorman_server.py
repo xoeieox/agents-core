@@ -1926,8 +1926,8 @@ class TestLeaseKindDrainGate:
 
         t1 = threading.Thread(target=place_hold)
         t2 = threading.Thread(target=place_inference)
-        t1.start(); t1.join()
-        t2.start(); t2.join()
+        t1.start(); t2.start()
+        t1.join(); t2.join()
         assert not errors, f"concurrent test errors: {errors}"
 
     # AC3: two inference workers under distinct principals still contend (#113 TOCTOU preserved)
