@@ -100,6 +100,9 @@ DOORMAN_IDLE_LOG = os.environ.get("DOORMAN_IDLE_LOG", "/var/log/doorman-idle.jso
 # Sentinel for deferred acquire (controller owns the mode)
 DEFERRED = object()
 
+# Sentinel for contended acquire (require_drain_clear=True failed: another-principal worker active)
+CONTENDED = object()
+
 # Sentinel principal for worker leases acquired without an explicit principal.
 # Never excluded from drain_count — makes a forgotten-principal diagnosable instead of invisible.
 GHOST_PRINCIPAL = "__GHOST_LEASE__"
@@ -433,11 +436,12 @@ class _NodeState:
             del self.leases[wid]
         return expired
 
-    def acquire_lease(self, work_id: str, ttl_sec: int, reason: str, role: str = "worker", principal: str | None = None) -> bool | object:
+    def acquire_lease(self, work_id: str, ttl_sec: int, reason: str, role: str = "worker", principal: str | None = None, require_drain_clear: bool = False) -> bool | object:
         """Try to ensure GW is serving, then register the lease.
 
         Returns True on success, DEFERRED if a foreign caller acquires during controller
-        ownership (no lease registered), False on failure.
+        ownership (no lease registered), CONTENDED if require_drain_clear=True and another
+        principal's worker lease is active (lease not registered), False on failure.
 
         Args:
           role: optional role descriptor (default "worker"). E.g., "mode-controller"
@@ -447,6 +451,10 @@ class _NodeState:
                      without a principal are stamped GHOST_PRINCIPAL — always counted,
                      never excluded, emits critical log when counted in a drain decision.
                      Non-worker leases are drain-gate-exempt; principal is ignored.
+          require_drain_clear: when True and role=="worker", atomically checks for
+                               other-principal worker leases before registering this one.
+                               Returns CONTENDED without registering if any exist.
+                               Defaults False — all existing callers are unchanged.
         """
         # Clear idle tracking: an arriving lease means the node is no longer idle
         was_idle = self.idle_since is not None
@@ -474,6 +482,29 @@ class _NodeState:
                 return DEFERRED
         if not ok:
             return False
+
+        # Atomic drain-gate check (AC3): count cross-group worker leases and register
+        # the new lease in one critical section — check-and-register atomic; closes the
+        # drain-gate TOCTOU where separate drain_count + acquire calls let multiple
+        # distinct-principal workers all observe drain=0 before any registers.
+        if require_drain_clear and role == "worker":
+            effective_principal = principal if principal is not None else GHOST_PRINCIPAL
+            for _wid, _info in self.leases.items():
+                if _info.get("role") != "worker":
+                    continue
+                _p = _info.get("principal", GHOST_PRINCIPAL)
+                if _p == GHOST_PRINCIPAL:
+                    # Ghost leases always count as contending; never silently excluded (AC6).
+                    log.critical(
+                        "[doorman] drain_count ghost_lease_counted work_id=%s - "
+                        "role=worker lease has no principal; add principal= to "
+                        "acquire() call to prevent drain-gate freeze",
+                        _wid,
+                    )
+                    return CONTENDED
+                if _p != effective_principal:
+                    return CONTENDED
+
         lease_entry: dict = {
             "acquired_at": time.time(),
             "ttl_sec": ttl_sec,
@@ -810,6 +841,7 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         reason = body.get("reason", "")
         role = body.get("role", "worker")
         principal = body.get("principal") or None  # empty string → None → ghost
+        require_drain_clear = bool(body.get("require_drain_clear", False))
 
         if node not in nodes:
             return JSONResponse(
@@ -824,8 +856,13 @@ def create_app(gw_url: str | None = None) -> FastAPI:
 
         state = nodes[node]
         with state.lock:
-            ok = state.acquire_lease(work_id, ttl_sec, reason, role=role, principal=principal)
+            ok = state.acquire_lease(
+                work_id, ttl_sec, reason, role=role, principal=principal,
+                require_drain_clear=require_drain_clear,
+            )
 
+        if ok is CONTENDED:
+            return {"ok": False, "contended": True, "node": node}
         if ok is DEFERRED:
             return {
                 "status": "deferred",
@@ -836,7 +873,10 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         if not ok:
             return {"status": "wake_failed", "detail": state.last_error or "wake failed"}
 
-        return {"status": "serving", "node": node, "work_id": work_id}
+        resp: dict = {"status": "serving", "node": node, "work_id": work_id}
+        if require_drain_clear:
+            resp["drain_cleared"] = True  # signals to client that drain check was honored (AC5a)
+        return resp
 
     # ------------------------------------------------------------------
     # POST /lease/release

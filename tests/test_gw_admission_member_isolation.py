@@ -41,12 +41,14 @@ def db(tmp_path):
 def _gw_dc_serving():
     """Return (DoormanClient class mock, instance mock) with status=serving."""
     instance = MagicMock()
-    instance.acquire.return_value = {"status": "serving", "node": "gravitywell", "work_id": "w1"}
+    instance.acquire.return_value = {"status": "serving", "node": "gravitywell", "work_id": "w1",
+                                     "drain_cleared": True}
     instance.drain_count.return_value = 0
     instance.release = MagicMock()
     instance.close = MagicMock()
     dc = MagicMock(return_value=instance)
     dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
     return dc, instance
 
 
@@ -364,6 +366,7 @@ def test_ac5_second_principal_admits_after_hung_member_cleared(tmp_path, monkeyp
     def run_second():
         dc_cls = MagicMock(side_effect=[mock_client2])
         dc_cls.is_deferred = lambda r: r.get("status") == "deferred"
+        dc_cls.is_contended = lambda r: bool(r.get("contended"))
         with patch("agents_core.elevator.IS_MASTER", True), \
              patch("agents_core.doorman_client.DoormanClient", dc_cls), \
              patch("agents_core.llm._call_gravitywell_backend", return_value="second-ok"):
@@ -389,6 +392,7 @@ def test_ac5_second_principal_admits_after_hung_member_cleared(tmp_path, monkeyp
 
     dc_cls_first = MagicMock(side_effect=[mock_client1])
     dc_cls_first.is_deferred = lambda r: r.get("status") == "deferred"
+    dc_cls_first.is_contended = lambda r: bool(r.get("contended"))
 
     with patch("agents_core.elevator.IS_MASTER", True), \
          patch("agents_core.doorman_client.DoormanClient", dc_cls_first), \
@@ -443,6 +447,7 @@ def test_ac5a_no_traffic_self_heal(tmp_path, monkeypatch):
 
     dc_cls = MagicMock(side_effect=[mock_client])
     dc_cls.is_deferred = lambda r: r.get("status") == "deferred"
+    dc_cls.is_contended = lambda r: bool(r.get("contended"))
 
     with patch("agents_core.elevator.IS_MASTER", True), \
          patch("agents_core.doorman_client.DoormanClient", dc_cls), \

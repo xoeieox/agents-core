@@ -82,7 +82,10 @@ def _gw_mock_client(status="serving"):
     mock = MagicMock()
     mock.__enter__ = MagicMock(return_value=mock)
     mock.__exit__ = MagicMock(return_value=False)
-    mock.acquire.return_value = {"status": status, "node": "gravitywell", "work_id": "w1"}
+    resp = {"status": status, "node": "gravitywell", "work_id": "w1"}
+    if status == "serving":
+        resp["drain_cleared"] = True  # new atomic-acquire field; absence triggers AC5a warning
+    mock.acquire.return_value = resp
     return mock
 
 
@@ -91,12 +94,13 @@ def _gw_dc(status="serving"):
 
     Use as: dc, mock_client = _gw_dc(status); patch("...DoormanClient", dc)
 
-    The class mock has is_deferred wired to the real static logic so that
-    patch("...DoormanClient", dc) doesn't make every status look deferred.
+    The class mock has is_deferred and is_contended wired to the real static logic so that
+    patch("...DoormanClient", dc) doesn't make every status look deferred or contended.
     """
     instance = _gw_mock_client(status)
     dc = MagicMock(return_value=instance)
     dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
     return dc, instance
 
 
@@ -402,18 +406,27 @@ def test_ac2_enforce_enqueues_and_serves(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_ac4_fresh_group_waits_for_drain_count(tmp_path, monkeypatch):
-    """AC4: fresh principal-group holds until drain_count==0; dispatches once it clears."""
+    """AC4: fresh principal-group waits when CONTENDED; dispatches once drain clears.
+
+    Updated for atomic drain-gate (gw-admission-drain-gate-atomic-acquire-v0):
+    require_drain_clear=True is now passed to acquire; CONTENDED response → retry,
+    serving response → proceed. The old two-step drain_count + acquire is gone.
+    """
     monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
     monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
     monkeypatch.setenv("GW_ADMISSION_POLL_INTERVAL_SEC", "0.01")
 
     dc = MagicMock()
     instance = MagicMock()
-    # drain_count returns 1 on first call, then 0 (clears)
-    instance.drain_count.side_effect = [1, 0]
-    instance.acquire.return_value = {"status": "serving"}
+    # First acquire returns CONTENDED (another group active); second returns serving.
+    acquire_responses = [
+        {"ok": False, "contended": True},
+        {"status": "serving", "drain_cleared": True},
+    ]
+    instance.acquire.side_effect = acquire_responses
     dc.return_value = instance
     dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
 
     with patch("agents_core.elevator.IS_MASTER", True), \
          patch("agents_core.doorman_client.DoormanClient", dc), \
@@ -424,12 +437,18 @@ def test_ac4_fresh_group_waits_for_drain_count(tmp_path, monkeypatch):
 
     assert result == "ok"
     assert ("success", "gravitywell") in prov
-    # drain_count must have been polled at least twice (1 then 0)
-    assert instance.drain_count.call_count >= 2
+    # acquire must have been called at least twice (CONTENDED → retry → serving)
+    assert instance.acquire.call_count >= 2
+    # drain_count must NOT be called (replaced by atomic acquire)
+    instance.drain_count.assert_not_called()
 
 
 def test_ac4_ride_along_skips_drain_count(tmp_path, monkeypatch):
-    """AC4: same-principal ride-along dispatches immediately, drain_count not checked."""
+    """AC4: same-principal ride-along dispatches immediately, drain check skipped.
+
+    Updated for atomic drain-gate: ride-alongs call acquire with require_drain_clear=False
+    (unconditional). drain_count is never called (replaced by atomic acquire).
+    """
     monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
     monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
     monkeypatch.setenv("GW_ADMISSION_POLL_INTERVAL_SEC", "0.01")
@@ -446,11 +465,11 @@ def test_ac4_ride_along_skips_drain_count(tmp_path, monkeypatch):
 
     dc = MagicMock()
     instance = MagicMock()
-    # drain_count returns non-zero; ride-along must NOT block on it
-    instance.drain_count.return_value = 5
-    instance.acquire.return_value = {"status": "serving"}
+    # drain_count is irrelevant; ride-along must NOT block even if contended drain
+    instance.acquire.return_value = {"status": "serving", "drain_cleared": True}
     dc.return_value = instance
     dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
 
     with patch("agents_core.elevator.IS_MASTER", True), \
          patch("agents_core.doorman_client.DoormanClient", dc), \
@@ -461,8 +480,12 @@ def test_ac4_ride_along_skips_drain_count(tmp_path, monkeypatch):
 
     assert result == "ok"
     assert ("success", "gravitywell") in prov
-    # drain_count must NOT have been called (ride-along skips the gate)
+    # drain_count must NOT be called (atomic acquire replaced two-step for all paths)
     instance.drain_count.assert_not_called()
+    # Ride-along: acquire must have been called with require_drain_clear=False (or omitted)
+    for call_args in instance.acquire.call_args_list:
+        assert not call_args.kwargs.get("require_drain_clear", False), \
+            "ride-along must not pass require_drain_clear=True"
 
 
 # ---------------------------------------------------------------------------
@@ -538,15 +561,15 @@ def test_ac6_deferred_requeues_then_serves(tmp_path, monkeypatch):
 
     acquire_responses = [
         {"status": "deferred"},
-        {"status": "serving"},
+        {"status": "serving", "drain_cleared": True},
     ]
 
     dc = MagicMock()
     instance = MagicMock()
     instance.acquire.side_effect = acquire_responses
-    instance.drain_count.return_value = 0
     dc.return_value = instance
     dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
 
     apply_wake_fail_calls = []
 
@@ -620,9 +643,9 @@ def test_ac8_wake_failed_bounded_backoff(tmp_path, monkeypatch):
     dc = MagicMock()
     instance = MagicMock()
     instance.acquire.return_value = {"status": "wake_failed"}
-    instance.drain_count.return_value = 0
     dc.return_value = instance
     dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
 
     with patch("agents_core.elevator.IS_MASTER", True), \
          patch("agents_core.doorman_client.DoormanClient", dc), \
@@ -752,13 +775,24 @@ def test_ac11_provenance_precedence():
 # ---------------------------------------------------------------------------
 
 def test_ac12_drain_count_unavailable_proceeds(tmp_path, monkeypatch):
-    """AC12: drain_count=None -> proceed loud with elevator gate alone."""
+    """AC12 (AC5a): older doorman returns serving without drain_cleared → proceed loud with provenance.
+
+    Updated for atomic drain-gate: drain_count is no longer called. The AC5a forward-compat
+    path triggers when the doorman returns {"status": "serving"} without drain_cleared=True,
+    signaling it ignored require_drain_clear (pre-atomic doorman). Client loud-proceeds with
+    drain_count_unavailable provenance (same semantics, new detection mechanism).
+    """
     monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
     monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
     monkeypatch.setenv("GW_ADMISSION_POLL_INTERVAL_SEC", "0.01")
 
-    dc, mock_client = _gw_dc(status="serving")
-    mock_client.drain_count.return_value = None  # unavailable
+    dc = MagicMock()
+    instance = MagicMock()
+    # Old doorman: returns serving WITHOUT drain_cleared (ignored require_drain_clear)
+    instance.acquire.return_value = {"status": "serving"}
+    dc.return_value = instance
+    dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
 
     with patch("agents_core.elevator.IS_MASTER", True), \
          patch("agents_core.doorman_client.DoormanClient", dc), \
