@@ -146,18 +146,25 @@ class _MockDoormanState:
         role: str = "worker",
         ttl_sec: int = 300,
         require_drain_clear: bool = False,
+        lease_kind: str = "inference",
     ) -> bool | object:
         """Try to register a lease. Mirrors _NodeState.acquire_lease atomic semantics.
 
         Returns CONTENDED (without registering) if require_drain_clear=True and another
         principal's worker lease is active. Returns True on success.
         GHOST_PRINCIPAL leases always count as contending (never excluded).
+        lease_kind="coordination" leases are skipped in the contention loop, mirroring
+        doorman_server.py:500-503. drain_count() still counts them (AC1a).
         """
         with self.lock:
             if require_drain_clear and role == "worker":
                 effective_principal = principal if principal is not None else GHOST_PRINCIPAL
                 for wid, info in self.leases.items():
                     if info.get("role") != "worker":
+                        continue
+                    # Coordination leases hold no inference — not a drain-gate contender.
+                    # Mirrors doorman_server.py:502-503.
+                    if info.get("lease_kind", "inference") == "coordination":
                         continue
                     _p = info.get("principal", GHOST_PRINCIPAL)
                     if _p == GHOST_PRINCIPAL:
@@ -175,6 +182,7 @@ class _MockDoormanState:
                 "ttl_sec": ttl_sec,
                 "role": role,
                 "principal": principal if principal is not None else GHOST_PRINCIPAL,
+                "lease_kind": lease_kind,
             }
         return True
 
@@ -989,6 +997,207 @@ def run_s4(
 
 
 # ---------------------------------------------------------------------------
+# S5 — Span-hold coordination lease + distinct-operator-principal admit
+# ---------------------------------------------------------------------------
+
+def run_s5(
+    elevator: ElevatorStore,
+    doorman: _MockDoormanState,
+    n: int,
+    friction: _FrictionBackend | None,
+) -> dict:
+    """S5: Reproduces the 2026-06-24 span-principal wedge; proves kind-aware drain-gate fix.
+
+    A session holds a span-hold coordination lease (P_span) while its own GW operator
+    legs (P_op != P_span) acquire with require_drain_clear=True.
+
+    AC2: every operator leg admits — the coordination lease is skipped, not a contender.
+    AC3: cross-principal inference still contends inference (drain-gate purpose intact).
+    AC3a: transition — CONTENDED while inference present, ADMITS when only coordination remains.
+    AC6: inline self-check that the coordination-skip in the mock fires correctly.
+    """
+    print(f"\n=== S5 SPAN-HOLD COORDINATION + DISTINCT-OPERATOR ADMIT (n={n}) ===", flush=True)
+
+    failures = []
+    served_count = 0
+    peaks = []
+    stop_sampler = threading.Event()
+    peak_lock = threading.Lock()
+
+    P_span = f"shared-delib-s5-{uuid.uuid4().hex[:8]}"
+    P_op = f"op-gravitywell-s5-{uuid.uuid4().hex[:8]}"
+    span_hold_id = f"s5-span-{uuid.uuid4().hex[:6]}"
+
+    def _sample_peaks():
+        while not stop_sampler.is_set():
+            c = doorman.active_group_count()
+            with peak_lock:
+                peaks.append(c)
+            time.sleep(0.05)
+
+    sampler = threading.Thread(target=_sample_peaks, daemon=True)
+    sampler.start()
+
+    try:
+        # ---- Phase 1: Acquire span-hold (coordination) — held for the entire scenario ----
+        res = doorman.acquire(span_hold_id, principal=P_span, role="worker",
+                              lease_kind="coordination")
+        if res is not True:
+            failures.append(f"span_hold_acquire_failed: {res}")
+
+        # ---- Phase 2: AC6 inline self-check — confirm coordination-skip fires ----
+        # With only the coordination lease present, a distinct-principal inference acquire MUST admit.
+        _sc_admit_id = f"s5-sc-admit-{uuid.uuid4().hex[:4]}"
+        sc_admit = doorman.acquire(_sc_admit_id, principal=P_op, role="worker",
+                                   require_drain_clear=True, lease_kind="inference")
+        if sc_admit is not True:
+            failures.append(f"AC6_coordination_blocked_inference: got {sc_admit!r}")
+        else:
+            doorman.release(_sc_admit_id)
+
+        # With an inference lease under a third principal present, inference MUST contend.
+        P_sc_inf = f"s5-sc-inf-{uuid.uuid4().hex[:6]}"
+        _sc_inf_id = f"s5-sc-inf-{uuid.uuid4().hex[:4]}"
+        doorman.acquire(_sc_inf_id, principal=P_sc_inf, role="worker", lease_kind="inference")
+        _sc_op_id = f"s5-sc-op-{uuid.uuid4().hex[:4]}"
+        sc_contend = doorman.acquire(_sc_op_id, principal=P_op, role="worker",
+                                     require_drain_clear=True, lease_kind="inference")
+        if sc_contend is not CONTENDED:
+            failures.append(f"AC6_inference_should_contend: got {sc_contend!r}")
+        doorman.release(_sc_inf_id)
+
+        # ---- Phase 3: AC3a transition + AC3 negative control ----
+        # State: span-hold (coordination, P_span) is held throughout this phase.
+        P_inf = f"inf-s5-{uuid.uuid4().hex[:6]}"
+        P_op2 = f"op2-s5-{uuid.uuid4().hex[:6]}"
+        P_inf_b = f"inf-b-s5-{uuid.uuid4().hex[:6]}"
+        _inf_id = f"s5-inf-{uuid.uuid4().hex[:4]}"
+        _op2_id = f"s5-op2-{uuid.uuid4().hex[:4]}"
+        _inf_b_id = f"s5-inf-b-{uuid.uuid4().hex[:4]}"
+
+        # Add an inference worker under P_inf (simulates another session holding GPU).
+        doorman.acquire(_inf_id, principal=P_inf, role="worker", lease_kind="inference")
+
+        # AC3a-part1: P_op2 CONTENDS — the inference worker is the cause, not the coordination lease.
+        res_contend = doorman.acquire(_op2_id, principal=P_op2, role="worker",
+                                      require_drain_clear=True, lease_kind="inference")
+        if res_contend is not CONTENDED:
+            failures.append(f"AC3a_expected_CONTENDED_with_inference_present: got {res_contend!r}")
+
+        # AC3 negative control: a second inference principal (P_inf_b) CONTENDS the first (P_inf).
+        res_inf_b = doorman.acquire(_inf_b_id, principal=P_inf_b, role="worker",
+                                    require_drain_clear=True, lease_kind="inference")
+        if res_inf_b is not CONTENDED:
+            failures.append(f"AC3_inference_b_not_contended_by_inference_a: got {res_inf_b!r}")
+
+        # Release the inference worker — only the span-hold (coordination) now remains.
+        doorman.release(_inf_id)
+
+        # AC3a-part2: P_op2 now ADMITS — the coordination lease is skipped, not a blocker.
+        res_admit = doorman.acquire(_op2_id, principal=P_op2, role="worker",
+                                    require_drain_clear=True, lease_kind="inference")
+        if res_admit is CONTENDED:
+            failures.append("AC3a_still_CONTENDED_after_inference_released")
+        elif res_admit is True:
+            doorman.release(_op2_id)
+        else:
+            failures.append(f"AC3a_unexpected_after_inference_released: {res_admit!r}")
+
+        # ---- Phase 4: AC2 main elevator test ----
+        # N operator legs (P_op, shared) + 3 Facets personas (distinct per-persona principal).
+        # Span-hold (P_span, coordination) is held throughout. Every leg MUST be served.
+        all_tickets = []
+
+        def _admit_and_serve(principal: str, label: str) -> None:
+            nonlocal served_count
+            work_id = f"s5-{label}-{uuid.uuid4().hex[:6]}"
+            try:
+                ticket = elevator.enqueue(
+                    lane="deliberation",
+                    kind="gw-admission",
+                    payload={"work_id": work_id},
+                    principal=principal,
+                    latency_class="batch",
+                )
+                all_tickets.append(ticket)
+                deadline = time.monotonic() + 20.0
+                while time.monotonic() < deadline:
+                    elevator.reclaim_stale("deliberation")
+                    ok, is_ride_along = elevator.try_admit(ticket, "deliberation", principal)
+                    if ok:
+                        while time.monotonic() < deadline:
+                            res = doorman.acquire(
+                                work_id, principal=principal, role="worker",
+                                require_drain_clear=(not is_ride_along),
+                                lease_kind="inference",
+                            )
+                            if res is not CONTENDED:
+                                break
+                            time.sleep(0.05)
+                        else:
+                            elevator.fail(ticket)
+                            failures.append(f"AC2_drain_timeout_{label}")
+                            return
+                        try:
+                            time.sleep(friction.gw_call_delay() if friction else 0.05)
+                        finally:
+                            doorman.release(work_id)
+                        elevator.ack(ticket)
+                        served_count += 1
+                        return
+                    time.sleep(0.05)
+                elevator.fail(ticket)
+                failures.append(f"AC2_timeout_{label}")
+            except Exception as e:
+                failures.append(f"AC2_error_{label}:{e}")
+
+        threads = []
+        for i in range(n):
+            threads.append(threading.Thread(target=_admit_and_serve, args=(P_op, f"op-{i}")))
+        for persona in ("facets-alpha", "facets-beta", "facets-gamma"):
+            threads.append(threading.Thread(
+                target=_admit_and_serve, args=(f"s5-{persona}", persona)
+            ))
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+
+        expected_callers = n + 3
+        if served_count < expected_callers:
+            failures.append(f"AC2_not_all_served: {served_count}/{expected_callers}")
+
+        claimed = _claimed_principals(elevator, "deliberation")
+        if claimed:
+            failures.append(f"leaked_claims={claimed}")
+
+    finally:
+        doorman.release(span_hold_id)
+        stop_sampler.set()
+        sampler.join(timeout=2)
+
+    peak_drain = max(peaks) if peaks else 0
+    passed = len(failures) == 0
+    result = {
+        "scenario": "S5",
+        "pass": passed,
+        "failures": failures,
+        "details": {
+            "served": served_count,
+            "expected_callers": n + 3,
+            "peak_in_flight": peak_drain,
+            "AC2_admits_pass": not any("AC2_" in f for f in failures),
+            "AC3_contention_pass": not any("AC3_" in f for f in failures),
+            "AC3a_transition_pass": not any("AC3a_" in f for f in failures),
+            "AC6_self_check_pass": not any("AC6_" in f for f in failures),
+        },
+    }
+    _print_scenario_result(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Verdict emitter
 # ---------------------------------------------------------------------------
 
@@ -1045,10 +1254,18 @@ def emit_verdict(results: dict, seed: int, n: int, mode: str) -> Path:
         "  CONTENDED). S4 is the end-to-end confirmation that the fixed atomic drain-gate",
         "  pattern (require_drain_clear=True, mirroring agents_core/llm.py) holds under",
         "  the 2026-06-24 incident-shaped burst with no permanent wedge.",
+        "- **S5**: Kind-aware drain-gate re-arm prerequisite (gw-enforce-ab-harness-kind-aware-scenario-v0).",
+        "  Reproduces the 2026-06-24 span-principal wedge: a session's span-hold coordination",
+        "  lease (P_span, lease_kind=coordination) must NOT block its own GW operator legs",
+        "  (P_op, lease_kind=inference, require_drain_clear=True). AC2 asserts all operator/Facets",
+        "  legs admit with span-hold held. AC3 asserts cross-principal inference still contends.",
+        "  AC3a asserts the transition: CONTENDED-while-inference-present → ADMITS-when-coordination-only.",
+        "  AC6 is an inline coordination-skip self-check. A --live GO that includes S5 PASS is",
+        "  the trustworthy gate for enforce re-arm. Do NOT re-arm until S5 PASS is confirmed.",
         "",
         f"## Decision: **{go_no_go}** for re-arming `GW_ADMISSION_MODE=enforce`",
         "",
-        f"GO requires all scenarios PASS. {'All scenarios passed.' if all_pass else 'One or more scenarios FAILED — do not re-arm enforce until fixed.'}",
+        f"GO requires all scenarios PASS (S0–S5). {'All scenarios passed.' if all_pass else 'One or more scenarios FAILED — do not re-arm enforce until fixed.'}",
         "",
         "<!-- gw-enforce-rearm-ab-harness-v0 -->",
     ]
@@ -1103,6 +1320,7 @@ def main() -> int:
                         help="Number of concurrent callers per scenario (default 4)")
     parser.add_argument("--skip-s0", action="store_true")
     parser.add_argument("--skip-s4", action="store_true")
+    parser.add_argument("--skip-s5", action="store_true")
     args = parser.parse_args()
 
     live_mode = args.live
@@ -1167,6 +1385,16 @@ def main() -> int:
             elev, db_path = _scenario_db("s4")
             try:
                 results["S4"] = run_s4(elev, doorman, db_path, friction, args.n)
+            finally:
+                _cleanup_elevator(elev)
+                elev.close()
+            doorman.leases.clear()
+
+        if not args.skip_s5:
+            elev, _ = _scenario_db("s5")
+            doorman.leases.clear()
+            try:
+                results["S5"] = run_s5(elev, doorman, args.n, friction)
             finally:
                 _cleanup_elevator(elev)
                 elev.close()
