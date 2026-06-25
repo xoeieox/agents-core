@@ -505,3 +505,144 @@ def test_slow_leak_warning_fires(caplog):
     slow_warnings = [r for r in caplog.records if "slow" in r.message.lower()]
     assert len(slow_warnings) >= 1, "warning must be emitted for read above soft threshold"
     assert "pm_state read failed" not in caplog.text, "must not emit failure message"
+
+
+# ---------------------------------------------------------------------------
+# 13. GROUND_TOTAL_BUDGET_S — RAG skipped when PM-state exhausts the budget
+# ---------------------------------------------------------------------------
+
+def test_rag_skipped_when_pm_exhausts_budget():
+    """When PM-state consumes > GROUND_TOTAL_BUDGET_S, RAG is not queried and stale=True."""
+    import time
+    import agents_core.ground as gmod
+
+    orig_budget = gmod._TOTAL_BUDGET_S
+    gmod._TOTAL_BUDGET_S = 0.05  # 50ms budget
+
+    retrieve_calls = []
+
+    def slow_pm_state():
+        time.sleep(0.15)  # 3x the budget
+        return (
+            "[pm:x]\ntarget:x (X) [high]",
+            [{"tag": "pm:x", "source": "pm_state", "score": None, "why": "active-target"}],
+            False,
+        )
+
+    try:
+        with patch("agents_core.ground._assemble_pm_state", side_effect=slow_pm_state), \
+             patch("agents_core.ground.retrieve",
+                   side_effect=lambda *a, **kw: retrieve_calls.append(kw) or []):
+            bundle = ground("q", pm_state=True)
+    finally:
+        gmod._TOTAL_BUDGET_S = orig_budget
+
+    assert len(retrieve_calls) == 0, "retrieve must not be called when budget exhausted by PM-state"
+    assert bundle.stale is True
+    ungrounded = [p for p in bundle.provenance if p.get("why") == "budget-exhausted"]
+    assert len(ungrounded) >= 1, "budget-exhausted ungrounded markers must appear in provenance"
+
+
+# ---------------------------------------------------------------------------
+# 14. Remaining budget is passed to retrieve() as effective timeout
+# ---------------------------------------------------------------------------
+
+def test_remaining_budget_passed_to_retrieve():
+    """After PM-state, ground() passes min(RAG_HTTP_TIMEOUT, remaining) to retrieve."""
+    import time
+    import agents_core.ground as gmod
+    import agents_core.retrieval as rmod
+
+    orig_budget = gmod._TOTAL_BUDGET_S
+    gmod._TOTAL_BUDGET_S = 0.4  # 400ms total budget
+
+    captured_timeouts = []
+
+    def pm_consumes_200ms():
+        time.sleep(0.2)  # leaves ~200ms remaining, < 1.5s RAG_HTTP_TIMEOUT
+        return ("", [], False)
+
+    def capture_retrieve(query, scope, top_k=10, min_score=0.0, timeout=None, **kw):
+        captured_timeouts.append(timeout)
+        return []
+
+    try:
+        with patch("agents_core.ground._assemble_pm_state", side_effect=pm_consumes_200ms), \
+             patch("agents_core.ground.retrieve", side_effect=capture_retrieve):
+            bundle = ground("q", pm_state=True)
+    finally:
+        gmod._TOTAL_BUDGET_S = orig_budget
+
+    assert len(captured_timeouts) == 1, "retrieve should be called exactly once"
+    t = captured_timeouts[0]
+    assert t is not None, "timeout kwarg must be passed to retrieve"
+    assert t < rmod.RAG_HTTP_TIMEOUT, "effective timeout must be < RAG_HTTP_TIMEOUT when budget constrained"
+    assert t <= 0.4, "effective timeout must not exceed the total budget"
+    assert bundle.stale is True, "budget-constrained RAG timeout must set stale=True"
+
+
+# ---------------------------------------------------------------------------
+# 15. retrieve(timeout=...) override — unit test for the retrieval layer
+# ---------------------------------------------------------------------------
+
+def test_retrieve_timeout_override():
+    """retrieve() passes an explicit timeout to _search_rag; None preserves module default."""
+    from unittest.mock import patch as mpatch
+    from agents_core import retrieval as rmod
+
+    captured = []
+
+    def fake_rag(source, query, filters, timeout=None):
+        captured.append(timeout)
+        return []
+
+    with mpatch.object(rmod, "_search_rag", side_effect=fake_rag):
+        rmod.retrieve("q", scope=["vault-rag"], timeout=0.3)
+        rmod.retrieve("q", scope=["vault-rag"])
+
+    assert len(captured) == 2
+    assert captured[0] == pytest.approx(0.3), "explicit timeout must be threaded to _search_rag"
+    assert captured[1] is None, "omitting timeout must pass None (module default applies in _search_rag)"
+
+
+# ---------------------------------------------------------------------------
+# 16. Healthy path with budget: stale=False when backends are fast
+# ---------------------------------------------------------------------------
+
+def test_healthy_path_budget_stale_false():
+    """With fast backends and normal budget, the total-budget mechanism leaves stale=False."""
+    import agents_core.ground as gmod
+
+    # Verify the default budget is sane (> RAG_HTTP_TIMEOUT so normal calls are never stale)
+    import agents_core.retrieval as rmod
+    assert gmod._TOTAL_BUDGET_S > rmod.RAG_HTTP_TIMEOUT, \
+        "default GROUND_TOTAL_BUDGET_S must exceed RAG_HTTP_TIMEOUT so healthy calls aren't stale"
+
+    fake_hits = [_make_hit("mem", "decision/x", "content", 0.9)]
+
+    with patch("agents_core.ground.retrieve", return_value=fake_hits), \
+         patch("agents_core.ground._assemble_pm_state", return_value=("pm text", [], False)):
+        bundle = ground("q")
+
+    assert bundle.stale is False, "healthy fast call must not be marked stale"
+    assert "decision/x" in bundle.context_block
+    assert "pm text" in bundle.context_block
+
+
+# ---------------------------------------------------------------------------
+# 17. GROUND_TOTAL_BUDGET_S env override is honored (reload test)
+# ---------------------------------------------------------------------------
+
+def test_total_budget_env_override(monkeypatch):
+    """GROUND_TOTAL_BUDGET_S env var sets _TOTAL_BUDGET_S at import time."""
+    import importlib
+    import agents_core.ground as gmod
+
+    monkeypatch.setenv("GROUND_TOTAL_BUDGET_S", "4.2")
+    importlib.reload(gmod)
+    try:
+        assert gmod._TOTAL_BUDGET_S == pytest.approx(4.2), \
+            f"Expected _TOTAL_BUDGET_S=4.2, got {gmod._TOTAL_BUDGET_S}"
+    finally:
+        monkeypatch.delenv("GROUND_TOTAL_BUDGET_S", raising=False)
+        importlib.reload(gmod)

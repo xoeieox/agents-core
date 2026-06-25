@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 
 from agents_core.mem import MemoryStore
-from agents_core.retrieval import retrieve
+from agents_core.retrieval import RAG_HTTP_TIMEOUT, retrieve
 from agents_core.targets import TargetStore
 
 log = logging.getLogger(__name__)
@@ -29,6 +29,10 @@ _DEFAULT_SCOPE = ["mem", "vault-rag", "chub"]
 # the measured ~412ms healthy read on BRIX) to 1.5s to catch only pathological
 # lock/hang cases. Override without a code change via GROUND_PM_TIMEOUT_S env var.
 _PM_TIMEOUT_S: float = float(os.environ.get("GROUND_PM_TIMEOUT_S", "1.5"))
+# Hard total wall-clock budget for the entire ground() call (PM-state + RAG).
+# Default 2.5s keeps weaver's turn-handler well under loupe's proxy timeout (5s).
+# Override via GROUND_TOTAL_BUDGET_S env var.
+_TOTAL_BUDGET_S: float = float(os.environ.get("GROUND_TOTAL_BUDGET_S", "2.5"))
 _PM_WARN_FRACTION = 0.6  # emit warning when healthy read >= this fraction of the guard
 _MEM_BIAS_NAMESPACES = {"decision", "project", "architecture"}
 
@@ -67,8 +71,12 @@ def ground(
         scope:        RAG/mem backends to query. Default: ["mem","vault-rag","chub"].
 
     Note:
-        RAG backend timeouts are controlled by retrieve() and are env-overridable:
-        RAG_HTTP_TIMEOUT (default 1.5 s) and CHUB_TIMEOUT (default 1.5 s).
+        Per-backend timeouts (env-overridable): GROUND_PM_TIMEOUT_S (PM-state,
+        default 1.5 s), RAG_HTTP_TIMEOUT (per-RAG-backend, default 1.5 s),
+        CHUB_TIMEOUT (default 1.5 s). Total wall-clock budget: GROUND_TOTAL_BUDGET_S
+        (default 2.5 s). If PM-state consumes the full budget, RAG is skipped and
+        the bundle is marked stale=True. If remaining budget < RAG_HTTP_TIMEOUT, the
+        effective RAG timeout is capped at the remaining budget and stale=True.
 
     Returns:
         GroundBundle (never raises).
@@ -77,6 +85,8 @@ def ground(
     char_budget = token_budget * 4
     provenance: list[dict] = []
     stale = False
+
+    t0 = time.monotonic()
 
     # -------------------------------------------------------------------------
     # Half 2 first: reserve PM-state slice before RAG fill
@@ -92,12 +102,26 @@ def ground(
     rag_budget = max(0, char_budget - pm_chars)
 
     # -------------------------------------------------------------------------
-    # Half 1: retrieval substrate
+    # Half 1: retrieval substrate — bounded by total wall-clock budget
     # -------------------------------------------------------------------------
-    rag_block, rag_provenance, truncated = _assemble_rag(
-        query, effective_scope, rag_budget
-    )
-    provenance.extend(rag_provenance)
+    elapsed = time.monotonic() - t0
+    remaining = _TOTAL_BUDGET_S - elapsed
+
+    if remaining <= 0:
+        # Budget exhausted by PM-state; skip RAG to keep the call bounded.
+        stale = True
+        for src in effective_scope:
+            provenance.append({"tag": "ungrounded", "source": src, "why": "budget-exhausted"})
+        rag_block, truncated = "", False
+    else:
+        rag_timeout = min(RAG_HTTP_TIMEOUT, remaining)
+        if rag_timeout < RAG_HTTP_TIMEOUT:
+            # Running RAG on a tighter-than-normal timeout — honest degradation signal.
+            stale = True
+        rag_block, rag_provenance, truncated = _assemble_rag(
+            query, effective_scope, rag_budget, timeout=rag_timeout
+        )
+        provenance.extend(rag_provenance)
 
     # -------------------------------------------------------------------------
     # Assemble context_block — only real retrieved substrate, no error prose
@@ -147,6 +171,7 @@ def _assemble_rag(
     query: str,
     scope: list[str],
     char_budget: int,
+    timeout: float | None = None,
 ) -> tuple[str, list[dict], bool]:
     """Query retrieve() with per-backend fail-soft; return (block, provenance, truncated)."""
     provenance: list[dict] = []
@@ -160,6 +185,7 @@ def _assemble_rag(
             scope=scope,
             top_k=40,
             min_score=0.0,
+            timeout=timeout,
         )
     except Exception as exc:
         log.warning("ground: retrieve() raised: %s", exc)

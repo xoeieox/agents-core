@@ -61,7 +61,7 @@ def test_unreachable_rag_backend_returns_others_hits():
     """vault-rag connect-fail -> [] for that backend; other backend hits still returned."""
     mem_hits = [_make_hit("mem", "decision/foo", "mem hit")]
 
-    def fake_search_rag(source, query, filters):
+    def fake_search_rag(source, query, filters, timeout=None):
         if source == "vault-rag":
             raise httpx.ConnectError("connection refused")
         return []
@@ -84,7 +84,7 @@ def test_unreachable_rag_wall_clock_bounded():
     """
     sim_delay = RAG_HTTP_TIMEOUT  # each backend consumes the full timeout
 
-    def fake_search_rag(source, query, filters):
+    def fake_search_rag(source, query, filters, timeout=None):
         time.sleep(sim_delay)
         raise httpx.ReadTimeout(f"timed out after {sim_delay}s")
 
@@ -251,7 +251,7 @@ def test_parallel_fanout_all_backends_queried():
         queried.append("chub")
         return []
 
-    def fake_search_rag(source, query, filters):
+    def fake_search_rag(source, query, filters, timeout=None):
         queried.append(source)
         return []
 
