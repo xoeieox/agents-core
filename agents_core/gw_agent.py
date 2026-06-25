@@ -1225,13 +1225,25 @@ def _force_conclusion(
         "produce your final answer now as plain content."
     )
     if partial:
-        conclusion_instruction += (
-            " IMPORTANT: This is a PARTIAL review — you ran out of time before completing"
-            " your investigation. You MUST begin your verdict with a brief caveat stating"
-            " that this is a partial review, approximately how many steps you completed,"
-            " and what areas you could not examine. Do not present an incomplete review"
-            " as if it were complete."
-        )
+        if json_mode:
+            # json_mode requires no leading prose; embed the caveat as a JSON field instead
+            # so the Truth-Integrity requirement is met without conflicting with the
+            # "JSON only" instruction that follows.
+            conclusion_instruction += (
+                " IMPORTANT: This is a PARTIAL review — you ran out of time before completing"
+                " your investigation. Add a \"partial_review_note\" field to your JSON verdict"
+                " that briefly states this is a partial review, approximately how many steps"
+                " you completed, and what areas you could not examine. Do not omit this field"
+                " and do not present an incomplete review as if it were complete."
+            )
+        else:
+            conclusion_instruction += (
+                " IMPORTANT: This is a PARTIAL review — you ran out of time before completing"
+                " your investigation. You MUST begin your verdict with a brief caveat stating"
+                " that this is a partial review, approximately how many steps you completed,"
+                " and what areas you could not examine. Do not present an incomplete review"
+                " as if it were complete."
+            )
     if json_mode:
         conclusion_instruction += " Respond with the required JSON verdict only — no prose, no tool calls."
 
@@ -1318,7 +1330,18 @@ def _finalize_result(
     elif max_steps_reached:
         text = "[gw_agent: max_steps reached — no verdict reached]"
     if budget_forced_suffix and text:
-        text = text + f"\n\n{budget_forced_suffix}"
+        # If content is valid JSON (json_mode=True case), inject as a field so
+        # json.loads() by callers (e.g. spec_review.py:1671) still succeeds.
+        # Appending a text suffix to JSON causes JSONDecodeError → false error verdict.
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                parsed["_budget_forced"] = budget_forced_suffix
+                text = json.dumps(parsed)
+            else:
+                text = text + f"\n\n{budget_forced_suffix}"
+        except (json.JSONDecodeError, ValueError):
+            text = text + f"\n\n{budget_forced_suffix}"
     elif budget_forced_suffix:
         text = budget_forced_suffix
 

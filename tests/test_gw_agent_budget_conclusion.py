@@ -488,3 +488,48 @@ class TestBudgetForcedMetadataNotError:
             result = _build_fixer_result(td, [], concluded=False, budget_forced=True)
         assert result["budget_forced"] is True
         assert result["concluded"] is False
+
+    def test_budget_forced_json_mode_result_is_valid_json(self, tmp_path):
+        """json_mode=True + budget-forced: returned string must still be valid JSON.
+
+        Regression for: budget_forced_suffix was appended as text to JSON content,
+        causing json.loads() in spec_review.py:1671 to raise JSONDecodeError.
+
+        Clock sequence (acquire_lease=False, timeout=300):
+          call 1: _loop_start=0    deadline=300
+          call 2: step0 _now=0     avg=18  reserve=max(36,60)=60  300>60 → OK
+          call 3: step1 _now=265   avg=(0+265)/2  reserve≥60  300-265=35<reserve → FIRE
+        """
+        repo = _tmp_git_repo(tmp_path)
+
+        step0 = _mock_resp(_make_tool_call_response("read_file", {"path": "README.md"}, "c0"))
+        fc_json = _mock_resp(_make_stop_response('{"verdict": "partial", "findings": [], "partial_review_note": "ran 1 step"}'))
+        post_responses = [step0, fc_json]
+
+        def fake_post(url, json=None, timeout=None):
+            return post_responses.pop(0)
+
+        with patch("agents_core.gw_agent.time.monotonic", side_effect=[0.0, 0.0, 265.0]), \
+             patch("agents_core.gw_agent.requests.post", side_effect=fake_post), \
+             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+            MockDoorman.return_value = MagicMock()
+            result = call_gw_agent(
+                prompt="Review.",
+                cwd=str(repo),
+                writeable=False,
+                acquire_lease=False,
+                backend_url=_FAKE_BACKEND,
+                max_steps=5,
+                timeout=300,
+                json_mode=True,
+            )
+
+        assert result is not None
+        # Must be parseable JSON — appending the text suffix would break this.
+        parsed = json.loads(result)
+        assert isinstance(parsed, dict)
+        # Budget-forced info injected as JSON field, not trailing text.
+        assert "_budget_forced" in parsed
+        assert "budget-forced conclusion" in parsed["_budget_forced"]
+        # Original verdict fields intact.
+        assert parsed.get("verdict") == "partial"
