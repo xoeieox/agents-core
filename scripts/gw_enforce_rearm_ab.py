@@ -13,6 +13,12 @@ Scenarios:
        orphan is reaped within bound and successor is admitted.
   S3 — Hard timeout / kill mid-flight. All tickets terminal, zero leaked claims.
   S4 — Combined realistic burst (council + facets + 1 injected death).
+  S5 — Span-hold coordination lease + distinct-operator-principal admit (kind-
+       aware drain-gate). Proves coordination-skip; guards cross-principal fence.
+  S6 — GW reference-leg unified-principal admit + ghost/split wedge guards (5th
+       wedge). Reference leg held as inference under shared principal P; all
+       operator legs admit. Ghost ref (principal=None) and split-principal ref
+       (P_ref != P_op) each assert CONTENDED.
 
 Usage:
   python scripts/gw_enforce_rearm_ab.py [--mock-gw | --live] [--seed N] [--n N]
@@ -1198,6 +1204,223 @@ def run_s5(
 
 
 # ---------------------------------------------------------------------------
+# S6 — GW reference-leg unified-principal admit + ghost/split wedge guards
+# ---------------------------------------------------------------------------
+
+def run_s6(
+    elevator: ElevatorStore,
+    doorman: _MockDoormanState,
+    n: int,
+    friction: "_FrictionBackend | None",
+) -> dict:
+    """S6: GW reference-leg ghost/split inference acquire — 5th-wedge guard.
+
+    Models the actual reference-reviewer acquire in gw_agent.py: a long-held
+    lease_kind="inference" worker under the shared spec-review principal P,
+    concurrent with Facets/Council operator legs. The arc fix (U1-U3) threads
+    one shared gw_principal so the whole spec-review is one admission group.
+
+    AC2: unified-principal — reference leg (inference, P) + span-hold
+         (coordination, P) held; every operator leg under same P with
+         require_drain_clear=True is GRANTED (not CONTENDED).
+    AC3 (guard A): ghost reference leg (principal=None, inference) → CONTENDED.
+    AC4 (guard B): split-principal ref (P_ref) + operator (P_op != P_ref) → CONTENDED.
+    AC5: elevator serve phase — all n operator + Facets persona legs served.
+    """
+    print(
+        f"\n=== S6 GW REFERENCE-LEG UNIFIED-PRINCIPAL ADMIT + GHOST/SPLIT GUARDS (n={n}) ===",
+        flush=True,
+    )
+
+    failures = []
+    served_count = 0
+    peaks = []
+    stop_sampler = threading.Event()
+    peak_lock = threading.Lock()
+
+    P = f"gw-gate-{uuid.uuid4().hex[:8]}"
+    ref_id = f"s6-ref-{uuid.uuid4().hex[:6]}"
+    span_id = f"s6-span-{uuid.uuid4().hex[:6]}"
+    ref_elev_id = None
+
+    def _sample_peaks():
+        while not stop_sampler.is_set():
+            c = doorman.active_group_count()
+            with peak_lock:
+                peaks.append(c)
+            time.sleep(0.05)
+
+    sampler = threading.Thread(target=_sample_peaks, daemon=True)
+    sampler.start()
+
+    try:
+        # ---- Phase 1: Unified-principal ADMIT (the payoff) ----
+        # Reference leg: inference, shared P — models gw_agent.py long acquire.
+        res_ref = doorman.acquire(ref_id, principal=P, role="worker", lease_kind="inference")
+        if res_ref is not True:
+            failures.append(f"AC2_ref_leg_acquire_failed: {res_ref!r}")
+
+        # Span-hold: coordination, shared P — held throughout for realism.
+        res_span = doorman.acquire(span_id, principal=P, role="worker", lease_kind="coordination")
+        if res_span is not True:
+            failures.append(f"AC2_span_hold_acquire_failed: {res_span!r}")
+
+        # Operator legs under same P with require_drain_clear=True, inference.
+        # Reference-leg inference worker is held — shared P must ride-along, not contend.
+        for i in range(n):
+            op_id = f"s6-op-{i}-{uuid.uuid4().hex[:4]}"
+            res = doorman.acquire(
+                op_id, principal=P, role="worker",
+                require_drain_clear=True, lease_kind="inference",
+            )
+            if res is not True:
+                failures.append(f"AC2_op_{i}_not_admitted: {res!r}")
+            else:
+                doorman.release(op_id)
+
+        # Facets personas — also under shared P, ride-along.
+        for persona in ("facets-alpha", "facets-beta", "facets-gamma"):
+            persona_id = f"s6-{persona}-{uuid.uuid4().hex[:4]}"
+            res = doorman.acquire(
+                persona_id, principal=P, role="worker",
+                require_drain_clear=True, lease_kind="inference",
+            )
+            if res is not True:
+                failures.append(f"AC2_{persona}_not_admitted: {res!r}")
+            else:
+                doorman.release(persona_id)
+
+        # ---- Phase 2: GHOST reference leg WEDGES (guard A) ----
+        # Release the Phase 1 reference leg; hold a ghost (principal=None) instead.
+        doorman.release(ref_id)
+        ref_ghost_id = f"s6-ghost-{uuid.uuid4().hex[:6]}"
+        doorman.acquire(ref_ghost_id, principal=None, role="worker", lease_kind="inference")
+
+        # Operator leg under valid P, require_drain_clear → CONTENDED (ghost blocks always).
+        op_ghost_probe = f"s6-ghost-op-{uuid.uuid4().hex[:4]}"
+        res_ghost = doorman.acquire(
+            op_ghost_probe, principal=P, role="worker",
+            require_drain_clear=True, lease_kind="inference",
+        )
+        if res_ghost is not CONTENDED:
+            failures.append(f"AC3_ghost_ref_should_CONTEND: got {res_ghost!r}")
+
+        doorman.release(ref_ghost_id)
+
+        # ---- Phase 3: SPLIT principal WEDGES (guard B) ----
+        # Reference leg under P_ref; operator leg under P_op != P_ref → CONTENDED.
+        P_ref = f"gw-ref-{uuid.uuid4().hex[:8]}"
+        P_op = f"gw-op-{uuid.uuid4().hex[:8]}"
+        ref_split_id = f"s6-split-ref-{uuid.uuid4().hex[:6]}"
+        op_split_id = f"s6-split-op-{uuid.uuid4().hex[:4]}"
+
+        doorman.acquire(ref_split_id, principal=P_ref, role="worker", lease_kind="inference")
+        res_split = doorman.acquire(
+            op_split_id, principal=P_op, role="worker",
+            require_drain_clear=True, lease_kind="inference",
+        )
+        if res_split is not CONTENDED:
+            failures.append(f"AC4_split_principal_should_CONTEND: got {res_split!r}")
+
+        doorman.release(ref_split_id)
+
+        # ---- Phase 4: Main elevator admit/serve (mirror S5 Phase 4) ----
+        # Re-acquire reference leg under shared P for the elevator serve phase.
+        ref_elev_id = f"s6-ref-elev-{uuid.uuid4().hex[:6]}"
+        doorman.acquire(ref_elev_id, principal=P, role="worker", lease_kind="inference")
+
+        all_tickets = []
+
+        def _admit_and_serve(principal: str, label: str) -> None:
+            nonlocal served_count
+            work_id = f"s6-{label}-{uuid.uuid4().hex[:6]}"
+            try:
+                ticket = elevator.enqueue(
+                    lane="deliberation",
+                    kind="gw-admission",
+                    payload={"work_id": work_id},
+                    principal=principal,
+                    latency_class="batch",
+                )
+                all_tickets.append(ticket)
+                deadline = time.monotonic() + 20.0
+                while time.monotonic() < deadline:
+                    elevator.reclaim_stale("deliberation")
+                    ok, is_ride_along = elevator.try_admit(ticket, "deliberation", principal)
+                    if ok:
+                        while time.monotonic() < deadline:
+                            res = doorman.acquire(
+                                work_id, principal=principal, role="worker",
+                                require_drain_clear=(not is_ride_along),
+                                lease_kind="inference",
+                            )
+                            if res is not CONTENDED:
+                                break
+                            time.sleep(0.05)
+                        else:
+                            elevator.fail(ticket)
+                            failures.append(f"AC5_drain_timeout_{label}")
+                            return
+                        try:
+                            time.sleep(friction.gw_call_delay() if friction else 0.05)
+                        finally:
+                            doorman.release(work_id)
+                        elevator.ack(ticket)
+                        served_count += 1
+                        return
+                    time.sleep(0.05)
+                elevator.fail(ticket)
+                failures.append(f"AC5_timeout_{label}")
+            except Exception as e:
+                failures.append(f"AC5_error_{label}:{e}")
+
+        threads = []
+        for i in range(n):
+            threads.append(threading.Thread(target=_admit_and_serve, args=(P, f"op-{i}")))
+        for persona in ("facets-alpha", "facets-beta", "facets-gamma"):
+            threads.append(threading.Thread(target=_admit_and_serve, args=(P, persona)))
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+
+        expected_callers = n + 3
+        if served_count < expected_callers:
+            failures.append(f"AC5_not_all_served: {served_count}/{expected_callers}")
+
+        claimed = _claimed_principals(elevator, "deliberation")
+        if claimed:
+            failures.append(f"leaked_claims={claimed}")
+
+    finally:
+        doorman.release(span_id)
+        if ref_elev_id is not None:
+            doorman.release(ref_elev_id)
+        stop_sampler.set()
+        sampler.join(timeout=2)
+
+    peak_drain = max(peaks) if peaks else 0
+    passed = len(failures) == 0
+    result = {
+        "scenario": "S6",
+        "pass": passed,
+        "failures": failures,
+        "details": {
+            "served": served_count,
+            "expected_callers": n + 3,
+            "peak_in_flight": peak_drain,
+            "AC2_admit_pass": not any("AC2_" in f for f in failures),
+            "AC3_ghost_wedge_pass": not any("AC3_" in f for f in failures),
+            "AC4_split_wedge_pass": not any("AC4_" in f for f in failures),
+            "AC5_serve_pass": not any("AC5_" in f for f in failures),
+        },
+    }
+    _print_scenario_result(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Verdict emitter
 # ---------------------------------------------------------------------------
 
@@ -1262,10 +1485,21 @@ def emit_verdict(results: dict, seed: int, n: int, mode: str) -> Path:
         "  AC3a asserts the transition: CONTENDED-while-inference-present → ADMITS-when-coordination-only.",
         "  AC6 is an inline coordination-skip self-check. A --live GO that includes S5 PASS is",
         "  the trustworthy gate for enforce re-arm. Do NOT re-arm until S5 PASS is confirmed.",
+        "- **S6**: GW reference-leg 5th-wedge guard (gw-gate-principal-unification-ab-harness-v0).",
+        "  Models gw_agent.py's long-held lease_kind=inference acquire (the reference-reviewer leg)",
+        "  concurrent with Facets/Council operator legs. Phase 1 (AC2): with the reference leg held",
+        "  as inference under shared principal P, every operator leg under the same P with",
+        "  require_drain_clear=True is GRANTED — proves the shared-principal fix (U1-U3) closes",
+        "  the 5th wedge without a lease_kind change. Phase 2 (AC3 guard A): a ghost reference leg",
+        "  (principal=None, inference) causes CONTENDED — the exact regression this arc fixes;",
+        "  a future reintroduction of a principal-less GW acquire will break S6. Phase 3 (AC4",
+        "  guard B): split-principal ref (P_ref) + operator (P_op != P_ref) causes CONTENDED —",
+        "  proves cross-deliberation serialization is preserved. Phase 4 (AC5): elevator serve",
+        "  phase confirms all n operator + Facets persona legs are served under shared P.",
         "",
         f"## Decision: **{go_no_go}** for re-arming `GW_ADMISSION_MODE=enforce`",
         "",
-        f"GO requires all scenarios PASS (S0–S5). {'All scenarios passed.' if all_pass else 'One or more scenarios FAILED — do not re-arm enforce until fixed.'}",
+        f"GO requires all scenarios PASS (S0–S6). {'All scenarios passed.' if all_pass else 'One or more scenarios FAILED — do not re-arm enforce until fixed.'}",
         "",
         "<!-- gw-enforce-rearm-ab-harness-v0 -->",
     ]
@@ -1321,6 +1555,7 @@ def main() -> int:
     parser.add_argument("--skip-s0", action="store_true")
     parser.add_argument("--skip-s4", action="store_true")
     parser.add_argument("--skip-s5", action="store_true")
+    parser.add_argument("--skip-s6", action="store_true")
     args = parser.parse_args()
 
     live_mode = args.live
@@ -1395,6 +1630,16 @@ def main() -> int:
             doorman.leases.clear()
             try:
                 results["S5"] = run_s5(elev, doorman, args.n, friction)
+            finally:
+                _cleanup_elevator(elev)
+                elev.close()
+            doorman.leases.clear()
+
+        if not args.skip_s6:
+            elev, _ = _scenario_db("s6")
+            doorman.leases.clear()
+            try:
+                results["S6"] = run_s6(elev, doorman, args.n, friction)
             finally:
                 _cleanup_elevator(elev)
                 elev.close()
