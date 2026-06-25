@@ -396,6 +396,18 @@ class ClaudeQueue:
         tasks.sort(key=sort_key)
 
         for chosen in tasks:
+            # Defect 3: gravitywell-122b serves --parallel 1, so only one task may be
+            # active at a time. If one is already running, defer the next claim.
+            if chosen.get("model") == "gravitywell-122b":
+                gw122b_active = False
+                for ap in self.active_dir.glob("*.yaml"):
+                    at = self._read_task(ap)
+                    if at and at.get("model") == "gravitywell-122b":
+                        gw122b_active = True
+                        break
+                if gw122b_active:
+                    continue
+
             src_path = Path(chosen.pop("_path"))
             chosen["status"] = "running"
             chosen["started_at"] = _now_iso()

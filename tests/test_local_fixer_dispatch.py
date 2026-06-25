@@ -504,3 +504,276 @@ def test_worktree_torn_down_even_on_exception(tmp_path):
 
     assert url == ""
     mock_teardown.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# AC1: Salvage on max_steps_reached with passing tests
+# ---------------------------------------------------------------------------
+
+def _max_steps_fixer_result(
+    diff: str = "diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n@@ -1 +1 @@\n-old\n+new\n",
+    passed: int = 5,
+    failed: int = 0,
+    errors: int = 0,
+) -> dict:
+    return {
+        "final_diff": diff,
+        "concluded": False,
+        "max_steps_reached": True,
+        "no_progress": False,
+        "last_test_outcome": {"passed": passed, "failed": failed, "errors": errors},
+        "steps": [],
+    }
+
+
+def test_salvage_max_steps_reached_with_passing_tests_opens_pr(tmp_path):
+    """AC1: max_steps_reached + non-empty diff + passing tests → PR opened (harness-salvaged)."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    captured_body: list[str] = []
+
+    def fake_create_pr(**kwargs):
+        captured_body.append(kwargs.get("body", ""))
+        return {"html_url": "http://203.0.113.10:3000/Erah/agents-core/pulls/99"}
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_max_steps_fixer_result(), [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", side_effect=fake_create_pr),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        url = sr._run_local_fixer(spec, str(tmp_path))
+
+    assert url == "http://203.0.113.10:3000/Erah/agents-core/pulls/99"
+    assert captured_body, "create_pr was not called"
+    assert "harness-salvaged" in captured_body[0], "salvage marker missing from PR body"
+
+
+def test_no_pr_max_steps_reached_empty_diff(tmp_path):
+    """AC1: max_steps_reached + empty diff → no-op."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    result = _max_steps_fixer_result(diff="")
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(result, [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr") as mock_pr,
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        url = sr._run_local_fixer(spec, str(tmp_path))
+
+    assert url == ""
+    mock_pr.assert_not_called()
+
+
+def test_no_pr_max_steps_reached_failing_tests(tmp_path):
+    """AC1: max_steps_reached + failing tests → no-op."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    result = _max_steps_fixer_result(passed=3, failed=2, errors=0)
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(result, [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr") as mock_pr,
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        url = sr._run_local_fixer(spec, str(tmp_path))
+
+    assert url == ""
+    mock_pr.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# AC2a: max_steps precedence (spec > env > default 60)
+# ---------------------------------------------------------------------------
+
+def test_max_steps_uses_spec_value_over_env_and_default(tmp_path, monkeypatch):
+    """AC2a: spec JSON max_steps takes highest precedence."""
+    spec = json.loads(_make_spec(tmp_path, max_steps=99).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    monkeypatch.setenv("GW_AGENT_MAX_STEPS", "77")
+
+    import agents_core.shaped_runner as sr
+
+    captured_kwargs: list[dict] = []
+
+    def fake_gw_agent(**kwargs):
+        captured_kwargs.append(kwargs)
+        return (_good_fixer_result(), [])
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw_agent),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", return_value={"html_url": "http://x/p/1"}),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        sr._run_local_fixer(spec, str(tmp_path))
+
+    assert captured_kwargs, "call_gw_agent not called"
+    assert captured_kwargs[0]["max_steps"] == 99, "spec max_steps not used"
+
+
+def test_max_steps_uses_env_when_spec_absent(tmp_path, monkeypatch):
+    """AC2a: env GW_AGENT_MAX_STEPS used when spec has no max_steps."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    spec.pop("max_steps", None)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    monkeypatch.setenv("GW_AGENT_MAX_STEPS", "55")
+
+    import agents_core.shaped_runner as sr
+
+    captured_kwargs: list[dict] = []
+
+    def fake_gw_agent(**kwargs):
+        captured_kwargs.append(kwargs)
+        return (_good_fixer_result(), [])
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw_agent),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", return_value={"html_url": "http://x/p/1"}),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        sr._run_local_fixer(spec, str(tmp_path))
+
+    assert captured_kwargs[0]["max_steps"] == 55, "env GW_AGENT_MAX_STEPS not used"
+
+
+def test_max_steps_default_60_when_spec_and_env_absent(tmp_path, monkeypatch):
+    """AC2a: default 60 used when neither spec nor env supplies max_steps."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    spec.pop("max_steps", None)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    monkeypatch.delenv("GW_AGENT_MAX_STEPS", raising=False)
+
+    import agents_core.shaped_runner as sr
+
+    captured_kwargs: list[dict] = []
+
+    def fake_gw_agent(**kwargs):
+        captured_kwargs.append(kwargs)
+        return (_good_fixer_result(), [])
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw_agent),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", return_value={"html_url": "http://x/p/1"}),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        sr._run_local_fixer(spec, str(tmp_path))
+
+    assert captured_kwargs[0]["max_steps"] == 60, "default max_steps should be 60"
+
+
+# ---------------------------------------------------------------------------
+# AC4: Disambiguated warn messages
+# ---------------------------------------------------------------------------
+
+def _no_pr_result(*, max_steps_reached=False, no_progress=False, diff="", passed=0) -> dict:
+    return {
+        "final_diff": diff,
+        "concluded": False,
+        "max_steps_reached": max_steps_reached,
+        "no_progress": no_progress,
+        "last_test_outcome": {"passed": passed, "failed": 0, "errors": 0} if passed else None,
+        "steps": [],
+    }
+
+
+def test_warn_message_max_steps_reached_no_diff(tmp_path, capsys):
+    """AC4: max_steps_reached with empty diff emits specific message."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_no_pr_result(max_steps_reached=True), [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        sr._run_local_fixer(spec, str(tmp_path))
+
+    err = capsys.readouterr().err
+    assert "max_steps" in err
+    assert "doorman" not in err.lower()
+    assert "spinning" not in err.lower()
+
+
+def test_warn_message_no_progress(tmp_path, capsys):
+    """AC4: no_progress emits specific spinning-wheels message."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_no_pr_result(no_progress=True), [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        sr._run_local_fixer(spec, str(tmp_path))
+
+    err = capsys.readouterr().err
+    assert "spinning" in err or "no semantic progress" in err
+    assert "doorman" not in err.lower()
+
+
+def test_warn_message_doorman_unreachable(tmp_path, capsys):
+    """AC4: concluded=False with no max_steps/no_progress flags → DoormanUnreachable message."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_no_pr_result(), [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        sr._run_local_fixer(spec, str(tmp_path))
+
+    err = capsys.readouterr().err
+    assert "DoormanUnreachable" in err or "doorman" in err.lower()

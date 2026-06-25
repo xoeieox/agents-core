@@ -665,3 +665,163 @@ class TestParsePytestOutcome:
         tail_lines = result["output_tail"].splitlines()
         assert len(tail_lines) == 20
         assert tail_lines[0] == "line10"
+
+
+# ---------------------------------------------------------------------------
+# AC2b: No-progress guard in call_gw_agent (writeable mode)
+# ---------------------------------------------------------------------------
+
+class TestNoProgressGuard:
+    """Tests for the no-progress (spinning-wheels) guard in call_gw_agent."""
+
+    def _make_read_response(self, path: str = "README.md", call_id: str = "c_read") -> dict:
+        """A read_file tool-call response (no semantic progress)."""
+        return _make_tool_call_response("read_file", {"path": path}, call_id)
+
+    def _make_edit_response(self, call_id: str = "c_edit") -> dict:
+        """An apply_edit tool-call response (semantic progress)."""
+        return _make_tool_call_response(
+            "apply_edit",
+            {"path": "src.py", "old_string": "x = 1", "new_string": "x = 42"},
+            call_id,
+        )
+
+    def _run_with_responses(self, tmp_path, responses, no_progress_steps=3):
+        """Helper: run call_gw_agent(writeable=True) with given mock responses."""
+        repo = _tmp_git_repo(tmp_path)
+        (repo / "src.py").write_text("x = 1\n")
+        subprocess.run(["git", "add", "."], check=True, capture_output=True, cwd=str(repo))
+        subprocess.run(["git", "commit", "-m", "add src"], check=True, capture_output=True, cwd=str(repo))
+
+        for r in responses:
+            if not hasattr(r, "raise_for_status"):
+                r.raise_for_status = MagicMock()
+
+        with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
+             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+            mock_client = MagicMock()
+            mock_client.acquire.return_value = {"status": "serving"}
+            MockDoorman.return_value = mock_client
+
+            fixer, transcript = call_gw_agent(
+                prompt="Fix.",
+                cwd=str(repo),
+                writeable=True,
+                acquire_lease=True,
+                backend_url=None,
+                no_progress_steps=no_progress_steps,
+            )
+        return fixer, transcript
+
+    def test_no_progress_triggers_after_k_consecutive_idle_steps(self, tmp_path):
+        """AC2b: K consecutive read-only steps → no_progress=True, no PR."""
+        # 3 read_file calls with no edits → should abort at step 3 (k=3)
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read_response("f1.py", "c1"))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read_response("f2.py", "c2"))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read_response("f3.py", "c3"))),
+            # Should never reach here
+            MagicMock(status_code=200, json=MagicMock(return_value=_make_stop_response("Done."))),
+        ]
+        for r in responses:
+            r.raise_for_status = MagicMock()
+
+        fixer, transcript = self._run_with_responses(tmp_path, responses[:], no_progress_steps=3)
+
+        assert fixer["no_progress"] is True
+        assert fixer["concluded"] is False
+        # Only 3 steps should have run (not 4)
+        assert len(transcript) == 3
+
+    def test_progress_resets_counter(self, tmp_path):
+        """AC2b: progress resets the counter — edit after 2 idle steps prevents abort."""
+        # 2 reads (idle), 1 edit (progress, resets counter), 2 reads (idle again) → no abort at k=3
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read_response("f1.py", "c1"))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read_response("f2.py", "c2"))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_edit_response("c3"))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read_response("f3.py", "c4"))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read_response("f4.py", "c5"))),
+            MagicMock(status_code=200, json=MagicMock(return_value=_make_stop_response("Done."))),
+        ]
+        for r in responses:
+            r.raise_for_status = MagicMock()
+
+        fixer, transcript = self._run_with_responses(tmp_path, responses, no_progress_steps=3)
+
+        assert fixer["no_progress"] is False
+        assert fixer["concluded"] is True
+
+    def test_successful_edit_counts_as_progress(self, tmp_path):
+        """AC2b: apply_edit success resets consecutive_no_progress."""
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_edit_response("c1"))),
+            MagicMock(status_code=200, json=MagicMock(return_value=_make_stop_response("Done."))),
+        ]
+        for r in responses:
+            r.raise_for_status = MagicMock()
+
+        fixer, _ = self._run_with_responses(tmp_path, responses, no_progress_steps=3)
+
+        assert fixer["no_progress"] is False
+        assert fixer["concluded"] is True
+
+    def test_no_progress_guard_not_triggered_for_readonly_mode(self, tmp_path):
+        """AC2b: guard is disabled for writeable=False — read-only agent may read freely."""
+        # 5 read steps, then stop — should NOT trigger no_progress guard at k=3
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read_response("f1.py", "c1"))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read_response("f2.py", "c2"))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read_response("f3.py", "c3"))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read_response("f4.py", "c4"))),
+            MagicMock(status_code=200, json=MagicMock(return_value=_make_stop_response("conclusion"))),
+        ]
+        for r in responses:
+            r.raise_for_status = MagicMock()
+
+        with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
+             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+            mock_client = MagicMock()
+            mock_client.acquire.return_value = {"status": "serving"}
+            MockDoorman.return_value = mock_client
+
+            result = call_gw_agent(
+                prompt="Review.",
+                cwd="/tmp",
+                writeable=False,
+                acquire_lease=True,
+                backend_url=None,
+                no_progress_steps=3,
+            )
+
+        # Should be a plain string result (read-only), not no_progress abort
+        assert isinstance(result, str)
+        assert "conclusion" in result
+
+    def test_fixer_result_includes_max_steps_reached_and_no_progress_fields(self, tmp_path):
+        """AC2b: FixerResult always contains max_steps_reached and no_progress fields."""
+        repo = _tmp_git_repo(tmp_path)
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=_make_stop_response("Done."))),
+        ]
+        for r in responses:
+            r.raise_for_status = MagicMock()
+
+        with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
+             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+            mock_client = MagicMock()
+            mock_client.acquire.return_value = {"status": "serving"}
+            MockDoorman.return_value = mock_client
+
+            fixer, _ = call_gw_agent(
+                prompt="Fix.",
+                cwd=str(repo),
+                writeable=True,
+                acquire_lease=True,
+                backend_url=None,
+            )
+
+        assert "max_steps_reached" in fixer
+        assert "no_progress" in fixer
+        assert fixer["max_steps_reached"] is False
+        assert fixer["no_progress"] is False

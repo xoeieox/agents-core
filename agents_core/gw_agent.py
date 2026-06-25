@@ -477,6 +477,8 @@ def _build_fixer_result(
     cwd: str,
     transcript: list[dict],
     concluded: bool,
+    max_steps_reached: bool = False,
+    no_progress: bool = False,
 ) -> dict:
     """Build a FixerResult dict from the completed writeable run."""
     diff_result = subprocess.run(
@@ -500,6 +502,8 @@ def _build_fixer_result(
         "final_diff": final_diff,
         "last_test_outcome": last_test_outcome,
         "concluded": concluded,
+        "max_steps_reached": max_steps_reached,
+        "no_progress": no_progress,
         "steps": transcript,
     }
 
@@ -701,6 +705,7 @@ def call_gw_agent(
     backend_url: str | None = None,
     acquire_lease: bool = True,
     writeable: bool = False,
+    no_progress_steps: int = 8,
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Run a multi-step read-only tool-loop on GravityWell.
 
@@ -780,6 +785,9 @@ def call_gw_agent(
     tool_executors = _get_tool_executors(cwd, writeable=writeable)
     repeated_calls: dict[str, int] = {}
     ctx_tokens = 0
+    # No-progress guard state (writeable mode): track consecutive steps with no semantic progress.
+    consecutive_no_progress = 0
+    last_test_counts: tuple | None = None
 
     # Acquire doorman lease for the whole run (unless acquire_lease=False for swarm).
     from agents_core.doorman_client import DoormanClient, DoormanUnreachable, _gw_acquire_timeout
@@ -831,6 +839,7 @@ def call_gw_agent(
         for step_num in range(max_steps):
             if log:
                 log(f"[gw_agent] step {step_num + 1}/{max_steps}")
+            step_made_progress = False
 
             # POST to the backend (GW or swarm) with current message state.
             try:
@@ -962,6 +971,39 @@ def call_gw_agent(
                             "content": result_str,
                         }
                     )
+
+                    # Semantic-progress tracking for no-progress guard (writeable only).
+                    if writeable and no_progress_steps > 0:
+                        if tool_name in ("apply_edit", "write_file"):
+                            if not (isinstance(tool_result, dict) and "error" in tool_result):
+                                step_made_progress = True
+                        elif tool_name == "run_tests":
+                            if isinstance(tool_result, dict) and "error" not in tool_result:
+                                tc = (
+                                    int(tool_result.get("passed") or 0),
+                                    int(tool_result.get("failed") or 0),
+                                    int(tool_result.get("errors") or 0),
+                                )
+                                if tc != last_test_counts:
+                                    step_made_progress = True
+                                    last_test_counts = tc
+
+                # No-progress guard: abort if K consecutive steps made no semantic progress.
+                if writeable and no_progress_steps > 0:
+                    if step_made_progress:
+                        consecutive_no_progress = 0
+                    else:
+                        consecutive_no_progress += 1
+                        if consecutive_no_progress >= no_progress_steps:
+                            if log:
+                                log(
+                                    f"[gw_agent] no-progress guard: {consecutive_no_progress} "
+                                    f"consecutive steps with no semantic progress - aborting"
+                                )
+                            return _finalize_writeable_or_readonly(
+                                messages, "", return_transcript, transcript, writeable, cwd,
+                                concluded=False, no_progress=True,
+                            )
 
                 # Context-growth guard: truncate oldest tool-result messages if needed.
                 if ctx_tokens > GW_AGENT_CTX_CAP:
@@ -1164,10 +1206,16 @@ def _finalize_writeable_or_readonly(
     cwd: str,
     concluded: bool,
     max_steps_reached: bool = False,
+    no_progress: bool = False,
 ) -> str | None | tuple:
     """Route to FixerResult or plain result based on writeable flag."""
     if writeable:
-        fixer = _build_fixer_result(cwd, transcript, concluded=concluded and not max_steps_reached)
+        fixer = _build_fixer_result(
+            cwd, transcript,
+            concluded=concluded and not max_steps_reached and not no_progress,
+            max_steps_reached=max_steps_reached,
+            no_progress=no_progress,
+        )
         return (fixer, transcript)
     return _finalize_result(messages, content, return_transcript, transcript, max_steps_reached)
 

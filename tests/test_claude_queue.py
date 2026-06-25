@@ -270,6 +270,74 @@ def test_generate_id_format(queue):
     assert parts[4] == "fixerfoo"
 
 
+# ---------------------------------------------------------------------------
+# AC3: gravitywell-122b serialization — at most one active claim at a time
+# ---------------------------------------------------------------------------
+
+def test_gravitywell_122b_second_claim_defers_while_first_active(queue):
+    """AC3: second gravitywell-122b task is not claimed while one is already active."""
+    t1 = queue.submit(_basic_task(model="gravitywell-122b"))
+    t2 = queue.submit(_basic_task(model="gravitywell-122b"))
+
+    # Claim the first — should succeed.
+    first = queue.claim()
+    assert first is not None
+    assert first["model"] == "gravitywell-122b"
+
+    # First is now active; claiming again should defer the second gravitywell-122b.
+    second = queue.claim()
+    assert second is None, "second gravitywell-122b should be deferred while first is active"
+
+
+def test_gravitywell_122b_can_claim_after_first_completes(queue):
+    """AC3: once the first gravitywell-122b task completes, the second can be claimed."""
+    t1 = queue.submit(_basic_task(model="gravitywell-122b"))
+    t2 = queue.submit(_basic_task(model="gravitywell-122b"))
+
+    first = queue.claim()
+    assert first is not None
+    # Verify deferred while first active
+    assert queue.claim() is None
+
+    queue.complete(first["id"])
+
+    # Now the second should be claimable.
+    second = queue.claim()
+    assert second is not None
+    assert second["model"] == "gravitywell-122b"
+
+
+def test_non_gravitywell_model_not_blocked_by_serialization(queue):
+    """AC3: sonnet/haiku tasks are not affected by the gravitywell-122b serialization gate."""
+    t1 = queue.submit(_basic_task(model="gravitywell-122b"))
+    t2 = queue.submit(_basic_task(model="sonnet"))
+
+    # Claim gravitywell first.
+    first = queue.claim()
+    assert first is not None
+    assert first["model"] == "gravitywell-122b"
+
+    # Sonnet task should still be claimable despite gravitywell being active.
+    second = queue.claim()
+    assert second is not None
+    assert second["model"] == "sonnet"
+
+
+def test_gravitywell_122b_mixed_queue_claims_non_gw_when_gw_active(queue):
+    """AC3: with a gravitywell-122b active, other model tasks can still be claimed."""
+    queue.submit(_basic_task(model="gravitywell-122b"))
+    queue.submit(_basic_task(model="gravitywell-122b"))
+    queue.submit(_basic_task(model="haiku"))
+
+    gw_task = queue.claim()
+    assert gw_task["model"] == "gravitywell-122b"
+
+    # With gw active: second gw deferred but haiku available.
+    next_task = queue.claim()
+    assert next_task is not None
+    assert next_task["model"] == "haiku"
+
+
 def test_generate_id_uses_single_clock_read(queue, monkeypatch):
     """Regression guard: GPUQueue._generate_id calls _now_pacific() twice
     which can straddle a second boundary. ClaudeQueue calls it once."""
