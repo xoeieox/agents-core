@@ -1814,3 +1814,205 @@ class TestPrincipalAwareDrainGate:
         self._acquire(c, "w-other", principal="group-B")
         r = c.get("/v0/drain-count?node=gravitywell&exclude_principal=group-A")
         assert r.json()["drain_count"] == 1  # only group-B counts
+
+
+# ---------------------------------------------------------------------------
+# lease_kind drain-gate tests (gw-admission-elevator-kind-aware-v0)
+# ---------------------------------------------------------------------------
+
+class TestLeaseKindDrainGate:
+    """AC1-AC4, AC7 from spec gw-admission-elevator-kind-aware-v0.
+
+    Verifies that lease_kind="coordination" is excluded from drain-gate
+    contention while lease_kind="inference" (default) still serializes,
+    and /v0/drain-count still counts coordination leases for flip-protection.
+    """
+
+    def _make_state(self) -> _NodeState:
+        return _NodeState(GW_URL_DEFAULT)
+
+    def _serving_state(self) -> _NodeState:
+        s = self._make_state()
+        s.ensure_serving = lambda role="worker": True  # type: ignore[method-assign]
+        s._place_hold = lambda: None  # type: ignore[method-assign]
+        return s
+
+    def _tc(self):
+        with patch("agents_core.doorman_server._start_refresh_thread"):
+            app = create_app(gw_url=GW_URL_DEFAULT)
+        return TestClient(app, raise_server_exceptions=True)
+
+    def _acquire_http(self, c, work_id, *, principal=None, lease_kind="inference",
+                      require_drain_clear=False, role="worker"):
+        body = {
+            "node": "gravitywell",
+            "work_id": work_id,
+            "ttl_sec": 300,
+            "reason": "test",
+            "role": role,
+            "lease_kind": lease_kind,
+        }
+        if principal is not None:
+            body["principal"] = principal
+        if require_drain_clear:
+            body["require_drain_clear"] = True
+        with patch.object(_NodeState, "ensure_serving", return_value=True), \
+             patch.object(_NodeState, "_place_hold"):
+            return c.post("/lease/acquire", json=body)
+
+    # AC1: lease_kind stored on entry; omitting is byte-identical to "inference"
+    def test_ac1_lease_kind_stored_on_entry(self):
+        s = self._serving_state()
+        s.acquire_lease("w1", 300, "test", role="worker", principal="p1",
+                        lease_kind="inference")
+        assert s.leases["w1"]["lease_kind"] == "inference"
+
+    def test_ac1_lease_kind_coordination_stored(self):
+        s = self._serving_state()
+        s.acquire_lease("w-hold", 300, "test", role="worker", principal="p-hold",
+                        lease_kind="coordination")
+        assert s.leases["w-hold"]["lease_kind"] == "coordination"
+
+    def test_ac1_omit_lease_kind_defaults_inference(self):
+        s = self._serving_state()
+        s.acquire_lease("w-default", 300, "test", role="worker", principal="p1")
+        assert s.leases["w-default"]["lease_kind"] == "inference"
+
+    def test_ac1_omit_lease_kind_still_succeeds(self):
+        s = self._serving_state()
+        result = s.acquire_lease("w-legacy", 300, "test", role="worker", principal="p1")
+        assert result is True
+
+    # AC2: coordination hold does NOT contend with an inference require_drain_clear acquire
+    def test_ac2_coordination_hold_does_not_contend_inference_acquire(self):
+        """A session's own coordination hold must not block its inference legs."""
+        s = self._serving_state()
+        # Place the span-hold as coordination (principal=P1, lease_kind=coordination)
+        res = s.acquire_lease("span-hold", 300, "span-hold",
+                              role="worker", principal="delib-session-abc",
+                              lease_kind="coordination")
+        assert res is True
+
+        # A different principal's inference leg with require_drain_clear must be GRANTED
+        res2 = s.acquire_lease("op-leg", 300, "inference",
+                               role="worker", principal="op-gravitywell-xyz",
+                               require_drain_clear=True, lease_kind="inference")
+        assert res2 is True, "coordination hold must not contend inference acquire"
+
+    # AC2 concurrent: verify with real threading (mirrors the atomic acquire test pattern)
+    def test_ac2_concurrent_coordination_hold_plus_inference_granted(self):
+        s = self._serving_state()
+        errors = []
+
+        def place_hold():
+            try:
+                r = s.acquire_lease("span-hold", 300, "hold",
+                                    role="worker", principal="session-P1",
+                                    lease_kind="coordination")
+                if r is not True:
+                    errors.append(f"hold acquire returned {r!r}")
+            except Exception as e:
+                errors.append(str(e))
+
+        def place_inference():
+            try:
+                r = s.acquire_lease("inference-leg", 300, "inference",
+                                    role="worker", principal="op-P2",
+                                    require_drain_clear=True, lease_kind="inference")
+                if r is not True:
+                    errors.append(f"inference acquire returned {r!r}")
+            except Exception as e:
+                errors.append(str(e))
+
+        t1 = threading.Thread(target=place_hold)
+        t2 = threading.Thread(target=place_inference)
+        t1.start(); t1.join()
+        t2.start(); t2.join()
+        assert not errors, f"concurrent test errors: {errors}"
+
+    # AC3: two inference workers under distinct principals still contend (#113 TOCTOU preserved)
+    def test_ac3_two_inference_workers_distinct_principals_contend(self):
+        s = self._serving_state()
+        res1 = s.acquire_lease("inf-1", 300, "inf",
+                               role="worker", principal="op-A",
+                               require_drain_clear=True, lease_kind="inference")
+        assert res1 is True
+
+        from agents_core.doorman_server import CONTENDED
+        res2 = s.acquire_lease("inf-2", 300, "inf",
+                               role="worker", principal="op-B",
+                               require_drain_clear=True, lease_kind="inference")
+        assert res2 is CONTENDED, "distinct-principal inference workers must still contend"
+
+    # AC3 concurrent: race two inference workers; at most one must win
+    def test_ac3_concurrent_inference_workers_only_one_wins(self):
+        s = self._serving_state()
+        from agents_core.doorman_server import CONTENDED
+        results = []
+
+        def try_acquire(wid, principal):
+            r = s.acquire_lease(wid, 300, "inf",
+                                role="worker", principal=principal,
+                                require_drain_clear=True, lease_kind="inference")
+            results.append(r)
+
+        t1 = threading.Thread(target=try_acquire, args=("inf-A", "op-A"))
+        t2 = threading.Thread(target=try_acquire, args=("inf-B", "op-B"))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        wins = [r for r in results if r is True]
+        contended = [r for r in results if r is CONTENDED]
+        assert len(wins) == 1, f"exactly one inference worker must win; got wins={wins}"
+        assert len(contended) == 1, f"second must be CONTENDED; got contended={contended}"
+
+    # AC4: /v0/drain-count still counts coordination leases (flip-protection preserved)
+    def test_ac4_drain_count_still_counts_coordination(self):
+        """Coordination lease must count toward drain-count for flip-protection."""
+        c = self._tc()
+        self._acquire_http(c, "span-hold", principal="session-P1",
+                           lease_kind="coordination")
+        r = c.get("/v0/drain-count?node=gravitywell")
+        assert r.status_code == 200
+        assert r.json()["drain_count"] == 1
+
+    def test_ac4_drain_count_counts_coordination_alongside_inference(self):
+        c = self._tc()
+        self._acquire_http(c, "span-hold", principal="session-P1",
+                           lease_kind="coordination")
+        self._acquire_http(c, "inf-leg", principal="op-P2",
+                           lease_kind="inference")
+        r = c.get("/v0/drain-count?node=gravitywell")
+        assert r.json()["drain_count"] == 2  # both kinds counted for flip-protection
+
+    # AC7: GHOST_PRINCIPAL inference lease still contends (regression guard)
+    def test_ac7_ghost_inference_still_contends(self):
+        from agents_core.doorman_server import CONTENDED
+        s = self._serving_state()
+        # Ghost inference lease (no principal)
+        s.acquire_lease("w-ghost", 300, "ghost", role="worker", principal=None,
+                        lease_kind="inference")
+        # A new inference acquire with require_drain_clear must be CONTENDED by the ghost
+        res = s.acquire_lease("w-new", 300, "new",
+                              role="worker", principal="some-principal",
+                              require_drain_clear=True, lease_kind="inference")
+        assert res is CONTENDED
+
+    # AC6 (Fix 2): coordination lease self-expires via TTL without depending on explicit release
+    def test_ac6_coordination_lease_expires_via_gc_stale(self):
+        """A held coordination lease expires via _gc_stale once TTL lapses — no release needed."""
+        s = self._serving_state()
+        s.acquire_lease("span-hold", ttl_sec=1, reason="hold",
+                        role="worker", principal="session-P",
+                        lease_kind="coordination")
+        assert "span-hold" in s.leases
+
+        # Backdate the acquired_at by more than ttl_sec to simulate TTL expiry
+        s.leases["span-hold"]["acquired_at"] = time.time() - 5
+
+        # _gc_stale should reap it without any explicit release call
+        s._gc_stale()
+        assert "span-hold" not in s.leases, (
+            "coordination lease must self-expire via TTL/gc_stale — "
+            "no explicit release call made"
+        )

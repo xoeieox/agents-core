@@ -115,7 +115,7 @@ class DoormanClient:
         except httpx.TimeoutException as e:
             raise DoormanUnreachable(f"doorman timeout at {self._base_url}: {e}") from e
 
-    def acquire(self, node: str, work_id: str, ttl_sec: int, reason: str, role: str = "worker", timeout: float | None = None, principal: str | None = None, require_drain_clear: bool = False) -> dict:
+    def acquire(self, node: str, work_id: str, ttl_sec: int, reason: str, role: str = "worker", timeout: float | None = None, principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference") -> dict:
         """Acquire a lease for node.
 
         Args:
@@ -135,6 +135,10 @@ class DoormanClient:
                                Returns {"ok": False, "contended": True} if gated.
                                Use is_contended() to detect this outcome.
                                Defaults False — all existing callers unchanged.
+          lease_kind: "inference" (default) or "coordination". Coordination leases are
+                      excluded from the drain-gate contention count (they hold no GPU
+                      inference) but still counted by /v0/drain-count for flip-protection.
+                      Omitting is byte-identical to "inference".
 
         Returns dict with status field (or contended sentinel):
           "serving" — GW is serving; lease registered and keepawake hold placed
@@ -153,6 +157,8 @@ class DoormanClient:
             body["principal"] = principal
         if require_drain_clear:
             body["require_drain_clear"] = True
+        if lease_kind != "inference":
+            body["lease_kind"] = lease_kind
         return self._post("/lease/acquire", body, timeout=timeout)
 
     def release(self, node: str, work_id: str) -> None:

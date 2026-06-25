@@ -436,7 +436,7 @@ class _NodeState:
             del self.leases[wid]
         return expired
 
-    def acquire_lease(self, work_id: str, ttl_sec: int, reason: str, role: str = "worker", principal: str | None = None, require_drain_clear: bool = False) -> bool | object:
+    def acquire_lease(self, work_id: str, ttl_sec: int, reason: str, role: str = "worker", principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference") -> bool | object:
         """Try to ensure GW is serving, then register the lease.
 
         Returns True on success, DEFERRED if a foreign caller acquires during controller
@@ -455,6 +455,11 @@ class _NodeState:
                                other-principal worker leases before registering this one.
                                Returns CONTENDED without registering if any exist.
                                Defaults False — all existing callers are unchanged.
+          lease_kind: discriminator for admission-contention counting. "inference" (default)
+                      — the lease holds GPU inference and serializes via the drain-gate.
+                      "coordination" — the lease holds no inference (span/keepawake); excluded
+                      from drain-gate contention count but still counted by /v0/drain-count
+                      for flip-protection. Omitting is byte-identical to "inference".
         """
         # Clear idle tracking: an arriving lease means the node is no longer idle
         was_idle = self.idle_since is not None
@@ -492,9 +497,13 @@ class _NodeState:
             for _wid, _info in self.leases.items():
                 if _info.get("role") != "worker":
                     continue
+                # Coordination leases hold no inference — not a drain-gate contender (AC2).
+                # /v0/drain-count still counts them for flip-protection (unchanged, AC4).
+                if _info.get("lease_kind", "inference") == "coordination":
+                    continue
                 _p = _info.get("principal", GHOST_PRINCIPAL)
                 if _p == GHOST_PRINCIPAL:
-                    # Ghost leases always count as contending; never silently excluded (AC6).
+                    # Ghost leases always count as contending; never silently excluded (AC7).
                     log.critical(
                         "[doorman] drain_count ghost_lease_counted work_id=%s - "
                         "role=worker lease has no principal; add principal= to "
@@ -510,6 +519,7 @@ class _NodeState:
             "ttl_sec": ttl_sec,
             "reason": reason,
             "role": role,
+            "lease_kind": lease_kind,
         }
         if role == "worker":
             lease_entry["principal"] = principal if principal is not None else GHOST_PRINCIPAL
@@ -842,6 +852,7 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         role = body.get("role", "worker")
         principal = body.get("principal") or None  # empty string → None → ghost
         require_drain_clear = bool(body.get("require_drain_clear", False))
+        lease_kind = body.get("lease_kind", "inference")
 
         if node not in nodes:
             return JSONResponse(
@@ -858,7 +869,7 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         with state.lock:
             ok = state.acquire_lease(
                 work_id, ttl_sec, reason, role=role, principal=principal,
-                require_drain_clear=require_drain_clear,
+                require_drain_clear=require_drain_clear, lease_kind=lease_kind,
             )
 
         if ok is CONTENDED:
