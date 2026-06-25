@@ -63,7 +63,7 @@ from agents_core.elevator import (
     HOSTNAME,
     IS_MASTER,
 )
-from agents_core.doorman_server import GHOST_PRINCIPAL
+from agents_core.doorman_server import CONTENDED, GHOST_PRINCIPAL
 
 # Guard: if this fires, agents_core.elevator was imported before this file set the env vars.
 assert GW_ADMISSION_ORPHAN_GRACE_SEC == _TEST_ORPHAN_GRACE_SEC, (
@@ -145,14 +145,38 @@ class _MockDoormanState:
         principal: str | None = None,
         role: str = "worker",
         ttl_sec: int = 300,
-    ) -> None:
+        require_drain_clear: bool = False,
+    ) -> bool | object:
+        """Try to register a lease. Mirrors _NodeState.acquire_lease atomic semantics.
+
+        Returns CONTENDED (without registering) if require_drain_clear=True and another
+        principal's worker lease is active. Returns True on success.
+        GHOST_PRINCIPAL leases always count as contending (never excluded).
+        """
         with self.lock:
+            if require_drain_clear and role == "worker":
+                effective_principal = principal if principal is not None else GHOST_PRINCIPAL
+                for wid, info in self.leases.items():
+                    if info.get("role") != "worker":
+                        continue
+                    _p = info.get("principal", GHOST_PRINCIPAL)
+                    if _p == GHOST_PRINCIPAL:
+                        self._critical_log_count += 1
+                        log.critical(
+                            "[mock_doorman] ghost_lease_counted work_id=%s — "
+                            "no principal; frozen counts as drain",
+                            wid,
+                        )
+                        return CONTENDED
+                    if _p != effective_principal:
+                        return CONTENDED
             self.leases[work_id] = {
                 "acquired_at": time.time(),
                 "ttl_sec": ttl_sec,
                 "role": role,
                 "principal": principal if principal is not None else GHOST_PRINCIPAL,
             }
+        return True
 
     def release(self, work_id: str) -> None:
         with self.lock:
@@ -183,6 +207,15 @@ class _MockDoormanState:
     def worker_count(self) -> int:
         with self.lock:
             return sum(1 for i in self.leases.values() if i.get("role") == "worker")
+
+    def active_group_count(self) -> int:
+        """Count distinct active principal groups (ride-alongs share one slot)."""
+        with self.lock:
+            return len({
+                info.get("principal", GHOST_PRINCIPAL)
+                for info in self.leases.values()
+                if info.get("role") == "worker"
+            })
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +289,9 @@ def run_s0(
                 with peak_lock:
                     c = doorman.worker_count()
                     peaks.append(c)
-                time.sleep(0.1)
+                # 0.02s interval: fine enough to catch peaks shorter than gw_call_delay
+                # min (≈0.05s in mock mode); 0.1s was too coarse and undersampled.
+                time.sleep(0.02)
 
         stop = threading.Event()
         sampler = threading.Thread(target=_sample, daemon=True)
@@ -283,26 +318,31 @@ def run_s0(
                     )
                     deadline = time.monotonic() + 30.0
                     admitted = False
+                    is_ride_along = False
                     while time.monotonic() < deadline:
                         elevator.reclaim_stale("deliberation")
-                        ok, _ = elevator.try_admit(ticket, "deliberation", principal)
+                        ok, is_ride_along = elevator.try_admit(ticket, "deliberation", principal)
                         if ok:
                             admitted = True
                             break
-                        # Wait for drain (exclude own principal — fresh group)
-                        dc = doorman.drain_count(exclude_principal=principal)
-                        if dc == 0:
-                            ok, _ = elevator.try_admit(ticket, "deliberation", principal)
-                            if ok:
-                                admitted = True
-                                break
                         time.sleep(0.05)
                     if not admitted:
                         elevator.fail(ticket)
                         errors.append(f"timeout-{idx}")
                         return
-                    # Admitted: acquire doorman lease
-                    doorman.acquire(work_id, principal=principal)
+                    # Atomic drain-gate: single acquire(require_drain_clear=True) for fresh
+                    # groups replaces the old two-step drain_count+acquire, mirroring llm.py.
+                    # On CONTENDED → retry within deadline; ride-alongs use False.
+                    while time.monotonic() < deadline:
+                        res = doorman.acquire(work_id, principal=principal,
+                                              require_drain_clear=(not is_ride_along))
+                        if res is not CONTENDED:
+                            break
+                        time.sleep(0.05)
+                    else:
+                        elevator.fail(ticket)
+                        errors.append(f"timeout-drain-{idx}")
+                        return
                     try:
                         time.sleep(friction.gw_call_delay() if friction else 0.1)
                     finally:
@@ -413,14 +453,11 @@ def run_s1(
             continue
         if not is_ride_along:
             failures.append(f"voice_{i}_not_ride_along")
-        # Simulate: check drain_count(exclude_principal=P) before proceeding
-        dc = doorman.drain_count(exclude_principal=P)
-        if dc != 0:
-            failures.append(f"voice_{i}_drain_nonzero_got_{dc}")
-            continue
-        # Voice proceeds — acquire doorman lease, simulate call, release
+        # Voice is a ride-along (same principal P, already admitted).
+        # AC2 drain_count assertion is proven at the scenario level above.
+        # require_drain_clear=False: ride-along shares the group's admitted slot.
         v_work_id = f"s1-voice-work-{i}"
-        doorman.acquire(v_work_id, principal=P, role="worker")
+        doorman.acquire(v_work_id, principal=P, role="worker", require_drain_clear=False)
         time.sleep(0.02)
         doorman.release(v_work_id)
         elevator.ack(t)
@@ -791,7 +828,9 @@ def run_s4(
 
     def _sample_peaks():
         while not stop_sampler.is_set():
-            c = doorman.worker_count()
+            # Count distinct active principal groups: ride-alongs sharing one principal
+            # count as 1 slot, matching the drain-gate's group-level occupancy model.
+            c = doorman.active_group_count()
             with peak_lock:
                 peaks.append(c)
             time.sleep(0.05)
@@ -819,18 +858,19 @@ def run_s4(
                 elevator.reclaim_stale("deliberation")
                 ok, is_ride_along = elevator.try_admit(ticket, "deliberation", principal)
                 if ok:
-                    if not is_ride_along:
-                        # Ticket is now 'claimed'; do NOT re-call try_admit.
-                        # Poll until concurrent workers drain, then proceed.
-                        while time.monotonic() < deadline:
-                            if doorman.drain_count(exclude_principal=principal) == 0:
-                                break
-                            time.sleep(0.05)
-                        else:
-                            elevator.fail(ticket)
-                            failures.append(f"{label}_timeout")
-                            return False
-                    doorman.acquire(work_id, principal=principal, role="worker")
+                    # Atomic drain-gate: require_drain_clear=True for fresh groups collapses
+                    # the old two-step drain_count+acquire into one lock operation, mirroring
+                    # agents_core/llm.py. Ride-alongs (same group already admitted) use False.
+                    while time.monotonic() < deadline:
+                        res = doorman.acquire(work_id, principal=principal, role="worker",
+                                              require_drain_clear=(not is_ride_along))
+                        if res is not CONTENDED:
+                            break
+                        time.sleep(0.05)
+                    else:
+                        elevator.fail(ticket)
+                        failures.append(f"{label}_timeout")
+                        return False
                     try:
                         if friction:
                             time.sleep(friction.gw_call_delay())
@@ -999,7 +1039,12 @@ def emit_verdict(results: dict, seed: int, n: int, mode: str) -> Path:
         "  Ghost leases counted + critical log; distinct-principal gates group.",
         "- **S2**: PR #107 fix proven — dead-enqueuer orphan reaped; no FIFO wedge.",
         "- **S3**: All tickets terminal after timeout/kill; zero leaked claims.",
-        "- **S4**: Combined burst (council+facets+injected death) with no permanent wedge.",
+        "- **S4**: Combined burst (council+facets+injected death). The production fix's",
+        "  authoritative proof is `tests/test_doorman_atomic_acquire.py` (N concurrent",
+        "  distinct-principal threads against the real doorman → exactly 1 True, rest",
+        "  CONTENDED). S4 is the end-to-end confirmation that the fixed atomic drain-gate",
+        "  pattern (require_drain_clear=True, mirroring agents_core/llm.py) holds under",
+        "  the 2026-06-24 incident-shaped burst with no permanent wedge.",
         "",
         f"## Decision: **{go_no_go}** for re-arming `GW_ADMISSION_MODE=enforce`",
         "",
