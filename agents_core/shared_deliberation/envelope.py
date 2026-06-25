@@ -18,6 +18,7 @@ class DeliberationRequest:
     facets_operator: str = "gravitywell"
     seam: Optional[dict] = None  # reserved for jagged-seam tap (v0: unused)
     grounding_result_file: Optional[str] = None  # pre-computed grounding path (H5b producer passthrough)
+    gw_principal: Optional[str] = None  # shared GW admission group for all legs of this deliberation
 
     def to_dict(self) -> dict:
         return asdict(self)

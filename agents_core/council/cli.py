@@ -913,6 +913,7 @@ def run_deliberation(run_id: str) -> None:
     # on_step refreshes the lease (heartbeat-coupled). TTL = COUNCIL_STALL_S so a dead
     # worker's hold auto-expires — zombie-hold guard (no unconditional pinning).
     _hold_work_id = f"council-delib-{run_id}"
+    _hold_principal = run.get("gw_principal") or _hold_work_id
     _doorman = None
     _hold_active = False
     _refresh_threads: list = []  # fire-and-forget refresh threads, joined in finally
@@ -925,7 +926,7 @@ def run_deliberation(run_id: str) -> None:
                 ttl_sec=COUNCIL_STALL_S,
                 reason="council-deliberation-hold",
                 timeout=_gw_acquire_timeout(),
-                principal=_hold_work_id,
+                principal=_hold_principal,
             )
             _hold_active = _hold_res.get("status") == "serving"
             print(
@@ -1002,7 +1003,7 @@ def run_deliberation(run_id: str) -> None:
         from agents_core.council.narrator_entity import NarratorEntity
 
         try:
-            adapter = _build_adapter(run["voicing"], ClaudeAdapter, LlamaAdapter, run_id=run_id)
+            adapter = _build_adapter(run["voicing"], ClaudeAdapter, LlamaAdapter, run_id=run_id, gw_principal=run.get("gw_principal") or None)
             entities = [
                 _build_entity(sel, adapter, CharacterEntity, NarratorEntity)
                 for sel in run["selected_entities"]
@@ -1040,7 +1041,7 @@ def run_deliberation(run_id: str) -> None:
                                 ttl_sec=COUNCIL_STALL_S,
                                 reason="council-deliberation-heartbeat",
                                 timeout=5.0,
-                                principal=_hold_work_id,
+                                principal=_hold_principal,
                             )
                         except Exception as _ref_err:
                             print(
@@ -1250,11 +1251,11 @@ def _build_director(mode: str, prompt: str, turns: int,
     raise ValueError(f"Unknown mode: {mode!r}")
 
 
-def _build_adapter(voicing: str, ClaudeAdapter, LlamaAdapter, run_id: str | None = None):
+def _build_adapter(voicing: str, ClaudeAdapter, LlamaAdapter, run_id: str | None = None, gw_principal: str | None = None):
     if voicing == "local":
         return LlamaAdapter(temperature=0.8, max_tokens=900)
     if voicing == "gravitywell":
-        principal = f"council-delib-{run_id}" if run_id else None
+        principal = gw_principal or (f"council-delib-{run_id}" if run_id else None)
         return GravityWellAdapter(temperature=0.8, principal=principal)
     if voicing in ("haiku", "sonnet", "opus"):
         raise ValueError(
@@ -1470,6 +1471,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         "voicing": args.voicing,
         "turns_cap": args.turns,
         "turns": [],
+        "gw_principal": getattr(args, "gw_principal", None),
     }
     save_run(run)
 
