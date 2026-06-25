@@ -287,8 +287,8 @@ def test_walk_lineage_respects_node_cap(tmp_path):
         entries.append({
             "key": f"decision/node-{i:02d}",
             "content": f"Node {i}.",
-            "created_at": f"2026-01-{i+1:02d}T00:00:00+00:00",
-            "updated_at": f"2026-01-{i+1:02d}T00:00:00+00:00",
+            "created_at": "2026-01-02T00:00:00+00:00",
+            "updated_at": "2026-01-02T00:00:00+00:00",
         })
     db = _make_mem_db(tmp_path, entries)
     nodes = walk_lineage("decision/root-v0", max_hops=2, db_path=db)

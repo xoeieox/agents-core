@@ -45,7 +45,7 @@ _EDGE_PATTERN = re.compile(
     r"/([a-z0-9][a-z0-9-]+)"
 )
 
-# Operators that make an edge "strong" when found near a key mention (±120 chars)
+# Operators that make an edge "strong" when found near a key mention (±60 chars from match boundaries)
 _STRONG_OP = re.compile(r"\b(supersed\w*|depends|sequences-before)\b", re.IGNORECASE)
 
 _LANDED_RE = re.compile(r"\b(LANDED|MERGED|DEPLOYED|LIVE|CLOSED)\b", re.IGNORECASE)
@@ -214,7 +214,10 @@ def _materialize(dest: Path, *, db_path: Path | None) -> dict:
 def _load_roadmap_rows(store: MemoryStore) -> list[dict]:
     rows: list[dict] = []
     for ns in sorted(_ROADMAP_NAMESPACES):
-        rows.extend(store.list_by_prefix(f"{ns}/", limit=500))
+        ns_rows = store.list_by_prefix(f"{ns}/", limit=500)
+        if len(ns_rows) == 500:
+            log.warning("roadmap: namespace %r hit 500-row cap; entries may be truncated from snapshot", ns)
+        rows.extend(ns_rows)
     return rows
 
 
@@ -502,7 +505,9 @@ def _ground(
     # (b) FTS over-recall for seeds
     seed_keys = _fts_seeds(query, node_anchor=node_anchor, db_path=db_path)
 
-    # Echo-chamber guard: split confirmed_keys vs candidate_keys
+    # Echo-chamber guard: split confirmed_keys vs candidate_keys.
+    # Emitted even when snapshot is absent so downstream consumers keying off
+    # confirmed_keys always find the guard entry (stale=True signals the gap).
     if snapshot:
         snapshot_key_set = {item["key"] for item in snapshot.get("items", [])}
         confirmed_keys = [k for k in seed_keys if k in snapshot_key_set]
@@ -513,6 +518,14 @@ def _ground(
             "candidate_keys": candidate_keys,
             "source": "snapshot",
         })
+    else:
+        # No snapshot available — all FTS seeds are unconfirmed candidates.
+        provenance.append({
+            "tag": "already-have",
+            "confirmed_keys": [],
+            "candidate_keys": list(seed_keys),
+            "source": "fts-only",
+        })
 
     # (c) Lineage walk from top seeds
     nodes = (
@@ -520,7 +533,14 @@ def _ground(
         if seed_keys else []
     )
 
-    # Thin-recall detection: flag when no strong edges were traversed
+    # Thin-recall detection: flag when no strong edges were traversed.
+    # NOTE: this checks edges_in of walked nodes only. Seed nodes (hop=0) always
+    # have edges_in=[], so a seed with strong outbound edges pointing outside
+    # roadmap namespaces never propagates has_strong=True. The flag therefore
+    # means "no neighbor was reached via a strong edge", which is narrower than
+    # the spec's "few/no strong edges" framing. This errs toward caution (GW-122B
+    # treats the connection as uncertain) and is acceptable for v0. Unit 2 wiring
+    # should be aware of this semantics when consuming the flag.
     has_strong = any(
         any(e.edge_type == "strong" for e in n.edges_in)
         for n in nodes
