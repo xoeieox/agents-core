@@ -49,6 +49,14 @@ from pathlib import Path
 
 sys.path.insert(0, "/srv/agents")
 
+# D-AMEND-1: GW_ADMISSION_ORPHAN_GRACE_SEC / GW_ADMISSION_MAX_WAIT_SEC are
+# module-level constants frozen at import. Set them before agents_core loads
+# so the in-process reaper uses short test values, not the 60/900-second defaults.
+_TEST_ORPHAN_GRACE_SEC = 2
+_TEST_MAX_WAIT_SEC = 30
+os.environ["GW_ADMISSION_ORPHAN_GRACE_SEC"] = str(_TEST_ORPHAN_GRACE_SEC)
+os.environ["GW_ADMISSION_MAX_WAIT_SEC"] = str(_TEST_MAX_WAIT_SEC)
+
 from agents_core.elevator import (
     ElevatorStore,
     GW_ADMISSION_ORPHAN_GRACE_SEC,
@@ -56,6 +64,12 @@ from agents_core.elevator import (
     IS_MASTER,
 )
 from agents_core.doorman_server import GHOST_PRINCIPAL
+
+# Guard: if this fires, agents_core.elevator was imported before this file set the env vars.
+assert GW_ADMISSION_ORPHAN_GRACE_SEC == _TEST_ORPHAN_GRACE_SEC, (
+    f"D-AMEND-1 import-order bug: elevator constant={GW_ADMISSION_ORPHAN_GRACE_SEC} "
+    f"but env set {_TEST_ORPHAN_GRACE_SEC} — something imported agents_core.elevator first"
+)
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -519,13 +533,12 @@ def run_s2(
     print(f"\n=== S2 DEAD-ENQUEUER ORPHAN (seeds={n_seeds}) ===", flush=True)
 
     failures = []
-    # Use a short grace and max-wait for test speed
-    grace = 2
-    max_wait = 30
+    # D-AMEND-1: use the module-level constant (frozen from env before import) so
+    # aging is always relative to the effective grace the in-process reaper uses.
+    grace = GW_ADMISSION_ORPHAN_GRACE_SEC
     env = dict(os.environ)
     env["ELEVATOR_DB_PATH"] = db_path
-    env["GW_ADMISSION_ORPHAN_GRACE_SEC"] = str(grace)
-    env["GW_ADMISSION_MAX_WAIT_SEC"] = str(max_wait)
+    # GW_ADMISSION_ORPHAN_GRACE_SEC and GW_ADMISSION_MAX_WAIT_SEC already in os.environ
 
     seeds = [42, 137, 7] if n_seeds >= 3 else [42]
     all_passed = True
@@ -1053,34 +1066,68 @@ def main() -> int:
     if not IS_MASTER and not live_mode:
         print("WARNING: not IS_MASTER — some elevator writes will fail. Run on BRIX.", flush=True)
 
-    # ---- Isolated temp DB ----
+    # ---- Isolated temp dir; one DB per scenario (D-AMEND-2: no cross-scenario FIFO cascade) ----
     tmpdir = tempfile.mkdtemp(prefix="gw_ab_harness_")
-    db_path = Path(tmpdir) / "elevator.db"
-    os.environ["ELEVATOR_DB_PATH"] = str(db_path)
-    print(f"HARNESS START mode={mode_label} seed={args.seed} n={args.n} db={db_path}", flush=True)
+    print(f"HARNESS START mode={mode_label} seed={args.seed} n={args.n} tmpdir={tmpdir}", flush=True)
 
     friction = _FrictionBackend(seed=args.seed) if not live_mode else None
     if friction:
         print(f"  friction: {friction.describe()}", flush=True)
 
-    elevator = ElevatorStore(db_path=db_path)
+    def _scenario_db(name: str) -> tuple[ElevatorStore, str]:
+        """Open a fresh isolated elevator DB for one scenario (D-AMEND-2)."""
+        db = Path(tmpdir) / f"elevator_{name}.db"
+        db_str = str(db)
+        os.environ["ELEVATOR_DB_PATH"] = db_str
+        return ElevatorStore(db_path=db), db_str
+
     doorman = _MockDoormanState()
     results = {}
 
     try:
         if not args.skip_s0:
-            results["S0"] = run_s0(elevator, doorman, args.n, friction, live_mode)
+            elev, _ = _scenario_db("s0")
+            try:
+                results["S0"] = run_s0(elev, doorman, args.n, friction, live_mode)
+            finally:
+                _cleanup_elevator(elev)
+                elev.close()
+            doorman.leases.clear()
 
-        results["S1"] = run_s1(elevator, doorman, args.n, friction)
-        results["S2"] = run_s2(elevator, str(db_path), friction)
-        results["S3"] = run_s3(elevator, doorman, friction)
+        elev, _ = _scenario_db("s1")
+        try:
+            results["S1"] = run_s1(elev, doorman, args.n, friction)
+        finally:
+            _cleanup_elevator(elev)
+            elev.close()
+        doorman.leases.clear()
+
+        elev, db_path = _scenario_db("s2")
+        try:
+            results["S2"] = run_s2(elev, db_path, friction)
+        finally:
+            _cleanup_elevator(elev)
+            elev.close()
+
+        elev, _ = _scenario_db("s3")
+        doorman.leases.clear()
+        try:
+            results["S3"] = run_s3(elev, doorman, friction)
+        finally:
+            _cleanup_elevator(elev)
+            elev.close()
+        doorman.leases.clear()
 
         if not args.skip_s4:
-            results["S4"] = run_s4(elevator, doorman, str(db_path), friction, args.n)
+            elev, db_path = _scenario_db("s4")
+            try:
+                results["S4"] = run_s4(elev, doorman, db_path, friction, args.n)
+            finally:
+                _cleanup_elevator(elev)
+                elev.close()
+            doorman.leases.clear()
 
     finally:
-        _cleanup_elevator(elevator)
-        elevator.close()
         try:
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
