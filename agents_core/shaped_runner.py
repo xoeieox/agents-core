@@ -182,11 +182,12 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         cwd = str(worktree_path)
 
         # Resolve max_steps: spec JSON > env GW_AGENT_MAX_STEPS > local-fixer default 60.
-        _max_steps = int(
-            spec.get("max_steps")
-            or os.environ.get("GW_AGENT_MAX_STEPS")
-            or 60
-        )
+        if spec.get("max_steps") is not None:
+            _max_steps = int(spec["max_steps"])
+        elif os.environ.get("GW_AGENT_MAX_STEPS") is not None:
+            _max_steps = int(os.environ["GW_AGENT_MAX_STEPS"])
+        else:
+            _max_steps = 60
 
         fixer_result, transcript = call_gw_agent(
             prompt=spec["prompt"],
@@ -231,19 +232,19 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                 salvaged = True
             elif no_progress_hit:
                 print(
-                    "WARN: local-fixer: run aborted — no semantic progress after consecutive idle steps (spinning wheels)",
+                    "WARN: local-fixer: run aborted - no semantic progress after consecutive idle steps (spinning wheels)",
                     file=sys.stderr,
                 )
                 return ""
             elif max_steps_hit:
                 print(
-                    "WARN: local-fixer: run not concluded — max_steps ceiling reached (no passing tests or empty diff)",
+                    "WARN: local-fixer: run not concluded - max_steps ceiling reached (no passing tests or empty diff)",
                     file=sys.stderr,
                 )
                 return ""
             else:
                 print(
-                    "WARN: local-fixer: run not concluded — DoormanUnreachable or wake timeout",
+                    "WARN: local-fixer: run not concluded - DoormanUnreachable or wake timeout",
                     file=sys.stderr,
                 )
                 return ""
@@ -300,7 +301,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
 
         step_count = len(fixer_result.get("steps") or [])
         salvage_note = (
-            "**harness-salvaged: max_steps_reached** — loop hit the step ceiling but diff and tests were clean.\n\n"
+            "**harness-salvaged: max_steps_reached** - loop hit the step ceiling but diff and tests were clean.\n\n"
             if salvaged else ""
         )
 

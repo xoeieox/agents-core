@@ -998,7 +998,7 @@ def call_gw_agent(
                             if log:
                                 log(
                                     f"[gw_agent] no-progress guard: {consecutive_no_progress} "
-                                    f"consecutive steps with no semantic progress — aborting"
+                                    f"consecutive steps with no semantic progress - aborting"
                                 )
                             return _finalize_writeable_or_readonly(
                                 messages, "", return_transcript, transcript, writeable, cwd,
