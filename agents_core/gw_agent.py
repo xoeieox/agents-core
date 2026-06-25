@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -479,6 +480,7 @@ def _build_fixer_result(
     concluded: bool,
     max_steps_reached: bool = False,
     no_progress: bool = False,
+    budget_forced: bool = False,
 ) -> dict:
     """Build a FixerResult dict from the completed writeable run."""
     diff_result = subprocess.run(
@@ -504,6 +506,7 @@ def _build_fixer_result(
         "concluded": concluded,
         "max_steps_reached": max_steps_reached,
         "no_progress": no_progress,
+        "budget_forced": budget_forced,
         "steps": transcript,
     }
 
@@ -838,10 +841,62 @@ def call_gw_agent(
                     raise ValueError(f"unknown on_wake_fail: {on_wake_fail}")
 
         # Loop: request → tool execution → result → request → ...
+        # Wall-clock deadline tracking for budget-forced conclusion.
+        _loop_start = time.monotonic()
+        _deadline = _loop_start + timeout
+        _avg_step_s = 18.0  # seed before any step completes (typical 122B latency)
+        _step_times: list[float] = []
+        _step_start: float | None = None
+
         for step_num in range(max_steps):
+            # Update rolling avg using the wall-clock of the just-completed step (if any).
+            _now = time.monotonic()
+            if _step_start is not None:
+                _step_times.append(_now - _step_start)
+                _avg_step_s = sum(_step_times) / len(_step_times)
+            _step_start = _now
+
+            # Pre-step budget check: stop exploring if too close to the deadline to
+            # fit another step AND still have time for a forced-conclusion call.
+            _conclusion_reserve_s = max(2.0 * _avg_step_s, 0.20 * timeout)
+            if _deadline - _now <= _conclusion_reserve_s:
+                if log:
+                    log(
+                        f"[gw_agent] budget deadline approaching at step {step_num + 1}: "
+                        f"{_deadline - _now:.1f}s remaining, reserve={_conclusion_reserve_s:.1f}s — "
+                        "forcing conclusion"
+                    )
+                _elapsed = _now - _loop_start
+                _budget_suffix = (
+                    f"[gw_agent: budget-forced conclusion at step {step_num + 1}/"
+                    f"elapsed {_elapsed:.0f}s]"
+                )
+                _fc_timeout = max(20.0, _deadline - _now)
+                _forced_content = _force_conclusion(
+                    messages, backend_url, timeout, json_mode, log, _is_swarm,
+                    call_timeout=_fc_timeout, partial=True,
+                )
+                if _forced_content:
+                    return _finalize_writeable_or_readonly(
+                        messages, _forced_content, return_transcript, transcript,
+                        writeable, cwd, concluded=False,
+                        budget_forced=True,
+                        budget_forced_suffix=_budget_suffix,
+                    )
+                return _finalize_writeable_or_readonly(
+                    messages, "", return_transcript, transcript,
+                    writeable, cwd, concluded=False,
+                    budget_forced=True,
+                    budget_forced_suffix=_budget_suffix,
+                )
+
             if log:
                 log(f"[gw_agent] step {step_num + 1}/{max_steps}")
             step_made_progress = False
+
+            # Per-step timeout: leave headroom for the forced-conclusion model call.
+            # Never cap below 20s (a legitimate slow step on a loaded 122B can take minutes).
+            _per_step_timeout = max(20.0, _deadline - _now - _conclusion_reserve_s)
 
             # POST to the backend (GW or swarm) with current message state.
             try:
@@ -854,7 +909,7 @@ def call_gw_agent(
                         "temperature": 0.7,
                         **({} if _is_swarm else {"chat_template_kwargs": {"enable_thinking": think}}),
                     },
-                    timeout=timeout,
+                    timeout=_per_step_timeout,
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -1132,15 +1187,28 @@ def _force_conclusion(
     json_mode: bool,
     log: Callable[[str], None] | None,
     is_swarm: bool = False,
+    call_timeout: int | float | None = None,
+    partial: bool = False,
 ) -> str:
     """Emit a forced conclusion when the agent exhausts its tool budget.
 
     Makes one final inference call with tools disabled, forcing the model to conclude
     based on accumulated evidence. Returns the model's content or empty string on failure.
 
+    Args:
+        call_timeout: Actual seconds to allow for this one model call. When budget-forced,
+                      pass the remaining wall-clock budget here so the conclusion call gets
+                      real time to complete. Defaults to `timeout` (full budget) for the
+                      existing max_steps and repeated-call paths.
+        partial: When True, instructs the model to acknowledge its incomplete investigation
+                 in the verdict text — required for the budget-forced path so a partial
+                 review is not presented as complete.
+
     Validates that the response is not a leaked tool-call (content-integrity check).
     Does NOT raise exceptions or add to transcript.
     """
+    post_timeout = call_timeout if call_timeout is not None else timeout
+
     # Clean the conversation tail: clear unmatched tool_calls from the trailing
     # assistant message to ensure the conversation ends on a clean boundary
     # (required for OpenAI-compatible backends to accept the following user turn).
@@ -1156,6 +1224,14 @@ def _force_conclusion(
         "and you MUST NOT emit a tool call. Based only on what you have already gathered, "
         "produce your final answer now as plain content."
     )
+    if partial:
+        conclusion_instruction += (
+            " IMPORTANT: This is a PARTIAL review — you ran out of time before completing"
+            " your investigation. You MUST begin your verdict with a brief caveat stating"
+            " that this is a partial review, approximately how many steps you completed,"
+            " and what areas you could not examine. Do not present an incomplete review"
+            " as if it were complete."
+        )
     if json_mode:
         conclusion_instruction += " Respond with the required JSON verdict only — no prose, no tool calls."
 
@@ -1170,7 +1246,7 @@ def _force_conclusion(
                 "temperature": 0.3,
                 **({} if is_swarm else {"chat_template_kwargs": {"enable_thinking": False}}),
             },
-            timeout=timeout,
+            timeout=post_timeout,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -1209,17 +1285,22 @@ def _finalize_writeable_or_readonly(
     concluded: bool,
     max_steps_reached: bool = False,
     no_progress: bool = False,
+    budget_forced: bool = False,
+    budget_forced_suffix: str = "",
 ) -> str | None | tuple:
     """Route to FixerResult or plain result based on writeable flag."""
     if writeable:
         fixer = _build_fixer_result(
             cwd, transcript,
-            concluded=concluded and not max_steps_reached and not no_progress,
+            concluded=concluded and not max_steps_reached and not no_progress and not budget_forced,
             max_steps_reached=max_steps_reached,
             no_progress=no_progress,
+            budget_forced=budget_forced,
         )
         return (fixer, transcript)
-    return _finalize_result(messages, content, return_transcript, transcript, max_steps_reached)
+    return _finalize_result(
+        messages, content, return_transcript, transcript, max_steps_reached, budget_forced_suffix
+    )
 
 
 def _finalize_result(
@@ -1228,13 +1309,18 @@ def _finalize_result(
     return_transcript: bool,
     transcript: list[dict],
     max_steps_reached: bool = False,
+    budget_forced_suffix: str = "",
 ) -> str | None | tuple[str | None, list[dict]]:
-    """Finalize the return value with optional max_steps marker."""
+    """Finalize the return value with optional max_steps or budget-forced marker."""
     text = content or ""
     if max_steps_reached and text:
         text = text + "\n\n[gw_agent: max_steps reached — verdict may be incomplete]"
     elif max_steps_reached:
         text = "[gw_agent: max_steps reached — no verdict reached]"
+    if budget_forced_suffix and text:
+        text = text + f"\n\n{budget_forced_suffix}"
+    elif budget_forced_suffix:
+        text = budget_forced_suffix
 
     if return_transcript:
         return (text if text else None, transcript)
