@@ -856,3 +856,128 @@ def test_queue_runner_watchdog_preserves_self_captured_traceback(tmp_path):
     assert result.get("worker_error") == captured_tb, (
         f"Self-captured traceback was overwritten. Got: {result.get('worker_error')!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# AC5 — Orchestrator span-hold acquires with lease_kind="coordination"
+# (gw-admission-elevator-kind-aware-v0 / Fix 1 end-to-end integration)
+# ---------------------------------------------------------------------------
+
+def test_orchestrator_span_hold_uses_coordination_kind(monkeypatch):
+    """AC5: orchestrator span-hold must acquire with lease_kind='coordination'.
+
+    A coordination hold does not count as a drain-gate contender, so the
+    session's own GW operator legs can admit while the span-hold is held.
+    """
+    import asyncio
+    from agents_core.shared_deliberation import orchestrator
+    from agents_core.shared_deliberation.envelope import DeliberationRequest
+
+    acquire_calls = []
+
+    class FakeDoorman:
+        def acquire(self, *args, **kwargs):
+            acquire_calls.append(kwargs)
+            return {"status": "serving"}
+
+        def release(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    # (ok, result_dict, facets_id, error) — 4-tuple
+    fake_facets = (True, {"answer": "stub"}, "facets-id-stub", None)
+    fake_council = (True, "run-stub", {"status": "resolved", "landing": "stub",
+                                        "confidence": "high", "open_questions": [],
+                                        "positions": [], "voicing_effective": "gravitywell",
+                                        "voicing_degraded": False,
+                                        "voicing_degraded_reason": None}, None)
+
+    with patch("agents_core.doorman_client.DoormanClient",
+               return_value=FakeDoorman()), \
+         patch("agents_core.doorman_client._gw_acquire_timeout",
+               return_value=5.0), \
+         patch.object(orchestrator, "_facets_subprocess",
+                      return_value=fake_facets), \
+         patch.object(orchestrator, "_council_subprocess",
+                      return_value=fake_council):
+        asyncio.run(orchestrator.run_deliberation(
+            DeliberationRequest(
+                text="test",
+                context={},
+                council_voicing="gravitywell",
+                facets_operator="gravitywell",
+            )
+        ))
+
+    # The initial span-hold acquire must use lease_kind="coordination"
+    hold_calls = [c for c in acquire_calls if c.get("lease_kind") == "coordination"]
+    assert hold_calls, (
+        f"Expected at least one acquire call with lease_kind='coordination'; "
+        f"all calls: {acquire_calls}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC6 / Fix 2 — Refresh loop stops at deliberation deadline
+# ---------------------------------------------------------------------------
+
+def test_orchestrator_span_hold_uses_short_refresh_ttl(monkeypatch):
+    """AC6 / Fix 2: initial span-hold uses refresh_ttl (2x interval), not the long span_ttl.
+
+    If the refresh thread dies, the hold expires within 2x SHARED_DELIB_SPAN_REFRESH_S
+    without depending on the finally-release firing.
+    """
+    import asyncio
+    from agents_core.shared_deliberation import orchestrator
+    from agents_core.shared_deliberation.envelope import DeliberationRequest
+
+    monkeypatch.setenv("SHARED_DELIB_SPAN_REFRESH_S", "300")
+    monkeypatch.setenv("SHARED_DELIBERATION_COUNCIL_TIMEOUT_S", "1800")
+
+    ttl_values = []
+
+    class FakeDoorman:
+        def acquire(self, node, work_id, ttl_sec, reason, **kwargs):
+            ttl_values.append(ttl_sec)
+            return {"status": "serving"}
+
+        def release(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    fake_facets = (True, {"answer": "stub"}, "facets-id-stub", None)
+    fake_council = (True, "run-stub", {"status": "resolved", "landing": "stub",
+                                        "confidence": "high", "open_questions": [],
+                                        "positions": [], "voicing_effective": "gravitywell",
+                                        "voicing_degraded": False,
+                                        "voicing_degraded_reason": None}, None)
+
+    with patch("agents_core.doorman_client.DoormanClient",
+               return_value=FakeDoorman()), \
+         patch("agents_core.doorman_client._gw_acquire_timeout",
+               return_value=5.0), \
+         patch.object(orchestrator, "_facets_subprocess",
+                      return_value=fake_facets), \
+         patch.object(orchestrator, "_council_subprocess",
+                      return_value=fake_council):
+        asyncio.run(orchestrator.run_deliberation(
+            DeliberationRequest(
+                text="test",
+                context={},
+                council_voicing="gravitywell",
+                facets_operator="gravitywell",
+            )
+        ))
+
+    assert ttl_values, "span-hold acquire must have been called"
+    # Initial TTL must be _refresh_interval * 2 (600s), not the long span_ttl (2400s)
+    initial_ttl = ttl_values[0]
+    expected_refresh_ttl = 300 * 2  # SHARED_DELIB_SPAN_REFRESH_S * 2
+    assert initial_ttl == expected_refresh_ttl, (
+        f"Initial span-hold TTL must be refresh_ttl={expected_refresh_ttl}; "
+        f"got {initial_ttl}. A long TTL means a leaked hold pins flip-protection indefinitely."
+    )

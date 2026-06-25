@@ -378,16 +378,24 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
         try:
             from agents_core.doorman_client import DoormanClient, _gw_acquire_timeout
             _span_doorman = DoormanClient()
-            # TTL comfortably covers max deliberation: council_timeout + facets_timeout + margin.
+            # Max deliberation window: used as absolute deadline for the refresh loop.
             _span_ttl = (
                 int(os.environ.get("SHARED_DELIBERATION_COUNCIL_TIMEOUT_S", "1800")) + 600
             )
+            # Refresh interval and short per-lease TTL (Fix 2: hold self-expires if refresh stops).
+            # _refresh_ttl < _span_ttl: a leaked hold expires within 2x refresh intervals
+            # without depending on the finally-release firing.
+            _refresh_interval = int(os.environ.get("SHARED_DELIB_SPAN_REFRESH_S", "300"))
+            _refresh_ttl = _refresh_interval * 2
+            _span_deadline_abs = time.time() + _span_ttl  # absolute deadline for refresh loop
+
             _hold_res = await asyncio.to_thread(
                 _span_doorman.acquire,
-                "gravitywell", _span_work_id, _span_ttl,
+                "gravitywell", _span_work_id, _refresh_ttl,
                 "shared-deliberation-span-hold",
                 timeout=_gw_acquire_timeout(),
                 principal=_span_work_id,
+                lease_kind="coordination",
             )
             _hold_status = _hold_res.get("status")
             if _hold_status == "serving":
@@ -402,30 +410,38 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
                     request_id, _hold_status,
                 )
             if _hold_status == "serving":
-                _refresh_interval = int(
-                    os.environ.get("SHARED_DELIB_SPAN_REFRESH_S", "300")
-                )
-
                 def _span_refresh_loop(
                     _dc=_span_doorman,
                     _wid=_span_work_id,
-                    _ttl=_span_ttl,
+                    _refresh_ttl=_refresh_ttl,
                     _stop=_span_stop,
                     _iv=_refresh_interval,
+                    _deadline=_span_deadline_abs,
                 ):
-                    while not _stop.wait(_iv):
-                        try:
-                            _dc.acquire(
-                                "gravitywell", _wid, _ttl,
-                                "shared-deliberation-span-refresh",
-                                timeout=10.0,
-                                principal=_wid,
-                            )
-                        except Exception as _ref_err:
-                            log.warning(
-                                "[shared-deliberation] span hold refresh failed: %s",
-                                _ref_err,
-                            )
+                    # Short-interval poll: responsive to stop event and deadline check.
+                    _POLL_S = 15
+                    _next_refresh = time.time() + _iv
+                    while not _stop.wait(_POLL_S):
+                        now = time.time()
+                        if now >= _deadline:
+                            # Past absolute deliberation deadline — stop refreshing.
+                            # Lease expires within _refresh_ttl seconds on its own.
+                            break
+                        if now >= _next_refresh:
+                            try:
+                                _dc.acquire(
+                                    "gravitywell", _wid, _refresh_ttl,
+                                    "shared-deliberation-span-refresh",
+                                    timeout=10.0,
+                                    principal=_wid,
+                                    lease_kind="coordination",
+                                )
+                            except Exception as _ref_err:
+                                log.warning(
+                                    "[shared-deliberation] span hold refresh failed: %s",
+                                    _ref_err,
+                                )
+                            _next_refresh = now + _iv
 
                 _span_refresh_thread = threading.Thread(
                     target=_span_refresh_loop,
