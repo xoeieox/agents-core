@@ -86,6 +86,7 @@ async def _facets_subprocess(
     context: dict,
     operator: str = "gravitywell",
     grounding_result_file: Optional[str] = None,
+    gw_principal: Optional[str] = None,
 ) -> tuple[bool, Optional[dict], Optional[str], Optional[str]]:
     """Invoke Facets via subprocess. Returns (ok, deliberation_dict, deliberation_id, errors).
 
@@ -107,7 +108,7 @@ async def _facets_subprocess(
 
     async with _facets_semaphore:
         return await asyncio.to_thread(
-            _run_facets_subprocess, text, context, operator, facets_repo, grounding_result_file
+            _run_facets_subprocess, text, context, operator, facets_repo, grounding_result_file, gw_principal
         )
 
 
@@ -117,6 +118,7 @@ def _run_facets_subprocess(
     operator: str,
     facets_repo: Path,
     grounding_result_file: Optional[str] = None,
+    gw_principal: Optional[str] = None,
 ) -> tuple[bool, Optional[dict], Optional[str], Optional[str]]:
     """Synchronous subprocess invocation (runs in thread)."""
     # Grounding handoff guard: validate before building argv.
@@ -147,6 +149,8 @@ def _run_facets_subprocess(
                     p for p in (str(facets_repo), os.environ.get("PYTHONPATH", "")) if p
                 ),
             }
+            if gw_principal:
+                facets_env["GW_GATE_PRINCIPAL"] = gw_principal
             argv = [
                 "python3", "-m", "facets.adapter", "deliberate",
                 text,
@@ -205,6 +209,7 @@ def _run_facets_subprocess(
 async def _council_subprocess(
     text: str,
     voicing: str = "gravitywell",
+    gw_principal: Optional[str] = None,
 ) -> tuple[bool, Optional[str], Optional[dict], Optional[str]]:
     """Submit council deliberation and poll until terminal.
 
@@ -215,7 +220,7 @@ async def _council_subprocess(
         # Stub mode for testing
         return (True, "stub-council-id", {"status": "resolved", "positions": []}, None)
 
-    run_id = await asyncio.to_thread(_submit_council, text, voicing)
+    run_id = await asyncio.to_thread(_submit_council, text, voicing, gw_principal)
     if not run_id:
         return (False, None, None, "Failed to submit council")
 
@@ -228,7 +233,7 @@ async def _council_subprocess(
     return (True, run_id, council_data, None)
 
 
-def _submit_council(text: str, voicing: str) -> Optional[str]:
+def _submit_council(text: str, voicing: str, gw_principal: Optional[str] = None) -> Optional[str]:
     """Submit council deliberation via agents_core.council.cli.cmd_submit."""
     try:
         from agents_core.council.cli import cmd_submit, DEFAULT_TURNS
@@ -248,6 +253,7 @@ def _submit_council(text: str, voicing: str) -> Optional[str]:
             narrator_voice=None,
             no_queue=False,
             notify=False,
+            gw_principal=gw_principal,
         )
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -389,12 +395,13 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
             _refresh_ttl = _refresh_interval * 2
             _span_deadline_abs = time.time() + _span_ttl  # absolute deadline for refresh loop
 
+            _span_principal = request.gw_principal or _span_work_id
             _hold_res = await asyncio.to_thread(
                 _span_doorman.acquire,
                 "gravitywell", _span_work_id, _refresh_ttl,
                 "shared-deliberation-span-hold",
                 timeout=_gw_acquire_timeout(),
-                principal=_span_work_id,
+                principal=_span_principal,
                 lease_kind="coordination",
             )
             _hold_status = _hold_res.get("status")
@@ -413,6 +420,7 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
                 def _span_refresh_loop(
                     _dc=_span_doorman,
                     _wid=_span_work_id,
+                    _principal=_span_principal,
                     _refresh_ttl=_refresh_ttl,
                     _stop=_span_stop,
                     _iv=_refresh_interval,
@@ -433,7 +441,7 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
                                     "gravitywell", _wid, _refresh_ttl,
                                     "shared-deliberation-span-refresh",
                                     timeout=10.0,
-                                    principal=_wid,
+                                    principal=_principal,
                                     lease_kind="coordination",
                                 )
                             except Exception as _ref_err:
@@ -463,6 +471,7 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
                 request.context,
                 request.facets_operator,
                 request.grounding_result_file,
+                request.gw_principal,
             )
 
         async def _council_leg():
@@ -472,6 +481,7 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
             return await _council_subprocess(
                 request.text,
                 request.council_voicing,
+                request.gw_principal,
             )
 
         facets_result, council_result = await asyncio.gather(

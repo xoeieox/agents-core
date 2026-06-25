@@ -706,6 +706,7 @@ def call_gw_agent(
     acquire_lease: bool = True,
     writeable: bool = False,
     no_progress_steps: int = 8,
+    principal: str | None = None,
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Run a multi-step read-only tool-loop on GravityWell.
 
@@ -802,6 +803,7 @@ def call_gw_agent(
                     ttl_sec=timeout + 60,
                     reason="gw_agent",
                     timeout=_gw_acquire_timeout(),
+                    principal=principal,
                 )
             except DoormanUnreachable as e:
                 if log:
