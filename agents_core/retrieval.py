@@ -96,6 +96,7 @@ def retrieve(
     top_k: int = 10,
     min_score: float = 0.0,
     exclude: set[str] | None = None,
+    timeout: float | None = None,
 ) -> list[Hit]:
     """Return up to top_k hits across the requested scope, sorted by score desc.
 
@@ -112,6 +113,9 @@ def retrieve(
                    (applied after per-backend normalisation).
         exclude:   Set of Hit.id values to omit from results. Applied after
                    retrieval — backends don't need to support it natively.
+        timeout:   Per-call wall-clock override for RAG HTTP backends (seconds).
+                   Overrides RAG_HTTP_TIMEOUT for this call only. Default None
+                   preserves the module-level RAG_HTTP_TIMEOUT for all callers.
 
     Returns:
         List of Hit objects, sorted by score descending, at most top_k items.
@@ -140,7 +144,7 @@ def retrieve(
             elif src == "chub":
                 return _search_chub(query, filters)
             else:
-                return _search_rag(src, query, filters)
+                return _search_rag(src, query, filters, timeout=timeout)
         except Exception as exc:
             log.warning("retrieval: %s raised unexpectedly: %s", src, exc)
             return []
@@ -282,7 +286,7 @@ def _search_chub(query: str, filters: dict) -> list[Hit]:
 # Backend: *-rag (vault-rag / room-rag / code-rag)
 # ---------------------------------------------------------------------------
 
-def _search_rag(source: str, query: str, filters: dict) -> list[Hit]:
+def _search_rag(source: str, query: str, filters: dict, timeout: float | None = None) -> list[Hit]:
     _warn_unknown_keys(source, filters, {"path_prefix"})
 
     base_url = _RAG_BASE_URLS[source]
@@ -290,7 +294,8 @@ def _search_rag(source: str, query: str, filters: dict) -> list[Hit]:
     if "path_prefix" in filters:
         payload["path_prefix"] = filters["path_prefix"]
 
-    timeout = httpx.Timeout(RAG_HTTP_TIMEOUT, connect=min(0.5, RAG_HTTP_TIMEOUT))
+    effective_timeout = timeout if timeout is not None else RAG_HTTP_TIMEOUT
+    timeout = httpx.Timeout(effective_timeout, connect=min(0.5, effective_timeout))
     try:
         resp = httpx.post(f"{base_url}/search", json=payload, timeout=timeout)
         resp.raise_for_status()
