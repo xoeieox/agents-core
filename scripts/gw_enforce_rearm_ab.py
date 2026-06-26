@@ -50,10 +50,13 @@ import threading
 import time
 import uuid
 import warnings
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, "/srv/agents")
+# Insert the repo root (parent of scripts/) first so the worktree's agents_core
+# takes precedence over any system-wide /srv/agents copy.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(1, "/srv/agents")
 
 # D-AMEND-1: GW_ADMISSION_ORPHAN_GRACE_SEC / GW_ADMISSION_MAX_WAIT_SEC are
 # module-level constants frozen at import. Set them before agents_core loads
@@ -65,9 +68,11 @@ os.environ["GW_ADMISSION_MAX_WAIT_SEC"] = str(_TEST_MAX_WAIT_SEC)
 
 from agents_core.elevator import (
     ElevatorStore,
+    GW_ADMISSION_MAX_WAIT_SEC,
     GW_ADMISSION_ORPHAN_GRACE_SEC,
     HOSTNAME,
     IS_MASTER,
+    _now,
 )
 from agents_core.doorman_server import CONTENDED, GHOST_PRINCIPAL
 
@@ -1421,6 +1426,266 @@ def run_s6(
 
 
 # ---------------------------------------------------------------------------
+# S7 — Liveness-aware admission (6th-wedge regression gate)
+# ---------------------------------------------------------------------------
+
+def run_s7(
+    elevator: ElevatorStore,
+    doorman: _MockDoormanState,
+    friction: "_FrictionBackend | None",
+) -> dict:
+    """S7: Liveness-aware admission — 6th-wedge regression gate.
+
+    (i)   Dead pending head: live waiter admits via D2 squeeze-past (same try_admit call).
+    (ii)  Dead claimed slot: D4 fast-reclaim frees slot within 1 reaper cycle.
+    (iii) Slow-but-live owner: reclaim_stale requeues to BACK (fresh created_at), not failed.
+    (iv)  Ghost/spoofed stamp (unknown verdict): requeued to BACK at reclaim, NOT falsely
+          failed; clears at the presumed-dead backstop (no indefinite head-of-line deadlock).
+
+    AC8: (i)+(ii) squeeze-past, (iii) back-of-line, (iv) no deadlock/not-falsely-failed,
+    drain-to-0.
+    """
+    print("\n=== S7 LIVENESS-AWARE ADMISSION — 6TH-WEDGE REGRESSION GATE ===", flush=True)
+
+    failures = []
+    DEAD_PID = 99999999  # almost certainly non-existent
+    DEAD_START = 1.0
+
+    # ---- Shared helpers ----
+
+    def _insert_pending_controlled(item_id, principal, pid, host=None, start_time=None):
+        """Insert a pending gw-admission ticket with a controlled _enqueuer_id stamp."""
+        h = host if host is not None else HOSTNAME
+        eid = {"host": h, "pid": pid}
+        if start_time is not None:
+            eid["start_time"] = start_time
+        payload = json.dumps({"work_id": f"s7-{item_id}", "_enqueuer_id": eid})
+        now_ts = _now()
+        with elevator._lock:
+            elevator._conn.execute(
+                "INSERT INTO queue_items (item_id, lane, kind, principal, payload, "
+                "latency_class, status, attempts, created_at) "
+                "VALUES (?, 'deliberation', 'gw-admission', ?, ?, 'batch', 'pending', 0, ?)",
+                (item_id, principal, payload, now_ts),
+            )
+            elevator._conn.commit()
+        return now_ts
+
+    def _claim_direct(item_id, claim_ttl_sec=300):
+        """Directly claim a ticket (bypasses try_admit for test injection)."""
+        now_ts = _now()
+        with elevator._lock:
+            elevator._conn.execute(
+                "UPDATE queue_items SET status='claimed', claim_owner=?, "
+                "claim_ttl_sec=?, claimed_at=? WHERE item_id=?",
+                (item_id, claim_ttl_sec, now_ts, item_id),
+            )
+            elevator._conn.commit()
+
+    def _backdate_claimed(item_id, seconds):
+        new_ts = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+        with elevator._lock:
+            elevator._conn.execute(
+                "UPDATE queue_items SET claimed_at=? WHERE item_id=?",
+                (new_ts, item_id),
+            )
+            elevator._conn.commit()
+
+    all_tickets = []
+
+    # ---- (i) Dead pending head → D2 squeeze-past ----
+    print("  S7(i): dead pending head → squeeze-past inline on try_admit", flush=True)
+    iid_dead_head = f"s7-i-dead-{uuid.uuid4().hex[:6]}"
+    iid_live_waiter = f"s7-i-live-{uuid.uuid4().hex[:6]}"
+    P_dead_i = f"s7-i-dead-{uuid.uuid4().hex[:4]}"
+    P_live_i = f"s7-i-live-{uuid.uuid4().hex[:4]}"
+    all_tickets += [iid_dead_head, iid_live_waiter]
+
+    _insert_pending_controlled(iid_dead_head, P_dead_i, DEAD_PID, start_time=DEAD_START)
+    _age_ticket(elevator, iid_dead_head, GW_ADMISSION_ORPHAN_GRACE_SEC + 5)
+    time.sleep(0.005)
+    _insert_pending_controlled(iid_live_waiter, P_live_i, os.getpid(), start_time=None)
+
+    ok_i, _ = elevator.try_admit(iid_live_waiter, "deliberation", P_live_i)
+    dead_head_i_status = (elevator.get(iid_dead_head) or {}).get("status")
+
+    if not ok_i:
+        failures.append("S7i_live_waiter_not_admitted_via_squeeze_past")
+    if dead_head_i_status != "failed":
+        failures.append(f"S7i_dead_head_not_failed_status={dead_head_i_status}")
+    else:
+        print(f"    dead_head=failed, live_admitted={ok_i} ✓", flush=True)
+
+    if ok_i:
+        elevator.ack(iid_live_waiter)
+    else:
+        elevator.fail(iid_live_waiter)
+
+    # ---- (ii) Dead claimed slot → D4 fast-reclaim within 1 reaper cycle ----
+    print("  S7(ii): dead claimed slot → fast-reclaim via D4 reap", flush=True)
+    iid_dead_claimed = f"s7-ii-dead-{uuid.uuid4().hex[:6]}"
+    iid_next_waiter = f"s7-ii-next-{uuid.uuid4().hex[:6]}"
+    P_dead_ii = f"s7-ii-dead-{uuid.uuid4().hex[:4]}"
+    P_next_ii = f"s7-ii-next-{uuid.uuid4().hex[:4]}"
+    all_tickets += [iid_dead_claimed, iid_next_waiter]
+
+    _insert_pending_controlled(iid_dead_claimed, P_dead_ii, DEAD_PID, start_time=DEAD_START)
+    _claim_direct(iid_dead_claimed, claim_ttl_sec=960)
+    _backdate_claimed(iid_dead_claimed, GW_ADMISSION_ORPHAN_GRACE_SEC + 5)
+    _insert_pending_controlled(iid_next_waiter, P_next_ii, os.getpid(), start_time=None)
+
+    # Next waiter blocked while dead claimant holds the slot.
+    ok_before_ii, _ = elevator.try_admit(iid_next_waiter, "deliberation", P_next_ii)
+    if ok_before_ii:
+        failures.append("S7ii_next_waiter_admitted_before_reap_unexpected")
+        elevator.ack(iid_next_waiter)
+
+    if not ok_before_ii:
+        # Reap: D4 fast-reclaims the dead claimed ticket.
+        elevator.reap()
+        dead_claimed_status = (elevator.get(iid_dead_claimed) or {}).get("status")
+        if dead_claimed_status != "failed":
+            failures.append(f"S7ii_dead_claimed_not_reaped_status={dead_claimed_status}")
+        else:
+            print(f"    dead_claimed=failed ✓", flush=True)
+
+        ok_after_ii, _ = elevator.try_admit(iid_next_waiter, "deliberation", P_next_ii)
+        if not ok_after_ii:
+            failures.append("S7ii_next_waiter_not_admitted_after_reap")
+        else:
+            elevator.ack(iid_next_waiter)
+            print(f"    next_waiter_admitted={ok_after_ii} ✓", flush=True)
+
+    # ---- (iii) Slow-but-live owner → reclaim requeues to back, not failed ----
+    print("  S7(iii): slow-but-live owner → requeued to back at reclaim", flush=True)
+    iid_slow = f"s7-iii-slow-{uuid.uuid4().hex[:6]}"
+    P_slow = f"s7-iii-slow-{uuid.uuid4().hex[:4]}"
+    all_tickets.append(iid_slow)
+
+    _insert_pending_controlled(iid_slow, P_slow, os.getpid(), start_time=None)
+    iii_original_created = (elevator.get(iid_slow) or {}).get("created_at")
+
+    elevator.try_admit(iid_slow, "deliberation", P_slow, claim_ttl_sec=1)
+    _backdate_claimed(iid_slow, 10)  # 10 seconds past TTL of 1
+
+    elevator.reclaim_stale("deliberation")
+    iii_item = elevator.get(iid_slow) or {}
+
+    if iii_item.get("status") != "pending":
+        failures.append(f"S7iii_slow_alive_not_requeued_to_pending_status={iii_item.get('status')}")
+    elif iii_item.get("claim_owner") is not None:
+        failures.append("S7iii_slow_alive_claim_owner_not_cleared")
+    elif iii_original_created and iii_item.get("created_at", "") <= iii_original_created:
+        failures.append(
+            f"S7iii_created_at_not_advanced: original={iii_original_created} new={iii_item.get('created_at')}"
+        )
+    else:
+        print(f"    slow_alive requeued to back, created_at advanced ✓", flush=True)
+
+    elevator.fail(iid_slow)
+
+    # ---- (iv) Ghost/spoofed stamp → back-of-line, no deadlock, not falsely failed ----
+    print("  S7(iv): ghost/spoofed stamp → back-of-line; clears at backstop not before", flush=True)
+
+    # iv-A: ghost claim lapses → D3 requeues to back (not failed); real waiter admits.
+    iid_ghost_a = f"s7-iv-a-ghost-{uuid.uuid4().hex[:6]}"
+    iid_real_a = f"s7-iv-a-real-{uuid.uuid4().hex[:6]}"
+    P_ghost_a = f"s7-iv-ghost-{uuid.uuid4().hex[:4]}"
+    P_real_a = f"s7-iv-real-{uuid.uuid4().hex[:4]}"
+    all_tickets += [iid_ghost_a, iid_real_a]
+
+    _insert_pending_controlled(iid_ghost_a, P_ghost_a, 12345, host="other-host-xyz", start_time=DEAD_START)
+    _age_ticket(elevator, iid_ghost_a, GW_ADMISSION_ORPHAN_GRACE_SEC + 5)
+    ghost_a_original_created = (elevator.get(iid_ghost_a) or {}).get("created_at")
+
+    time.sleep(0.005)
+    _insert_pending_controlled(iid_real_a, P_real_a, os.getpid(), start_time=None)
+
+    # Claim the ghost and backdate past its TTL.
+    elevator.try_admit(iid_ghost_a, "deliberation", P_ghost_a, claim_ttl_sec=1)
+    _backdate_claimed(iid_ghost_a, 10)
+
+    # Reclaim: unknown verdict → requeue to back (fresh created_at), NOT failed.
+    elevator.reclaim_stale("deliberation")
+    ghost_a_item = elevator.get(iid_ghost_a) or {}
+
+    if ghost_a_item.get("status") == "failed":
+        failures.append("S7iv_ghost_falsely_failed_on_reclaim_should_requeue")
+    elif ghost_a_item.get("status") != "pending":
+        failures.append(f"S7iv_ghost_not_requeued_status={ghost_a_item.get('status')}")
+    elif ghost_a_original_created and ghost_a_item.get("created_at", "") <= ghost_a_original_created:
+        failures.append("S7iv_ghost_created_at_not_advanced_to_back")
+    else:
+        print(f"    ghost requeued to back (not failed) ✓", flush=True)
+
+    # Real waiter (older than ghost's fresh created_at) is now head → admits.
+    ok_real_a, _ = elevator.try_admit(iid_real_a, "deliberation", P_real_a)
+    if not ok_real_a:
+        failures.append("S7iv_real_waiter_not_admitted_after_ghost_requeued_to_back")
+    else:
+        elevator.ack(iid_real_a)
+        print(f"    real_waiter admitted after ghost requeued ✓", flush=True)
+
+    elevator.fail(iid_ghost_a)
+
+    # iv-B: ghost pending past grace but before backstop → NOT falsely failed.
+    iid_ghost_b = f"s7-iv-b-ghost-{uuid.uuid4().hex[:6]}"
+    P_ghost_b = f"s7-iv-b-ghost-{uuid.uuid4().hex[:4]}"
+    all_tickets.append(iid_ghost_b)
+
+    _insert_pending_controlled(iid_ghost_b, P_ghost_b, 12346, host="other-host-xyz", start_time=DEAD_START)
+    _age_ticket(elevator, iid_ghost_b, GW_ADMISSION_ORPHAN_GRACE_SEC + 5)
+
+    # Reap: ghost has no same-host stamp → unknown → not reaped (not falsely failed).
+    reap_before_backstop = elevator.reap()
+    ghost_b_before = (elevator.get(iid_ghost_b) or {}).get("status")
+    if ghost_b_before == "failed":
+        failures.append("S7iv_ghost_falsely_failed_before_backstop")
+    else:
+        print(f"    ghost not falsely failed before backstop (status={ghost_b_before}) ✓", flush=True)
+
+    # iv-C: ghost pending past MAX_WAIT → reaped by presumed-dead backstop.
+    _age_ticket(elevator, iid_ghost_b, GW_ADMISSION_MAX_WAIT_SEC + 5)
+    reap_at_backstop = elevator.reap()
+    ghost_b_after = (elevator.get(iid_ghost_b) or {}).get("status")
+    if ghost_b_after != "failed":
+        failures.append(f"S7iv_ghost_not_cleared_at_backstop_status={ghost_b_after}")
+    else:
+        prov = (elevator.get(iid_ghost_b) or {}).get("provenance") or {}
+        if prov.get("orphan_reap") != "presumed_dead_backstop":
+            failures.append(f"S7iv_ghost_backstop_wrong_reason={prov}")
+        else:
+            print(f"    ghost cleared at backstop (presumed_dead_backstop) ✓", flush=True)
+
+    # ---- Drain check: all tickets terminal ----
+    non_terminal = []
+    for t in all_tickets:
+        item = elevator.get(t) or {}
+        if item.get("status") not in ("served", "failed", "expired"):
+            non_terminal.append(f"{t}={item.get('status')}")
+            elevator.fail(t)
+    if non_terminal:
+        failures.append(f"S7_not_drained={non_terminal}")
+    else:
+        print("    drain-to-0 ✓", flush=True)
+
+    passed = len(failures) == 0
+    result = {
+        "scenario": "S7",
+        "pass": passed,
+        "failures": failures,
+        "details": {
+            "AC2_squeeze_past_dead_pending": not any("S7i_" in f for f in failures),
+            "AC5_dead_claimed_fast_reclaim": not any("S7ii_" in f for f in failures),
+            "AC3_slow_alive_back_of_line": not any("S7iii_" in f for f in failures),
+            "AC8_ghost_no_deadlock": not any("S7iv_" in f for f in failures),
+        },
+    }
+    _print_scenario_result(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Verdict emitter
 # ---------------------------------------------------------------------------
 
@@ -1499,7 +1764,7 @@ def emit_verdict(results: dict, seed: int, n: int, mode: str) -> Path:
         "",
         f"## Decision: **{go_no_go}** for re-arming `GW_ADMISSION_MODE=enforce`",
         "",
-        f"GO requires all scenarios PASS (S0–S6). {'All scenarios passed.' if all_pass else 'One or more scenarios FAILED — do not re-arm enforce until fixed.'}",
+        f"GO requires all scenarios PASS (S0–S7). {'All scenarios passed.' if all_pass else 'One or more scenarios FAILED — do not re-arm enforce until fixed.'}",
         "",
         "<!-- gw-enforce-rearm-ab-harness-v0 -->",
     ]
@@ -1556,6 +1821,7 @@ def main() -> int:
     parser.add_argument("--skip-s4", action="store_true")
     parser.add_argument("--skip-s5", action="store_true")
     parser.add_argument("--skip-s6", action="store_true")
+    parser.add_argument("--skip-s7", action="store_true")
     args = parser.parse_args()
 
     live_mode = args.live
@@ -1640,6 +1906,16 @@ def main() -> int:
             doorman.leases.clear()
             try:
                 results["S6"] = run_s6(elev, doorman, args.n, friction)
+            finally:
+                _cleanup_elevator(elev)
+                elev.close()
+            doorman.leases.clear()
+
+        if not args.skip_s7:
+            elev, _ = _scenario_db("s7")
+            doorman.leases.clear()
+            try:
+                results["S7"] = run_s7(elev, doorman, friction)
             finally:
                 _cleanup_elevator(elev)
                 elev.close()
