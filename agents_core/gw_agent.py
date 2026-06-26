@@ -710,6 +710,7 @@ def call_gw_agent(
     writeable: bool = False,
     no_progress_steps: int = 8,
     principal: str | None = None,
+    verdict_schema: dict | None = None,
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Run a multi-step read-only tool-loop on GravityWell.
 
@@ -792,6 +793,9 @@ def call_gw_agent(
     # No-progress guard state (writeable mode): track consecutive steps with no semantic progress.
     consecutive_no_progress = 0
     last_test_counts: tuple | None = None
+    # Grounding guard state (json_mode review runs): track verified (error-free) tool calls.
+    grounding_count = 0  # tool calls with error is None
+    grounding_nudged = False  # True after the first 0-tool-call stop nudge
 
     # Acquire doorman lease for the whole run (unless acquire_lease=False for swarm).
     from agents_core.doorman_client import DoormanClient, DoormanUnreachable, _gw_acquire_timeout
@@ -1020,6 +1024,10 @@ def call_gw_agent(
                         }
                     )
 
+                    # Track grounding: count error-free tool calls (verified, not merely attempted).
+                    if error_value is None:
+                        grounding_count += 1
+
                     # Append tool result message.
                     messages.append(
                         {
@@ -1068,20 +1076,72 @@ def call_gw_agent(
                         log(f"[gw_agent] context cap exceeded ({ctx_tokens} > {GW_AGENT_CTX_CAP}); truncating")
                     messages = _truncate_messages(messages)
 
-            elif finish_reason == "stop":
-                # Agent concluded (no tool_calls, just content).
-                if log:
-                    log(f"[gw_agent] agent concluded at step {step_num + 1}")
-                return _finalize_writeable_or_readonly(
-                    messages, content, return_transcript, transcript, writeable, cwd, concluded=True
-                )
-            else:
-                # finish_reason is neither tool_calls nor stop; treat as stop.
-                if log:
+            elif finish_reason == "stop" or finish_reason not in ("tool_calls", "stop"):
+                # Agent concluded voluntarily (finish_reason == "stop", or unknown treated as stop).
+                if finish_reason != "stop" and log:
                     log(
                         f"[gw_agent] agent ended with finish_reason={finish_reason} "
                         f"(expected stop or tool_calls)"
                     )
+                if log and finish_reason == "stop":
+                    log(f"[gw_agent] agent concluded at step {step_num + 1}")
+
+                # §1c: Grounding guard — json_mode review runs only, not writeable fixer runs.
+                if json_mode and not writeable and grounding_count == 0:
+                    if not grounding_nudged:
+                        # First ungrounded stop: nudge and continue the loop.
+                        grounding_nudged = True
+                        if log:
+                            log("[gw_agent] grounding guard: 0 verified tool calls — nudging")
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "You concluded without investigating. A verdict with no successful "
+                                "tool call is not acceptable — use the available tools to read the "
+                                "spec target and the relevant code, THEN produce your verdict."
+                            ),
+                        })
+                        continue
+                    else:
+                        # Second ungrounded stop: UNFOUNDED — do not accept as a verdict.
+                        if log:
+                            log("[gw_agent] grounding guard: second ungrounded stop — UNFOUNDED")
+                        return _finalize_writeable_or_readonly(
+                            messages, "", return_transcript, transcript, writeable, cwd,
+                            concluded=False,
+                        )
+
+                # §1b: Validate JSON on voluntary stop for json_mode runs.
+                if json_mode and not writeable:
+                    _stripped = re.sub(
+                        r"^```(?:json)?\s*\n?(.+?)\n?```$", r"\1", content.strip(), flags=re.DOTALL
+                    )
+                    try:
+                        json.loads(_stripped)
+                        # Already valid JSON — finalize directly, no extra turn.
+                        return _finalize_writeable_or_readonly(
+                            messages, _stripped, return_transcript, transcript, writeable, cwd,
+                            concluded=True,
+                        )
+                    except (json.JSONDecodeError, ValueError):
+                        # Not valid JSON — re-emit under grammar constraint.
+                        if log:
+                            log("[gw_agent] voluntary stop: content not parseable JSON — re-emitting")
+                        _re_emitted = _force_conclusion(
+                            messages, backend_url, timeout, json_mode, log, _is_swarm,
+                            verdict_schema=verdict_schema,
+                            reason=(
+                                "You stopped without emitting a valid JSON verdict. "
+                                "Based only on what you have already gathered, produce "
+                                "your final answer now as valid JSON only."
+                            ),
+                        )
+                        return _finalize_writeable_or_readonly(
+                            messages, _re_emitted if _re_emitted else content,
+                            return_transcript, transcript, writeable, cwd, concluded=True,
+                        )
+
+                # Non-json_mode or writeable: byte-identical to previous behavior.
                 return _finalize_writeable_or_readonly(
                     messages, content, return_transcript, transcript, writeable, cwd, concluded=True
                 )
@@ -1189,6 +1249,8 @@ def _force_conclusion(
     is_swarm: bool = False,
     call_timeout: int | float | None = None,
     partial: bool = False,
+    verdict_schema: dict | None = None,
+    reason: str | None = None,
 ) -> str:
     """Emit a forced conclusion when the agent exhausts its tool budget.
 
@@ -1203,6 +1265,11 @@ def _force_conclusion(
         partial: When True, instructs the model to acknowledge its incomplete investigation
                  in the verdict text — required for the budget-forced path so a partial
                  review is not presented as complete.
+        verdict_schema: OpenAI json_schema object for grammar-constrained JSON emission.
+                        When provided (GW path only), sets response_format to json_schema.
+        reason: Truthful framing for the re-emission prompt. When provided, replaces the
+                default "reached your investigation budget" opening so a voluntary-stop
+                re-emission does not lie about why the model is being asked to conclude.
 
     Validates that the response is not a leaked tool-call (content-integrity check).
     Does NOT raise exceptions or add to transcript.
@@ -1219,11 +1286,17 @@ def _force_conclusion(
 
     # Append the conclusion instruction with explicit negative constraints
     # forbidding tool use.
-    conclusion_instruction = (
-        "You have reached your investigation budget. You may NOT call any tools, "
-        "and you MUST NOT emit a tool call. Based only on what you have already gathered, "
-        "produce your final answer now as plain content."
-    )
+    if reason is not None:
+        # Truthful framing for voluntary-stop and grounding-guard re-emissions.
+        conclusion_instruction = (
+            f"{reason} You may NOT call any tools, and you MUST NOT emit a tool call."
+        )
+    else:
+        conclusion_instruction = (
+            "You have reached your investigation budget. You may NOT call any tools, "
+            "and you MUST NOT emit a tool call. Based only on what you have already gathered, "
+            "produce your final answer now as plain content."
+        )
     if partial:
         if json_mode:
             # json_mode requires no leading prose; embed the caveat as a JSON field instead
@@ -1249,6 +1322,14 @@ def _force_conclusion(
 
     messages.append({"role": "user", "content": conclusion_instruction})
 
+    # §1a: Build response_format for grammar-constrained emission (GW path only; swarm excluded).
+    _response_format: dict | None = None
+    if not is_swarm:
+        if verdict_schema is not None:
+            _response_format = {"type": "json_schema", "json_schema": verdict_schema}
+        elif json_mode:
+            _response_format = {"type": "json_object"}
+
     # Make the final POST with tools strictly omitted (not tool_choice: "none").
     try:
         resp = requests.post(
@@ -1257,6 +1338,7 @@ def _force_conclusion(
                 "messages": messages,
                 "temperature": 0.3,
                 **({} if is_swarm else {"chat_template_kwargs": {"enable_thinking": False}}),
+                **({} if _response_format is None else {"response_format": _response_format}),
             },
             timeout=post_timeout,
         )
