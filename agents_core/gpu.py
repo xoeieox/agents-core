@@ -42,9 +42,11 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
+from agents_core.room_paths import room_path
+
 PACIFIC = ZoneInfo("America/Los_Angeles")
 
-QUEUE_DIR = Path("/srv/lapis/gpu-queue")
+QUEUE_DIR = room_path("gpu_queue")
 PENDING_DIR = QUEUE_DIR / "pending"
 ACTIVE_DIR = QUEUE_DIR / "active"
 COMPLETED_DIR = QUEUE_DIR / "completed"

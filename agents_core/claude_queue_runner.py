@@ -35,7 +35,7 @@ import psutil
 from agents_core.claude_queue import CLAUDE_QUEUE_DIR, ClaudeQueue
 from agents_core.gpu import PACIFIC, Priority as QueuePriority  # noqa: F401
 from agents_core.notify import Priority as PushoverPriority, send_notification
-
+from agents_core.room_paths import room_path
 from agents_core.worktree import WORKTREE_ROOT
 
 RUNNER_SCRIPT_MODULE = "agents_core.shaped_runner"
@@ -63,11 +63,11 @@ throughput to zero.  With the outer-first ordering, the second council task
 blocks without holding a worker slot.
 """
 
-_COUNCIL_DIR = Path("/srv/lapis/council")
-_COUNCIL_LOG_DIR = Path("/srv/lapis/council/logs")
+_COUNCIL_DIR = room_path("council")
+_COUNCIL_LOG_DIR = room_path("council.logs")
 _COUNCIL_ORPHAN_AGE_SECS = int(os.environ.get("COUNCIL_ORPHAN_AGE_SECS", "3600"))
 
-SILENCED_LOG = Path("/srv/lapis/notify-audit/silenced.jsonl")
+SILENCED_LOG = room_path("notify_audit.silenced")
 
 # Terminal status sets per mode.
 _DELIBERATION_TERMINAL = frozenset({"resolved", "open", "laid-down"})

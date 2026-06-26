@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from agents_core.shared_deliberation.envelope import DeliberationEnvelope, DeliberationRequest
+from agents_core.room_paths import room_path
 
 log = logging.getLogger("shared-deliberation")
 
@@ -282,7 +283,7 @@ def _poll_council(run_id: str, timeout_s: int = 1800) -> tuple[Optional[dict], O
     """
     import yaml
 
-    council_dir = Path("/srv/lapis/council")
+    council_dir = room_path("council")
     start_time = time.time()
     poll_interval = 5
     stall_s = int(os.environ.get("COUNCIL_STALL_S", "180"))

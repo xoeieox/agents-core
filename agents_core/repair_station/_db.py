@@ -15,9 +15,9 @@ import sqlite3
 import threading
 from pathlib import Path
 
-_DEFAULT_DB = Path(
-    os.environ.get("REPAIR_STATION_DB", "/srv/lapis/repair-station/repair_station.db")
-)
+from agents_core.room_paths import room_path
+
+_DEFAULT_DB = room_path("repair_station")
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS station_registry (

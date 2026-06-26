@@ -20,8 +20,10 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from agents_core.room_paths import room_path
+
 PACIFIC = ZoneInfo("America/Los_Angeles")
-DEFAULT_DIR = Path("/srv/lapis/targets/comments")
+DEFAULT_DIR = room_path("targets.comments")
 VALID_AUTHOR_TYPES = {"user", "agent", "system"}
 
 _KNOWN_FIELDS = {"id", "ts", "author", "author_type", "content", "tags"}

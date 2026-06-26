@@ -27,7 +27,9 @@ from typing import Any
 
 import yaml
 
-TARGETS_DIR = Path("/srv/lapis/targets")
+from agents_core.room_paths import room_path
+
+TARGETS_DIR = room_path("targets")
 
 
 def current_targets_state(scope: dict, freshness: int, policy: str) -> dict:

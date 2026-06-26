@@ -21,7 +21,9 @@ Layout:
 """
 from pathlib import Path
 
-EXPERTS_ROOT = Path("/srv/lapis/experts")
+from agents_core.room_paths import room_path
+
+EXPERTS_ROOT = room_path("experts")
 
 _VALID_CORPUS_MODES = frozenset({"build", "adversary"})
 

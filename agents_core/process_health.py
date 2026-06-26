@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from agents_core.room_paths import room_str
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -225,7 +227,7 @@ def _detect_claude_view() -> ProcessState:
 
 def _detect_claude_queue_runner() -> ProcessState:
     running, pid, uptime = pgrep_match(r"agents_core\.claude_queue_runner")
-    mtime = log_mtime("/srv/lapis/claude-queue/history.jsonl")
+    mtime = log_mtime(room_str("claude_queue.history"))
     notes_parts = []
     if running:
         notes_parts.append(f"pgrep matched pid {pid}")
@@ -237,7 +239,7 @@ def _detect_claude_queue_runner() -> ProcessState:
         pid=pid,
         uptime_seconds=uptime,
         last_advanced=mtime,
-        last_advanced_source="log mtime: /srv/lapis/claude-queue/history.jsonl",
+        last_advanced_source=f"log mtime: {room_str('claude_queue.history')}",
         notes="; ".join(notes_parts),
     )
 
