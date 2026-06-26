@@ -276,7 +276,7 @@ def test_dod4_env_room_root(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_dod5_sh_parity():
-    """--emit-sh output: all ROOM_* values match golden expected paths."""
+    """--emit-sh output matches golden paths AND matches the checked-in room_paths.sh."""
     clean = {k: v for k, v in os.environ.items() if k not in _ENV_VARS_TO_CLEAR}
     result = subprocess.run(
         [sys.executable, "-m", "agents_core.room_paths", "--emit-sh"],
@@ -306,6 +306,14 @@ def test_dod5_sh_parity():
                 f"expected {expected!r}"
             )
 
+    # Diff against the checked-in room_paths.sh — proves the file is never hand-edited
+    checked_in = Path(__file__).parent.parent.parent / "room_paths.sh"
+    assert checked_in.exists(), f"room_paths.sh not found at {checked_in}"
+    assert result.stdout == checked_in.read_text(), (
+        "Emitted --emit-sh output differs from checked-in room_paths.sh. "
+        "Run `python -m agents_core.room_paths --emit-sh > room_paths.sh` to regenerate."
+    )
+
 
 # ---------------------------------------------------------------------------
 # DoD-7: package-data ships
@@ -334,37 +342,60 @@ def test_dod9_access_domain():
 
 
 # ---------------------------------------------------------------------------
-# DoD-10: stdlib-only import (subprocess test in bare Python)
+# DoD-10: stdlib-only import — proved via a real bare venv lacking httpx/requests
 # ---------------------------------------------------------------------------
 
-def test_dod10_stdlib_only_import():
-    """agents_core.room_paths submodule imports successfully.
+def test_dod10_stdlib_only_import(tmp_path):
+    """from agents_core.room_paths import room_path succeeds in a bare venv (no httpx/requests).
 
-    We verify by importing just agents_core.room_paths (not the top-level
-    agents_core package which has heavy third-party deps) and confirming the
-    submodule works correctly. The stdlib-only contract is enforced structurally
-    by DoD-3 (AST scan), which is the more reliable check.
+    Creates a temporary venv with system_site_packages=False so that httpx and
+    requests are absent. Sets PYTHONPATH to the repo root so agents_core is
+    found without installing the package (and pulling its heavy deps). Verifies:
+      1. httpx is NOT importable in the bare venv (proves isolation).
+      2. the from-import of room_path succeeds and returns the correct path.
+
+    This test fails if the PEP-562 lazy-import refactor in agents_core/__init__.py
+    is reverted, because __init__.py would then eagerly import httpx/requests.
     """
-    # Import the submodule directly, bypassing agents_core's top-level __init__
-    code = (
-        "import importlib; "
-        "mod = importlib.import_module('agents_core.room_paths'); "
-        "keys = mod.iter_keys(); "
-        "assert len(keys) > 0, f'no keys: {keys}'; "
-        "p = mod.room_path('targets'); "
-        "assert str(p) == '/srv/lapis/targets', repr(str(p)); "
-        "print('OK')"
-    )
+    import venv as _venv_mod
+
+    venv_dir = tmp_path / "bare_venv"
+    _venv_mod.create(str(venv_dir), with_pip=False, system_site_packages=False)
+    venv_python = venv_dir / "bin" / "python"
+
+    # Repo root contains agents_core/ package directory
+    repo_root = Path(__file__).parent.parent.parent
+
     clean = {k: v for k, v in os.environ.items() if k not in _ENV_VARS_TO_CLEAR}
+    clean["PYTHONPATH"] = str(repo_root)
+    clean.pop("VIRTUAL_ENV", None)
+
+    # Step 1: prove isolation — httpx must NOT be importable in the bare venv
+    no_httpx = subprocess.run(
+        [str(venv_python), "-c", "import httpx"],
+        capture_output=True, text=True, env=clean,
+    )
+    assert no_httpx.returncode != 0, (
+        "httpx is importable in the bare venv — isolation not achieved; "
+        "check that system_site_packages=False is respected"
+    )
+
+    # Step 2: the actual DoD-10 check
+    code = (
+        "from agents_core.room_paths import room_path; "
+        "result = str(room_path('targets')); "
+        "assert result == '/srv/lapis/targets', repr(result); "
+        "print(result)"
+    )
     result = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True, text=True,
-        env=clean,
+        [str(venv_python), "-c", code],
+        capture_output=True, text=True, env=clean,
     )
     assert result.returncode == 0, (
-        f"Import failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        f"Import failed in bare venv (no httpx/requests):\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
-    assert "OK" in result.stdout
+    assert result.stdout.strip() == "/srv/lapis/targets"
 
 
 # ---------------------------------------------------------------------------

@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -758,3 +761,42 @@ def test_walk_lineage_string_seed(tmp_path):
     ])
     nodes = walk_lineage("decision/str-seed-v0", db_path=db)
     assert any(n.key == "decision/str-seed-v0" for n in nodes)
+
+
+# ---------------------------------------------------------------------------
+# DoD-6: roadmap._LAPIS_STATE default is /srv/lapis/lapis-state (anomaly fix)
+# ---------------------------------------------------------------------------
+
+def test_lapis_state_default_is_room():
+    """roadmap._LAPIS_STATE is Path('/srv/lapis/lapis-state') when LAPIS_STATE is unset.
+
+    Covers the anomaly fix: old default was Path(os.environ.get('LAPIS_STATE', '/data/lapis-state'))
+    which silently pointed at the wrong /data location whenever the env var was absent.
+    The fix canonicalises the default to /srv/lapis/lapis-state via room_path('lapis_state')
+    while preserving LAPIS_STATE env-override precedence.
+
+    Runs in a subprocess so that LAPIS_STATE is guaranteed absent at module import time
+    (module-level constants bind once at first import).
+    """
+    code = (
+        "import os; "
+        "os.environ.pop('LAPIS_STATE', None); "
+        "os.environ.pop('ROADMAP_SNAPSHOT_PATH', None); "
+        "import agents_core.roadmap as rmod; "
+        "from pathlib import Path; "
+        "got = rmod._LAPIS_STATE; "
+        "assert got == Path('/srv/lapis/lapis-state'), "
+        "    f'_LAPIS_STATE={got!r}, expected Path(\"/srv/lapis/lapis-state\")'; "
+        "print('OK')"
+    )
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("LAPIS_STATE", "ROADMAP_SNAPSHOT_PATH")}
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, env=env,
+    )
+    assert result.returncode == 0, (
+        f"roadmap._LAPIS_STATE check failed:\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
