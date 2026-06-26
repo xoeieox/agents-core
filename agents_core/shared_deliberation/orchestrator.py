@@ -168,20 +168,94 @@ def _run_facets_subprocess(
                     grounding_result_file,
                 )
 
-            result = subprocess.run(
+            idle_kill_secs = float(os.environ.get("FACETS_ORCH_IDLE_KILL_SECS", "600"))
+            hard_ceiling_secs = float(os.environ.get("FACETS_ORCH_HARD_CEILING_SECS", "1800"))
+
+            proc = subprocess.Popen(
                 argv,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=600,
                 env=facets_env,
             )
 
-            if result.returncode != 0:
-                error_msg = f"Facets subprocess exited {result.returncode}: {result.stderr}"
+            # Track liveness via stderr reader thread
+            last_stderr_at = [time.monotonic()]
+            stderr_lines = []
+
+            def _read_stderr():
+                for line in proc.stderr:
+                    last_stderr_at[0] = time.monotonic()
+                    stderr_lines.append(line)
+
+            stdout_chunks = []
+
+            def _read_stdout():
+                for chunk in proc.stdout:
+                    stdout_chunks.append(chunk)
+
+            t_stderr = threading.Thread(target=_read_stderr, daemon=True)
+            t_stdout = threading.Thread(target=_read_stdout, daemon=True)
+            t_stderr.start()
+            t_stdout.start()
+
+            start_time = time.monotonic()
+            kill_reason = None
+
+            while True:
+                # Check if process has finished
+                retcode = proc.poll()
+                if retcode is not None:
+                    break
+
+                now = time.monotonic()
+                elapsed = now - start_time
+                idle = now - last_stderr_at[0]
+
+                if elapsed >= hard_ceiling_secs:
+                    kill_reason = "hard ceiling"
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        proc.kill()
+                        proc.wait()
+                    break
+
+                if idle >= idle_kill_secs:
+                    kill_reason = "silence"
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        proc.kill()
+                        proc.wait()
+                    break
+
+                time.sleep(0.5)
+
+            t_stderr.join(timeout=5.0)
+            t_stdout.join(timeout=5.0)
+
+            if kill_reason == "silence":
+                error_msg = "Facets timeout (silence)"
                 log.error(error_msg)
                 return (False, None, None, error_msg)
 
-            deliberation_json = json.loads(result.stdout)
+            if kill_reason == "hard ceiling":
+                error_msg = "Facets timeout (hard ceiling)"
+                log.error(error_msg)
+                return (False, None, None, error_msg)
+
+            retcode = proc.poll()
+            if retcode != 0:
+                stderr_text = "".join(stderr_lines)
+                error_msg = f"Facets subprocess exited {retcode}: {stderr_text}"
+                log.error(error_msg)
+                return (False, None, None, error_msg)
+
+            stdout_text = "".join(stdout_chunks)
+            deliberation_json = json.loads(stdout_text)
             deliberation_id = deliberation_json.get("deliberation_id")
             if not deliberation_id:
                 error_msg = "No deliberation_id in Facets output"
@@ -197,10 +271,6 @@ def _run_facets_subprocess(
             except OSError:
                 pass
 
-    except subprocess.TimeoutExpired:
-        error_msg = "Facets timeout (10 min)"
-        log.error(error_msg)
-        return (False, None, None, error_msg)
     except Exception as e:
         error_msg = f"Facets error: {e}"
         log.error(error_msg)
