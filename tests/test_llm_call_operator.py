@@ -104,22 +104,39 @@ def _gw_dc(status="serving"):
     return dc, instance
 
 
+def _make_gw_sse_resp(content_text, captured_dict=None):
+    """Build a streaming SSE mock response for GW tests.
+
+    Returns a requests.Response mock that:
+    - Accepts payload via json= kwarg and optionally records it in captured_dict["payload"]
+    - Yields one SSE data line with content then a [DONE] line via iter_lines()
+    """
+    import json as _json
+
+    def fake_post(url, json=None, timeout=None, stream=None):
+        if captured_dict is not None:
+            captured_dict["payload"] = json
+
+        def lines():
+            yield f"data: {_json.dumps({'choices': [{'delta': {'content': content_text}, 'finish_reason': None}]})}"
+            yield "data: [DONE]"
+
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.iter_lines = MagicMock(return_value=lines())
+        resp.close = MagicMock()
+        return resp
+
+    return fake_post
+
+
 def test_gravitywell_default_think_off():
     """Default call injects enable_thinking=False into the payload."""
     captured = {}
 
-    def fake_post(url, json=None, timeout=None):
-        captured["payload"] = json
-        resp = MagicMock()
-        resp.raise_for_status = MagicMock()
-        resp.json.return_value = {
-            "choices": [{"message": {"content": '{"ok": true}', "reasoning_content": None}}]
-        }
-        return resp
-
     dc, _mock_client = _gw_dc()
     with patch("agents_core.doorman_client.DoormanClient", dc), \
-         patch("requests.post", side_effect=fake_post):
+         patch("requests.post", side_effect=_make_gw_sse_resp('{"ok": true}', captured)):
         result = call_operator("gravitywell", prompt="test", json_mode=True)
 
     assert result is not None
@@ -130,18 +147,9 @@ def test_gravitywell_think_true():
     """think=True injects enable_thinking=True."""
     captured = {}
 
-    def fake_post(url, json=None, timeout=None):
-        captured["payload"] = json
-        resp = MagicMock()
-        resp.raise_for_status = MagicMock()
-        resp.json.return_value = {
-            "choices": [{"message": {"content": "answer", "reasoning_content": "trace"}}]
-        }
-        return resp
-
     dc, _mock_client = _gw_dc()
     with patch("agents_core.doorman_client.DoormanClient", dc), \
-         patch("requests.post", side_effect=fake_post):
+         patch("requests.post", side_effect=_make_gw_sse_resp("answer", captured)):
         result = call_operator("gravitywell", prompt="test", think=True)
 
     assert captured["payload"]["chat_template_kwargs"]["enable_thinking"] is True
@@ -155,16 +163,8 @@ def test_gravitywell_bundle_ids_discarded_no_typeerror():
     """bundle_ids kwarg is discarded before reaching _call_gravitywell_backend."""
     dc, _mock_client = _gw_dc()
 
-    def fake_post(url, json=None, timeout=None):
-        resp = MagicMock()
-        resp.raise_for_status = MagicMock()
-        resp.json.return_value = {
-            "choices": [{"message": {"content": "ok", "reasoning_content": None}}]
-        }
-        return resp
-
     with patch("agents_core.doorman_client.DoormanClient", dc), \
-         patch("requests.post", side_effect=fake_post):
+         patch("requests.post", side_effect=_make_gw_sse_resp("ok")):
         # Must not raise TypeError
         result = call_operator("gravitywell", prompt="test", bundle_ids=["some/bundle"])
     assert result == "ok"
@@ -232,11 +232,18 @@ def test_gravitywell_haiku_fallback_raises_propagates():
 # ---------------------------------------------------------------------------
 
 def test_gravitywell_release_called_on_backend_error():
-    """client.release is called in the finally block even when the backend raises."""
+    """client.release is called in the finally block even when the backend raises.
+
+    With streaming, a generic Exception from requests.post propagates through
+    _gw_stream_attempt up to call_operator's except-Exception handler (gw_member_error),
+    which re-raises. The release must still fire in the finally block.
+    """
     dc, mock_client = _gw_dc(status="serving")
     with patch("agents_core.doorman_client.DoormanClient", dc), \
-         patch("requests.post", side_effect=Exception("backend exploded")):
-        result = call_operator("gravitywell", prompt="test")
+         patch("agents_core.llm._call_gravitywell_backend",
+               side_effect=Exception("backend exploded")):
+        with pytest.raises(Exception, match="backend exploded"):
+            call_operator("gravitywell", prompt="test")
     assert mock_client.release.call_count == 1
     release_args = mock_client.release.call_args[0]
     assert release_args[0] == "gravitywell"

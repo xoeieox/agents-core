@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
 import warnings
@@ -22,6 +23,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
+from requests.exceptions import Timeout, ConnectionError, HTTPError, ChunkedEncodingError
 
 TAILSCALE_IP = "203.0.113.12"
 LLAMACPP_URL = f"http://{TAILSCALE_IP}:8081"
@@ -231,6 +233,111 @@ def _post_chat_completion(
             return None
 
 
+def _gw_stream_attempt(base_url, model, payload, idle_gap, first_token_gap, hard_ceiling, call_start, log):
+    """One streaming attempt. Returns (text_or_None, cull_tuple_or_None).
+
+    Raises requests exceptions on connect failure (for caller to retry).
+    cull_tuple = (reason_str, elapsed_secs, idle_secs) or None.
+    """
+    # Socket must outlast all Python timers so the watchdog fires first.
+    # idle_gap * 2 would cause ReadTimeout before phase-1 first_token_gap (600s default).
+    sock_timeout = (30, hard_ceiling + 60)
+
+    resp = requests.post(
+        f"{base_url}/v1/chat/completions",
+        json=payload,
+        timeout=sock_timeout,
+        stream=True,
+    )
+    resp.raise_for_status()
+
+    _state = {
+        "cull": None,          # (reason, elapsed, idle) when fired
+        "first_token_at": None,
+        "last_chunk_at": time.monotonic(),
+    }
+    _done_event = threading.Event()
+
+    # Watchdog poll interval: responsive but not CPU-burning
+    poll_interval = max(0.2, min(0.5, idle_gap / 10))
+
+    def _watchdog():
+        while not _done_event.wait(poll_interval):
+            now = time.monotonic()
+            elapsed = now - call_start
+            if elapsed >= hard_ceiling:
+                _state["cull"] = ("hard_ceiling_exceeded", elapsed, now - _state["last_chunk_at"])
+                resp.close()
+                return
+            if _state["first_token_at"] is None:
+                # Phase 1: check first-token grace
+                if elapsed >= first_token_gap:
+                    idle = elapsed
+                    _state["cull"] = ("first_token_grace_exceeded", elapsed, idle)
+                    resp.close()
+                    return
+            else:
+                # Phase 2: check idle gap since last content chunk
+                idle = now - _state["last_chunk_at"]
+                if idle >= idle_gap:
+                    _state["cull"] = ("idle_gap_exceeded", elapsed, idle)
+                    resp.close()
+                    return
+
+    wt = threading.Thread(target=_watchdog, daemon=True)
+    wt.start()
+
+    content_parts = []
+    reasoning_parts = []
+    clean_end = False
+
+    try:
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            line_str = line.decode("utf-8") if isinstance(line, bytes) else line
+            if not line_str.startswith("data: "):
+                continue
+            data_str = line_str[6:]
+            if data_str.strip() == "[DONE]":
+                clean_end = True
+                break
+            try:
+                chunk = json.loads(data_str)
+                delta = chunk["choices"][0].get("delta", {})
+                content = delta.get("content") or ""
+                reasoning = delta.get("reasoning_content") or ""
+                if content or reasoning:
+                    # First token received - transition to phase 2
+                    if _state["first_token_at"] is None:
+                        _state["first_token_at"] = time.monotonic()
+                    _state["last_chunk_at"] = time.monotonic()
+                    if content:
+                        content_parts.append(content)
+                    if reasoning:
+                        reasoning_parts.append(reasoning)
+            except (json.JSONDecodeError, KeyError, IndexError):
+                continue
+    except Exception:
+        # Connection closed by watchdog or network error - check cull state below
+        pass
+    finally:
+        _done_event.set()
+        wt.join(timeout=2.0)
+
+    # If stream ended cleanly, ignore any watchdog cull (race condition safe-fallback)
+    if clean_end:
+        text = "".join(content_parts) or "".join(reasoning_parts)
+        return (text if text.strip() else None, None)
+
+    if _state["cull"]:
+        return (None, _state["cull"])
+
+    # Stream ended without [DONE] and no cull - return what we have
+    text = "".join(content_parts) or "".join(reasoning_parts)
+    return (text if text.strip() else None, None)
+
+
 def _call_gravitywell_backend(
     prompt: str,
     system: str = None,
@@ -240,7 +347,7 @@ def _call_gravitywell_backend(
     log=None,
     think: bool = False,
 ) -> str | None:
-    """Send a completion request to the GravityWell llama.cpp endpoint.
+    """Send a completion request to the GravityWell llama.cpp endpoint via streaming SSE.
 
     GW is a Qwen3.5-122B reasoning model. By default think=False injects
     chat_template_kwargs={"enable_thinking": false} to suppress the think-trace
@@ -252,29 +359,82 @@ def _call_gravitywell_backend(
 
     Does NOT accept bundle_ids — GW gets system verbatim, no chub-bundle injection.
 
-    Retryable transient errors (timeout, connection errors, chunked encoding)
-    are retried up to 3 attempts (2 retries) with backoff 2s then 4s.
-    Persistent errors raise OperatorUnreachableError; non-request errors return None.
+    Dual-timer liveness model:
+    - Phase 1 (pre-first-token): cull after GW_FIRST_TOKEN_GAP_SECS (default 600).
+    - Phase 2 (post-first-token): cull after GW_IDLE_GAP_SECS (default 45) of chunk silence.
+    - Hard ceiling: GW_LIVENESS_HARD_CEILING_SECS (default 1800) total.
+    - Stall retry: if idle_gap_exceeded, retry once within the same ceiling budget.
+
+    Connection-level retry: 3 attempts, 2s/4s backoff on network errors.
+    Persistent errors raise OperatorUnreachableError; parse errors return None.
     """
+    idle_gap = float(os.environ.get("GW_IDLE_GAP_SECS", "45"))
+    first_token_gap = float(os.environ.get("GW_FIRST_TOKEN_GAP_SECS", "600"))
+    hard_ceiling = float(os.environ.get("GW_LIVENESS_HARD_CEILING_SECS", "1800"))
+    # Caller-supplied timeout caps hard_ceiling in non-enforce mode; enforce mode
+    # applies _member_deadline externally via Future.result(timeout=...) and doesn't
+    # rely on this, but honor a tighter caller deadline here too.
+    hard_ceiling = min(hard_ceiling, float(timeout))
+
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    # Use shared POST core
-    return _post_chat_completion(
-        base_url=GW_URL,
-        model=OPERATOR_DEFAULTS["gravitywell"],
-        messages=messages,
-        timeout=timeout,
-        json_mode=json_mode,
-        temperature=temperature,
-        think=think,
-        max_retries=3,
-        log=log,
-        cache_prompt=True,
-        chat_template_kwargs={"enable_thinking": think},
-    )
+    payload = {
+        "model": OPERATOR_DEFAULTS["gravitywell"],
+        "messages": messages,
+        "temperature": temperature,
+        "cache_prompt": True,
+        "chat_template_kwargs": {"enable_thinking": think},
+        "stream": True,
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+
+    call_start = time.monotonic()
+
+    def _attempt_with_connect_retry():
+        """Run _gw_stream_attempt with up to 3 connect-level retries."""
+        last_exc = None
+        for attempt in range(3):
+            try:
+                return _gw_stream_attempt(
+                    GW_URL, OPERATOR_DEFAULTS["gravitywell"],
+                    payload, idle_gap, first_token_gap, hard_ceiling,
+                    call_start, log,
+                )
+            except (Timeout, ConnectionError, HTTPError, ChunkedEncodingError) as e:
+                last_exc = e
+                if attempt < 2:
+                    backoff = 2 if attempt == 0 else 4
+                    if log:
+                        log(f"[gw-stream] connect error attempt {attempt+1}/3: {e}")
+                    time.sleep(backoff)
+                else:
+                    raise OperatorUnreachableError(GW_URL, e)
+
+    # First attempt
+    text, cull = _attempt_with_connect_retry()
+
+    # Stall retry: if idle_gap_exceeded, retry once within the same ceiling budget
+    if cull is not None and cull[0] == "idle_gap_exceeded":
+        cull_reason, cull_elapsed, cull_idle = cull
+        _log.error(
+            "[gw-liveness] cull on first attempt reason=%s elapsed=%.1fs idle=%.1fs — retrying",
+            cull_reason, cull_elapsed, cull_idle,
+        )
+        text, cull = _attempt_with_connect_retry()
+
+    if cull is not None:
+        cull_reason, cull_elapsed, cull_idle = cull
+        _log.error(
+            "[gw-liveness] stream culled reason=%s elapsed=%.1fs idle=%.1fs",
+            cull_reason, cull_elapsed, cull_idle,
+        )
+        return None
+
+    return text
 
 
 def _apply_wake_fail(

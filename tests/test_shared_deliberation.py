@@ -283,6 +283,8 @@ async def test_client_health_check(stub_facets, init_semaphore):
 # AC1: default parity — grounding_result_file unset, argv unchanged
 def test_ac1_default_parity_no_grounding_field(tmp_path):
     """AC1: grounding_result_file=None produces identical argv (no --grounding-result-file)."""
+    import io
+    import json
     from pathlib import Path
     from unittest.mock import patch, MagicMock
 
@@ -290,16 +292,23 @@ def test_ac1_default_parity_no_grounding_field(tmp_path):
     facets_repo.mkdir()
     context_file_holder = []
 
-    def fake_run(argv, **kwargs):
-        context_file_holder.append(argv)
-        m = MagicMock()
-        m.returncode = 0
-        import json
-        m.stdout = json.dumps({"deliberation_id": "test-id"})
-        m.stderr = ""
-        return m
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            context_file_holder.append(argv)
+            self.stdout = io.StringIO(json.dumps({"deliberation_id": "test-id"}))
+            self.stderr = io.StringIO("")
+            self.returncode = 0
 
-    with patch("subprocess.run", side_effect=fake_run):
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            pass
+
+    with patch("subprocess.Popen", side_effect=FakePopen):
         _run_facets_subprocess("text", {}, "gravitywell", facets_repo, grounding_result_file=None)
 
     argv = context_file_holder[0]
@@ -310,6 +319,8 @@ def test_ac1_default_parity_no_grounding_field(tmp_path):
 # AC2: injection — set + exists -> argv gains --grounding-result-file + --no-auto-ground
 def test_ac2_injection_set_and_exists(tmp_path):
     """AC2: grounding_result_file pointing to an existing file injects argv flags."""
+    import io
+    import json
     from unittest.mock import patch, MagicMock
 
     grounding_file = tmp_path / "grounding.json"
@@ -318,16 +329,23 @@ def test_ac2_injection_set_and_exists(tmp_path):
     facets_repo.mkdir()
     captured = []
 
-    def fake_run(argv, **kwargs):
-        captured.append(argv)
-        m = MagicMock()
-        m.returncode = 0
-        import json
-        m.stdout = json.dumps({"deliberation_id": "test-id"})
-        m.stderr = ""
-        return m
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            captured.append(argv)
+            self.stdout = io.StringIO(json.dumps({"deliberation_id": "test-id"}))
+            self.stderr = io.StringIO("")
+            self.returncode = 0
 
-    with patch("subprocess.run", side_effect=fake_run):
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            pass
+
+    with patch("subprocess.Popen", side_effect=FakePopen):
         _run_facets_subprocess(
             "text", {}, "gravitywell", facets_repo,
             grounding_result_file=str(grounding_file),
@@ -351,13 +369,13 @@ def test_ac3_set_but_missing_raises_handoff_error(tmp_path):
     facets_repo.mkdir()
     missing_path = str(tmp_path / "does_not_exist.json")
 
-    with patch("subprocess.run") as mock_run:
+    with patch("subprocess.Popen") as mock_popen:
         with pytest.raises(GroundingHandoffError):
             _run_facets_subprocess(
                 "text", {}, "gravitywell", facets_repo,
                 grounding_result_file=missing_path,
             )
-        mock_run.assert_not_called()
+        mock_popen.assert_not_called()
 
 
 def test_ac3_set_but_empty_raises_handoff_error(tmp_path):
@@ -369,13 +387,13 @@ def test_ac3_set_but_empty_raises_handoff_error(tmp_path):
     empty_file = tmp_path / "empty.json"
     empty_file.write_text("")
 
-    with patch("subprocess.run") as mock_run:
+    with patch("subprocess.Popen") as mock_popen:
         with pytest.raises(GroundingHandoffError):
             _run_facets_subprocess(
                 "text", {}, "gravitywell", facets_repo,
                 grounding_result_file=str(empty_file),
             )
-        mock_run.assert_not_called()
+        mock_popen.assert_not_called()
 
 
 # AC4: serialization — grounding_result_file round-trips via to_dict()
