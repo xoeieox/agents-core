@@ -216,7 +216,11 @@ def test_presumed_dead_backstop_live_pid(store):
 # ---------------------------------------------------------------------------
 
 def test_dead_orphan_wedge_cleared_live_waiter_admits(store):
-    """The production wedge: dead orphan at FIFO head; after reap(), live waiter admits."""
+    """AC2 (D2): dead orphan at FIFO head is squeezed past inline; live waiter admits in same call.
+
+    With liveness-aware admission (gw-admission-liveness-aware-admission-v0), try_admit
+    itself fails the dead pending head and admits the live waiter — no reaper cycle needed.
+    """
     dead_pid = 99999999
 
     # Dead-enqueuer orphan is head-of-line (enqueued first).
@@ -228,20 +232,12 @@ def test_dead_orphan_wedge_cleared_live_waiter_admits(store):
 
     _age_ticket(store, orphan, GW_ADMISSION_ORPHAN_GRACE_SEC + 10)
 
-    # Before reap: try_admit on waiter fails (orphan is head-of-line).
-    admitted_before, _ = store.try_admit(waiter, "deliberation", "live-council")
-    assert admitted_before is False, "waiter should be blocked by orphan at FIFO head"
-
-    # Reap: dead orphan is cleared.
-    with patch("agents_core.elevator.os.kill", side_effect=OSError("no such process")):
-        result = store.reap()
-
-    assert result["orphan_reaped"] == 1
-    assert store.get(orphan)["status"] == "failed"
-
-    # After reap: live waiter is now head-of-line and can admit.
-    admitted_after, _ = store.try_admit(waiter, "deliberation", "live-council")
-    assert admitted_after is True, "live waiter should admit after orphan is reaped"
+    # D2: single try_admit on the live waiter succeeds — dead head is failed inline,
+    # live waiter is admitted in the same call (AC2 regression gate).
+    admitted, _ = store.try_admit(waiter, "deliberation", "live-council")
+    assert admitted is True, "live waiter should admit via squeeze-past (dead head failed inline)"
+    assert store.get(orphan)["status"] == "failed", "dead head should be failed inline"
+    store.ack(waiter)
 
 
 # ---------------------------------------------------------------------------

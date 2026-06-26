@@ -421,7 +421,12 @@ class ElevatorStore:
                 self._conn.commit()
                 return True, True  # admitted as ride-along
 
-            # Fresh group or lane idle: FIFO head-of-line check.
+            # Fresh group or lane idle: squeeze past any dead pending heads (D2),
+            # then run the FIFO head check against the updated state.
+            now_dt = datetime.now(timezone.utc)
+            self._squeeze_past_dead_pending_locked(lane, now_dt)
+            self._conn.commit()  # commit dead-head failures (may be empty commit)
+
             head = self._conn.execute(
                 "SELECT item_id, principal FROM queue_items "
                 "WHERE lane=? AND status='pending' "
@@ -547,16 +552,71 @@ class ElevatorStore:
                 pass
 
     def _reclaim_stale_locked(self, lane: str, now_str: str) -> int:
-        """Run stale-claim reclaim SQL. Caller must hold self._lock; does not commit."""
+        """Run stale-claim reclaim. Caller must hold self._lock; does not commit.
+
+        D3: gw-admission tickets past TTL branch on owner liveness (FOLD 1):
+          - 'dead' (past grace): fail (do not requeue — dead rider is not requeued).
+          - 'alive' or 'unknown': requeue to BACK with fresh created_at.
+            No reclaim path retains created_at (prevents re-heading the line).
+        Non-gw-admission tickets: bulk requeue to pending (existing behaviour)."""
+        # Non-gw-admission: bulk requeue (unchanged behaviour).
         cursor = self._conn.execute(
             "UPDATE queue_items SET status='pending', attempts=attempts+1, "
             "claimed_at=NULL, claim_owner=NULL, claim_ttl_sec=NULL "
-            "WHERE lane=? AND status='claimed' AND claim_ttl_sec IS NOT NULL "
-            "AND claimed_at IS NOT NULL "
+            "WHERE lane=? AND status='claimed' AND kind != 'gw-admission' "
+            "AND claim_ttl_sec IS NOT NULL AND claimed_at IS NOT NULL "
             "AND datetime(claimed_at) < datetime(?, '-' || claim_ttl_sec || ' seconds')",
             (lane, now_str),
         )
-        return cursor.rowcount
+        reclaimed = cursor.rowcount
+
+        # gw-admission: per-row liveness branching (D3).
+        try:
+            now_dt = datetime.fromisoformat(now_str)
+        except Exception:
+            now_dt = datetime.now(timezone.utc)
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=timezone.utc)
+
+        gw_stale = self._conn.execute(
+            "SELECT item_id, payload, claimed_at FROM queue_items "
+            "WHERE lane=? AND status='claimed' AND kind='gw-admission' "
+            "AND claim_ttl_sec IS NOT NULL AND claimed_at IS NOT NULL "
+            "AND datetime(claimed_at) < datetime(?, '-' || claim_ttl_sec || ' seconds')",
+            (lane, now_str),
+        ).fetchall()
+
+        for row in gw_stale:
+            item_id = row["item_id"]
+            try:
+                claimed_at = datetime.fromisoformat(row["claimed_at"])
+                if claimed_at.tzinfo is None:
+                    claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+                age_sec = (now_dt - claimed_at).total_seconds()
+                payload = json.loads(row["payload"]) if row["payload"] else {}
+            except Exception:
+                age_sec = float("inf")
+                payload = {}
+
+            verdict = self._enqueuer_liveness(payload, age_sec)
+            if verdict == "dead":
+                # Dead owner past grace: fail, do not requeue (FOLD 1).
+                self._conn.execute(
+                    "UPDATE queue_items SET status='failed', provenance=? WHERE item_id=?",
+                    (json.dumps({"reclaim_stale": "owner_dead", "liveness": verdict}), item_id),
+                )
+            else:
+                # Alive or unknown: requeue to BACK with fresh created_at (FOLD 1).
+                fresh_ts = _now()
+                self._conn.execute(
+                    "UPDATE queue_items SET status='pending', attempts=attempts+1, "
+                    "claimed_at=NULL, claim_owner=NULL, claim_ttl_sec=NULL, "
+                    "created_at=? WHERE item_id=?",
+                    (fresh_ts, item_id),
+                )
+            reclaimed += 1
+
+        return reclaimed
 
     def reclaim_stale(self, lane: str) -> int:
         """Reclaim stale claimed items on lane past their claim_ttl_sec.
@@ -596,11 +656,65 @@ class ElevatorStore:
             expired = cursor.rowcount
             # Reap dead-enqueuer pending orphans (fast path; before absolute TTL).
             orphan_reaped = self._reap_pending_orphans_locked(now)
+            # D4: fast-reclaim claimed slots whose owner is provably dead.
+            dead_claimed_reaped = self._reap_dead_claimed_locked(now)
             # Reclaim stale claims on all lanes in the same transaction.
             reclaimed = sum(self._reclaim_stale_locked(lane, now_str) for lane in LANES)
             self._conn.commit()
 
-        return {"expired": expired, "reclaimed": reclaimed, "orphan_reaped": orphan_reaped}
+        return {
+            "expired": expired,
+            "reclaimed": reclaimed,
+            "orphan_reaped": orphan_reaped,
+            "dead_claimed_reaped": dead_claimed_reaped,
+        }
+
+    def _enqueuer_liveness(self, payload: dict, age_sec: float) -> str:
+        """Compute host+pid+start_time liveness verdict for a ticket's _enqueuer_id stamp.
+
+        Returns 'alive', 'dead', or 'unknown'.
+        - 'dead': pid is ESRCH or start_time mismatches, AND age_sec is past the grace
+          window. A dead pid within the grace window is treated as 'unknown' (FOLD 2:
+          process may be mid-handoff/restart).
+        - 'alive': same-host, pid alive, start_time matches (or absent).
+        - 'unknown': cross-host, missing stamp/pid, or within grace window for a dead pid.
+
+        Caller does NOT need to hold self._lock.
+        """
+        enqueuer_id = (payload or {}).get("_enqueuer_id")
+        if not enqueuer_id:
+            return "unknown"
+
+        enqueuer_host = enqueuer_id.get("host")
+        enqueuer_pid = enqueuer_id.get("pid")
+        enqueuer_start_time = enqueuer_id.get("start_time")
+
+        if enqueuer_host != HOSTNAME or enqueuer_pid is None:
+            return "unknown"  # cross-host or missing pid: unverifiable
+
+        # Probe pid liveness.
+        try:
+            os.kill(enqueuer_pid, 0)
+            pid_alive = True
+        except OSError:
+            pid_alive = False
+
+        if not pid_alive:
+            # Grace window (FOLD 2): dead pid within grace treated as transitioning.
+            if age_sec < GW_ADMISSION_ORPHAN_GRACE_SEC:
+                return "unknown"
+            return "dead"
+
+        # PID is alive — check start_time to guard against PID recycling.
+        if enqueuer_start_time is not None:
+            current_start = _get_process_start_time(enqueuer_pid)
+            if current_start is not None and abs(current_start - enqueuer_start_time) > 1.0:
+                # Start-time mismatch: PID was recycled; original enqueuer is dead.
+                if age_sec < GW_ADMISSION_ORPHAN_GRACE_SEC:
+                    return "unknown"
+                return "dead"
+
+        return "alive"
 
     def _reap_pending_orphans_locked(self, now: datetime) -> int:
         """Reap pending gw-admission tickets whose enqueuer process is provably dead.
@@ -609,9 +723,7 @@ class ElevatorStore:
 
         Liveness ladder (per spec gw-admission-pending-orphan-reclaim-v0 D2):
         1. Grace period: tickets younger than GW_ADMISSION_ORPHAN_GRACE_SEC are spared.
-        2. Precise liveness (primary): if stamped host matches, probe pid. Reap if:
-           - pid is dead (ESRCH), OR
-           - pid is alive but start_time mismatches (PID recycled; original enqueuer dead).
+        2. Precise liveness (primary): calls _enqueuer_liveness. Reaps on 'dead' verdict.
         3. Presumed-dead backstop: any pending gw-admission ticket older than
            GW_ADMISSION_MAX_WAIT_SEC is reaped regardless of liveness result.
         4. Absolute TTL: handled by the caller's cutoff sweep (ELEVATOR_PENDING_MAX_AGE_SEC).
@@ -648,52 +760,96 @@ class ElevatorStore:
                 reaped += 1
                 continue
 
-            # 2. Precise liveness: only probes same-host tickets with a valid stamp.
+            # 2. Precise liveness via shared helper.
             try:
                 payload = json.loads(row["payload"]) if row["payload"] else {}
             except Exception:
                 payload = {}
 
-            enqueuer_id = payload.get("_enqueuer_id")
-            if not enqueuer_id:
-                continue  # no stamp: fall through to absolute TTL
-
-            enqueuer_host = enqueuer_id.get("host")
-            enqueuer_pid = enqueuer_id.get("pid")
-            enqueuer_start_time = enqueuer_id.get("start_time")
-
-            if enqueuer_host != HOSTNAME or enqueuer_pid is None:
-                continue  # cross-host or missing pid: fall through to absolute TTL
-
-            # Probe pid liveness.
-            try:
-                os.kill(enqueuer_pid, 0)
-                pid_alive = True
-            except OSError:
-                pid_alive = False
-
-            if not pid_alive:
+            verdict = self._enqueuer_liveness(payload, age_sec)
+            if verdict == "dead":
+                enqueuer_id = payload.get("_enqueuer_id", {})
+                enqueuer_pid = enqueuer_id.get("pid")
+                # Distinguish pid_dead vs pid_recycled for provenance compatibility.
+                try:
+                    os.kill(enqueuer_pid, 0)
+                    reap_reason = "pid_recycled"
+                except OSError:
+                    reap_reason = "pid_dead"
                 self._conn.execute(
                     "UPDATE queue_items SET status='failed', provenance=? WHERE item_id=?",
-                    (json.dumps({"orphan_reap": "pid_dead",
+                    (json.dumps({"orphan_reap": reap_reason,
                                  "enqueuer_pid": enqueuer_pid}), item_id),
                 )
                 reaped += 1
+            # 'alive' → spare; 'unknown' → fall through to absolute TTL
+
+        return reaped
+
+    def _squeeze_past_dead_pending_locked(self, lane: str, now_dt: datetime) -> int:
+        """Inline-fail any pending gw-admission ticket on lane whose owner is provably dead.
+
+        D2: called in try_admit before the FIFO head check so a live waiter behind a
+        dead pending head is not forced to wait one full reaper cycle.
+
+        Caller MUST hold self._lock. Does NOT commit.
+        Returns count of tickets transitioned to failed."""
+        rows = self._conn.execute(
+            "SELECT item_id, payload, created_at FROM queue_items "
+            "WHERE lane=? AND status='pending' AND kind='gw-admission'",
+            (lane,),
+        ).fetchall()
+
+        failed = 0
+        for row in rows:
+            try:
+                created = datetime.fromisoformat(row["created_at"])
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                age_sec = (now_dt - created).total_seconds()
+                payload = json.loads(row["payload"]) if row["payload"] else {}
+            except Exception:
                 continue
 
-            # PID is alive — check start_time to guard against PID recycling.
-            if enqueuer_start_time is not None:
-                current_start = _get_process_start_time(enqueuer_pid)
-                if current_start is not None and abs(current_start - enqueuer_start_time) > 1.0:
-                    # Start-time mismatch: PID was recycled; original enqueuer is dead.
-                    self._conn.execute(
-                        "UPDATE queue_items SET status='failed', provenance=? WHERE item_id=?",
-                        (json.dumps({"orphan_reap": "pid_recycled",
-                                     "enqueuer_pid": enqueuer_pid}), item_id),
-                    )
-                    reaped += 1
-                    continue
-                # start_time matches: enqueuer is alive — spare this ticket.
+            if self._enqueuer_liveness(payload, age_sec) == "dead":
+                self._conn.execute(
+                    "UPDATE queue_items SET status='failed', provenance=? WHERE item_id=?",
+                    (json.dumps({"squeeze_past": "owner_dead"}), row["item_id"]),
+                )
+                failed += 1
+
+        return failed
+
+    def _reap_dead_claimed_locked(self, now: datetime) -> int:
+        """D4: fail claimed gw-admission tickets whose owner pid is provably dead.
+
+        Fast-reclaim of the slot from a dead claimant — does not wait for claim_ttl_sec
+        to elapse. Caller MUST hold self._lock and must call self._conn.commit() after.
+
+        Returns count of tickets transitioned to failed."""
+        rows = self._conn.execute(
+            "SELECT item_id, payload, claimed_at FROM queue_items "
+            "WHERE status='claimed' AND kind='gw-admission'"
+        ).fetchall()
+
+        reaped = 0
+        for row in rows:
+            try:
+                claimed_at = datetime.fromisoformat(row["claimed_at"])
+                if claimed_at.tzinfo is None:
+                    claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+                age_sec = (now - claimed_at).total_seconds()
+                payload = json.loads(row["payload"]) if row["payload"] else {}
+            except Exception:
+                continue
+
+            if self._enqueuer_liveness(payload, age_sec) == "dead":
+                self._conn.execute(
+                    "UPDATE queue_items SET status='failed', provenance=? WHERE item_id=?",
+                    (json.dumps({"orphan_reap": "claim_owner_dead",
+                                 "age_since_claimed_sec": int(age_sec)}), row["item_id"]),
+                )
+                reaped += 1
 
         return reaped
 
