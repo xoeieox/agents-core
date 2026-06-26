@@ -35,6 +35,12 @@ where = ["."]
 include = ["agents_core*"]
 exclude = ["tests*"]
 
+[tool.setuptools.package-data]
+"agents_core.room_paths" = ["*.toml"]
+
+[tool.setuptools]
+include-package-data = true
+
 [tool.pytest.ini_options]
 markers = [
     "integration: real backend calls (mem, chub, *-rag); run with -m integration",

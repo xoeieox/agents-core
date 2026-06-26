@@ -32,6 +32,7 @@ import yaml
 
 from agents_core.claude_queue import ClaudeQueue
 from agents_core.gpu import GPUQueue, Priority
+from agents_core.room_paths import room_path
 
 # chub_broker still lives in /srv/agents/scripts/ (deferred from the agents-core
 # day-one scope). Keep this last sys.path shim until chub_broker moves into
@@ -46,7 +47,7 @@ except Exception:
     compose_with_system = None  # type: ignore
 
 
-SPEC_DIR = Path("/srv/lapis/gpu-queue/shaped")
+SPEC_DIR = room_path("gpu_queue.shaped")
 RUNNER_MODULE = "agents_core.shaped_runner"
 
 # Per-repo working-clone convention. A repo name like "lapis-engine" maps to
@@ -323,7 +324,7 @@ class Shaper:
                 "notify_policy": agent.notify_policy,
                 "payload": {"command": cmd, "spec_path": str(spec_path)},
             }, task_id=task_id)
-            output_path = f"/srv/lapis/claude-queue/completed/{task_id}-output.md"
+            output_path = str(room_path("claude_queue.completed") / f"{task_id}-output.md")
         else:
             spec_path.write_text(json.dumps(spec, ensure_ascii=False))
             queue = GPUQueue()
@@ -335,7 +336,7 @@ class Shaper:
                 "model": agent.model,
                 "payload": {"command": cmd},
             })
-            output_path = f"/srv/lapis/gpu-queue/completed/{task_id}-output.md"
+            output_path = str(room_path("gpu_queue.completed") / f"{task_id}-output.md")
 
         # Open a project-slot on the blackboard for this dispatch. Best-effort:
         # slot-store trouble must never block a real dispatch (mirrors

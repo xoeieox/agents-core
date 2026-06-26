@@ -14,10 +14,26 @@ Modules:
     worktree  — per-task git worktree lifecycle (WORKTREE_ROOT, setup_worktree, ...)
 """
 
-from agents_core.gw_agent import call_gw_agent
-from agents_core.retrieval import Hit, retrieve
-from agents_core.shaper import DispatchResult, ShapedAgent, Shaper
-
 __version__ = "0.3.0"
 
 __all__ = ["call_gw_agent", "Hit", "retrieve", "Shaper", "ShapedAgent", "DispatchResult"]
+
+_lazy_map: dict[str, tuple[str, str]] = {
+    "call_gw_agent": ("agents_core.gw_agent", "call_gw_agent"),
+    "Hit": ("agents_core.retrieval", "Hit"),
+    "retrieve": ("agents_core.retrieval", "retrieve"),
+    "Shaper": ("agents_core.shaper", "Shaper"),
+    "ShapedAgent": ("agents_core.shaper", "ShapedAgent"),
+    "DispatchResult": ("agents_core.shaper", "DispatchResult"),
+}
+
+
+def __getattr__(name: str):
+    if name in _lazy_map:
+        import importlib
+        module_name, attr = _lazy_map[name]
+        mod = importlib.import_module(module_name)
+        val = getattr(mod, attr)
+        globals()[name] = val
+        return val
+    raise AttributeError(f"module 'agents_core' has no attribute {name!r}")

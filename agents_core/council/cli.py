@@ -60,8 +60,9 @@ import yaml
 
 from agents_core.llm import call_operator  # noqa: E402
 from agents_core.council.gravitywell_adapter import GravityWellAdapter
+from agents_core.room_paths import room_path
 
-COUNCIL_DIR = Path("/srv/lapis/council")
+COUNCIL_DIR = room_path("council")
 CARDS_ROOT = Path(
     "/srv/git/archetypal-intelligence-working/cards/characters"
 )
@@ -81,7 +82,7 @@ COUNCIL_STALL_S = int(os.environ.get("COUNCIL_STALL_S", "180"))
 # Roles are recorded in the run YAML's `selected_entities` list so the
 # runtime subprocess can construct the right Entity type per slot.
 ROLE_NARRATOR = "narrator"
-LOG_DIR = Path("/srv/lapis/council/logs")
+LOG_DIR = room_path("council.logs")
 
 DASHBOARD_BASE = "http://203.0.113.12:8400"
 

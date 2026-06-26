@@ -26,9 +26,11 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agents_core.room_paths import room_path
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_ROOT = Path("/srv/lapis/agent-observations")
+DEFAULT_ROOT = room_path("agent_observations")
 
 VALID_OBSERVATION_TYPES = frozenset({
     "friction", "decision", "lesson", "anomaly", "intervention"

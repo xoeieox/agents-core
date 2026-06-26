@@ -18,6 +18,7 @@ import httpx
 
 from .observe import Observation
 from .scenario import Scenario
+from agents_core.room_paths import room_path
 
 
 @runtime_checkable
@@ -79,7 +80,7 @@ def _read_jsonl_lines(path: Path) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 FOYER_BASE = "http://localhost:8402"
-CONSULT_LOG_DIR = Path("/srv/lapis/radio/consults")
+CONSULT_LOG_DIR = room_path("radio.consults")
 HARVEST_QUEUE_DIR = Path("/data/foyer/talk_it_out/harvest_queue")
 
 
@@ -309,7 +310,7 @@ class RadioOpDriver:
 COCKPIT_BASE = "http://localhost:8400"
 MEM_DB_PATH = Path("/srv/agents/mem.db")
 VAULT_AUDIT_DIR = Path("/data/vault-audit")
-COMMENT_STORE_DIR = Path("/srv/lapis/targets/comments")
+COMMENT_STORE_DIR = room_path("targets.comments")
 
 
 class CockpitDriver:

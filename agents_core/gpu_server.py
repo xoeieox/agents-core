@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from agents_core.room_paths import room_path
+
 from fastapi import Body, FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
 from fastapi.responses import JSONResponse
@@ -294,7 +296,7 @@ def create_app(queue_dir: Path) -> FastAPI:
 def main():
     import uvicorn
 
-    queue_dir = Path(os.environ.get("GPU_QUEUE_DIR", "/srv/lapis/gpu-queue"))
+    queue_dir = room_path("gpu_queue")
     host = os.environ.get("GPU_QUEUE_BIND_HOST", "127.0.0.1")
     port = int(os.environ.get("GPU_QUEUE_BIND_PORT", "8405"))
     log_level = os.environ.get("GPU_QUEUE_LOG_LEVEL", "info")

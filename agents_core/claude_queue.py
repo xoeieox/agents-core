@@ -47,8 +47,9 @@ from pathlib import Path
 import yaml
 
 from agents_core.gpu import PACIFIC, Priority, _now_iso, _now_pacific  # noqa: F401
+from agents_core.room_paths import room_path
 
-CLAUDE_QUEUE_DIR = Path("/srv/lapis/claude-queue")
+CLAUDE_QUEUE_DIR = room_path("claude_queue")
 
 # ---------------------------------------------------------------------------
 # Task coordinator hook (Lapis Ops Layer parity).

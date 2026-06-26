@@ -27,6 +27,7 @@ from typing import Literal
 from agents_core.ground import GroundBundle
 from agents_core.mem import MemoryStore
 from agents_core.retrieval import retrieve
+from agents_core.room_paths import room_path
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ _DEFERRED_RE = re.compile(r"\bdeferred?\b", re.IGNORECASE)
 _MAX_WALK_NODES = 40
 _SUMMARY_MAX_CHARS = 300
 
-_LAPIS_STATE = Path(os.environ.get("LAPIS_STATE", "/data/lapis-state"))
+_LAPIS_STATE = room_path("lapis_state")
 _DEFAULT_SNAPSHOT_PATH = Path(
     os.environ.get(
         "ROADMAP_SNAPSHOT_PATH",

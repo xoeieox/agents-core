@@ -28,6 +28,7 @@ import yaml
 
 from agents_core.expert_layout import corpus_root as _default_corpus_root
 from agents_core.mem import MemoryStore
+from agents_core.room_paths import room_path
 
 # ---------------------------------------------------------------------------
 # Module-level constants — Tech-Kami source set (v0).
@@ -45,7 +46,7 @@ _MEM_SOURCES: tuple[tuple[str, str], ...] = (
 )
 
 _ARC_DOC_SOURCE_KIND = "arc-doc"
-_ARC_DOC_DIR = Path("/srv/lapis/lapis-state")
+_ARC_DOC_DIR = room_path("lapis_state")
 
 # Fail loud if any single mem source reaches this count (silently truncating).
 _MEM_LIMIT = 1000

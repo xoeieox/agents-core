@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 from agents_core.llm import call_claude_cli
+from agents_core.room_paths import room_path
 
 
 _FORGEJO_PR_RE = re.compile(r"http://\d+\.\d+\.\d+\.\d+:\d+/[\w\-]+/[\w\-]+/pulls?/\d+")
@@ -168,7 +169,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
     bare_repo = repo.rsplit("/", 1)[-1] if repo else "agents-core"
     effective_cwd = base_cwd or "/srv/agents"
 
-    _ARTIFACT_DIR = Path("/srv/lapis/gpu-queue/shaped")
+    _ARTIFACT_DIR = room_path("gpu_queue.shaped")
     transcript_path = _ARTIFACT_DIR / f"{task_id}-gw-transcript.json"
 
     worktree_path = None

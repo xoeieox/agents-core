@@ -24,8 +24,10 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from agents_core.room_paths import room_path, room_str
+
 PACIFIC = ZoneInfo("America/Los_Angeles")
-TARGETS_DIR = Path("/srv/lapis/targets")
+TARGETS_DIR = room_path("targets")
 
 URGENCY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
@@ -155,7 +157,7 @@ class Target:
 
     @property
     def arc_doc_path(self) -> str:
-        return f"/srv/lapis/lapis-state/{self.id}.md"
+        return room_str("lapis_state", f"{self.id}.md")
 
     @property
     def arc_doc_exists(self) -> bool:

@@ -37,6 +37,7 @@ from typing import Literal
 
 from agents_core.mem import HOSTNAME, IS_MASTER, MEM_MASTER_URL, MemoryStore
 from agents_core.notify import Priority, send_notification
+from agents_core.room_paths import room_path
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 FAULT_EVENT_DIR = Path("/srv/agents/logs/fault-events")
-SUMMARY_JSONL = Path("/srv/lapis/memory/host-fault-events.jsonl")
+SUMMARY_JSONL = room_path("memory.host_fault_events")
 PACIFIC_OFFSET = timedelta(hours=-7)  # PDT; adjust for PST (-8) when in effect
 
 # ---------------------------------------------------------------------------

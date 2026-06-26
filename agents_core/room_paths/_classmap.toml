@@ -1,0 +1,513 @@
+root = "/room"
+
+# Class A — Research / creative substrate
+[keys.research]
+subpath = "research"
+class = "A"
+access = "both"
+
+[keys."research.source_texts"]
+subpath = "research/source-texts"
+class = "A"
+access = "read"
+
+[keys."research.invariant"]
+subpath = "research/invariant"
+class = "A"
+access = "read"
+
+[keys."research.governance_watch"]
+subpath = "research/governance-watch"
+class = "A"
+access = "read"
+
+[keys."research.enlightenment_corpus"]
+subpath = "research/enlightenment-corpus"
+class = "A"
+access = "both"
+
+[keys."research.arxiv_watch"]
+subpath = "research/arxiv-watch"
+class = "A"
+access = "write"
+
+[keys."research.rsi"]
+subpath = "research/rsi"
+class = "A"
+access = "both"
+
+[keys."research.dplace"]
+subpath = "research/dplace"
+class = "A"
+access = "read"
+
+[keys.forming]
+subpath = "forming"
+class = "A"
+access = "both"
+
+[keys."forming.psych_mining"]
+subpath = "forming/psych-mining"
+class = "A"
+access = "both"
+
+[keys.library]
+subpath = "library"
+class = "A"
+access = "both"
+
+[keys."library.atoms"]
+subpath = "library/atoms"
+class = "A"
+env_var = "ATOM_CORPUS_ROOT"
+access = "both"
+
+[keys."library.ideas"]
+subpath = "library/ideas"
+class = "A"
+env_var = "IDEA_CORPUS_DIR"
+access = "both"
+
+[keys."library.podcasts"]
+subpath = "library/podcasts"
+class = "A"
+access = "read"
+
+[keys.collider]
+subpath = "collider"
+class = "A"
+access = "write"
+
+[keys.extracts]
+subpath = "extracts"
+class = "A"
+access = "both"
+
+# Class B — Operational/system paths
+[keys.targets]
+subpath = "targets"
+class = "B"
+env_var = ["TARGETS_DIR", "WEAVER_TARGETS_DIR", "PM_TARGETS_DIR"]
+access = "both"
+
+[keys."targets.comments"]
+subpath = "targets/comments"
+class = "B"
+access = "both"
+
+[keys.lapis_state]
+subpath = "lapis-state"
+class = "B"
+env_var = "LAPIS_STATE"
+access = "both"
+
+[keys."lapis_state.roadmap"]
+subpath = "lapis-state/roadmap"
+class = "B"
+access = "both"
+
+[keys."lapis_state.roadmap.committed_plan"]
+subpath = "lapis-state/roadmap/committed-plan.json"
+class = "B"
+access = "read"
+
+[keys."lapis_state.restart_pending"]
+subpath = "lapis-state/restart-pending"
+class = "B"
+access = "both"
+
+[keys."lapis_state.deploy_log"]
+subpath = "lapis-state/lapis-pm-deploy-log.md"
+class = "B"
+access = "write"
+
+[keys.gpu_queue]
+subpath = "gpu-queue"
+class = "B"
+env_var = "GPU_QUEUE_DIR"
+access = "both"
+
+[keys."gpu_queue.shaped"]
+subpath = "gpu-queue/shaped"
+class = "B"
+access = "both"
+
+[keys."gpu_queue.active"]
+subpath = "gpu-queue/active"
+class = "B"
+access = "both"
+
+[keys."gpu_queue.failed"]
+subpath = "gpu-queue/failed"
+class = "B"
+access = "write"
+
+[keys."gpu_queue.completed"]
+subpath = "gpu-queue/completed"
+class = "B"
+access = "write"
+
+[keys.claude_queue]
+subpath = "claude-queue"
+class = "B"
+env_var = "CLAUDE_QUEUE_DIR"
+access = "read"
+
+[keys."claude_queue.active"]
+subpath = "claude-queue/active"
+class = "B"
+access = "read"
+
+[keys."claude_queue.completed"]
+subpath = "claude-queue/completed"
+class = "B"
+access = "write"
+
+[keys."claude_queue.failed"]
+subpath = "claude-queue/failed"
+class = "B"
+access = "write"
+
+[keys."claude_queue.history"]
+subpath = "claude-queue/history.jsonl"
+class = "B"
+access = "both"
+
+[keys.intentions]
+subpath = "intentions"
+class = "B"
+env_var = "LAPIS_INTENTIONS_DIR"
+access = "both"
+
+[keys.directives]
+subpath = "directives"
+class = "B"
+access = "both"
+
+[keys."directives.brief_decisions"]
+subpath = "directives/brief-decisions"
+class = "B"
+access = "both"
+
+[keys.proposals]
+subpath = "proposals"
+class = "B"
+access = "both"
+
+[keys.signals]
+subpath = "signals"
+class = "B"
+access = "both"
+
+[keys.tasks]
+subpath = "tasks"
+class = "B"
+access = "both"
+
+[keys.schedule]
+subpath = "schedule"
+class = "B"
+access = "both"
+
+[keys.trajectory]
+subpath = "trajectory"
+class = "B"
+access = "both"
+
+[keys.intent]
+subpath = "intent"
+class = "B"
+access = "read"
+
+[keys.dropbox]
+subpath = "dropbox"
+class = "B"
+access = "unknown"
+
+[keys.notify_audit]
+subpath = "notify-audit"
+class = "B"
+access = "write"
+
+[keys."notify_audit.silenced"]
+subpath = "notify-audit/silenced.jsonl"
+class = "B"
+access = "write"
+
+# Class C — Agent/infra support
+[keys.council]
+subpath = "council"
+class = "C"
+access = "both"
+
+[keys."council.logs"]
+subpath = "council/logs"
+class = "C"
+access = "write"
+
+[keys."council.cache_cohesion"]
+subpath = "council/cache/cohesion"
+class = "C"
+access = "both"
+
+[keys."council.speakers"]
+subpath = "council/speakers"
+class = "C"
+access = "read"
+
+[keys.facets]
+subpath = "facets"
+class = "C"
+access = "both"
+
+[keys."facets.personas"]
+subpath = "facets/personas"
+class = "C"
+access = "both"
+
+[keys."facets.deliberations"]
+subpath = "facets/deliberations"
+class = "C"
+access = "both"
+
+[keys.kami]
+subpath = "kami"
+class = "C"
+access = "both"
+
+[keys."kami.processed"]
+subpath = "kami/processed"
+class = "C"
+access = "read"
+
+[keys.scout]
+subpath = "scout"
+class = "C"
+access = "both"
+
+[keys."scout.sims"]
+subpath = "scout/sims"
+class = "C"
+access = "both"
+
+[keys."scout.sims_tonight"]
+subpath = "scout/sims-tonight"
+class = "C"
+access = "both"
+
+[keys."scout.nightlogs"]
+subpath = "scout/nightlogs"
+class = "C"
+access = "write"
+
+[keys."scout.traces"]
+subpath = "scout/traces"
+class = "C"
+access = "both"
+
+[keys."scout.maps"]
+subpath = "scout/maps"
+class = "C"
+access = "write"
+
+[keys."scout.refiner"]
+subpath = "scout/refiner"
+class = "C"
+access = "write"
+
+[keys.experts]
+subpath = "experts"
+class = "C"
+access = "both"
+
+[keys.reviews]
+subpath = "review"
+class = "C"
+access = "both"
+
+[keys."reviews.sweep"]
+subpath = "review/sweep"
+class = "C"
+access = "write"
+
+[keys."reviews.seeds"]
+subpath = "review/seeds"
+class = "C"
+access = "both"
+
+[keys."radio.consults"]
+subpath = "radio/consults"
+class = "C"
+access = "both"
+
+[keys.keeper]
+subpath = "keeper"
+class = "C"
+access = "both"
+
+[keys.repair_station]
+subpath = "repair-station/repair_station.db"
+class = "C"
+env_var = "REPAIR_STATION_DB"
+access = "both"
+
+[keys.agent_observations]
+subpath = "agent-observations"
+class = "C"
+env_var = "AGENT_OBSERVATIONS_ROOT"
+access = "both"
+
+[keys.backcaster]
+subpath = "backcaster"
+class = "C"
+access = "both"
+
+[keys."backcaster.runs"]
+subpath = "backcaster/runs"
+class = "C"
+access = "both"
+
+[keys."gardener.synthesis"]
+subpath = "gardener/synthesis"
+class = "C"
+env_var = "GARDENER_OUTPUT_DIR"
+access = "write"
+
+[keys.spec_review_artifacts]
+subpath = "spec-review-artifacts"
+class = "C"
+access = "write"
+
+[keys.simulations]
+subpath = "simulations"
+class = "C"
+access = "write"
+
+[keys.jagged_seam]
+subpath = "jagged-seam"
+class = "C"
+access = "both"
+
+[keys.experiments]
+subpath = "experiments"
+class = "C"
+access = "write"
+
+[keys.scratch]
+subpath = "scratch"
+class = "C"
+access = "both"
+
+[keys.workshop]
+subpath = "workshop"
+class = "C/unknown"
+access = "both"
+
+# Class D — Planning/output
+[keys.planning]
+subpath = "planning"
+class = "D"
+access = "both"
+
+[keys."planning.specs"]
+subpath = "planning/specs"
+class = "D"
+access = "both"
+
+[keys."planning.specs.superseded"]
+subpath = "planning/specs/superseded"
+class = "D"
+access = "write"
+
+[keys."planning.evals"]
+subpath = "planning/evals"
+class = "D"
+access = "write"
+
+[keys.briefs]
+subpath = "briefs"
+class = "D"
+access = "both"
+
+[keys."briefs.kami_adjudication"]
+subpath = "briefs/kami-adjudication"
+class = "D"
+access = "write"
+
+[keys.briefings]
+subpath = "briefings"
+class = "D"
+access = "both"
+
+[keys.design]
+subpath = "design"
+class = "D"
+access = "read"
+
+[keys.narratives]
+subpath = "narratives"
+class = "D"
+access = "write"
+
+# Class E — Personal/journal
+[keys.journal]
+subpath = "journal"
+class = "E"
+access = "both"
+
+[keys.cards]
+subpath = "cards"
+class = "E"
+access = "both"
+
+[keys.memory]
+subpath = "memory"
+class = "E"
+access = "both"
+
+[keys."memory.activity_log"]
+subpath = "memory/activity.log"
+class = "E"
+access = "write"
+
+[keys."memory.host_fault_events"]
+subpath = "memory/host-fault-events.jsonl"
+class = "E"
+access = "write"
+
+# Unknown class
+[keys.sessions]
+subpath = "sessions"
+class = "unknown"
+env_var = "PM_SESSIONS_DIR"
+access = "both"
+
+[keys.focus]
+subpath = "FOCUS.md"
+class = "unknown"
+access = "both"
+
+[keys.heading]
+subpath = "HEADING.yaml"
+class = "unknown"
+access = "read"
+
+[keys.config]
+subpath = "config"
+class = "unknown"
+access = "read"
+
+[keys.agents]
+subpath = "agents"
+class = "unknown"
+access = "read"
+
+[keys.taxonomy_workspace]
+subpath = "taxonomy-workspace"
+class = "unknown"
+access = "write"
+
+[keys.current]
+subpath = "current"
+class = "unknown/B"
+access = "both"

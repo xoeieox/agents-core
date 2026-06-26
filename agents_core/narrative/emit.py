@@ -16,6 +16,7 @@ import yaml
 
 from agents_core.narrative.audiences import VALID_SLUGS
 from agents_core.narrative.engine import EmitResult, emit_draft
+from agents_core.room_paths import room_path
 
 
 def _slug_from_ask(ask: str, max_chars: int = 40) -> str:
@@ -29,7 +30,7 @@ def _slug_from_ask(ask: str, max_chars: int = 40) -> str:
 def _default_out(audience: str, ask: str) -> Path:
     today = date.today().isoformat()
     slug = _slug_from_ask(ask)
-    return Path("/srv/lapis/narratives") / audience / f"{today}-{slug}.md"
+    return room_path("narratives") / audience / f"{today}-{slug}.md"
 
 
 def _build_front_matter(result: EmitResult) -> str:

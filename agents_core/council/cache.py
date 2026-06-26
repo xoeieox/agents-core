@@ -22,7 +22,9 @@ from pathlib import Path
 
 import yaml
 
-CACHE_DIR = Path("/srv/lapis/council/cache/cohesion")
+from agents_core.room_paths import room_path
+
+CACHE_DIR = room_path("council.cache_cohesion")
 KERNEL_FILE = Path("/srv/git/inertia-vault-working/Lapis/Constitution-Kernel.md")
 
 log = logging.getLogger("council.cache")
