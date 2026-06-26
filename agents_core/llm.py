@@ -239,8 +239,9 @@ def _gw_stream_attempt(base_url, model, payload, idle_gap, first_token_gap, hard
     Raises requests exceptions on connect failure (for caller to retry).
     cull_tuple = (reason_str, elapsed_secs, idle_secs) or None.
     """
-    # Socket timeout: coarse backstop (not authoritative for liveness logic)
-    sock_timeout = (30, idle_gap * 2 + 10)
+    # Socket must outlast all Python timers so the watchdog fires first.
+    # idle_gap * 2 would cause ReadTimeout before phase-1 first_token_gap (600s default).
+    sock_timeout = (30, hard_ceiling + 60)
 
     resp = requests.post(
         f"{base_url}/v1/chat/completions",
@@ -370,6 +371,10 @@ def _call_gravitywell_backend(
     idle_gap = float(os.environ.get("GW_IDLE_GAP_SECS", "45"))
     first_token_gap = float(os.environ.get("GW_FIRST_TOKEN_GAP_SECS", "600"))
     hard_ceiling = float(os.environ.get("GW_LIVENESS_HARD_CEILING_SECS", "1800"))
+    # Caller-supplied timeout caps hard_ceiling in non-enforce mode; enforce mode
+    # applies _member_deadline externally via Future.result(timeout=...) and doesn't
+    # rely on this, but honor a tighter caller deadline here too.
+    hard_ceiling = min(hard_ceiling, float(timeout))
 
     messages = []
     if system:
@@ -408,7 +413,6 @@ def _call_gravitywell_backend(
                     time.sleep(backoff)
                 else:
                     raise OperatorUnreachableError(GW_URL, e)
-        raise OperatorUnreachableError(GW_URL, last_exc)
 
     # First attempt
     text, cull = _attempt_with_connect_retry()
