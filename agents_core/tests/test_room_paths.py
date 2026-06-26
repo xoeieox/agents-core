@@ -276,35 +276,17 @@ def test_dod4_env_room_root(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_dod5_sh_parity():
-    """--emit-sh output matches golden paths AND matches the checked-in room_paths.sh."""
+    """--emit-sh output matches the checked-in room_paths.sh (drift guard).
+
+    The actual shell==python resolution parity check (sourcing the file and
+    comparing evaluated values) lives in test_room_paths_shell_parity.py.
+    """
     clean = {k: v for k, v in os.environ.items() if k not in _ENV_VARS_TO_CLEAR}
     result = subprocess.run(
         [sys.executable, "-m", "agents_core.room_paths", "--emit-sh"],
         capture_output=True, text=True, check=True,
         env=clean,
     )
-    output = result.stdout
-
-    # Parse var=value lines
-    sh_vars: dict[str, str] = {}
-    for line in output.splitlines():
-        line = line.strip()
-        if line.startswith("export ROOM_") and "=" in line:
-            # export ROOM_FOO="/srv/lapis/foo"
-            _, rest = line.split(" ", 1)
-            name, val = rest.split("=", 1)
-            # Strip surrounding quotes
-            val = val.strip('"').strip("'")
-            sh_vars[name] = val
-
-    # Build expected from GOLDEN
-    for key, expected in GOLDEN.items():
-        sh_name = "ROOM_" + key.upper().replace(".", "_")
-        if sh_name in sh_vars:
-            assert sh_vars[sh_name] == expected, (
-                f"{sh_name} in shell output = {sh_vars[sh_name]!r}, "
-                f"expected {expected!r}"
-            )
 
     # Diff against the checked-in room_paths.sh — proves the file is never hand-edited
     checked_in = Path(__file__).parent.parent.parent / "room_paths.sh"
