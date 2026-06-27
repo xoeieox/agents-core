@@ -373,6 +373,16 @@ class = "C"
 env_var = "GARDENER_OUTPUT_DIR"
 access = "write"
 
+[keys.calibration]
+subpath = "calibration"
+class = "C"
+access = "write"
+
+[keys."calibration.queue_runner"]
+subpath = "calibration/queue-runner"
+class = "C"
+access = "write"
+
 [keys.spec_review_artifacts]
 subpath = "spec-review-artifacts"
 class = "C"
