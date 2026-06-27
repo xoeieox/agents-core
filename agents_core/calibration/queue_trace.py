@@ -142,7 +142,10 @@ records.  `cancelled` and `intention_*` events update replay state silently.
 Set by cross-checking replayed `in_flight` IDs against live `state.json`:
 
 - `"ok"`:      replay in_flight matches live state (within QUEUE_TRACE_DRIFT_THRESHOLD)
-- `"drift"`:   real divergence detected (reliable fields differ beyond threshold)
+- `"drift"`:   real divergence detected (reliable fields differ beyond threshold);
+              only reachable in `--follow` periodic checks (`abort_on_drift=False`).
+              In `--backfill` (`abort_on_drift=True`), threshold-exceeding drift raises
+              DriftAbortError before any record can carry this value.
 - `"unknown"`: no fidelity check has been run yet (initial transitions)
 
 `state.json.queue_depth` is EXCLUDED from fidelity checks — it globs `*.yaml`
@@ -571,9 +574,6 @@ def follow(
     # Replay from beginning to reconstruct accumulator state up to current offset
     acc = _ReplayAccumulator(workers=workers)
     if offset > 0:
-        bootstrap_events, _ = _read_events_from(history_path, start_offset=0)
-        # Filter to only events before our offset (read them all then truncate at offset)
-        # Actually: re-read from 0 to offset to reconstruct state
         try:
             with open(history_path, "rb") as fh:
                 fh.seek(0)
