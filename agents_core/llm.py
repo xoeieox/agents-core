@@ -31,6 +31,7 @@ PACIFIC = ZoneInfo("America/Los_Angeles")
 
 GW_URL = os.environ.get("GW_URL", "http://203.0.113.11:8081")
 GW_CREATIVE_URL = os.environ.get("GW_CREATIVE_URL", "http://203.0.113.11:8093")
+QUEST_URL = os.environ.get("QUEST_URL", "http://203.0.113.11:8080")
 SWARM_URL = os.environ.get("SWARM_URL", GW_URL)
 SWARM_MAX_CONCURRENT = int(os.environ.get("SWARM_MAX_CONCURRENT", "4"))
 
@@ -104,6 +105,7 @@ class CreativeOperatorUnavailable(Exception):
 
 OPERATOR_DEFAULTS: dict[str, str] = {
     "qwen":                 "qwen3.6-35b-a3b",
+    "quest":                "quest-35b-rl",
     "sonnet":               "claude-sonnet-4-6",
     "opus":                 "claude-opus-4-7",
     "haiku":                "claude-haiku-4-5-20251001",
@@ -515,11 +517,12 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                   **kwargs) -> str | None:
     """Route a completion request to the appropriate backend operator.
 
-    operator_class ∈ {"qwen", "sonnet", "opus", "haiku", "gravitywell", "gravitywell-creative"}.
+    operator_class ∈ {"qwen", "quest", "sonnet", "opus", "haiku", "gravitywell", "gravitywell-creative"}.
     Raises ValueError for unknown classes.
 
     Default models:
         qwen                 → "qwen3.6-35b-a3b"
+        quest                → "quest-35b-rl"       (vLLM swarm, QUEST_URL :8080, OpenAI-compat)
         sonnet               → "claude-sonnet-4-6"
         opus                 → "claude-opus-4-7"
         haiku                → "claude-haiku-4-5-20251001"
@@ -570,6 +573,47 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                 "default, or do the model swap out-of-band first."
             )
         return _call_qwen_backend(prompt=prompt, **kwargs)
+
+    if operator_class == "quest":
+        if model is not None and model != OPERATOR_DEFAULTS["quest"]:
+            raise ValueError(
+                f"call_operator(operator_class='quest', model={model!r}): "
+                "the QUEST vLLM swarm endpoint serves a single fixed model "
+                f"({OPERATOR_DEFAULTS['quest']!r}); model swaps are an "
+                "infrastructure operation, not a per-call parameter. "
+                "Either pass model=None to use the default, or do the swap out-of-band."
+            )
+        on_wake_fail = kwargs.get("on_wake_fail", "skip")
+        quest_kwargs = {
+            k: kwargs[k] for k in ("system", "timeout", "json_mode", "temperature", "log")
+            if k in kwargs
+        }
+        try:
+            return _post_chat_completion(
+                base_url=QUEST_URL,
+                model=OPERATOR_DEFAULTS["quest"],
+                messages=(
+                    ([{"role": "system", "content": quest_kwargs["system"]}]
+                     if quest_kwargs.get("system") else [])
+                    + [{"role": "user", "content": prompt}]
+                ),
+                timeout=int(quest_kwargs.get("timeout", 300)),
+                json_mode=bool(quest_kwargs.get("json_mode", False)),
+                temperature=float(quest_kwargs.get("temperature", 0.7)),
+                log=quest_kwargs.get("log"),
+            )
+        except OperatorUnreachableError:
+            if on_wake_fail == "skip" or on_wake_fail is None:
+                return None
+            if on_wake_fail == "error":
+                raise
+            # paid fallback operators
+            return _apply_wake_fail(
+                on_wake_fail, operator_class, prompt,
+                _provenance_out=_provenance_out, **{
+                    k: v for k, v in kwargs.items() if k not in ("on_wake_fail",)
+                },
+            )
 
     if operator_class == "gravitywell":
         if model is not None and model != OPERATOR_DEFAULTS["gravitywell"]:
