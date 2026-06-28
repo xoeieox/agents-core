@@ -903,6 +903,12 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                 "infrastructure operation (gw-collider-up/down), "
                 "not a per-call parameter. Either pass model=None or do the swap out-of-band."
             )
+        if kwargs.get("think"):
+            raise ValueError(
+                "call_operator(operator_class='gravitywell-creative', think=True): "
+                "Llama-3.3-70B-Instruct is not a reasoning model and cannot honor think=True. "
+                "Pass think=False or omit it."
+            )
         gw_kwargs = {
             k: kwargs[k] for k in (
                 "system", "timeout", "json_mode", "temperature", "log"
@@ -919,11 +925,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         except OperatorUnreachableError as exc:
             raise CreativeOperatorUnavailable(GW_CREATIVE_URL, exc) from exc
         if _provenance_out is not None:
-            _provenance_out.append({
-                "reason": "success",
-                "operator": "gravitywell-creative",
-                "model": OPERATOR_DEFAULTS["gravitywell-creative"],
-            })
+            _provenance_out.append(("success", "gravitywell-creative"))
         return result
 
     # Anthropic-family: route via ClaudeQueue → call_claude_cli.

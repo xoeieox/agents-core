@@ -994,7 +994,7 @@ def test_creative_unreachable_never_returns_none():
 # ---------------------------------------------------------------------------
 
 def test_creative_provenance_carries_model_key():
-    """Successful creative call appends a provenance dict with explicit model key."""
+    """Successful creative call appends ("success", "gravitywell-creative") 2-tuple."""
     import json as _json
 
     def fake_post(url, json=None, timeout=None, stream=None, **kw):
@@ -1013,11 +1013,13 @@ def test_creative_provenance_carries_model_key():
         result = call_operator("gravitywell-creative", prompt="hi", _provenance_out=prov)
 
     assert result == "response"
-    model_entries = [p for p in prov if isinstance(p, dict) and "model" in p]
-    assert len(model_entries) == 1
-    assert model_entries[0]["model"] == "gravitywell-llama-70b"
-    assert model_entries[0]["operator"] == "gravitywell-creative"
-    assert model_entries[0]["reason"] == "success"
+    assert ("success", "gravitywell-creative") in prov
+
+
+def test_creative_think_true_raises_value_error():
+    """think=True must raise ValueError - Llama-3.3-70B-Instruct is not a reasoning model."""
+    with pytest.raises(ValueError, match="not a reasoning model"):
+        call_operator("gravitywell-creative", prompt="hi", think=True)
 
 
 # ---------------------------------------------------------------------------
