@@ -3,7 +3,12 @@ import warnings
 import pytest
 from unittest.mock import patch, MagicMock, call
 
-from agents_core.llm import call_operator, OPERATOR_DEFAULTS, OperatorUnreachableError
+from agents_core.llm import (
+    call_operator,
+    OPERATOR_DEFAULTS,
+    OperatorUnreachableError,
+    CreativeOperatorUnavailable,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -838,3 +843,225 @@ def test_ac14_qwen_untouched_under_enforce(monkeypatch):
         result = call_operator("qwen", prompt="hi")
     assert result == "qok"
     mock_q.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# gravitywell-creative: operator class registration and model guard
+# ---------------------------------------------------------------------------
+
+def test_creative_in_operator_defaults():
+    """gravitywell-creative is registered with gravitywell-llama-70b default."""
+    assert "gravitywell-creative" in OPERATOR_DEFAULTS
+    assert OPERATOR_DEFAULTS["gravitywell-creative"] == "gravitywell-llama-70b"
+
+
+def test_creative_unknown_operator_rejected():
+    """Unknown operator still raises ValueError."""
+    with pytest.raises(ValueError, match="Unknown operator_class"):
+        call_operator("gravitywell-creative-typo", prompt="hi")
+
+
+def test_creative_non_default_model_raises():
+    """Passing a non-default model to gravitywell-creative raises ValueError."""
+    with pytest.raises(ValueError) as exc_info:
+        call_operator("gravitywell-creative", prompt="hi", model="some-other-model")
+    assert "infrastructure operation" in str(exc_info.value)
+    assert "some-other-model" in str(exc_info.value)
+    assert OPERATOR_DEFAULTS["gravitywell-creative"] in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# gravitywell-creative: routes to :8093 with llama-70b, no thinking knob
+# ---------------------------------------------------------------------------
+
+def test_creative_routes_to_creative_url():
+    """gravitywell-creative passes GW_CREATIVE_URL and llama-70b model to backend."""
+    from agents_core.llm import GW_CREATIVE_URL
+    import json as _json
+
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None, stream=None, **kw):
+        captured["url"] = url
+        captured["payload"] = json
+
+        def lines():
+            yield f"data: {_json.dumps({'choices': [{'delta': {'content': 'creative reply'}, 'finish_reason': None}]})}"
+            yield "data: [DONE]"
+
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.iter_lines = MagicMock(return_value=lines())
+        resp.close = MagicMock()
+        return resp
+
+    with patch("requests.post", side_effect=fake_post):
+        result = call_operator("gravitywell-creative", prompt="hello")
+
+    assert result == "creative reply"
+    assert captured["url"].startswith(GW_CREATIVE_URL)
+    assert captured["payload"]["model"] == "gravitywell-llama-70b"
+
+
+def test_creative_no_thinking_knob_in_payload():
+    """gravitywell-creative never adds chat_template_kwargs to the payload."""
+    import json as _json
+
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None, stream=None, **kw):
+        captured["payload"] = json
+
+        def lines():
+            yield f"data: {_json.dumps({'choices': [{'delta': {'content': 'ok'}, 'finish_reason': None}]})}"
+            yield "data: [DONE]"
+
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.iter_lines = MagicMock(return_value=lines())
+        resp.close = MagicMock()
+        return resp
+
+    with patch("requests.post", side_effect=fake_post):
+        call_operator("gravitywell-creative", prompt="test")
+
+    assert "chat_template_kwargs" not in captured["payload"]
+
+
+# ---------------------------------------------------------------------------
+# gravitywell-creative: env override for GW_CREATIVE_URL
+# ---------------------------------------------------------------------------
+
+def test_creative_env_url_override(monkeypatch):
+    """GW_CREATIVE_URL env var is honored; stub at that URL returns its response."""
+    import json as _json
+
+    monkeypatch.setenv("GW_CREATIVE_URL", "http://stub-creative:9999")
+    # Reload the module-level constant by patching it directly.
+    with patch("agents_core.llm.GW_CREATIVE_URL", "http://stub-creative:9999"):
+        captured = {}
+
+        def fake_post(url, json=None, timeout=None, stream=None, **kw):
+            captured["url"] = url
+
+            def lines():
+                yield f"data: {_json.dumps({'choices': [{'delta': {'content': 'stub'}, 'finish_reason': None}]})}"
+                yield "data: [DONE]"
+
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.iter_lines = MagicMock(return_value=lines())
+            resp.close = MagicMock()
+            return resp
+
+        with patch("requests.post", side_effect=fake_post):
+            result = call_operator("gravitywell-creative", prompt="hi")
+
+    assert result == "stub"
+    assert captured["url"].startswith("http://stub-creative:9999")
+
+
+# ---------------------------------------------------------------------------
+# gravitywell-creative: honest failure — CreativeOperatorUnavailable, no fallback
+# ---------------------------------------------------------------------------
+
+def test_creative_unreachable_raises_distinct_exception():
+    """Dead endpoint raises CreativeOperatorUnavailable, not OperatorUnreachableError."""
+    from requests.exceptions import ConnectionError as ReqConnError
+
+    with patch("requests.post", side_effect=ReqConnError("connection refused")), \
+         patch("time.sleep"):  # skip retry backoff
+        with pytest.raises(CreativeOperatorUnavailable) as exc_info:
+            call_operator("gravitywell-creative", prompt="hi")
+
+    assert "Llama-70B" in str(exc_info.value) or "8093" in str(exc_info.value)
+    # Must NOT be a bare OperatorUnreachableError
+    assert not isinstance(exc_info.value, OperatorUnreachableError)
+
+
+def test_creative_unreachable_never_returns_none():
+    """On network failure, gravitywell-creative raises rather than returning None."""
+    from requests.exceptions import ConnectionError as ReqConnError
+
+    with patch("requests.post", side_effect=ReqConnError("connection refused")), \
+         patch("time.sleep"):
+        with pytest.raises(CreativeOperatorUnavailable):
+            call_operator("gravitywell-creative", prompt="hi")
+
+
+# ---------------------------------------------------------------------------
+# gravitywell-creative: provenance carries explicit model key
+# ---------------------------------------------------------------------------
+
+def test_creative_provenance_carries_model_key():
+    """Successful creative call appends a provenance dict with explicit model key."""
+    import json as _json
+
+    def fake_post(url, json=None, timeout=None, stream=None, **kw):
+        def lines():
+            yield f"data: {_json.dumps({'choices': [{'delta': {'content': 'response'}, 'finish_reason': None}]})}"
+            yield "data: [DONE]"
+
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.iter_lines = MagicMock(return_value=lines())
+        resp.close = MagicMock()
+        return resp
+
+    prov = []
+    with patch("requests.post", side_effect=fake_post):
+        result = call_operator("gravitywell-creative", prompt="hi", _provenance_out=prov)
+
+    assert result == "response"
+    model_entries = [p for p in prov if isinstance(p, dict) and "model" in p]
+    assert len(model_entries) == 1
+    assert model_entries[0]["model"] == "gravitywell-llama-70b"
+    assert model_entries[0]["operator"] == "gravitywell-creative"
+    assert model_entries[0]["reason"] == "success"
+
+
+# ---------------------------------------------------------------------------
+# gravitywell-creative: 122B default path is byte-identical (regression guard)
+# ---------------------------------------------------------------------------
+
+def test_gravitywell_122b_default_path_unchanged():
+    """122B path still uses GW_URL (:8081) and gravitywell-122b; no url/model override."""
+    captured = {}
+
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.post", side_effect=_make_gw_sse_resp("122b-reply", captured)):
+        result = call_operator("gravitywell", prompt="test")
+
+    assert result == "122b-reply"
+    from agents_core.llm import GW_URL
+    assert captured["payload"]["model"] == "gravitywell-122b"
+    assert captured["payload"].get("chat_template_kwargs") is not None  # thinking knob present
+
+
+def test_gravitywell_122b_default_url_is_8081():
+    """122B operator hits :8081, not :8093."""
+    import json as _json
+
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None, stream=None, **kw):
+        captured["url"] = url
+
+        def lines():
+            yield f"data: {_json.dumps({'choices': [{'delta': {'content': 'ok'}, 'finish_reason': None}]})}"
+            yield "data: [DONE]"
+
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.iter_lines = MagicMock(return_value=lines())
+        resp.close = MagicMock()
+        return resp
+
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.post", side_effect=fake_post):
+        call_operator("gravitywell", prompt="test")
+
+    assert ":8081" in captured["url"]
+    assert ":8093" not in captured["url"]

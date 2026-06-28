@@ -30,6 +30,7 @@ LLAMACPP_URL = f"http://{TAILSCALE_IP}:8081"
 PACIFIC = ZoneInfo("America/Los_Angeles")
 
 GW_URL = os.environ.get("GW_URL", "http://203.0.113.11:8081")
+GW_CREATIVE_URL = os.environ.get("GW_CREATIVE_URL", "http://203.0.113.11:8093")
 SWARM_URL = os.environ.get("SWARM_URL", GW_URL)
 SWARM_MAX_CONCURRENT = int(os.environ.get("SWARM_MAX_CONCURRENT", "4"))
 
@@ -84,16 +85,30 @@ class OperatorUnreachableError(Exception):
         super().__init__(f"Operator unreachable at {url} after retries: {last_error}")
 
 
+class CreativeOperatorUnavailable(Exception):
+    """Raised when the gravitywell-creative (Llama-70B) endpoint cannot be reached.
+
+    Distinct from OperatorUnreachableError so callers can tell "creative serve not up"
+    from generic GW failures. Never silently falls back to a paid or other model.
+    """
+
+    def __init__(self, url: str, last_error: Exception):
+        self.url = url
+        self.last_error = last_error
+        super().__init__(f"Creative operator (Llama-70B) unreachable at {url}: {last_error}")
+
+
 # ---------------------------------------------------------------------------
 # Multi-operator routing
 # ---------------------------------------------------------------------------
 
 OPERATOR_DEFAULTS: dict[str, str] = {
-    "qwen":        "qwen3.6-35b-a3b",
-    "sonnet":      "claude-sonnet-4-6",
-    "opus":        "claude-opus-4-7",
-    "haiku":       "claude-haiku-4-5-20251001",
-    "gravitywell": "gravitywell-122b",
+    "qwen":                 "qwen3.6-35b-a3b",
+    "sonnet":               "claude-sonnet-4-6",
+    "opus":                 "claude-opus-4-7",
+    "haiku":                "claude-haiku-4-5-20251001",
+    "gravitywell":          "gravitywell-122b",
+    "gravitywell-creative": "gravitywell-llama-70b",
 }
 
 
@@ -346,18 +361,20 @@ def _call_gravitywell_backend(
     temperature: float = 0.7,
     log=None,
     think: bool = False,
+    _url: str = None,
+    _model: str = None,
+    _no_thinking: bool = False,
 ) -> str | None:
-    """Send a completion request to the GravityWell llama.cpp endpoint via streaming SSE.
+    """Send a completion request to a GravityWell llama.cpp endpoint via streaming SSE.
 
-    GW is a Qwen3.5-122B reasoning model. By default think=False injects
-    chat_template_kwargs={"enable_thinking": false} to suppress the think-trace
-    and keep responses clean (~2-4s). Callers may pass think=True for quality-mode
-    reasoning with a large max_tokens.
+    By default targets GW_URL (:8081) with the 122B model. Internal _url/_model params
+    route to alternate endpoints (e.g. the creative Llama-70B at :8093) without exposing
+    that routing on the public 122B operator path.
 
-    GW_URL coupling: reads the same GW_URL env var as doorman_server. Both must
-    be kept in sync (see doorman-server.env and operator environment docs).
-
-    Does NOT accept bundle_ids — GW gets system verbatim, no chub-bundle injection.
+    think=False (default) injects chat_template_kwargs={"enable_thinking": false} to
+    suppress the think-trace. Callers may pass think=True for quality-mode reasoning.
+    _no_thinking=True structurally omits chat_template_kwargs entirely (for models that
+    do not support the thinking knob, e.g. Llama-3.3-70B-Instruct).
 
     Dual-timer liveness model:
     - Phase 1 (pre-first-token): cull after GW_FIRST_TOKEN_GAP_SECS (default 600).
@@ -368,6 +385,9 @@ def _call_gravitywell_backend(
     Connection-level retry: 3 attempts, 2s/4s backoff on network errors.
     Persistent errors raise OperatorUnreachableError; parse errors return None.
     """
+    url = _url if _url is not None else GW_URL
+    model = _model if _model is not None else OPERATOR_DEFAULTS["gravitywell"]
+
     idle_gap = float(os.environ.get("GW_IDLE_GAP_SECS", "45"))
     first_token_gap = float(os.environ.get("GW_FIRST_TOKEN_GAP_SECS", "600"))
     hard_ceiling = float(os.environ.get("GW_LIVENESS_HARD_CEILING_SECS", "1800"))
@@ -382,13 +402,14 @@ def _call_gravitywell_backend(
     messages.append({"role": "user", "content": prompt})
 
     payload = {
-        "model": OPERATOR_DEFAULTS["gravitywell"],
+        "model": model,
         "messages": messages,
         "temperature": temperature,
         "cache_prompt": True,
-        "chat_template_kwargs": {"enable_thinking": think},
         "stream": True,
     }
+    if not _no_thinking:
+        payload["chat_template_kwargs"] = {"enable_thinking": think}
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
@@ -400,7 +421,7 @@ def _call_gravitywell_backend(
         for attempt in range(3):
             try:
                 return _gw_stream_attempt(
-                    GW_URL, OPERATOR_DEFAULTS["gravitywell"],
+                    url, model,
                     payload, idle_gap, first_token_gap, hard_ceiling,
                     call_start, log,
                 )
@@ -412,7 +433,7 @@ def _call_gravitywell_backend(
                         log(f"[gw-stream] connect error attempt {attempt+1}/3: {e}")
                     time.sleep(backoff)
                 else:
-                    raise OperatorUnreachableError(GW_URL, e)
+                    raise OperatorUnreachableError(url, e)
 
     # First attempt
     text, cull = _attempt_with_connect_retry()
@@ -494,15 +515,16 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                   **kwargs) -> str | None:
     """Route a completion request to the appropriate backend operator.
 
-    operator_class ∈ {"qwen", "sonnet", "opus", "haiku", "gravitywell"}.
+    operator_class ∈ {"qwen", "sonnet", "opus", "haiku", "gravitywell", "gravitywell-creative"}.
     Raises ValueError for unknown classes.
 
     Default models:
-        qwen   → "qwen3.6-35b-a3b"
-        sonnet → "claude-sonnet-4-6"
-        opus   → "claude-opus-4-7"
-        haiku  → "claude-haiku-4-5-20251001"
-        gravitywell → "gravitywell-122b"
+        qwen                 → "qwen3.6-35b-a3b"
+        sonnet               → "claude-sonnet-4-6"
+        opus                 → "claude-opus-4-7"
+        haiku                → "claude-haiku-4-5-20251001"
+        gravitywell          → "gravitywell-122b"   (122B reasoning, :8081, DoormanClient)
+        gravitywell-creative → "gravitywell-llama-70b" (Llama-70B instruct, :8093, direct)
 
     qwen routes via the local llama-server (same path as call_llm()).
 
@@ -513,8 +535,12 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
     No direct Anthropic-API calls — kill-switched per
     decision/no-anthropic-api-direct.
 
-    gravitywell routes via the doorman to the GravityWell llama.cpp endpoint.
+    gravitywell routes via the doorman to the GravityWell llama.cpp endpoint (:8081).
     On unreachable, falls back per on_wake_fail policy.
+
+    gravitywell-creative routes directly to the Llama-70B endpoint (:8093, GW_CREATIVE_URL).
+    No DoormanClient, no admission control, no wake_fail fallback. Raises
+    CreativeOperatorUnavailable on network failure — never silently falls back.
 
     _provenance_out: optional list to append (reason, effective_operator) tuples
                      for tracking which operator actually answered. Used by adapters
@@ -867,6 +893,38 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                 _provenance_out.append(("serving_http_error", "gravitywell"))
             return _apply_wake_fail(on_wake_fail, operator_class, prompt,
                                    _provenance_out=_provenance_out, **wake_fail_kwargs)
+
+    if operator_class == "gravitywell-creative":
+        if model is not None and model != OPERATOR_DEFAULTS["gravitywell-creative"]:
+            raise ValueError(
+                f"call_operator(operator_class='gravitywell-creative', model={model!r}): "
+                "the creative endpoint serves a single fixed model "
+                f"({OPERATOR_DEFAULTS['gravitywell-creative']!r}); model swaps are an "
+                "infrastructure operation (gw-collider-up/down), "
+                "not a per-call parameter. Either pass model=None or do the swap out-of-band."
+            )
+        gw_kwargs = {
+            k: kwargs[k] for k in (
+                "system", "timeout", "json_mode", "temperature", "log"
+            ) if k in kwargs
+        }
+        try:
+            result = _call_gravitywell_backend(
+                prompt=prompt,
+                _url=GW_CREATIVE_URL,
+                _model=OPERATOR_DEFAULTS["gravitywell-creative"],
+                _no_thinking=True,
+                **gw_kwargs,
+            )
+        except OperatorUnreachableError as exc:
+            raise CreativeOperatorUnavailable(GW_CREATIVE_URL, exc) from exc
+        if _provenance_out is not None:
+            _provenance_out.append({
+                "reason": "success",
+                "operator": "gravitywell-creative",
+                "model": OPERATOR_DEFAULTS["gravitywell-creative"],
+            })
+        return result
 
     # Anthropic-family: route via ClaudeQueue → call_claude_cli.
     # No direct Anthropic-API code path (decision/no-anthropic-api-direct).
