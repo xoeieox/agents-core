@@ -19,7 +19,7 @@ from typing import Any
 
 import httpx
 
-from agents_core.llm import call_operator, call_claude_cli, parse_json_object, parse_json_array
+from agents_core.llm import call_operator, call_claude_cli, parse_json_object
 
 _log = logging.getLogger(__name__)
 
@@ -82,8 +82,6 @@ def _query_gen(
     operator: str,
 ) -> tuple[list[str], bool]:
     """Returns (search_strings, rewrote_from_diagnosis)."""
-    rewrote = prior_diagnosis is not None
-
     if prior_diagnosis:
         prompt = (
             f"You are a search strategist. A previous research pass for the following intent "
@@ -113,14 +111,16 @@ def _query_gen(
 
     raw = _call_read_operator(operator, prompt, json_mode=True)
     if not raw:
-        # fallback: use intent as-is
-        return [intent], rewrote
+        # fallback: use intent as-is; no rewrite occurred
+        return [intent], False
 
     parsed = parse_json_object(raw)
     if not parsed or not isinstance(parsed.get("queries"), list):
-        return [intent], rewrote
+        return [intent], False
 
     queries = [q for q in parsed["queries"] if isinstance(q, str) and q.strip()]
+    # rewrote_from_diagnosis is True only when the LLM successfully returned rewritten queries
+    rewrote = prior_diagnosis is not None
     return (queries or [intent]), rewrote
 
 
@@ -134,29 +134,29 @@ def _search_searxng(queries: list[str], searxng_url: str) -> tuple[list[dict], s
     hits: list[dict] = []
     error_note = None
 
-    for query in queries:
-        try:
-            with httpx.Client(timeout=10, follow_redirects=True) as client:
+    with httpx.Client(timeout=10, follow_redirects=True) as client:
+        for query in queries:
+            try:
                 resp = client.get(
                     searxng_url + "/search",
                     params={"q": query, "format": "json"},
                 )
                 resp.raise_for_status()
                 data = resp.json()
-        except Exception as e:
-            error_note = f"SearXNG error: {e}"
-            _log.warning("[dowser] SearXNG error for query %r: %s", query, e)
-            continue
+            except Exception as e:
+                error_note = f"SearXNG error: {e}"
+                _log.warning("[dowser] SearXNG error for query %r: %s", query, e)
+                continue
 
-        for result in data.get("results", []):
-            url = result.get("url", "")
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                hits.append({
-                    "url": url,
-                    "title": result.get("title", ""),
-                    "snippet": result.get("content", ""),
-                })
+            for result in data.get("results", []):
+                url = result.get("url", "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    hits.append({
+                        "url": url,
+                        "title": result.get("title", ""),
+                        "snippet": result.get("content", ""),
+                    })
 
     return hits, error_note
 
@@ -370,6 +370,9 @@ def _classify_outcome(
     friction_ratio: float,
     findings: str,
 ) -> str:
+    # Partial failure (error_note set but hits non-empty from other queries): the infra error
+    # survives in provenance.notes but we let outcome reflect the actual content quality.
+    # Full infra failure (no hits at all) is the only case we surface as infra-unavailable.
     if error_note and not hits:
         return "infra-unavailable"
     if not findings:

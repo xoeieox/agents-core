@@ -604,10 +604,17 @@ class TestDowserClientServerRoundTrip:
         assert data["verdicts"][0]["status"] == "pass"
 
     def test_server_binds_default_port_8412(self):
+        # Verify the server's /healthz reports the default port when DOWSER_BIND_PORT is unset
         import os
-        # Ensure the default env produces port 8412
-        env_port = os.environ.get("DOWSER_BIND_PORT", "8412")
-        assert env_port == "8412"
+        env_backup = os.environ.pop("DOWSER_BIND_PORT", None)
+        try:
+            client = self._make_client()
+            resp = client.get("/healthz")
+            assert resp.status_code == 200
+            assert resp.json()["port"] == 8412
+        finally:
+            if env_backup is not None:
+                os.environ["DOWSER_BIND_PORT"] = env_backup
 
     def test_invalid_read_operator_returns_400(self):
         client = self._make_client()
