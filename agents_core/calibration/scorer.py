@@ -231,6 +231,7 @@ class Aggregator:
     def __init__(self) -> None:
         self.total = 0
         self.parse_failures = 0
+        self.parse_failure_types: dict[str, int] = {}  # 'truncated'/'malformed'/'error' → count
         self.by_event: dict[str, list[float]] = {}  # event_type → [fidelity]
         self.by_consistency: dict[str, list[float]] = {}  # consistency_flag → [fidelity]
 
@@ -262,11 +263,14 @@ class Aggregator:
         parse_ok: bool,
         event_type: str,
         consistency_flag: str,
+        parse_failure_type: str | None = None,
     ) -> None:
         self.total += 1
 
         if not parse_ok:
             self.parse_failures += 1
+            ft = parse_failure_type or "unknown"
+            self.parse_failure_types[ft] = self.parse_failure_types.get(ft, 0) + 1
 
         self.all_fidelity.append(fidelity)
 
@@ -279,10 +283,10 @@ class Aggregator:
         if not parse_ok:
             return
 
-        # Count exact-match
+        # Count exact-match — keys are "counts.pending" etc. (from score_counts)
         counts = field_scores.get("counts", {})
         for f in ["pending", "active", "completed", "failed"]:
-            val = counts.get(f, {}).get("exact", False)
+            val = counts.get(f"counts.{f}", {}).get("exact", False)
             self.count_exact[f].append(val)
 
         # in_flight
@@ -461,12 +465,15 @@ class Aggregator:
         }
 
     def resolution_map(self) -> dict:
-        """Mandate 4: per-field noise-floor vs prediction error, labeled."""
-        nf = self.noise_floor()
+        """Per-field noise-floor vs prediction error, labeled.
+
+        Every field's label is derived from its measured rate — no field is
+        labeled from an assumption.  Discrete fields follow the same gate as
+        continuous fields: any correct prediction → threshold-derivable,
+        all-wrong / no-data → signal-absent.
+        """
         stasis_v_analysis = self.stasis_velocity_threshold_analysis()
 
-        # Discrete fields: always deterministic, signal always present + derivable
-        # Continuous fields: gate on noise floor
         sv_status = stasis_v_analysis.get("status", "signal-absent")
         stasis_v_label = (
             "threshold-derivable"
@@ -474,13 +481,21 @@ class Aggregator:
             else ("unknowable-noise-dominated" if sv_status == "unknowable-noise-dominated" else "signal-absent")
         )
 
+        def _discrete_label(vals: list[bool]) -> str:
+            return "threshold-derivable" if any(vals) else "signal-absent"
+
+        in_flight_signal = (
+            any(p > 0 for p in self.in_flight_precision)
+            or any(r > 0 for r in self.in_flight_recall)
+        )
+
         return {
-            "counts.pending": "threshold-derivable",
-            "counts.active": "threshold-derivable",
-            "counts.completed": "threshold-derivable",
-            "counts.failed": "threshold-derivable",
-            "in_flight": "threshold-derivable",
-            "workers.capacity": "threshold-derivable",
+            "counts.pending": _discrete_label(self.count_exact.get("pending", [])),
+            "counts.active": _discrete_label(self.count_exact.get("active", [])),
+            "counts.completed": _discrete_label(self.count_exact.get("completed", [])),
+            "counts.failed": _discrete_label(self.count_exact.get("failed", [])),
+            "in_flight": "threshold-derivable" if in_flight_signal else "signal-absent",
+            "workers.capacity": _discrete_label(self.capacity_exact),
             "workers.utilization": "threshold-derivable" if any(self.util_pass) else "signal-absent",
             "stasis_duration": "threshold-derivable" if any(self.stasis_d_pass) else "signal-absent",
             "stasis_velocity": stasis_v_label,
@@ -526,6 +541,7 @@ class Aggregator:
             "scored_fraction": round(scored_count / total_corpus, 4) if total_corpus else 0.0,
             "parse_failures": self.parse_failures,
             "parse_failure_rate": parse_failure_rate,
+            "parse_failure_types": dict(self.parse_failure_types),
             "overall_fidelity": overall_fidelity,
             "per_field_fidelity": per_field,
             "per_event_type": per_event,
@@ -556,6 +572,18 @@ def render_report_md(agg: dict, run_args: dict) -> str:
     """Render the human-readable report.md (flame-shaped: written for Erah/PM reading)."""
     lines = ["# AgentWorld Queue-Runner Fidelity Report", ""]
 
+    prompt_mode = run_args.get("prompt_mode", "no-rules")
+
+    # Mandatory banner for with-rules mode (mandate 2: with-rules is instruction-following, not fidelity)
+    if prompt_mode == "with-rules":
+        lines += [
+            "> **Instruction-following benchmark - NOT world-model fidelity.**",
+            "> This report used `--prompt-mode with-rules`: the state-machine rules were supplied in the",
+            "> system prompt.  Results measure rule-following, not AgentWorld's learned prior.",
+            "> Use `--prompt-mode no-rules` (the default) for any fidelity claim.",
+            "",
+        ]
+
     # Run metadata
     lines += [
         "## Run",
@@ -564,14 +592,18 @@ def render_report_md(agg: dict, run_args: dict) -> str:
         f"- Samples per transition: {run_args.get('samples', 1)}",
         f"- Endpoint: {run_args.get('endpoint', 'n/a')}",
         f"- Model: {run_args.get('model', 'n/a')}",
+        f"- Prompt mode: `{prompt_mode}`",
         "",
     ]
 
     # Parse failure rate
     pfr = agg["parse_failure_rate"]
+    pft = agg.get("parse_failure_types", {})
+    pft_detail = ", ".join(f"{k}={v}" for k, v in sorted(pft.items())) if pft else "none"
     lines += [
         "## Parse Failures",
         f"- Rate: {pfr:.1%} ({agg['parse_failures']} / {agg['total_scored']})",
+        f"- By type: {pft_detail}",
         "- Parse failures count as fidelity=0 in all aggregates (distinct zero-valued category).",
         "",
     ]
@@ -779,6 +811,7 @@ def run_scorer(
 
                 fidelity = transition_fidelity_score(field_scores, parse_ok)
 
+                parse_failure_type = result.get("parse_failure_type")
                 agg.add(
                     transition_ref=ref,
                     sample_idx=sample_idx,
@@ -787,6 +820,7 @@ def run_scorer(
                     parse_ok=parse_ok,
                     event_type=event_type,
                     consistency_flag=consistency_flag,
+                    parse_failure_type=parse_failure_type,
                 )
 
                 record = {
@@ -796,6 +830,7 @@ def run_scorer(
                     "field_scores": field_scores,
                     "fidelity": fidelity,
                     "parse_ok": parse_ok,
+                    "parse_failure_type": parse_failure_type,
                     "consistency_flag": consistency_flag,
                     "event_type": event_type,
                 }
@@ -856,16 +891,27 @@ def main(argv: list[str] | None = None) -> None:
         "--fake", action="store_true",
         help="Use the deterministic fake predictor (offline mode — no AgentWorld endpoint needed)",
     )
+    parser.add_argument(
+        "--prompt-mode", choices=["no-rules", "with-rules"], default="no-rules",
+        dest="prompt_mode",
+        help=(
+            "no-rules (default): omit the state-machine rule list — tests AgentWorld's learned prior. "
+            "with-rules: supply rules verbatim (v0 baseline) — instruction-following benchmark only, NOT fidelity."
+        ),
+    )
     args = parser.parse_args(argv)
 
     endpoint = os.environ.get("AGENTWORLD_ENDPOINT", args.endpoint)
 
     if args.fake:
         client = FakeAgentWorldClient()
-        predictor = Predictor(client=client, model=args.model, endpoint=endpoint)
+        predictor = Predictor(
+            client=client, model=args.model, endpoint=endpoint,
+            prompt_mode=args.prompt_mode,
+        )
         log.info("using deterministic fake predictor (offline mode)")
     else:
-        predictor = Predictor(model=args.model, endpoint=endpoint)
+        predictor = Predictor(model=args.model, endpoint=endpoint, prompt_mode=args.prompt_mode)
         log.info("using HTTP AgentWorld client at %s", endpoint)
 
     # Load few-shot examples from the corpus TAIL to avoid contaminating the scored set.
@@ -886,6 +932,7 @@ def main(argv: list[str] | None = None) -> None:
         "few_shot": args.few_shot,
         "limit": args.limit,
         "sample_stride": args.sample_stride,
+        "prompt_mode": args.prompt_mode,
     }
 
     summary = run_scorer(

@@ -15,6 +15,8 @@ import pytest
 from agents_core.calibration.predictor import (
     FakeAgentWorldClient,
     Predictor,
+    _SYSTEM_PROMPT_NO_RULES,
+    _SYSTEM_PROMPT_WITH_RULES,
     _apply_rules,
     _extract_json,
     build_prompt,
@@ -223,8 +225,8 @@ class TestParseFailureAsZeroCategory:
         _write_transitions(transitions_path, [tr])
 
         class _AlwaysFailClient:
-            def predict(self, **kwargs) -> str:
-                return "NOT JSON AT ALL"
+            def predict(self, **kwargs) -> tuple[str, str]:
+                return "NOT JSON AT ALL", "stop"
 
         predictor = Predictor(client=_AlwaysFailClient())
         summary = run_scorer(
@@ -251,11 +253,11 @@ class TestParseFailureAsZeroCategory:
 
         class _HalfFail:
             _call = 0
-            def predict(self, **kwargs) -> str:
+            def predict(self, **kwargs) -> tuple[str, str]:
                 self._call += 1
                 if self._call == 1:
-                    return "not json"
-                return json.dumps(_make_state(pending=2))
+                    return "not json", "stop"
+                return json.dumps(_make_state(pending=2)), "stop"
 
         predictor = Predictor(client=_HalfFail())
         summary = run_scorer(
@@ -498,13 +500,13 @@ class TestNoiseFloorAggregation:
         call_count = {"n": 0}
 
         class _StochasticClient:
-            def predict(self, **kwargs) -> str:
+            def predict(self, **kwargs) -> tuple[str, str]:
                 call_count["n"] += 1
                 # Alternate between correct and wrong prediction
                 if call_count["n"] % 2 == 0:
-                    return json.dumps(_make_state(pending=2))
+                    return json.dumps(_make_state(pending=2)), "stop"
                 else:
-                    return json.dumps(_make_state(pending=99))
+                    return json.dumps(_make_state(pending=99)), "stop"
 
         predictor = Predictor(client=_StochasticClient())
         summary = run_scorer(
@@ -804,3 +806,261 @@ class TestEndToEnd:
         assert "Q1" in md
         assert "Q2" in md
         assert "Resolution Map" in md
+
+
+# ---------------------------------------------------------------------------
+# 14. v0.1 features: prompt-mode, D1 resolution-map, D2 counts fix, D4 truncation
+# ---------------------------------------------------------------------------
+
+class TestV01PromptMode:
+    def test_no_rules_omits_state_machine_section(self):
+        """Spec 1: no-rules prompt must not contain the lifecycle rule list."""
+        messages = build_prompt({}, {}, prompt_mode="no-rules")
+        sys_content = messages[0]["content"]
+        assert "submitted  →" not in sys_content
+        assert "claimed    →" not in sys_content
+        assert "Queue-runner state machine" not in sys_content
+
+    def test_no_rules_retains_role_schema_task(self):
+        """Spec 1: no-rules prompt keeps role framing, State schema, and task instruction."""
+        messages = build_prompt({}, {}, prompt_mode="no-rules")
+        sys_content = messages[0]["content"]
+        assert "AgentWorld" in sys_content
+        assert "State schema" in sys_content
+        assert "state_after" in sys_content
+
+    def test_with_rules_includes_lifecycle_rules(self):
+        """Spec 1: with-rules prompt retains the v0 state-machine rule list."""
+        messages = build_prompt({}, {}, prompt_mode="with-rules")
+        sys_content = messages[0]["content"]
+        assert "submitted  →" in sys_content
+        assert "claimed    →" in sys_content
+        assert "Queue-runner state machine" in sys_content
+
+    def test_default_is_no_rules(self):
+        """Spec 1: default prompt_mode is no-rules."""
+        messages_default = build_prompt({}, {})
+        messages_no_rules = build_prompt({}, {}, prompt_mode="no-rules")
+        assert messages_default[0]["content"] == messages_no_rules[0]["content"]
+
+    def test_with_rules_report_carries_banner(self, tmp_path):
+        """Spec 1 / mandate 2: with-rules report.md carries the instruction-following banner."""
+        state_before = _make_state(pending=0)
+        state_after = _make_state(pending=1)
+        transitions_path = tmp_path / "t.jsonl"
+        _write_transitions(transitions_path, [_make_transition("submitted", state_before, state_after)])
+
+        predictor = Predictor(client=FakeAgentWorldClient(), prompt_mode="with-rules")
+        summary = run_scorer(
+            transitions_path=transitions_path,
+            output_dir=tmp_path / "scores",
+            predictor=predictor,
+            samples=1,
+        )
+        md = render_report_md(summary, {
+            "samples": 1, "endpoint": "fake", "model": "fake", "prompt_mode": "with-rules"
+        })
+        assert "Instruction-following benchmark" in md
+        assert "NOT world-model fidelity" in md
+
+    def test_no_rules_report_has_no_banner(self, tmp_path):
+        """Spec 1: no-rules report must NOT carry the instruction-following banner."""
+        state_before = _make_state(pending=0)
+        state_after = _make_state(pending=1)
+        transitions_path = tmp_path / "t.jsonl"
+        _write_transitions(transitions_path, [_make_transition("submitted", state_before, state_after)])
+
+        predictor = Predictor(client=FakeAgentWorldClient(), prompt_mode="no-rules")
+        summary = run_scorer(
+            transitions_path=transitions_path,
+            output_dir=tmp_path / "scores",
+            predictor=predictor,
+            samples=1,
+        )
+        md = render_report_md(summary, {
+            "samples": 1, "endpoint": "fake", "model": "fake", "prompt_mode": "no-rules"
+        })
+        assert "Instruction-following benchmark" not in md
+
+    def test_prompt_mode_recorded_in_run_args_report(self, tmp_path):
+        """Spec 1: prompt_mode appears in the Run section of the report."""
+        state_before = _make_state(pending=0)
+        state_after = _make_state(pending=1)
+        transitions_path = tmp_path / "t.jsonl"
+        _write_transitions(transitions_path, [_make_transition("submitted", state_before, state_after)])
+
+        predictor = Predictor(client=FakeAgentWorldClient())
+        summary = run_scorer(
+            transitions_path=transitions_path,
+            output_dir=tmp_path / "scores",
+            predictor=predictor,
+            samples=1,
+        )
+        md = render_report_md(summary, {
+            "samples": 1, "endpoint": "fake", "model": "fake", "prompt_mode": "no-rules"
+        })
+        assert "no-rules" in md
+
+
+class TestV01D2CountsFieldFix:
+    """D2: per-field counts fidelity must reflect actual exact-match, not always-0."""
+
+    def test_correct_prediction_yields_100pct_counts(self, tmp_path):
+        """D2 regression: FakeAgentWorldClient gives correct predictions → all counts 100%."""
+        state_before = _make_state(pending=1)
+        state_after = _make_state(pending=2)  # submitted increments pending
+        transitions_path = tmp_path / "t.jsonl"
+        _write_transitions(transitions_path, [_make_transition("submitted", state_before, state_after)])
+
+        predictor = Predictor(client=FakeAgentWorldClient())
+        summary = run_scorer(
+            transitions_path=transitions_path,
+            output_dir=tmp_path / "scores",
+            predictor=predictor,
+            samples=1,
+        )
+        pf = summary["per_field_fidelity"]
+        assert pf["counts.pending"] == 1.0, "correct pending count must yield 100%"
+        assert pf["counts.active"] == 1.0
+        assert pf["counts.completed"] == 1.0
+        assert pf["counts.failed"] == 1.0
+
+    def test_wrong_counts_yield_0pct(self, tmp_path):
+        """D2 regression: a wrong count prediction must yield 0% for that field."""
+        state_before = _make_state(pending=1)
+        state_after = _make_state(pending=2)
+
+        class _WrongPendingClient:
+            def predict(self, **kwargs) -> tuple[str, str]:
+                return json.dumps(_make_state(pending=99)), "stop"
+
+        transitions_path = tmp_path / "t.jsonl"
+        _write_transitions(transitions_path, [_make_transition("submitted", state_before, state_after)])
+
+        predictor = Predictor(client=_WrongPendingClient())
+        summary = run_scorer(
+            transitions_path=transitions_path,
+            output_dir=tmp_path / "scores",
+            predictor=predictor,
+            samples=1,
+        )
+        pf = summary["per_field_fidelity"]
+        assert pf["counts.pending"] == 0.0, "wrong pending count must yield 0%"
+
+
+class TestV01D1ResolutionMapDerived:
+    """D1: resolution_map must derive every label from measured rates."""
+
+    def test_signal_absent_when_all_counts_wrong(self, tmp_path):
+        """D1: a field is signal-absent when the predictor always gets it wrong."""
+        state_before = _make_state(pending=0)
+        state_after = _make_state(pending=1)
+
+        class _AlwaysWrongCountsClient:
+            def predict(self, **kwargs) -> tuple[str, str]:
+                return json.dumps(_make_state(pending=999)), "stop"
+
+        transitions_path = tmp_path / "t.jsonl"
+        _write_transitions(transitions_path, [_make_transition("submitted", state_before, state_after)])
+
+        predictor = Predictor(client=_AlwaysWrongCountsClient())
+        summary = run_scorer(
+            transitions_path=transitions_path,
+            output_dir=tmp_path / "scores",
+            predictor=predictor,
+            samples=1,
+        )
+        rm = summary["resolution_map"]
+        assert rm["counts.pending"] == "signal-absent"
+
+    def test_threshold_derivable_when_correct(self, tmp_path):
+        """D1: a correctly-predicted discrete field is threshold-derivable."""
+        state_before = _make_state(pending=0)
+        state_after = _make_state(pending=1)
+        transitions_path = tmp_path / "t.jsonl"
+        _write_transitions(transitions_path, [_make_transition("submitted", state_before, state_after)])
+
+        predictor = Predictor(client=FakeAgentWorldClient())
+        summary = run_scorer(
+            transitions_path=transitions_path,
+            output_dir=tmp_path / "scores",
+            predictor=predictor,
+            samples=1,
+        )
+        rm = summary["resolution_map"]
+        assert rm["counts.pending"] == "threshold-derivable"
+        assert rm["workers.capacity"] == "threshold-derivable"
+        assert rm["in_flight"] == "threshold-derivable"
+
+
+class TestV01D4TruncationDetection:
+    """D4: truncation must be detected as a distinct parse-failure subtype."""
+
+    def test_max_tokens_default_is_4096(self):
+        """D4: Predictor default max_tokens >= 4096."""
+        p = Predictor(client=FakeAgentWorldClient())
+        assert p.max_tokens >= 4096
+
+    def test_finish_reason_length_recorded_as_truncated(self, tmp_path):
+        """D4: finish_reason=length → parse_failure_type=truncated in summary."""
+        class _TruncatingClient:
+            def predict(self, **kwargs) -> tuple[str, str]:
+                return '{"counts": {"pending": 1', "length"
+
+        state_before = _make_state(pending=0)
+        state_after = _make_state(pending=1)
+        transitions_path = tmp_path / "t.jsonl"
+        _write_transitions(transitions_path, [_make_transition("submitted", state_before, state_after)])
+
+        predictor = Predictor(client=_TruncatingClient())
+        summary = run_scorer(
+            transitions_path=transitions_path,
+            output_dir=tmp_path / "scores",
+            predictor=predictor,
+            samples=1,
+        )
+        assert summary["parse_failures"] == 1
+        types = summary.get("parse_failure_types", {})
+        assert types.get("truncated", 0) == 1, f"expected truncated=1, got {types}"
+
+    def test_malformed_response_not_labeled_truncated(self, tmp_path):
+        """D4: malformed JSON with finish_reason=stop is labeled malformed, not truncated."""
+        class _MalformedClient:
+            def predict(self, **kwargs) -> tuple[str, str]:
+                return "sorry, cannot answer", "stop"
+
+        state_before = _make_state(pending=0)
+        state_after = _make_state(pending=1)
+        transitions_path = tmp_path / "t.jsonl"
+        _write_transitions(transitions_path, [_make_transition("submitted", state_before, state_after)])
+
+        predictor = Predictor(client=_MalformedClient())
+        summary = run_scorer(
+            transitions_path=transitions_path,
+            output_dir=tmp_path / "scores",
+            predictor=predictor,
+            samples=1,
+        )
+        types = summary.get("parse_failure_types", {})
+        assert types.get("malformed", 0) == 1
+        assert types.get("truncated", 0) == 0
+
+    def test_truncation_still_scores_fidelity_zero(self, tmp_path):
+        """D4 / mandate from v0: parse failures (including truncated) score fidelity=0."""
+        class _TruncatingClient:
+            def predict(self, **kwargs) -> tuple[str, str]:
+                return '{"counts":', "length"
+
+        state_before = _make_state(pending=0)
+        state_after = _make_state(pending=1)
+        transitions_path = tmp_path / "t.jsonl"
+        _write_transitions(transitions_path, [_make_transition("submitted", state_before, state_after)])
+
+        predictor = Predictor(client=_TruncatingClient())
+        summary = run_scorer(
+            transitions_path=transitions_path,
+            output_dir=tmp_path / "scores",
+            predictor=predictor,
+            samples=1,
+        )
+        assert summary["overall_fidelity"] == 0.0
