@@ -47,7 +47,7 @@ def score_counts(predicted: dict, real: dict, event_type: str) -> dict:
         p_val = predicted.get("counts", {}).get(f, None)
         r_val = real.get("counts", {}).get(f, None)
         if p_val is None or r_val is None:
-            scores[f"counts.{f}"] = {"exact": False, "delta_correct": False, "predicted": p_val, "real": r_val}
+            scores[f"counts.{f}"] = {"exact": False, "predicted": p_val, "real": r_val}
             continue
         exact = p_val == r_val
         scores[f"counts.{f}"] = {
@@ -250,7 +250,6 @@ class Aggregator:
         # Stored as lists of per-sample values indexed by (transition_ref, sample_idx)
         # Aggregated into variance across samples per transition, then averaged
         self._self_consistency_fidelity: dict[str, list[float]] = {}  # ref → [fidelity per sample]
-        self._self_consistency_stasis_v: dict[str, list[float]] = {}  # ref → [stasis_v per sample]
 
         self.all_fidelity: list[float] = []
 
@@ -312,9 +311,6 @@ class Aggregator:
 
         # Self-consistency accumulators
         self._self_consistency_fidelity.setdefault(transition_ref, []).append(fidelity)
-        sv_pred = sv.get("predicted")
-        if sv_pred is not None:
-            self._self_consistency_stasis_v.setdefault(transition_ref, []).append(float(sv_pred))
 
     def noise_floor(self) -> dict:
         """Per-field self-consistency (predictor's intrinsic noise floor)."""
@@ -485,12 +481,8 @@ class Aggregator:
             "counts.failed": "threshold-derivable",
             "in_flight": "threshold-derivable",
             "workers.capacity": "threshold-derivable",
-            "workers.utilization": "threshold-derivable" if self.util_pass else "signal-absent",
-            "stasis_duration": (
-                "threshold-derivable"
-                if self.stasis_d_pass and len(self.stasis_d_pass) > 0
-                else "signal-absent"
-            ),
+            "workers.utilization": "threshold-derivable" if any(self.util_pass) else "signal-absent",
+            "stasis_duration": "threshold-derivable" if any(self.stasis_d_pass) else "signal-absent",
             "stasis_velocity": stasis_v_label,
         }
 
@@ -728,7 +720,7 @@ def load_transitions(
         raise
 
     total = len(all_records)
-    if skip_tail > 0 and len(all_records) > skip_tail:
+    if skip_tail > 0 and len(all_records) >= skip_tail:
         all_records = all_records[:-skip_tail]
     # Apply stride
     sampled = all_records[::sample_stride] if sample_stride > 1 else all_records
