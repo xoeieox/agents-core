@@ -16,8 +16,8 @@ import argparse
 import json
 import logging
 import math
+import os
 import statistics
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -31,8 +31,6 @@ SCORES_DIR_KEY = "calibration.queue_runner"
 # Tolerance bands for continuous fields
 UTILIZATION_ABS_TOLERANCE = 0.05   # ±5pp is a pass
 STASIS_DURATION_REL_TOLERANCE = 0.10  # ±10% relative error is a pass
-STASIS_VELOCITY_REL_TOLERANCE = 0.20  # ±20% for sign-correct predictions
-
 # Minimum ratio of noise-floor to be considered "resolvable"
 NOISE_FLOOR_SNR_MIN = 2.0  # prediction error must be >= 2x self-consistency variance
 
@@ -52,28 +50,12 @@ def score_counts(predicted: dict, real: dict, event_type: str) -> dict:
             scores[f"counts.{f}"] = {"exact": False, "delta_correct": False, "predicted": p_val, "real": r_val}
             continue
         exact = p_val == r_val
-        # Check delta direction per event type
-        delta_correct = _check_count_delta(f, event_type, int(p_val), int(r_val))
         scores[f"counts.{f}"] = {
             "exact": exact,
-            "delta_correct": delta_correct,
             "predicted": p_val,
             "real": r_val,
         }
     return scores
-
-
-def _check_count_delta(field: str, event_type: str, predicted: int, real: int) -> bool:
-    """True if the prediction moved the field in the right direction for this event."""
-    # For exact match this is always right; check direction only when wrong
-    if predicted == real:
-        return True
-    # Direction: did the sign of (predicted - baseline) match (real - baseline)?
-    # We can't recover baseline easily here, so we simply check predicted >= 0
-    # and that the prediction is not wildly off in the wrong direction.
-    # Full direction logic would need state_before; here we just return True for
-    # exact and flag separately — the aggregate uses the "exact" field for fidelity.
-    return False
 
 
 def score_in_flight(predicted: dict, real: dict) -> dict:
@@ -335,7 +317,7 @@ class Aggregator:
             self._self_consistency_stasis_v.setdefault(transition_ref, []).append(float(sv_pred))
 
     def noise_floor(self) -> dict:
-        """Per-field self-consistency variance (predictor's intrinsic noise floor)."""
+        """Per-field self-consistency (predictor's intrinsic noise floor)."""
         def _variance_of_lists(groups: dict[str, list[float]]) -> float:
             variances = []
             for vals in groups.values():
@@ -344,10 +326,16 @@ class Aggregator:
             return statistics.mean(variances) if variances else 0.0
 
         fidelity_var = _variance_of_lists(self._self_consistency_fidelity)
-        stasis_v_var = _variance_of_lists(self._self_consistency_stasis_v)
+        # Noise floor for stasis_velocity: std-dev of per-transition relative errors.
+        # Using rel-error space keeps units compatible with mean_err in the SNR gate.
+        stasis_v_rel_std = (
+            statistics.stdev(self.stasis_v_rel_errors)
+            if len(self.stasis_v_rel_errors) >= 2
+            else 0.0
+        )
         return {
             "fidelity_variance": round(fidelity_var, 6),
-            "stasis_velocity_variance": round(stasis_v_var, 6),
+            "stasis_velocity_rel_error_std": round(stasis_v_rel_std, 6),
         }
 
     def velocity_distribution(self) -> dict:
@@ -376,26 +364,28 @@ class Aggregator:
     def stasis_velocity_threshold_analysis(self) -> dict:
         """Q1: derive a candidate threshold or report 'unknowable-noise-dominated'."""
         nf = self.noise_floor()
-        stasis_v_noise = nf["stasis_velocity_variance"]
+        stasis_v_noise = nf["stasis_velocity_rel_error_std"]
         dist = self.velocity_distribution()
 
         if dist["n"] == 0:
             return {
                 "status": "signal-absent",
                 "reason": "no stasis_velocity observations",
-                "noise_floor_variance": stasis_v_noise,
+                "noise_floor_rel_error_std": stasis_v_noise,
             }
 
         # Prediction error signal: mean relative error
         mean_err = dist.get("mean", 0.0)
 
-        # Gate: prediction error must exceed noise floor by SNR_MIN (mandate 1)
+        # Gate: prediction error must exceed noise floor by SNR_MIN (mandate 1).
+        # Both mean_err and stasis_v_noise are dimensionless relative errors, so
+        # SNR = mean_err / std(rel_errors) is a valid signal-to-noise ratio.
         if stasis_v_noise == 0.0 and mean_err == 0.0:
             # Perfect predictions — threshold derivable but trivially
             return {
                 "status": "threshold-derivable",
                 "candidate_threshold_rel_error": 0.0,
-                "noise_floor_variance": stasis_v_noise,
+                "noise_floor_rel_error_std": stasis_v_noise,
                 "snr_ratio": float("inf"),
                 "note": "perfect predictions (likely fake client)",
             }
@@ -406,9 +396,9 @@ class Aggregator:
                 "status": "unknowable-noise-dominated",
                 "reason": (
                     f"prediction error (mean_rel_err={mean_err:.4f}) does not clear "
-                    f"noise floor (variance={stasis_v_noise:.6f}, SNR={snr:.2f} < {NOISE_FLOOR_SNR_MIN})"
+                    f"noise floor (rel_error_std={stasis_v_noise:.6f}, SNR={snr:.2f} < {NOISE_FLOOR_SNR_MIN})"
                 ),
-                "noise_floor_variance": stasis_v_noise,
+                "noise_floor_rel_error_std": stasis_v_noise,
                 "snr_ratio": round(snr, 3),
                 "distribution": dist,
             }
@@ -418,7 +408,7 @@ class Aggregator:
         return {
             "status": "threshold-derivable",
             "candidate_threshold_rel_error": candidate,
-            "noise_floor_variance": stasis_v_noise,
+            "noise_floor_rel_error_std": stasis_v_noise,
             "snr_ratio": round(snr, 3),
             "distribution": dist,
             "note": (
@@ -478,13 +468,6 @@ class Aggregator:
         """Mandate 4: per-field noise-floor vs prediction error, labeled."""
         nf = self.noise_floor()
         stasis_v_analysis = self.stasis_velocity_threshold_analysis()
-
-        def _field_label(signal_present: bool, threshold_derivable: bool) -> str:
-            if not signal_present:
-                return "signal-absent"
-            if threshold_derivable:
-                return "threshold-derivable"
-            return "unknowable-noise-dominated"
 
         # Discrete fields: always deterministic, signal always present + derivable
         # Continuous fields: gate on noise floor
@@ -654,7 +637,7 @@ def render_report_md(agg: dict, run_args: dict) -> str:
     lines += [
         "## Noise Floor (Predictor Self-Consistency)",
         f"- Fidelity variance across samples: {nf.get('fidelity_variance', 'n/a')}",
-        f"- stasis_velocity variance across samples: {nf.get('stasis_velocity_variance', 'n/a')}",
+        f"- stasis_velocity rel-error std across samples: {nf.get('stasis_velocity_rel_error_std', 'n/a')}",
         "",
     ]
 
@@ -676,7 +659,7 @@ def render_report_md(agg: dict, run_args: dict) -> str:
         lines += [
             f"- Candidate threshold (p75 rel-error): {sva.get('candidate_threshold_rel_error', 'n/a')}",
             f"- SNR ratio: {sva.get('snr_ratio', 'n/a')}",
-            f"- Noise floor variance: {sva.get('noise_floor_variance', 'n/a')}",
+            f"- Noise floor (rel-error std): {sva.get('noise_floor_rel_error_std', 'n/a')}",
             "",
             f"_{sva.get('note', '')}_",
             "",
@@ -717,8 +700,16 @@ def render_report_md(agg: dict, run_args: dict) -> str:
 # Main scoring loop
 # ---------------------------------------------------------------------------
 
-def load_transitions(transitions_path: Path, limit: int | None, sample_stride: int) -> tuple[list[dict], int]:
+def load_transitions(
+    transitions_path: Path,
+    limit: int | None,
+    sample_stride: int,
+    skip_tail: int = 0,
+) -> tuple[list[dict], int]:
     """Load transitions.jsonl, applying stride and limit.
+
+    skip_tail removes the last N records before stride/limit, used to exclude
+    few-shot examples that were sourced from the corpus tail.
 
     Returns (sampled_transitions, total_corpus_size).
     """
@@ -737,6 +728,8 @@ def load_transitions(transitions_path: Path, limit: int | None, sample_stride: i
         raise
 
     total = len(all_records)
+    if skip_tail > 0 and len(all_records) > skip_tail:
+        all_records = all_records[:-skip_tail]
     # Apply stride
     sampled = all_records[::sample_stride] if sample_stride > 1 else all_records
     # Apply limit
@@ -753,16 +746,17 @@ def run_scorer(
     limit: int | None = None,
     sample_stride: int = 1,
     few_shot_examples: list[dict] | None = None,
+    few_shot_skip_tail: int = 0,
 ) -> dict:
     """Core scoring loop. Returns the aggregate summary dict.
 
-    Writes scores.jsonl, report.md, report.json under output_dir.
+    Writes scores.jsonl under output_dir.
     Never mutates transitions_path.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     scores_path = output_dir / "scores.jsonl"
 
-    transitions, total_corpus = load_transitions(transitions_path, limit, sample_stride)
+    transitions, total_corpus = load_transitions(transitions_path, limit, sample_stride, skip_tail=few_shot_skip_tail)
     n_scored = len(transitions)
     log.info(
         "scoring %d transitions (stride=%d, limit=%s) out of %d corpus total (%.1f%%)",
@@ -872,9 +866,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    endpoint = (
-        __import__("os").environ.get("AGENTWORLD_ENDPOINT", args.endpoint)
-    )
+    endpoint = os.environ.get("AGENTWORLD_ENDPOINT", args.endpoint)
 
     if args.fake:
         client = FakeAgentWorldClient()
@@ -884,12 +876,16 @@ def main(argv: list[str] | None = None) -> None:
         predictor = Predictor(model=args.model, endpoint=endpoint)
         log.info("using HTTP AgentWorld client at %s", endpoint)
 
-    # Load few-shot examples from the corpus itself (first K transitions)
+    # Load few-shot examples from the corpus TAIL to avoid contaminating the scored set.
+    # The tail items are then excluded from scoring via few_shot_skip_tail.
     few_shot_examples: list[dict] | None = None
+    few_shot_skip_tail = 0
     if args.few_shot > 0:
-        transitions_all, _ = load_transitions(args.transitions, limit=args.few_shot, sample_stride=1)
-        few_shot_examples = transitions_all[: args.few_shot]
-        log.info("using %d few-shot examples", len(few_shot_examples))
+        all_transitions, _ = load_transitions(args.transitions, limit=None, sample_stride=1)
+        few_shot_examples = all_transitions[-args.few_shot:] if len(all_transitions) >= args.few_shot else all_transitions
+        few_shot_skip_tail = len(few_shot_examples)
+        log.info("using %d few-shot examples from corpus tail (last %d records excluded from scoring)",
+                 len(few_shot_examples), few_shot_skip_tail)
 
     run_args = {
         "samples": args.samples,
@@ -908,6 +904,7 @@ def main(argv: list[str] | None = None) -> None:
         limit=args.limit,
         sample_stride=args.sample_stride,
         few_shot_examples=few_shot_examples,
+        few_shot_skip_tail=few_shot_skip_tail,
     )
 
     # Write report.json

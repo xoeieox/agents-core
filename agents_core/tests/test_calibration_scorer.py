@@ -346,14 +346,16 @@ class TestVelocityThresholdAnalysis:
         assert analysis["status"] != "unknowable-noise-dominated"
 
     def test_unknowable_when_noise_dominates(self, tmp_path):
-        """When mean_err < noise_floor * SNR_MIN, report 'unknowable-noise-dominated'."""
+        """When mean_err < noise_floor_std * SNR_MIN, report 'unknowable-noise-dominated'.
+
+        The SNR gate operates in rel-error space: mean(rel_errors) / stdev(rel_errors).
+        Noise dominates when the spread of rel_errors is large relative to their mean.
+        """
         from agents_core.calibration.scorer import NOISE_FLOOR_SNR_MIN
 
-        # We'll test by constructing an aggregator directly with a scenario
-        # where stasis_v variance is large relative to prediction error.
         agg = Aggregator()
-        # Add two samples for the same transition with highly variable stasis_v predictions
-        for i, sv_pred in enumerate([1.0, -1.0]):
+        # Two transitions with very different rel_errors: mean=0.5, stdev≈0.636 → SNR≈0.79 < 2.0
+        for i, (sv_pred, rel_err) in enumerate([(1.0, 0.01), (-1.0, 0.99)]):
             field_scores = {
                 "counts": {},
                 "in_flight": {"precision": 1.0, "recall": 1.0, "true_positive_ids": [], "false_positive_ids": [], "false_negative_ids": [], "job_field_scores": []},
@@ -362,15 +364,15 @@ class TestVelocityThresholdAnalysis:
                 "stasis_duration": {"pass": True},
                 "stasis_velocity": {
                     "direction_match": True,
-                    "magnitude_error": 0.0,
-                    "rel_error": 0.01,  # tiny rel error = tiny signal
+                    "magnitude_error": abs(rel_err),
+                    "rel_error": rel_err,
                     "predicted": sv_pred,
-                    "real": 0.0,
+                    "real": 1.0,
                 },
             }
             agg.add(
-                transition_ref="tr-1",
-                sample_idx=i,
+                transition_ref=f"tr-{i}",
+                sample_idx=0,
                 fidelity=0.9,
                 field_scores=field_scores,
                 parse_ok=True,
@@ -379,13 +381,12 @@ class TestVelocityThresholdAnalysis:
             )
 
         nf = agg.noise_floor()
-        # stasis_v variance should be high (we went 1.0 vs -1.0)
-        assert nf["stasis_velocity_variance"] > 0.0
+        # Noise floor is now std-dev of rel-errors: stdev([0.01, 0.99]) ≈ 0.693
+        assert nf["stasis_velocity_rel_error_std"] > 0.0
 
         analysis = agg.stasis_velocity_threshold_analysis()
-        # With rel_error=0.01 mean and high variance, should be unknowable
-        if nf["stasis_velocity_variance"] > 0.01 / NOISE_FLOOR_SNR_MIN:
-            assert analysis["status"] == "unknowable-noise-dominated"
+        # SNR = mean([0.01, 0.99]) / stdev([0.01, 0.99]) = 0.5 / 0.693 ≈ 0.72 < 2.0
+        assert analysis["status"] == "unknowable-noise-dominated"
 
     def test_threshold_candidate_emitted_when_clear(self, tmp_path):
         """With consistent predictions far above noise floor, threshold is derivable."""
