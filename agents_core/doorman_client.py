@@ -140,11 +140,12 @@ class DoormanClient:
                       inference) but still counted by /v0/drain-count for flip-protection.
                       Omitting is byte-identical to "inference".
 
-        Returns dict with status field (or contended sentinel):
+        Returns dict with status field (or contended/creative_occupied sentinel):
           "serving" — GW is serving; lease registered and keepawake hold placed
           "deferred" — GW is serving a controller-owned non-big mode; no lease registered
           "wake_failed" — GW failed to wake
           {"ok": False, "contended": True} — drain gate active; another group holds a lease
+          {"ok": False, "creative_occupied": True} — Llama-3.3-70B holds the GPU; check is_creative_occupied()
         """
         body: dict = {
             "node": node,
@@ -222,6 +223,11 @@ class DoormanClient:
         Returns True iff resp["status"] == "deferred", False otherwise.
         """
         return resp.get("status") == "deferred"
+
+    @staticmethod
+    def is_creative_occupied(resp: dict) -> bool:
+        """Return True if the acquire was refused because the creative 70B holds the GPU."""
+        return bool(resp.get("creative_occupied"))
 
     @staticmethod
     def is_contended(resp: dict) -> bool:
