@@ -188,8 +188,9 @@ class _NodeState:
     def _is_creative_serving(self) -> bool:
         """Return True if the Llama-3.3-70B creative server is up on :8093.
 
-        Called OUTSIDE the lock (blocking HTTP). Returns False on any error -
-        if :8093 is unreachable, the 70B is not actively serving.
+        Lock-free HTTP - safe to call outside lock; also called under lock in
+        ensure_serving(). Returns False on any error - if :8093 is unreachable,
+        the 70B is not actively serving.
         """
         try:
             r = requests.get(f"{GW_CREATIVE_URL}/health", timeout=2.5)
