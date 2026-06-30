@@ -190,6 +190,7 @@ def build_prompt(
     event: dict,
     few_shot_examples: list[dict] | None = None,
     prompt_mode: str = "no-rules",
+    prior_transitions: list[dict] | None = None,
 ) -> list[dict]:
     """Build the messages list for an AgentWorld chat completion.
 
@@ -197,6 +198,8 @@ def build_prompt(
     They are inserted as (user, assistant) turns before the actual query.
     prompt_mode: 'no-rules' (default) omits the state-machine rule list to test
     learned prior; 'with-rules' uses the v0 verbatim prompt (instruction-following).
+    prior_transitions: ground-truth prior transitions (oldest first) prepended as
+    numbered context blocks [Prior -K]..[Prior -1] before the current prediction task.
     """
     system_prompt = (
         _SYSTEM_PROMPT_WITH_RULES if prompt_mode == "with-rules" else _SYSTEM_PROMPT_NO_RULES
@@ -213,17 +216,34 @@ def build_prompt(
 
     messages.append({
         "role": "user",
-        "content": _make_user_content(state_before, event),
+        "content": _make_user_content(state_before, event, prior_transitions),
     })
     return messages
 
 
-def _make_user_content(state_before: dict, event: dict) -> str:
-    return (
+def _make_user_content(
+    state_before: dict,
+    event: dict,
+    prior_transitions: list[dict] | None = None,
+) -> str:
+    current = (
         f"state_before:\n{json.dumps(state_before, indent=2)}\n\n"
         f"event:\n{json.dumps(event, indent=2)}\n\n"
         "Predict state_after:"
     )
+    if not prior_transitions:
+        return current
+    n = len(prior_transitions)
+    parts = ["Prior context (most recent last):", ""]
+    for i, pt in enumerate(prior_transitions):
+        label = i - n  # -n (oldest) .. -1 (newest)
+        parts.append(f"[Prior {label}]")
+        parts.append(f"state_before: {json.dumps(pt['state_before'])}")
+        parts.append(f"event: {json.dumps(pt['event'])}")
+        parts.append(f"state_after: {json.dumps(pt['state_after'])}")
+        parts.append("")
+    parts.append("Now predict:")
+    return "\n".join(parts) + "\n" + current
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +307,7 @@ class Predictor:
         state_before: dict,
         event: dict,
         few_shot_examples: list[dict] | None = None,
+        prior_transitions: list[dict] | None = None,
     ) -> dict:
         """Return a prediction result dict.
 
@@ -296,7 +317,11 @@ class Predictor:
           - raw_response: str
           - parse_failure_type: str | None  ('truncated', 'malformed', 'error', or None)
         """
-        messages = build_prompt(state_before, event, few_shot_examples, prompt_mode=self.prompt_mode)
+        messages = build_prompt(
+            state_before, event, few_shot_examples,
+            prompt_mode=self.prompt_mode,
+            prior_transitions=prior_transitions,
+        )
         try:
             raw, finish_reason = self.client.predict(
                 messages=messages,

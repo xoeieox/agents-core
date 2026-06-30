@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import statistics
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -573,6 +574,8 @@ def render_report_md(agg: dict, run_args: dict) -> str:
     lines = ["# AgentWorld Queue-Runner Fidelity Report", ""]
 
     prompt_mode = run_args.get("prompt_mode", "no-rules")
+    k = run_args.get("prior_transitions", 0)
+    prior_context = run_args.get("prior_context", "none")
 
     # Mandatory banner for with-rules mode (mandate 2: with-rules is instruction-following, not fidelity)
     if prompt_mode == "with-rules":
@@ -581,6 +584,16 @@ def render_report_md(agg: dict, run_args: dict) -> str:
             "> This report used `--prompt-mode with-rules`: the state-machine rules were supplied in the",
             "> system prompt.  Results measure rule-following, not AgentWorld's learned prior.",
             "> Use `--prompt-mode no-rules` (the default) for any fidelity claim.",
+            "",
+        ]
+
+    # Framing note for K>0 (mandate 1 from spec-review 2026-06-30)
+    if k > 0:
+        lines += [
+            "> **Prior context: ground-truth corpus transitions.**",
+            "> Score measures *contextual inference* (model reasons from supplied history),",
+            "> not *internal state retention* (model autonomously holds queue state).",
+            "> Use `--prior-transitions 0` for the pure learned-prior fidelity claim.",
             "",
         ]
 
@@ -593,6 +606,8 @@ def render_report_md(agg: dict, run_args: dict) -> str:
         f"- Endpoint: {run_args.get('endpoint', 'n/a')}",
         f"- Model: {run_args.get('model', 'n/a')}",
         f"- Prompt mode: `{prompt_mode}`",
+        f"- Prior transitions (K): {k}",
+        f"- Prior context: {prior_context}",
         "",
     ]
 
@@ -771,11 +786,13 @@ def run_scorer(
     sample_stride: int = 1,
     few_shot_examples: list[dict] | None = None,
     few_shot_skip_tail: int = 0,
+    prior_transitions: int = 0,
 ) -> dict:
     """Core scoring loop. Returns the aggregate summary dict.
 
     Writes scores.jsonl under output_dir.
     Never mutates transitions_path.
+    prior_transitions: K ground-truth prior transitions as rolling context (0 = v0.1 behavior).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     scores_path = output_dir / "scores.jsonl"
@@ -783,12 +800,13 @@ def run_scorer(
     transitions, total_corpus = load_transitions(transitions_path, limit, sample_stride, skip_tail=few_shot_skip_tail)
     n_scored = len(transitions)
     log.info(
-        "scoring %d transitions (stride=%d, limit=%s) out of %d corpus total (%.1f%%)",
-        n_scored, sample_stride, limit, total_corpus,
+        "scoring %d transitions (stride=%d, limit=%s, prior_k=%d) out of %d corpus total (%.1f%%)",
+        n_scored, sample_stride, limit, prior_transitions, total_corpus,
         100.0 * n_scored / total_corpus if total_corpus else 0.0,
     )
 
     agg = Aggregator()
+    ctx_deque: deque[dict] = deque(maxlen=prior_transitions if prior_transitions > 0 else 0)
 
     with open(scores_path, "w") as scores_fh:
         for i, tr in enumerate(transitions):
@@ -799,8 +817,10 @@ def run_scorer(
             consistency_flag = tr.get("consistency", "unknown")
             event_type = event.get("event", "unknown")
 
+            prior_ctx = list(ctx_deque) if prior_transitions > 0 else None
+
             for sample_idx in range(samples):
-                result = predictor.predict(state_before, event, few_shot_examples)
+                result = predictor.predict(state_before, event, few_shot_examples, prior_transitions=prior_ctx)
                 parse_ok = result["parse_ok"]
                 predicted_state = result.get("predicted_state") or {}
 
@@ -835,6 +855,14 @@ def run_scorer(
                     "event_type": event_type,
                 }
                 scores_fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+            # Advance rolling ground-truth context (after all samples for this transition)
+            if prior_transitions > 0:
+                ctx_deque.append({
+                    "state_before": state_before,
+                    "event": event,
+                    "state_after": real_state_after,
+                })
 
     summary = agg.summary(scored_count=n_scored, total_corpus=total_corpus)
     return summary
@@ -899,6 +927,14 @@ def main(argv: list[str] | None = None) -> None:
             "with-rules: supply rules verbatim (v0 baseline) — instruction-following benchmark only, NOT fidelity."
         ),
     )
+    parser.add_argument(
+        "--prior-transitions", type=int, default=3, dest="prior_transitions",
+        help=(
+            "K ground-truth prior transitions prepended as context (default: 3). "
+            "0 = v0.1 behavior (no prior context). "
+            "When K>0, score measures contextual inference, not learned prior retention."
+        ),
+    )
     args = parser.parse_args(argv)
 
     endpoint = os.environ.get("AGENTWORLD_ENDPOINT", args.endpoint)
@@ -933,6 +969,8 @@ def main(argv: list[str] | None = None) -> None:
         "limit": args.limit,
         "sample_stride": args.sample_stride,
         "prompt_mode": args.prompt_mode,
+        "prior_transitions": args.prior_transitions,
+        "prior_context": "ground-truth" if args.prior_transitions > 0 else "none",
     }
 
     summary = run_scorer(
@@ -944,6 +982,7 @@ def main(argv: list[str] | None = None) -> None:
         sample_stride=args.sample_stride,
         few_shot_examples=few_shot_examples,
         few_shot_skip_tail=few_shot_skip_tail,
+        prior_transitions=args.prior_transitions,
     )
 
     # Write report.json
