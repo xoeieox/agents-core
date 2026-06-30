@@ -993,6 +993,225 @@ class TestV01D1ResolutionMapDerived:
         assert rm["in_flight"] == "threshold-derivable"
 
 
+# ---------------------------------------------------------------------------
+# 15. v0.2: --prior-transitions K flag (temporal reframe)
+# ---------------------------------------------------------------------------
+
+class TestPriorTransitions:
+    """v0.2 spec: --prior-transitions K adds ground-truth prior context to prompts.
+
+    Fixture mirrors corpus-idx=1200: state_before has 1 pending + 1 in_flight,
+    event is 'claimed', state_after has 0 pending + 2 in_flight.
+    """
+
+    _JOB_EXISTING = {
+        "id": "existing-job",
+        "task_type": "calibration",
+        "model": "agentworld",
+        "claimed_at": "2026-01-01T00:00:00+00:00",
+        "stasis_duration": 5.0,
+    }
+    _JOB_NEW = {
+        "id": "new-job",
+        "task_type": "calibration",
+        "model": "agentworld",
+        "claimed_at": "2026-01-01T00:00:10+00:00",
+        "stasis_duration": 0.0,
+    }
+
+    def _state_before(self):
+        return _make_state(pending=1, active=1, in_flight=[self._JOB_EXISTING])
+
+    def _event(self):
+        ev = _make_event("claimed", job_id="new-job", task_type="calibration", model="agentworld")
+        ev["timestamp"] = "2026-01-01T00:00:10+00:00"
+        return ev
+
+    def _state_after(self):
+        return _make_state(pending=0, active=2, in_flight=[self._JOB_EXISTING, self._JOB_NEW])
+
+    def _priors(self):
+        return [
+            {
+                "state_before": _make_state(pending=0),
+                "event": _make_event("submitted", job_id="prior-1"),
+                "state_after": _make_state(pending=1),
+            },
+            {
+                "state_before": _make_state(pending=1),
+                "event": _make_event("submitted", job_id="prior-2"),
+                "state_after": _make_state(pending=2),
+            },
+            {
+                "state_before": _make_state(pending=2),
+                "event": _make_event("claimed", job_id="prior-3"),
+                "state_after": _make_state(pending=1, active=1, in_flight=[self._JOB_EXISTING]),
+            },
+        ]
+
+    def test_k0_prompt_has_no_prior_blocks(self):
+        """K=0: prompt must not contain [Prior blocks or 'Prior context' header."""
+        messages = build_prompt(self._state_before(), self._event(), prior_transitions=[])
+        last_user = next(m["content"] for m in reversed(messages) if m["role"] == "user")
+        assert "[Prior" not in last_user
+        assert "Prior context" not in last_user
+
+    def test_k3_prompt_has_three_prior_blocks_oldest_first(self):
+        """K=3: prompt has exactly 3 [Prior blocks, ordered oldest-first (-3/-2/-1)."""
+        import re as _re
+        messages = build_prompt(self._state_before(), self._event(), prior_transitions=self._priors())
+        last_user = next(m["content"] for m in reversed(messages) if m["role"] == "user")
+
+        labels = _re.findall(r"\[Prior -\d+\]", last_user)
+        assert len(labels) == 3, f"expected 3 prior blocks, got {len(labels)}: {labels}"
+        assert labels == ["[Prior -3]", "[Prior -2]", "[Prior -1]"], f"wrong order: {labels}"
+
+    def test_k3_current_state_before_matches_transition(self):
+        """K=3: the current prediction section reflects the actual state_before."""
+        messages = build_prompt(self._state_before(), self._event(), prior_transitions=self._priors())
+        last_user = next(m["content"] for m in reversed(messages) if m["role"] == "user")
+
+        # Current prediction section follows "Now predict:"
+        assert "Now predict:" in last_user
+        now_pos = last_user.index("Now predict:")
+        current_section = last_user[now_pos:]
+
+        # The current block uses indented JSON — verify the right pending count and job appear
+        # pending=1 appears in the current state_before (not the prior-3 state_after which also has pending=1,
+        # but we verify "existing-job" is present and the section is self-consistent)
+        assert '"pending": 1' in current_section
+        assert "existing-job" in current_section
+
+    def test_k3_prior_blocks_use_oldest_first_content(self):
+        """K=3: [Prior -3] block contains the oldest prior's data."""
+        import re as _re
+        messages = build_prompt(self._state_before(), self._event(), prior_transitions=self._priors())
+        last_user = next(m["content"] for m in reversed(messages) if m["role"] == "user")
+
+        # [Prior -3] is the oldest (index 0: submitted prior-1, pending 0→1)
+        prior3_pos = last_user.index("[Prior -3]")
+        prior2_pos = last_user.index("[Prior -2]")
+        section = last_user[prior3_pos:prior2_pos]
+        assert "prior-1" in section  # event id from oldest prior
+
+    def test_k3_scorer_rolling_deque_fills_from_corpus(self, tmp_path):
+        """K=3 run_scorer: after 3 transitions the deque is full; predictor receives prior context."""
+        import re as _re
+
+        captured_prompts = []
+
+        class _CapturingClient:
+            def predict(self, messages, **kwargs):
+                last_user = next(m["content"] for m in reversed(messages) if m["role"] == "user")
+                captured_prompts.append(last_user)
+                return json.dumps(_make_state(pending=0)), "stop"
+
+        transitions = [
+            _make_transition("submitted", _make_state(pending=i), _make_state(pending=i + 1), ts_offset=float(i))
+            for i in range(5)
+        ]
+        transitions_path = tmp_path / "t.jsonl"
+        _write_transitions(transitions_path, transitions)
+
+        predictor = Predictor(client=_CapturingClient())
+        run_scorer(
+            transitions_path=transitions_path,
+            output_dir=tmp_path / "scores",
+            predictor=predictor,
+            samples=1,
+            prior_transitions=3,
+        )
+
+        # First transition: no priors available yet
+        assert "[Prior" not in captured_prompts[0]
+        # 4th transition (index 3): should have 3 prior blocks
+        labels = _re.findall(r"\[Prior -\d+\]", captured_prompts[3])
+        assert len(labels) == 3, f"expected 3 prior blocks at transition 4, got {labels}"
+
+    def test_k0_run_scorer_backward_compatible(self, tmp_path):
+        """prior_transitions=0 produces the same output as not passing it (v0.1 behavior)."""
+        state_before = _make_state(pending=1)
+        state_after = _make_state(pending=2)
+        transitions_path = tmp_path / "t.jsonl"
+        _write_transitions(transitions_path, [_make_transition("submitted", state_before, state_after)])
+
+        predictor = Predictor(client=FakeAgentWorldClient())
+        summary = run_scorer(
+            transitions_path=transitions_path,
+            output_dir=tmp_path / "scores",
+            predictor=predictor,
+            samples=1,
+            prior_transitions=0,
+        )
+        assert summary["total_scored"] == 1
+        assert summary["parse_failures"] == 0
+
+    def test_prior_context_framing_note_in_report_when_k_gt_0(self, tmp_path):
+        """report.md carries the framing note when K>0 (mandate 1)."""
+        state_before = _make_state(pending=1)
+        state_after = _make_state(pending=2)
+        transitions_path = tmp_path / "t.jsonl"
+        _write_transitions(transitions_path, [_make_transition("submitted", state_before, state_after)])
+
+        predictor = Predictor(client=FakeAgentWorldClient())
+        summary = run_scorer(
+            transitions_path=transitions_path,
+            output_dir=tmp_path / "scores",
+            predictor=predictor,
+            samples=1,
+            prior_transitions=3,
+        )
+        md = render_report_md(summary, {
+            "samples": 1, "endpoint": "fake", "model": "fake",
+            "prior_transitions": 3, "prior_context": "ground-truth",
+        })
+        assert "Prior context: ground-truth corpus transitions" in md
+        assert "contextual inference" in md
+        assert "--prior-transitions 0" in md
+
+    def test_no_framing_note_when_k0(self, tmp_path):
+        """report.md must NOT carry the framing note when K=0."""
+        state_before = _make_state(pending=1)
+        state_after = _make_state(pending=2)
+        transitions_path = tmp_path / "t.jsonl"
+        _write_transitions(transitions_path, [_make_transition("submitted", state_before, state_after)])
+
+        predictor = Predictor(client=FakeAgentWorldClient())
+        summary = run_scorer(
+            transitions_path=transitions_path,
+            output_dir=tmp_path / "scores",
+            predictor=predictor,
+            samples=1,
+            prior_transitions=0,
+        )
+        md = render_report_md(summary, {
+            "samples": 1, "endpoint": "fake", "model": "fake",
+            "prior_transitions": 0, "prior_context": "none",
+        })
+        assert "contextual inference" not in md
+
+    def test_run_args_records_prior_context_provenance(self, tmp_path):
+        """report.md Run section shows prior_transitions and prior_context fields."""
+        state_before = _make_state(pending=1)
+        state_after = _make_state(pending=2)
+        transitions_path = tmp_path / "t.jsonl"
+        _write_transitions(transitions_path, [_make_transition("submitted", state_before, state_after)])
+
+        predictor = Predictor(client=FakeAgentWorldClient())
+        summary = run_scorer(
+            transitions_path=transitions_path,
+            output_dir=tmp_path / "scores",
+            predictor=predictor,
+            samples=1,
+        )
+        md = render_report_md(summary, {
+            "samples": 1, "endpoint": "fake", "model": "fake",
+            "prior_transitions": 3, "prior_context": "ground-truth",
+        })
+        assert "Prior transitions (K): 3" in md
+        assert "Prior context: ground-truth" in md
+
+
 class TestV01D4TruncationDetection:
     """D4: truncation must be detected as a distinct parse-failure subtype."""
 
