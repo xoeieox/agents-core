@@ -481,6 +481,8 @@ def _build_fixer_result(
     max_steps_reached: bool = False,
     no_progress: bool = False,
     budget_forced: bool = False,
+    interrupted: bool = False,
+    interrupt_reason: str = "",
 ) -> dict:
     """Build a FixerResult dict from the completed writeable run."""
     diff_result = subprocess.run(
@@ -507,6 +509,8 @@ def _build_fixer_result(
         "max_steps_reached": max_steps_reached,
         "no_progress": no_progress,
         "budget_forced": budget_forced,
+        "interrupted": interrupted,
+        "interrupt_reason": interrupt_reason,
         "steps": transcript,
     }
 
@@ -711,6 +715,9 @@ def call_gw_agent(
     no_progress_steps: int = 8,
     principal: str | None = None,
     verdict_schema: dict | None = None,
+    tool_executors: dict[str, ToolExecutor] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    before_tool: Callable[[str, dict], dict] | None = None,
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Run a multi-step read-only tool-loop on GravityWell.
 
@@ -747,6 +754,22 @@ def call_gw_agent(
                    (FixerResult, transcript). Default False keeps behavior byte-identical to
                    read-only callers. The return_transcript argument is ignored for writeable
                    runs — the tuple form is always used.
+        tool_executors: Optional executor map {tool_name: ToolExecutor}. When provided,
+                        used instead of the default registry built by _get_tool_executors.
+                        When None (default), behavior is unchanged. Supply together with
+                        a matching `tools` param (OpenAI tool defs).
+        cancel_check: Optional callable () -> bool. When provided, called at the top of each
+                      step and immediately before each tool execution. Truthy return halts the
+                      loop with an interrupted result (reason="user_cancel"). Raising halts
+                      with reason="cancel_check_failed" (fail-safe: a broken STOP must never
+                      silently continue). When None (default), never called.
+        before_tool: Optional callable (tool_name, tool_args) -> dict. When provided, called
+                     before each tool execution. Return value is a gate dict with key
+                     "decision": "proceed" (execute normally), "reject" (skip execution, feed
+                     {"error": "rejected: <reason>"} back to the model), or "stop" (halt
+                     loop, interrupted result). Raising is fail-closed: the tool is skipped
+                     with {"error": "gate_failure: <detail>"} fed back, loop continues. When
+                     None (default), never called.
 
     Returns:
         - str or None (or (str|None, list) when return_transcript=True).
@@ -787,7 +810,8 @@ def call_gw_agent(
     messages.append({"role": "user", "content": prompt})
 
     transcript: list[dict] = []
-    tool_executors = _get_tool_executors(cwd, writeable=writeable)
+    if tool_executors is None:
+        tool_executors = _get_tool_executors(cwd, writeable=writeable)
     repeated_calls: dict[str, int] = {}
     ctx_tokens = 0
     # No-progress guard state (writeable mode): track consecutive steps with no semantic progress.
@@ -796,6 +820,10 @@ def call_gw_agent(
     # Grounding guard state (json_mode review runs): track verified (error-free) tool calls.
     grounding_count = 0  # tool calls with error is None
     grounding_nudged = False  # True after the first 0-tool-call stop nudge
+    # Interrupt state: set by cancel_check or before_tool stop.
+    _interrupted = False
+    _interrupt_reason = ""
+    _interrupted_step = 0
 
     # Acquire doorman lease for the whole run (unless acquire_lease=False for swarm).
     from agents_core.doorman_client import DoormanClient, DoormanUnreachable, _gw_acquire_timeout
@@ -898,6 +926,21 @@ def call_gw_agent(
                 log(f"[gw_agent] step {step_num + 1}/{max_steps}")
             step_made_progress = False
 
+            # Step-top cancel check (fail-safe: raising halts the loop)
+            if cancel_check is not None:
+                try:
+                    if cancel_check():
+                        _interrupted = True
+                        _interrupt_reason = "user_cancel"
+                        _interrupted_step = step_num + 1
+                except Exception as _cc_exc:
+                    logger.error(f"[gw_agent] cancel_check raised at step top: {_cc_exc}")
+                    _interrupted = True
+                    _interrupt_reason = "cancel_check_failed"
+                    _interrupted_step = step_num + 1
+                if _interrupted:
+                    break
+
             # Per-step timeout: leave headroom for the forced-conclusion model call.
             # Never cap below 20s (a legitimate slow step on a loaded 122B can take minutes).
             _per_step_timeout = max(20.0, _deadline - _now - _conclusion_reserve_s)
@@ -992,8 +1035,44 @@ def call_gw_agent(
                             writeable, cwd, concluded=False, max_steps_reached=True,
                         )
 
-                    # Execute tool.
-                    if tool_name in tool_executors:
+                    # Pre-tool cancel check (fail-safe: raising halts the loop)
+                    if cancel_check is not None:
+                        try:
+                            if cancel_check():
+                                _interrupted = True
+                                _interrupt_reason = "user_cancel"
+                                _interrupted_step = step_num + 1
+                        except Exception as _cc_exc:
+                            logger.error(f"[gw_agent] cancel_check raised pre-tool: {_cc_exc}")
+                            _interrupted = True
+                            _interrupt_reason = "cancel_check_failed"
+                            _interrupted_step = step_num + 1
+                    if _interrupted:
+                        break
+
+                    # Before-tool gate (fail-closed: raising rejects this tool, loop continues)
+                    _gate_override: dict | None = None
+                    if before_tool is not None:
+                        try:
+                            _gate = before_tool(tool_name, tool_args)
+                            _decision = _gate.get("decision", "proceed") if isinstance(_gate, dict) else "proceed"
+                            if _decision == "stop":
+                                _interrupted = True
+                                _interrupt_reason = "user_cancel"
+                                _interrupted_step = step_num + 1
+                            elif _decision == "reject":
+                                _reason_text = _gate.get("reason", "gate rejected") if isinstance(_gate, dict) else "gate rejected"
+                                _gate_override = {"error": f"rejected: {_reason_text}"}
+                        except Exception as _bt_exc:
+                            logger.warning(f"[gw_agent] before_tool raised: {_bt_exc}")
+                            _gate_override = {"error": f"gate_failure: {_bt_exc}"}
+                    if _interrupted:
+                        break
+
+                    # Execute tool (or use gate override for reject/gate_failure)
+                    if _gate_override is not None:
+                        tool_result = _gate_override
+                    elif tool_name in tool_executors:
                         try:
                             tool_result = tool_executors[tool_name].execute(tool_args)
                         except Exception as e:
@@ -1052,6 +1131,9 @@ def call_gw_agent(
                                 if tc != last_test_counts:
                                     step_made_progress = True
                                     last_test_counts = tc
+
+                if _interrupted:
+                    break
 
                 # No-progress guard: abort if K consecutive steps made no semantic progress.
                 if writeable and no_progress_steps > 0:
@@ -1145,6 +1227,16 @@ def call_gw_agent(
                 return _finalize_writeable_or_readonly(
                     messages, content, return_transcript, transcript, writeable, cwd, concluded=True
                 )
+
+        # Interrupted: cancel_check or before_tool stop halted the loop.
+        if _interrupted:
+            if log:
+                log(f"[gw_agent] interrupted at step {_interrupted_step} reason={_interrupt_reason}")
+            return _finalize_writeable_or_readonly(
+                messages, "", return_transcript, transcript, writeable, cwd, concluded=False,
+                interrupted=True, interrupt_reason=_interrupt_reason,
+                interrupted_step=_interrupted_step,
+            )
 
         # Exhausted max_steps without conclusion; try forced conclusion.
         if log:
@@ -1381,19 +1473,25 @@ def _finalize_writeable_or_readonly(
     no_progress: bool = False,
     budget_forced: bool = False,
     budget_forced_suffix: str = "",
+    interrupted: bool = False,
+    interrupt_reason: str = "",
+    interrupted_step: int = 0,
 ) -> str | None | tuple:
     """Route to FixerResult or plain result based on writeable flag."""
     if writeable:
         fixer = _build_fixer_result(
             cwd, transcript,
-            concluded=concluded and not max_steps_reached and not no_progress and not budget_forced,
+            concluded=concluded and not max_steps_reached and not no_progress and not budget_forced and not interrupted,
             max_steps_reached=max_steps_reached,
             no_progress=no_progress,
             budget_forced=budget_forced,
+            interrupted=interrupted,
+            interrupt_reason=interrupt_reason,
         )
         return (fixer, transcript)
     return _finalize_result(
-        messages, content, return_transcript, transcript, max_steps_reached, budget_forced_suffix
+        messages, content, return_transcript, transcript, max_steps_reached, budget_forced_suffix,
+        interrupted=interrupted, interrupt_reason=interrupt_reason, interrupted_step=interrupted_step,
     )
 
 
@@ -1404,9 +1502,15 @@ def _finalize_result(
     transcript: list[dict],
     max_steps_reached: bool = False,
     budget_forced_suffix: str = "",
+    interrupted: bool = False,
+    interrupt_reason: str = "",
+    interrupted_step: int = 0,
 ) -> str | None | tuple[str | None, list[dict]]:
     """Finalize the return value with optional max_steps or budget-forced marker."""
     text = content or ""
+    if interrupted:
+        marker = f"[gw_agent: interrupted at step {interrupted_step} - reason: {interrupt_reason}]"
+        text = (text + f"\n\n{marker}") if text else marker
     if max_steps_reached and text:
         text = text + "\n\n[gw_agent: max_steps reached — verdict may be incomplete]"
     elif max_steps_reached:
