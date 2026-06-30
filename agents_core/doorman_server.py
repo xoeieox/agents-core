@@ -68,6 +68,8 @@ from fastapi.responses import JSONResponse
 log = logging.getLogger("doorman-server")
 
 GW_URL_DEFAULT = "http://203.0.113.11:8081"
+GW_CREATIVE_URL = os.getenv("GW_CREATIVE_URL", "http://203.0.113.11:8093")
+# Also defined in llm.py; intentionally not imported to avoid a doorman_server → llm dep.
 # GW_WAKE_DEADLINE_SEC coupling: this deadline (default 180s) must be kept in sync
 # with the client-side acquire timeout in agents_core.doorman_client._gw_acquire_timeout(),
 # which derives the HTTP acquire timeout as GW_WAKE_DEADLINE_SEC + GW_ACQUIRE_MARGIN_SEC.
@@ -102,6 +104,9 @@ DEFERRED = object()
 
 # Sentinel for contended acquire (require_drain_clear=True failed: another-principal worker active)
 CONTENDED = object()
+
+# Sentinel for creative-occupied acquire (Llama-3.3-70B on :8093 holds the GPU)
+CREATIVE_OCCUPIED = object()
 
 # Sentinel principal for worker leases acquired without an explicit principal.
 # Never excluded from drain_count — makes a forgotten-principal diagnosable instead of invisible.
@@ -164,6 +169,7 @@ class _NodeState:
         # Cached serving state (doorman-status-cached-serving-v0)
         self._cached_serving: bool | None = None   # None until first refresh
         self._serving_checked_at: float = 0.0      # walltime of last successful probe
+        self._cached_creative_serving: bool = False
         # Mode-aware big predicate (populated only when DOORMAN_MODE_AWARE_ADMISSION is True)
         self._serving_is_big: bool | None = None   # None until first refresh with flag ON
         self._big_probe_state: str | None = None   # 'confirmed'|'refuted'|'inconclusive'
@@ -176,6 +182,19 @@ class _NodeState:
         try:
             resp = requests.get(f"{self.gw_url}/health", timeout=timeout)
             return resp.status_code == 200 and resp.json().get("status") == "ok"
+        except Exception:
+            return False
+
+    def _is_creative_serving(self) -> bool:
+        """Return True if the Llama-3.3-70B creative server is up on :8093.
+
+        Lock-free HTTP - safe to call outside lock; also called under lock in
+        ensure_serving(). Returns False on any error - if :8093 is unreachable,
+        the 70B is not actively serving.
+        """
+        try:
+            r = requests.get(f"{GW_CREATIVE_URL}/health", timeout=2.5)
+            return r.status_code == 200 and r.json().get("status") == "ok"
         except Exception:
             return False
 
@@ -220,6 +239,7 @@ class _NodeState:
         the three-state serving_is_big predicate (outside the lock, AC11).
         """
         serving = self._is_serving(timeout=2.0)
+        creative_serving = self._is_creative_serving()
 
         # Optional big-model probe — outside the lock (blocking HTTP, AC11)
         big_probe_state: str | None = None
@@ -228,6 +248,7 @@ class _NodeState:
 
         with self.lock:
             self._cached_serving = serving
+            self._cached_creative_serving = creative_serving
             self._serving_checked_at = time.time()
             if DOORMAN_MODE_AWARE_ADMISSION:
                 self._big_probe_state = big_probe_state
@@ -287,6 +308,10 @@ class _NodeState:
           5. Poll /health until serving or GW_WAKE_DEADLINE_SEC (covers ~25s
              cold-load after gw-serve big).
         """
+        # Block co-load if creative 70B holds the GPU lane
+        if self._is_creative_serving():
+            return CREATIVE_OCCUPIED
+
         # HOLE 1 fix (AC2): mode-aware deference before _is_serving() fast path.
         # Worker acquires return DEFERRED immediately when the controller owns the mode,
         # even when _is_serving() would return True (avoids wrong-model leases on a live swarm).
@@ -469,6 +494,8 @@ class _NodeState:
 
         # ensure_serving serializes concurrent wakes under the same lock
         ok = self.ensure_serving(role=role)
+        if ok is CREATIVE_OCCUPIED:
+            return CREATIVE_OCCUPIED
         if ok is DEFERRED:
             # Controller's own acquire (role="mode-controller") registers the lease and hold
             # even though ensure_serving returns DEFERRED (no gw-serve big was issued).
@@ -589,6 +616,7 @@ class _NodeState:
                 "worker_lease_count": drain_count,
                 "serving_is_big": self._serving_is_big,
                 "big_probe_state": self._big_probe_state,
+                "creative_serving": self._cached_creative_serving,
             }
 
 
@@ -872,6 +900,12 @@ def create_app(gw_url: str | None = None) -> FastAPI:
                 require_drain_clear=require_drain_clear, lease_kind=lease_kind,
             )
 
+        if ok is CREATIVE_OCCUPIED:
+            return JSONResponse(
+                {"ok": False, "creative_occupied": True,
+                 "reason": "creative-collider-holding-gpu"},
+                status_code=409,
+            )
         if ok is CONTENDED:
             return {"ok": False, "contended": True, "node": node}
         if ok is DEFERRED:
