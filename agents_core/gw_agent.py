@@ -1509,7 +1509,7 @@ def _finalize_result(
     """Finalize the return value with optional max_steps or budget-forced marker."""
     text = content or ""
     if interrupted:
-        marker = f"[gw_agent: interrupted at step {interrupted_step} — reason: {interrupt_reason}]"
+        marker = f"[gw_agent: interrupted at step {interrupted_step} - reason: {interrupt_reason}]"
         text = (text + f"\n\n{marker}") if text else marker
     if max_steps_reached and text:
         text = text + "\n\n[gw_agent: max_steps reached — verdict may be incomplete]"
