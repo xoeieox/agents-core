@@ -2050,3 +2050,237 @@ class TestLeaseKindDrainGate:
             "coordination lease must self-expire via TTL/gc_stale — "
             "no explicit release call made"
         )
+
+
+# ---------------------------------------------------------------------------
+# llama-server /slots activity probe (doorman-probe-llama-activity-v0)
+# ---------------------------------------------------------------------------
+
+class TestProbeLlamaActivity:
+    """Unit tests for _NodeState._probe_llama_activity()."""
+
+    def test_is_processing_true_detects_activity(self):
+        state = _make_state()
+
+        def mock_slots(url, **kwargs):
+            m = MagicMock(status_code=200)
+            m.json.return_value = [{"id": 0, "is_processing": True, "id_task": 5}]
+            return m
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_slots):
+            assert state._probe_llama_activity() is True
+
+    def test_id_task_change_since_last_probe_detects_activity(self):
+        """A generation completed between ticks: id_task changed, is_processing now false."""
+        state = _make_state()
+        state._last_probed_task_by_slot = {0: 100}
+
+        def mock_slots(url, **kwargs):
+            m = MagicMock(status_code=200)
+            m.json.return_value = [{"id": 0, "is_processing": False, "id_task": 101}]
+            return m
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_slots):
+            assert state._probe_llama_activity() is True
+        assert state._last_probed_task_by_slot[0] == 101
+
+    def test_unchanged_task_not_processing_no_activity(self):
+        state = _make_state()
+        state._last_probed_task_by_slot = {0: 100}
+
+        def mock_slots(url, **kwargs):
+            m = MagicMock(status_code=200)
+            m.json.return_value = [{"id": 0, "is_processing": False, "id_task": 100}]
+            return m
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_slots):
+            assert state._probe_llama_activity() is False
+
+    def test_non_200_response_returns_false(self):
+        state = _make_state()
+
+        def mock_slots(url, **kwargs):
+            return MagicMock(status_code=500)
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_slots):
+            assert state._probe_llama_activity() is False
+
+    def test_timeout_returns_false_no_raise(self):
+        state = _make_state()
+        import requests as req_lib
+
+        def mock_timeout(url, **kwargs):
+            raise req_lib.exceptions.Timeout("simulated /slots timeout")
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_timeout):
+            assert state._probe_llama_activity() is False  # must not raise
+
+    def test_connection_refused_returns_false_no_raise(self):
+        state = _make_state()
+        import requests as req_lib
+
+        def mock_conn_error(url, **kwargs):
+            raise req_lib.exceptions.ConnectionError("connection refused")
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_conn_error):
+            assert state._probe_llama_activity() is False
+
+    def test_malformed_json_returns_false(self):
+        state = _make_state()
+
+        def mock_slots(url, **kwargs):
+            m = MagicMock(status_code=200)
+            m.json.side_effect = ValueError("malformed JSON")
+            return m
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_slots):
+            assert state._probe_llama_activity() is False
+
+    def test_empty_slots_list_returns_false(self):
+        state = _make_state()
+
+        def mock_slots(url, **kwargs):
+            m = MagicMock(status_code=200)
+            m.json.return_value = []
+            return m
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_slots):
+            assert state._probe_llama_activity() is False
+
+
+class TestProbeActivityIdleClock:
+    """Tests for D2: probe activity feeding into idle_since via _refresh_serving_cache()."""
+
+    def test_probe_activity_pushes_idle_since_forward_when_leases_empty(self):
+        state = _make_state()
+        state.idle_since = time.time() - 500  # already idle a while
+
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch.object(state, "_probe_llama_activity", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_PROBE_LLAMA_ACTIVITY", True), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            state._refresh_serving_cache()
+
+        assert state.idle_since is not None
+        assert time.time() - state.idle_since < 2
+        assert state._idle_since_source == "probe"
+
+    def test_probe_activity_noop_when_leases_present(self):
+        """Probe activity must not touch idle_since while leases exist (lease bookkeeping owns it)."""
+        state = _make_state()
+        state.leases["w1"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "x", "role": "worker",
+        }
+        state.idle_since = None
+
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch.object(state, "_probe_llama_activity", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_PROBE_LLAMA_ACTIVITY", True), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            state._refresh_serving_cache()
+
+        assert state.idle_since is None
+
+    def test_probe_activity_logs_only_on_first_detected_tick(self):
+        """Must not spam one idle-log line per refresh tick during a continuous session."""
+        state = _make_state()
+        write_calls = []
+
+        def fake_write(node, event, lease_count, **kwargs):
+            write_calls.append(event)
+
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch.object(state, "_probe_llama_activity", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_PROBE_LLAMA_ACTIVITY", True), \
+             patch("agents_core.doorman_server._write_idle_log", side_effect=fake_write):
+            state._refresh_serving_cache()  # None -> set: should log
+            state._refresh_serving_cache()  # already set: should not log again
+            state._refresh_serving_cache()  # still set: should not log again
+
+        probe_events = [e for e in write_calls if e == "probe_activity_detected"]
+        assert len(probe_events) == 1
+
+    def test_probe_disabled_env_flag_ignores_activity(self):
+        """DOORMAN_PROBE_LLAMA_ACTIVITY=false must not touch idle_since from probe activity."""
+        state = _make_state()
+        original_idle_since = time.time() - 700
+        state.idle_since = original_idle_since
+
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch.object(state, "_probe_llama_activity") as mock_probe, \
+             patch("agents_core.doorman_server.DOORMAN_PROBE_LLAMA_ACTIVITY", False), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            state._refresh_serving_cache()
+
+        mock_probe.assert_not_called()
+        assert state.idle_since == original_idle_since
+        assert state._idle_since_source is None
+
+
+class TestProbeActivityDwellStopIntegration:
+    """Integration tests (D4): probe activity delays dwell-stop; absence lets it fire on schedule."""
+
+    def test_continued_probe_activity_never_triggers_stop(self):
+        from agents_core.doorman_server import _start_refresh_thread
+
+        state = _NodeState(GW_URL_DEFAULT)
+        nodes = {"gravitywell": state}
+        stop_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "gw-serve" in str(cmd) and "stop" in str(cmd):
+                stop_calls.append(cmd)
+            return MagicMock(returncode=0, stderr="")
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("time.sleep"), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch.object(state, "_probe_llama_activity", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_PROBE_LLAMA_ACTIVITY", True), \
+             patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0), \
+             patch("agents_core.doorman_server.GW_STOP_GRACE_SEC", 5), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            t = _start_refresh_thread(nodes)
+            t.join(timeout=1.0)
+
+        assert len(stop_calls) == 0
+        assert state.leases == {}
+        assert state.idle_since is not None
+        assert time.time() - state.idle_since < 5
+
+    def test_probe_activity_stopping_lets_dwell_stop_fire_on_schedule(self):
+        """Once probe activity stops, the existing grace countdown proceeds and stop fires -
+        confirms this is a delay, not a permanent suppression, of dwell-stop."""
+        from agents_core.doorman_server import _start_refresh_thread
+
+        state = _NodeState(GW_URL_DEFAULT)
+        state.idle_since = time.time() - 700  # last probe-touched idle_since, now past grace
+        state._idle_since_source = "probe"
+        nodes = {"gravitywell": state}
+        stop_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "gw-serve" in str(cmd) and "stop" in str(cmd):
+                stop_calls.append(cmd)
+            return MagicMock(returncode=0, stderr="")
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("time.sleep"), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch.object(state, "_probe_llama_activity", return_value=False), \
+             patch("agents_core.doorman_server.DOORMAN_PROBE_LLAMA_ACTIVITY", True), \
+             patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0), \
+             patch("agents_core.doorman_server.GW_STOP_GRACE_SEC", 600), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            t = _start_refresh_thread(nodes)
+            t.join(timeout=1.0)
+
+        assert len(stop_calls) >= 1
+        assert state.service_stopped is True
+        assert state.idle_since is None
