@@ -261,6 +261,40 @@ class TestLeaseLifecycle:
             state.release_lease("nonexistent")
         mock_rh.assert_called_once()  # no leases → release hold (idempotent hold release)
 
+    def test_gc_stale_last_lease_sets_idle_since(self):
+        """TTL-expiry GC of the last lease must set idle_since (not just explicit release)."""
+        state = _make_state()
+        state.leases["work-1"] = {"acquired_at": time.time() - 1000, "ttl_sec": 1, "reason": "t"}
+        with patch.object(state, "_release_hold") as mock_rh, \
+             patch("agents_core.doorman_server._write_idle_log"):
+            expired = state._gc_stale()
+        assert "work-1" in expired
+        assert not state.leases
+        assert state.idle_since is not None
+        mock_rh.assert_not_called()  # _gc_stale must not release the hold itself
+
+    def test_gc_stale_non_last_lease_no_idle_since(self):
+        """GC'ing one of several concurrent leases must not set idle_since."""
+        state = _make_state()
+        now = time.time()
+        state.leases["stale"] = {"acquired_at": now - 1000, "ttl_sec": 1, "reason": "t"}
+        state.leases["live"] = {"acquired_at": now, "ttl_sec": 300, "reason": "t"}
+        with patch.object(state, "_release_hold"):
+            expired = state._gc_stale()
+        assert "stale" in expired
+        assert "live" in state.leases
+        assert state.idle_since is None
+
+    def test_gc_stale_does_not_clobber_existing_idle_since(self):
+        """If idle_since was already set, _gc_stale must not overwrite it."""
+        state = _make_state()
+        state.leases["stale"] = {"acquired_at": time.time() - 1000, "ttl_sec": 1, "reason": "t"}
+        earlier = time.time() - 500
+        state.idle_since = earlier
+        with patch.object(state, "_release_hold"):
+            state._gc_stale()
+        assert state.idle_since == earlier
+
 
 # ---------------------------------------------------------------------------
 # Concurrency: concurrent acquires serialize on lock
