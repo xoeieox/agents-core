@@ -33,6 +33,10 @@ Environment variables:
                                   fast path (HOLE 1), controller-lease-aware serving_mode
                                   (HOLE 2), and the three-state /v1/models big-model probe.
                                   Default false (lands dark). Set "true" or "1" to activate.
+  DOORMAN_PROBE_LLAMA_ACTIVITY — probe llama-server's own /slots for unmediated-caller
+                                 activity before dwell-stopping on zero leases
+                                 (default true; set "false"/"0" to disable and restore
+                                 pre-fix lease-only behavior as a rollback lever)
 
 Safety properties (gravitywell-doorman-clean-stop-v0):
   - Doorman crash → GW stays POWERED, not suspended. The host-side guard
@@ -92,6 +96,14 @@ DOORMAN_CONTROLLER_NAME = os.environ.get("DOORMAN_CONTROLLER_NAME", "flip-contro
 DOORMAN_MODE_AWARE_ADMISSION = os.environ.get(
     "DOORMAN_MODE_AWARE_ADMISSION", ""
 ).lower() in ("1", "true", "yes")
+
+# Probe llama-server's own /slots for unmediated-caller activity (doorman-probe-llama-activity-v0)
+# so dwell-stop doesn't fire out from under a direct (non-lease) caller like an interactive
+# OpenCode session hitting :8081. Default ON — this is a net-safety fix for a real incident,
+# not a speculative feature. Set "false"/"0" as a rollback lever.
+DOORMAN_PROBE_LLAMA_ACTIVITY = os.environ.get(
+    "DOORMAN_PROBE_LLAMA_ACTIVITY", "true"
+).lower() not in ("0", "false")
 
 # Must match OPERATOR_DEFAULTS['gravitywell'] in agents_core.llm (verified: llm.py:58).
 GW_BIG_MODEL_ID = "gravitywell-122b"
@@ -173,6 +185,9 @@ class _NodeState:
         # Mode-aware big predicate (populated only when DOORMAN_MODE_AWARE_ADMISSION is True)
         self._serving_is_big: bool | None = None   # None until first refresh with flag ON
         self._big_probe_state: str | None = None   # 'confirmed'|'refuted'|'inconclusive'
+        # llama-server /slots activity probe (doorman-probe-llama-activity-v0)
+        self._last_probed_task_by_slot: dict[int, int] = {}
+        self._idle_since_source: str | None = None  # 'lease' | 'probe' | None
 
     # ------------------------------------------------------------------
     # Health poll (lock-free — read-only HTTP, safe to call outside lock)
@@ -224,6 +239,44 @@ class _NodeState:
             log.debug(f"[{self.node_name}] big-model probe inconclusive: {exc}")
             return None, "inconclusive"
 
+    def _probe_llama_activity(self) -> bool:
+        """Probe llama-server's own /slots for unmediated-caller activity.
+
+        Detects activity from callers that never acquired a doorman lease (e.g. an
+        interactive session hitting :8081 directly) so the dwell-stop clock doesn't
+        get stopped out from under them. Activity is detected per slot when
+        is_processing is True, or when id_task changed since the last probe (a
+        generation completed between ticks).
+
+        Best-effort: any error (timeout, connection refused, non-200, malformed
+        JSON, empty list) returns False — inconclusive for this tick, never raises,
+        never treated as forced-idle.
+
+        Must be called OUTSIDE self.lock (blocking HTTP, ~2.5s timeout).
+        """
+        try:
+            resp = requests.get(f"{self.gw_url}/slots", timeout=2.5)
+            if resp.status_code != 200:
+                return False
+            slots = resp.json()
+            if not isinstance(slots, list) or not slots:
+                return False
+            activity = False
+            for slot in slots:
+                slot_id = slot.get("id")
+                id_task = slot.get("id_task")
+                prev_task = self._last_probed_task_by_slot.get(slot_id)
+                if slot.get("is_processing") or (
+                    prev_task is not None and id_task != prev_task
+                ):
+                    activity = True
+                if slot_id is not None:
+                    self._last_probed_task_by_slot[slot_id] = id_task
+            return activity
+        except Exception as exc:
+            log.debug(f"[{self.node_name}] llama activity probe inconclusive: {exc}")
+            return False
+
     def _refresh_serving_cache(self) -> None:
         """Refresh the serving cache by probing _is_serving outside the lock.
 
@@ -237,6 +290,9 @@ class _NodeState:
 
         When DOORMAN_MODE_AWARE_ADMISSION is True, also probes /v1/models for
         the three-state serving_is_big predicate (outside the lock, AC11).
+
+        When DOORMAN_PROBE_LLAMA_ACTIVITY is True, also probes /slots for
+        unmediated-caller activity (outside the lock) — see _probe_llama_activity.
         """
         serving = self._is_serving(timeout=2.0)
         creative_serving = self._is_creative_serving()
@@ -245,6 +301,11 @@ class _NodeState:
         big_probe_state: str | None = None
         if DOORMAN_MODE_AWARE_ADMISSION:
             _, big_probe_state = self._probe_big_model()
+
+        # Optional llama-activity probe — outside the lock (blocking HTTP)
+        probe_activity = False
+        if DOORMAN_PROBE_LLAMA_ACTIVITY:
+            probe_activity = self._probe_llama_activity()
 
         with self.lock:
             self._cached_serving = serving
@@ -265,6 +326,18 @@ class _NodeState:
                         f"falling back to legacy controller-lease judgment "
                         f"(serving_is_big={self._serving_is_big}); probe_inconclusive"
                     )
+
+            # Probe-driven idle keepalive (doorman-probe-llama-activity-v0): an unmediated
+            # caller (e.g. OpenCode hitting :8081 directly) never acquires a lease, so
+            # detected llama-server activity re-arms the dwell-stop clock the same way an
+            # arriving lease resets idle_since in acquire_lease(). No-op while leases exist
+            # — lease-driven bookkeeping already covers that case.
+            if DOORMAN_PROBE_LLAMA_ACTIVITY and probe_activity and not self.leases:
+                was_idle_unset = self.idle_since is None
+                self.idle_since = time.time()
+                self._idle_since_source = "probe"
+                if was_idle_unset:
+                    _write_idle_log(self.node_name, "probe_activity_detected", 0)
 
     def _controller_lease_active(self) -> bool:
         """Check if a mode-controller lease is currently active (non-expired).
@@ -464,6 +537,7 @@ class _NodeState:
             del self.leases[wid]
         if expired and not self.leases and self.idle_since is None:
             self.idle_since = time.time()
+            self._idle_since_source = "lease"
             _write_idle_log(self.node_name, "idle_start", 0)
         return expired
 
@@ -495,6 +569,7 @@ class _NodeState:
         # Clear idle tracking: an arriving lease means the node is no longer idle
         was_idle = self.idle_since is not None
         self.idle_since = None
+        self._idle_since_source = None
         if was_idle:
             _write_idle_log(self.node_name, "resumed", len(self.leases))
 
@@ -566,6 +641,7 @@ class _NodeState:
         self._gc_stale()
         if not self.leases:
             self.idle_since = time.time()
+            self._idle_since_source = "lease"
             self._release_hold()
             _write_idle_log(self.node_name, "idle_start", 0)
 
@@ -623,6 +699,8 @@ class _NodeState:
                 "serving_is_big": self._serving_is_big,
                 "big_probe_state": self._big_probe_state,
                 "creative_serving": self._cached_creative_serving,
+                "probe_activity_enabled": DOORMAN_PROBE_LLAMA_ACTIVITY,
+                "idle_since_source": self._idle_since_source,
             }
 
 
@@ -668,6 +746,7 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                                     if stop_proc.returncode == 0:
                                         state.service_stopped = True
                                         state.idle_since = None
+                                        state._idle_since_source = None
                                         state._cached_serving = False
                                         state._serving_checked_at = time.time()
                                         log.warning(
@@ -685,6 +764,7 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                                             # Already stopped — treat as success
                                             state.service_stopped = True
                                             state.idle_since = None
+                                            state._idle_since_source = None
                                             state._cached_serving = False
                                             state._serving_checked_at = time.time()
                                             log.warning(
