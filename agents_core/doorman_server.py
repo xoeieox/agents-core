@@ -176,7 +176,10 @@ class _NodeState:
         self.last_wake_at: float | None = None
         self.last_error: str | None = None
         # Service-lifecycle fields (gravitywell-doorman-clean-stop-v0)
-        self.idle_since: float | None = None   # set when last lease released
+        # Seeded at construction (doorman-seed-idle-since-on-startup-v0): leases
+        # starts empty, so idle-tracking must begin now, not only on a later
+        # empty-transition that may never occur if the process starts at zero leases.
+        self.idle_since: float | None = time.time()
         self.service_stopped: bool = False     # True after gw-serve stop confirmed
         # Cached serving state (doorman-status-cached-serving-v0)
         self._cached_serving: bool | None = None   # None until first refresh
