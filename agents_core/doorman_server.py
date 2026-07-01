@@ -428,6 +428,9 @@ class _NodeState:
         """Remove expired leases. Returns list of GC'd work_ids.
 
         Emits an orphan-reclaim scar event if a mode-controller lease is evicted.
+        If GC empties the lease set, records idle_since the same way release_lease()
+        does on an explicit release -- otherwise the dwell-stop timer never starts
+        for leases that expire via TTL rather than an explicit /lease/release call.
         """
         now = time.time()
         expired = [
@@ -459,6 +462,9 @@ class _NodeState:
                     detail="mode-controller lease TTL-expired (not released); deference lapsed; legacy wake/serve",
                 )
             del self.leases[wid]
+        if expired and not self.leases and self.idle_since is None:
+            self.idle_since = time.time()
+            _write_idle_log(self.node_name, "idle_start", 0)
         return expired
 
     def acquire_lease(self, work_id: str, ttl_sec: int, reason: str, role: str = "worker", principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference") -> bool | object:
