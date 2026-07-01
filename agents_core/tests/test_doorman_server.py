@@ -234,6 +234,9 @@ class TestLeaseLifecycle:
         now = time.time()
         state.leases["work-1"] = {"acquired_at": now, "ttl_sec": 300, "reason": "t"}
         state.leases["work-2"] = {"acquired_at": now, "ttl_sec": 300, "reason": "t"}
+        # Simulate leases having arrived via acquire_lease(), which always clears
+        # idle_since on arrival (including the construction-time seed).
+        state.idle_since = None
         with patch.object(state, "_release_hold") as mock_rh, \
              patch("agents_core.doorman_server._write_idle_log"):
             state.release_lease("work-1")
@@ -279,6 +282,9 @@ class TestLeaseLifecycle:
         now = time.time()
         state.leases["stale"] = {"acquired_at": now - 1000, "ttl_sec": 1, "reason": "t"}
         state.leases["live"] = {"acquired_at": now, "ttl_sec": 300, "reason": "t"}
+        # Simulate leases having arrived via acquire_lease(), which always clears
+        # idle_since on arrival (including the construction-time seed).
+        state.idle_since = None
         with patch.object(state, "_release_hold"):
             expired = state._gc_stale()
         assert "stale" in expired
@@ -294,6 +300,17 @@ class TestLeaseLifecycle:
         with patch.object(state, "_release_hold"):
             state._gc_stale()
         assert state.idle_since == earlier
+
+    def test_fresh_state_seeds_idle_since(self):
+        """A freshly constructed _NodeState must start idle-tracking immediately —
+        leases is always empty at construction, so there is never a transition to
+        wait for (doorman-seed-idle-since-on-startup-v0)."""
+        before = time.time()
+        state = _make_state()
+        after = time.time()
+        assert state.leases == {}
+        assert state.idle_since is not None
+        assert before <= state.idle_since <= after
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +587,37 @@ class TestDeferredStop:
         assert len(stop_calls) >= 1
         assert state.service_stopped is True
         assert state.idle_since is None
+
+    def test_fresh_state_reaches_stop_without_prior_lease_cycle(self):
+        """Regression guard for the 2026-07-01 live incident: a doorman process that
+        starts up with GravityWell already serving and zero leases must still
+        dwell-stop after grace — no prior acquire/release (or GC) transition should
+        be required to seed idle_since (doorman-seed-idle-since-on-startup-v0)."""
+        from agents_core.doorman_server import _start_refresh_thread
+
+        state = _NodeState(GW_URL_DEFAULT)  # fresh construction, no leases ever acquired
+        nodes = {"gravitywell": state}
+
+        stop_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "gw-serve" in str(cmd) and "stop" in str(cmd):
+                stop_calls.append(cmd)
+            return MagicMock(returncode=0, stderr="")
+
+        def fake_sleep(s):
+            pass
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("time.sleep", side_effect=fake_sleep), \
+             patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0), \
+             patch("agents_core.doorman_server.GW_STOP_GRACE_SEC", 0), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            t = _start_refresh_thread(nodes)
+            t.join(timeout=2.0)
+
+        assert len(stop_calls) >= 1
+        assert state.service_stopped is True
 
     def test_acquire_within_grace_clears_idle_no_stop(self):
         """An acquire within the grace period must clear idle_since — no stop issued."""
