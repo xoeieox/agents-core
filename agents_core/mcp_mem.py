@@ -20,31 +20,36 @@ def _client() -> MemClient:
 @mcp.tool()
 def mem_search(query: str, tag: str = "", limit: int = 20) -> list[dict]:
     """Search mem.db for memories matching a query, optionally filtered by tag."""
-    return _client().search(query, tag=tag, limit=limit)
+    with _client() as client:
+        return client.search(query, tag=tag, limit=limit)
 
 
 @mcp.tool()
 def mem_get(key: str) -> dict:
     """Fetch a single memory by its exact key."""
-    return _client().get(key)
+    with _client() as client:
+        return client.get(key)
 
 
 @mcp.tool()
 def mem_set(key: str, value: str, tags: str = "", source: str = "opencode") -> dict:
     """Write (create or update) a memory. Defaults source to 'opencode' for provenance."""
-    return _client().set(key, value, tags=tags, source=source)
+    with _client() as client:
+        return client.set(key, value, tags=tags, source=source)
 
 
 @mcp.tool()
 def mem_list(tag: str = "", since: str = "", limit: int = 50) -> list[dict]:
     """List memories, optionally filtered by tag and/or a since timestamp."""
-    return _client().list(tag=tag, since=since, limit=limit)
+    with _client() as client:
+        return client.list(tag=tag, since=since, limit=limit)
 
 
 @mcp.tool()
 def mem_tags() -> list[dict]:
     """List all known tags with their memory counts."""
-    return _client().tags()
+    with _client() as client:
+        return client.tags()
 
 
 def main() -> None:

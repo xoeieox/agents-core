@@ -8,6 +8,7 @@ from agents_core import mcp_mem
 
 def _mock_client():
     client = MagicMock()
+    client.__enter__.return_value = client
     client.search.return_value = [{"key": "a"}]
     client.get.return_value = {"key": "a", "content": "b"}
     client.set.return_value = {"key": "a", "content": "b"}

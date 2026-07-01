@@ -216,6 +216,58 @@ def test_lapispm_tick_normal_ok():
     }]
 
 
+def test_lapispm_tick_reason_with_spaces_parses_ok():
+    stdout = (
+        "[my-target] skipped=True reason=target not pm_bound encoded=False decision=skip\n"
+        "[other-target] skipped=True reason=exception: connection refused encoded=False decision=skip\n"
+    )
+    with patch.object(mcp_lapispm, "_run", return_value=_proc(stdout)):
+        result = mcp_lapispm.lapispm_tick()
+    assert result["parse_status"] == "ok"
+    assert result["ticks"] == [
+        {
+            "target_id": "my-target",
+            "skipped": "True",
+            "reason": "target not pm_bound",
+            "encoded": "False",
+            "decision": "skip",
+        },
+        {
+            "target_id": "other-target",
+            "skipped": "True",
+            "reason": "exception: connection refused",
+            "encoded": "False",
+            "decision": "skip",
+        },
+    ]
+
+
+def test_lapispm_tick_reason_with_spaces_and_reconciled_parses_ok():
+    stdout = "[my-target] skipped=True reason=target not pm_bound reconciled=True encoded=False decision=skip\n"
+    with patch.object(mcp_lapispm, "_run", return_value=_proc(stdout)):
+        result = mcp_lapispm.lapispm_tick()
+    assert result["parse_status"] == "ok"
+    assert result["ticks"] == [{
+        "target_id": "my-target",
+        "skipped": "True",
+        "reason": "target not pm_bound",
+        "reconciled": "True",
+        "encoded": "False",
+        "decision": "skip",
+    }]
+
+
+def test_lapispm_status_timeout_is_cli_error():
+    with patch.object(
+        mcp_lapispm.subprocess, "run",
+        side_effect=subprocess.TimeoutExpired(cmd=["lapis-pm", "status"], timeout=30.0),
+    ):
+        result = mcp_lapispm.lapispm_status(target_id="my-target")
+    assert result["parse_status"] == "cli_error"
+    assert result["exit_code"] == 124
+    assert "timed out" in result["stderr"]
+
+
 def test_lapispm_tick_no_bound_targets_is_ok_empty():
     with patch.object(mcp_lapispm, "_run", return_value=_proc("")):
         result = mcp_lapispm.lapispm_tick()

@@ -24,9 +24,26 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("lapis-pm")
 
+# `status` in particular makes a live Forgejo network call under the hood; bound
+# so a slow/unreachable Forgejo can't block this stdio server indefinitely.
+_SUBPROCESS_TIMEOUT_S = 30.0
+
 
 def _run(argv: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(["lapis-pm", *argv], capture_output=True, text=True)
+    try:
+        return subprocess.run(
+            ["lapis-pm", *argv],
+            capture_output=True,
+            text=True,
+            timeout=_SUBPROCESS_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            args=exc.cmd,
+            returncode=124,
+            stdout=exc.stdout or "",
+            stderr=(exc.stderr or "") + f"\n[mcp_lapispm] timed out after {_SUBPROCESS_TIMEOUT_S}s",
+        )
 
 
 def _cli_error(proc: subprocess.CompletedProcess) -> dict:
@@ -217,7 +234,7 @@ def lapispm_bind(
 
 
 _TICK_LINE_RE = re.compile(
-    r"^\[(?P<target_id>\S+)\] skipped=(?P<skipped>\S+) reason=(?P<reason>\S+)"
+    r"^\[(?P<target_id>\S+)\] skipped=(?P<skipped>\S+) reason=(?P<reason>.*?)"
     r"(?: reconciled=(?P<reconciled>\S+))? encoded=(?P<encoded>\S+) decision=(?P<decision>\S+)$"
 )
 _FORCE_DISPATCH_RE = re.compile(r"^Dispatched:\s+(\S+)\s+task_id=(\S+)$")
