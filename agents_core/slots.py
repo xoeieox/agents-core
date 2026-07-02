@@ -128,6 +128,10 @@ CREATE TABLE IF NOT EXISTS slots (
     -- verified at pick_up. See SlotStore.create_slot / set_down / pick_up.
     lineage            TEXT NOT NULL DEFAULT '{}',
     artifact           TEXT NOT NULL DEFAULT '{}',
+    -- set when expire() retires a withheld slot to abandoned (see expire());
+    -- marks the row as scar-bearing so the ordinary abandoned-deletion sweep
+    -- never hard-deletes it. NULL for slots abandoned by the normal path.
+    withheld_retired_at TEXT,
     created_at         TEXT NOT NULL
 );
 
@@ -153,6 +157,7 @@ _ADDED_COLUMNS = (
     ("next_actuated_at", "TEXT"),
     ("lineage", "TEXT NOT NULL DEFAULT '{}'"),
     ("artifact", "TEXT NOT NULL DEFAULT '{}'"),
+    ("withheld_retired_at", "TEXT"),
 )
 
 
@@ -601,10 +606,19 @@ class SlotStore:
         slot_id: str,
         *,
         contributor: dict,
+        by: str,
         forgejo_owner: str | None = None,
         join_check=None,
     ) -> str | None:
         """Attempt to pick up ``slot_id``'s baton via the Reality Snap.
+
+        ``by`` must be ``slot_id``'s current contributor-of-record (mirrors
+        ``set_down``'s ownership contract — only the owner who published the
+        baton may trigger its own withheld/landed transitions). Raises
+        ``SlotOwnershipError`` otherwise: without this check any caller could
+        force an unrelated slot into ``withheld``/``landed`` regardless of who
+        actually owns it, even though a direct ``update_status()`` call from
+        that same caller would be correctly rejected.
 
         On success: acknowledges the old baton (``set_actuated`` — a legal
         non-owner write, per the module's ownership design), mints a NEW slot for
@@ -613,6 +627,11 @@ class SlotStore:
         appended to the author chain and ``lineage.predecessor_slot_id`` set to
         ``slot_id``, marks the OLD slot ``landed`` (old slot is never otherwise
         mutated by the new owner), and returns the new slot_id.
+
+        The mint is gated on ``set_actuated``'s compare-and-swap: it returns
+        False if the baton was already actuated by a concurrent ``pick_up`` on
+        the same slot, in which case this call refuses to mint a second new
+        slot from the same predecessor and returns ``None``.
 
         On failure (hash mismatch, artifact unresolvable, or ``join_check`` fails):
         WITHHOLDS the old slot (``status="withheld"``), records what failed in a
@@ -628,10 +647,10 @@ class SlotStore:
         the handoff.
         """
         self._check_writable()
-        old = self.get(slot_id)
-        if old is None:
-            raise SlotNotFoundError(slot_id)
-        old_owner = old["contributor_id"]
+        with self._lock:
+            row = self._require_owner(slot_id, by)
+        old = self._row_to_dict(row)
+        old_owner = by
         artifact = old.get("artifact") or {}
         now = _now()
 
@@ -674,7 +693,11 @@ class SlotStore:
             )
             return None
 
-        self.set_actuated(slot_id, by=contributor.get("id", "pick_up"))
+        won = self.set_actuated(slot_id, by=contributor.get("id", "pick_up"))
+        if not won:
+            # A concurrent pick_up already claimed this baton — refuse to mint a
+            # second new slot from the same predecessor.
+            return None
 
         lineage = dict(old.get("lineage") or {})
         lineage.setdefault("origin_intent", None)
@@ -771,30 +794,34 @@ class SlotStore:
         False without error (safe for at-least-once retry). On successful actuation of
         a fresh baton, returns True.
 
+        The actual flip is a single conditional ``UPDATE ... WHERE next_actuated=0``
+        (compare-and-swap on ``rowcount``), not a check-then-write — so two
+        concurrent callers racing to actuate the same baton can never both observe
+        True; exactly one wins. Callers that mint follow-on state (e.g. ``pick_up``)
+        MUST treat a False return as "someone else already claimed this baton" and
+        refuse to proceed, not just as an idempotent no-op.
+
         Raises SlotNotFoundError if the slot does not exist.
         """
         self._check_writable()
         now = _now()
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM slots WHERE slot_id=?", (slot_id,)
+                "SELECT next FROM slots WHERE slot_id=?", (slot_id,)
             ).fetchone()
             if row is None:
                 raise SlotNotFoundError(slot_id)
-            # Idempotent: if no next baton or already actuated, return False.
+            # If there's no next baton at all, there's nothing to claim.
             next_data = json.loads(row["next"]) if row["next"] else {}
             if not next_data:
                 return False
-            # Check if already actuated (via the separate next_actuated column).
-            if row["next_actuated"]:
-                return False
-            # Mark as actuated in the separate column namespace.
-            self._conn.execute(
-                "UPDATE slots SET next_actuated=1, next_actuated_at=? WHERE slot_id=?",
+            cur = self._conn.execute(
+                "UPDATE slots SET next_actuated=1, next_actuated_at=? "
+                "WHERE slot_id=? AND (next_actuated IS NULL OR next_actuated=0)",
                 (now, slot_id),
             )
             self._conn.commit()
-        return True
+        return cur.rowcount > 0
 
     # -- reads --------------------------------------------------------------
 
@@ -967,10 +994,14 @@ class SlotStore:
         handoff-v0 "Withheld fate").
 
         The withheld retirement is a STATUS TRANSITION, not a delete: the scar
-        (failure checkpoint, reality-snap result, full lineage) stays legible in
-        the row rather than being erased with the live pointer. It rides this
-        already-running mechanism rather than a new cron, per spec's extension-
-        point note. Blackboards accumulate cruft fast — cleanup discipline matters.
+        (failure checkpoint, reality-snap result, full lineage) stays PERMANENTLY
+        legible in the row — it stamps ``withheld_retired_at`` so the ordinary
+        abandoned-deletion sweep below (and every future run of it) skips these
+        rows forever, instead of hard-deleting them once they cross
+        ABANDONED_AGE_DAYS the way an originally-abandoned slot would. It rides
+        this already-running mechanism rather than a new cron, per spec's
+        extension-point note. Blackboards accumulate cruft fast — cleanup
+        discipline matters, but not at the cost of erasing the scar.
         Returns counts.
         """
         self._check_writable()
@@ -979,20 +1010,21 @@ class SlotStore:
         abandoned_cut = (now - timedelta(days=ABANDONED_AGE_DAYS)).isoformat()
         withheld_cut = (now - timedelta(days=WITHHELD_AGE_DAYS)).isoformat()
         with self._lock:
-            # Retire unanswered withheld slots FIRST, stamping last_update=now so
-            # this same pass's abandoned-deletion sweep (below) doesn't immediately
-            # erase the row just retired.
+            # Retire unanswered withheld slots FIRST, marking them scar-bearing
+            # (withheld_retired_at) so they're excluded from the abandoned-deletion
+            # sweep below, permanently — not just for this pass.
             w = self._conn.execute(
-                "UPDATE slots SET status='abandoned', last_update=? "
+                "UPDATE slots SET status='abandoned', last_update=?, withheld_retired_at=? "
                 "WHERE status='withheld' AND last_update < ?",
-                (now.isoformat(), withheld_cut),
+                (now.isoformat(), now.isoformat(), withheld_cut),
             ).rowcount
             p = self._conn.execute(
                 "DELETE FROM slots WHERE status='parked' AND last_update < ?",
                 (parked_cut,),
             ).rowcount
             a = self._conn.execute(
-                "DELETE FROM slots WHERE status='abandoned' AND last_update < ?",
+                "DELETE FROM slots WHERE status='abandoned' AND last_update < ? "
+                "AND withheld_retired_at IS NULL",
                 (abandoned_cut,),
             ).rowcount
             self._conn.commit()

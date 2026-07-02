@@ -26,6 +26,7 @@ import pytest
 
 from agents_core.notify import Priority
 from agents_core.slots import (
+    ABANDONED_AGE_DAYS,
     ARTIFACT_KINDS,
     NEXT_KINDS,
     SCHEMA,
@@ -1008,7 +1009,7 @@ def test_pick_up_success_mints_new_slot_and_chains_lineage(store: SlotStore, tmp
     f.write_text("v1 content")
     store.set_down(old, {"kind": "draft-file", "ref": str(f)}, by="agent-1", next_kind="bind-next")
 
-    new_sid = store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"})
+    new_sid = store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"}, by="agent-1")
     assert new_sid is not None and new_sid != old
 
     old_slot = store.get(old)
@@ -1037,15 +1038,15 @@ def test_pick_up_three_hop_chain(store: SlotStore, tmp_path: Path):
 
     s0 = store.create_slot("proj-A", {"type": "fixer", "id": "hop-0"}, lineage={"origin_intent": origin})
     store.set_down(s0, {"kind": "draft-file", "ref": str(f)}, by="hop-0", next_kind="bind-next")
-    s1 = store.pick_up(s0, contributor={"type": "fixer", "id": "hop-1"})
+    s1 = store.pick_up(s0, contributor={"type": "fixer", "id": "hop-1"}, by="hop-0")
     assert s1 is not None
 
     store.set_down(s1, {"kind": "draft-file", "ref": str(f)}, by="hop-1", next_kind="bind-next")
-    s2 = store.pick_up(s1, contributor={"type": "fixer", "id": "hop-2"})
+    s2 = store.pick_up(s1, contributor={"type": "fixer", "id": "hop-2"}, by="hop-1")
     assert s2 is not None
 
     store.set_down(s2, {"kind": "draft-file", "ref": str(f)}, by="hop-2", next_kind="done")
-    s3 = store.pick_up(s2, contributor={"type": "fixer", "id": "hop-3"})
+    s3 = store.pick_up(s2, contributor={"type": "fixer", "id": "hop-3"}, by="hop-2")
     assert s3 is not None
 
     # 3 distinct new slots minted (s1, s2, s3), each chained to its predecessor.
@@ -1089,7 +1090,7 @@ def test_pick_up_hash_mismatch_withholds_and_escalates(store: SlotStore, tmp_pat
         lambda message, **kw: sent.append((message, kw)) or True,
     )
 
-    result = store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"})
+    result = store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"}, by="agent-1")
     assert result is None  # never resumes
 
     slot = store.get(old)
@@ -1112,7 +1113,7 @@ def test_pick_up_missing_artifact_withholds(store: SlotStore, monkeypatch):
     """No artifact on record at all -> Snap fails, withheld (not a crash)."""
     old = store.create_slot("proj-A", CONTRIB)
     monkeypatch.setattr("agents_core.slots.send_notification", lambda *a, **k: True)
-    result = store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"})
+    result = store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"}, by="agent-1")
     assert result is None
     assert store.get(old)["status"] == "withheld"
 
@@ -1125,7 +1126,9 @@ def test_pick_up_join_check_failure_withholds(store: SlotStore, tmp_path: Path, 
     store.set_down(old, {"kind": "draft-file", "ref": str(f)}, by="agent-1", next_kind="bind-next")
     monkeypatch.setattr("agents_core.slots.send_notification", lambda *a, **k: True)
 
-    result = store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"}, join_check=lambda: False)
+    result = store.pick_up(
+        old, contributor={"type": "fixer", "id": "agent-2"}, by="agent-1", join_check=lambda: False,
+    )
     assert result is None
     slot = store.get(old)
     assert slot["status"] == "withheld"
@@ -1137,13 +1140,49 @@ def test_pick_up_withheld_leaves_other_slots_untouched(store: SlotStore, monkeyp
     other = store.create_slot("proj-B", {"type": "fixer", "id": "bystander"})
     old = store.create_slot("proj-A", CONTRIB)
     monkeypatch.setattr("agents_core.slots.send_notification", lambda *a, **k: True)
-    store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"})
+    store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"}, by="agent-1")
     assert store.get(other)["status"] == "dispatched"  # unrelated slot untouched
 
 
 def test_pick_up_missing_slot_raises(store: SlotStore):
     with pytest.raises(SlotNotFoundError):
-        store.pick_up("nope", contributor={"type": "fixer", "id": "a"})
+        store.pick_up("nope", contributor={"type": "fixer", "id": "a"}, by="agent-1")
+
+
+def test_pick_up_rejects_non_owner_caller(store: SlotStore, tmp_path: Path):
+    """med finding: pick_up must not derive `by` from the row itself for its
+    owner-guarded writes -- an unrelated caller (who does not own the slot)
+    must be rejected exactly like a direct update_status() call would be,
+    not silently allowed to force the slot into withheld/landed."""
+    f = tmp_path / "draft.md"
+    f.write_text("content")
+    old = store.create_slot("proj-A", CONTRIB)  # owned by "agent-1"
+    store.set_down(old, {"kind": "draft-file", "ref": str(f)}, by="agent-1", next_kind="bind-next")
+
+    with pytest.raises(SlotOwnershipError):
+        store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"}, by="unrelated-caller")
+
+    # Untouched: still owned by agent-1, still dispatched, no handoff occurred.
+    slot = store.get(old)
+    assert slot["contributor_id"] == "agent-1"
+    assert slot["status"] == "dispatched"
+
+
+def test_pick_up_concurrent_double_pickup_does_not_double_mint(store: SlotStore, tmp_path: Path):
+    """low finding: if the baton was already actuated (e.g. by a concurrent
+    pick_up), a second pick_up on the same slot must refuse to mint a second
+    new slot from the same predecessor rather than proceeding regardless."""
+    f = tmp_path / "draft.md"
+    f.write_text("content")
+    old = store.create_slot("proj-A", CONTRIB)
+    store.set_down(old, {"kind": "draft-file", "ref": str(f)}, by="agent-1", next_kind="bind-next")
+
+    # Simulate a concurrent pick_up having already claimed the baton.
+    assert store.set_actuated(old, by="someone-else") is True
+
+    result = store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"}, by="agent-1")
+    assert result is None  # refused to mint a duplicate slot
+    assert store.query(project_id="proj-A", contributor_id="agent-2") == []
 
 
 # --- escalate() preserve_status -----------------------------------------
@@ -1196,6 +1235,43 @@ def test_expire_withheld_within_threshold_survives(store: SlotStore):
     counts = store.expire()
     assert counts["withheld_retired"] == 0
     assert store.get(sid)["status"] == "withheld"
+
+
+def test_expire_withheld_retired_row_survives_a_later_abandoned_sweep(store: SlotStore):
+    """high finding: a withheld slot retired to abandoned must stay PERMANENTLY
+    legible -- a second expire() pass, run after the row has also aged past
+    ABANDONED_AGE_DAYS since its retirement, must NOT hard-delete it the way an
+    ordinarily-abandoned slot would. The scar (lineage/checkpoints/escalation)
+    must survive every future expire() call, not just the first one."""
+    origin = {"author": "Erah", "intent": "x", "source_pointer": "spec:4"}
+    sid = store.create_slot("proj-A", CONTRIB, lineage={"origin_intent": origin})
+    store.update_status(sid, "withheld", by="agent-1")
+    store.append_checkpoint(sid, "reality-snap", "pick_up FAILED: hash mismatch", by="agent-1")
+
+    old = (datetime.now(timezone.utc) - timedelta(days=WITHHELD_AGE_DAYS + 1)).isoformat()
+    with store._lock:
+        store._conn.execute("UPDATE slots SET last_update=? WHERE slot_id=?", (old, sid))
+        store._conn.commit()
+
+    counts = store.expire()
+    assert counts["withheld_retired"] == 1
+    assert store.get(sid)["status"] == "abandoned"
+
+    # Now age the retired row itself well past ABANDONED_AGE_DAYS and run
+    # expire() again -- this is the pass that previously hard-deleted the row.
+    ancient = (datetime.now(timezone.utc) - timedelta(days=ABANDONED_AGE_DAYS + 100)).isoformat()
+    with store._lock:
+        store._conn.execute("UPDATE slots SET last_update=? WHERE slot_id=?", (ancient, sid))
+        store._conn.commit()
+
+    counts2 = store.expire()
+    assert counts2["abandoned_expired"] == 0  # the scarred row must not be swept
+
+    slot = store.get(sid)
+    assert slot is not None  # still queryable, NOT hard-deleted
+    assert slot["status"] == "abandoned"
+    assert slot["lineage"]["origin_intent"] == origin  # scar preserved
+    assert any("FAILED" in cp["note"] for cp in slot["checkpoints"])  # failure legible
 
 
 # --- Board read-view precedence (AC7) ---------------------------------------
