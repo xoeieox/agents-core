@@ -15,6 +15,7 @@ Covers:
 
 from __future__ import annotations
 
+import hashlib
 import multiprocessing
 import sqlite3
 import threading
@@ -23,13 +24,19 @@ from pathlib import Path
 
 import pytest
 
+from agents_core.notify import Priority
 from agents_core.slots import (
+    ABANDONED_AGE_DAYS,
+    ARTIFACT_KINDS,
     NEXT_KINDS,
     SCHEMA,
+    WITHHELD_AGE_DAYS,
     OffMasterWriteError,
     SlotNotFoundError,
     SlotOwnershipError,
     SlotStore,
+    board_bucket,
+    resolve_build_state,
 )
 
 
@@ -518,7 +525,7 @@ def test_expire_ages_out_parked_and_abandoned(store: SlotStore):
         store._conn.commit()
 
     counts = store.expire()
-    assert counts == {"parked_expired": 1, "abandoned_expired": 1}
+    assert counts == {"parked_expired": 1, "abandoned_expired": 1, "withheld_retired": 0}
     assert store.get("parked-old") is None
     assert store.get("aband-old") is None
     assert store.get("parked-new") is not None  # within 30d, survives
@@ -901,3 +908,397 @@ def test_adjacent_cache_multi_waiter_error(store: SlotStore, monkeypatch):
     assert all("database is locked" in e for e in errors_caught if e is not None)
     # None should have silently returned a result
     assert all(r is None for r in results)
+
+
+# --- baton-lineage-verified-handoff-v0 --------------------------------------
+# lineage / artifact columns, content-hash verification, withheld status,
+# new-slot-per-hop handoff, escalate-to-flame wiring, withheld fate, and the
+# Board read-view precedence helpers.
+
+def test_migration_adds_lineage_and_artifact_columns_to_legacy_db(tmp_path: Path):
+    """AC1: a pre-existing DB without lineage/artifact must be upgraded by
+    _migrate's ADD COLUMN on open, existing rows unaffected."""
+    db = tmp_path / "legacy.db"
+    legacy_schema = "\n".join(
+        ln for ln in SCHEMA.splitlines()
+        if "lineage" not in ln.lower() and "artifact" not in ln.lower()
+    )
+    assert "lineage" not in legacy_schema.lower()
+    assert "artifact" not in legacy_schema.lower()
+    conn = sqlite3.connect(db)
+    conn.executescript(legacy_schema)
+    conn.execute(
+        "INSERT INTO slots (slot_id, project_id, contributor_id, status, last_update, created_at) "
+        "VALUES ('s1', 'proj-A', 'legacy-agent', 'dispatched', ?, ?)",
+        ("2026-06-01T00:00:00+00:00", "2026-06-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(slots)").fetchall()}
+    conn.close()
+    assert "lineage" not in cols and "artifact" not in cols
+
+    store = SlotStore(db_path=db)
+    migrated = {r[1] for r in store._conn.execute("PRAGMA table_info(slots)").fetchall()}
+    assert {"lineage", "artifact"} <= migrated
+    # Pre-existing row survives, no loss.
+    slot = store.get("s1")
+    assert slot["project_id"] == "proj-A"
+    assert slot["lineage"] == {}  # legacy row: schema DEFAULT '{}', not normalized
+    store.close()
+
+
+def test_create_slot_normalizes_lineage_origin_intent_null_by_default(store: SlotStore):
+    """AC2: freshly authored molecule with no lineage passed -> origin_intent is
+    None, never a fabricated string."""
+    sid = store.create_slot("proj-A", CONTRIB)
+    lineage = store.get(sid)["lineage"]
+    assert lineage["origin_intent"] is None
+    assert lineage["authors"] == []
+    assert lineage["atoms"] == []
+
+
+def test_create_slot_accepts_real_origin_intent_pointer(store: SlotStore):
+    """AC2: a real pointer to the human utterance is preserved verbatim."""
+    origin = {"author": "Erah", "intent": "split retrieval", "source_pointer": "spec.md:12"}
+    sid = store.create_slot("proj-A", CONTRIB, lineage={"origin_intent": origin})
+    assert store.get(sid)["lineage"]["origin_intent"] == origin
+
+
+def test_set_down_computes_whole_body_sha256_for_draft_file(store: SlotStore, tmp_path: Path):
+    sid = store.create_slot("proj-A", CONTRIB)
+    f = tmp_path / "draft.md"
+    f.write_text("hello world")
+    store.set_down(
+        sid, {"kind": "draft-file", "ref": str(f)}, by="agent-1", next_kind="review-pr",
+    )
+    slot = store.get(sid)
+    expected = hashlib.sha256(b"hello world").hexdigest()
+    assert slot["artifact"] == {"kind": "draft-file", "ref": str(f), "content_hash": expected}
+    assert slot["next"]["kind"] == "review-pr"  # wraps set_next unchanged
+    assert slot["lineage"]["authors"][-1]["id"] == "agent-1"
+    assert slot["lineage"]["authors"][-1]["role"] == "set-down"
+
+
+def test_set_down_computes_head_sha_for_pr(store: SlotStore, monkeypatch):
+    sid = store.create_slot("proj-A", CONTRIB)
+    monkeypatch.setattr(
+        "agents_core.forgejo.get_pr",
+        lambda repo, number, owner=None: {"head": {"sha": "deadbeef"}},
+    )
+    store.set_down(sid, {"kind": "pr", "ref": "agents-core#141"}, by="agent-1", next_kind="done")
+    assert store.get(sid)["artifact"]["content_hash"] == "deadbeef"
+
+
+def test_set_down_invalid_artifact_kind_rejected(store: SlotStore):
+    sid = store.create_slot("proj-A", CONTRIB)
+    with pytest.raises(ValueError):
+        store.set_down(sid, {"kind": "bogus", "ref": "x"}, by="agent-1", next_kind="done")
+
+
+# --- pick_up: Reality Snap success -> new-slot-per-hop handoff -------------
+
+def test_pick_up_success_mints_new_slot_and_chains_lineage(store: SlotStore, tmp_path: Path):
+    """AC6 (single hop): successful pick_up mints a new slot with its own owner,
+    predecessor_slot_id set, origin_intent carried forward, author appended."""
+    origin = {"author": "Erah", "intent": "ship the baton spec", "source_pointer": "spec:1"}
+    old = store.create_slot(
+        "proj-A", CONTRIB, horizon={"immediate_goal": "land the spec"},
+        lineage={"origin_intent": origin},
+    )
+    f = tmp_path / "draft.md"
+    f.write_text("v1 content")
+    store.set_down(old, {"kind": "draft-file", "ref": str(f)}, by="agent-1", next_kind="bind-next")
+
+    new_sid = store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"}, by="agent-1")
+    assert new_sid is not None and new_sid != old
+
+    old_slot = store.get(old)
+    assert old_slot["status"] == "landed"
+    assert old_slot["next"]["actuated"] is True  # set_actuated acknowledged the baton
+
+    new_slot = store.get(new_sid)
+    assert new_slot["contributor_id"] == "agent-2"  # new owner, ownership never transferred
+    assert new_slot["horizon"]["immediate_goal"] == "land the spec"  # horizon carried forward
+    assert new_slot["artifact"]["content_hash"] == old_slot["artifact"]["content_hash"]
+    assert new_slot["lineage"]["origin_intent"] == origin  # never dropped/invented
+    assert new_slot["lineage"]["predecessor_slot_id"] == old
+    author_ids = [a["id"] for a in new_slot["lineage"]["authors"]]
+    assert author_ids == ["agent-1", "agent-2"]  # appended, prior author not dropped
+    # The new owner can write to its own slot (no SlotOwnershipError).
+    store.update_status(new_sid, "in-progress", by="agent-2")
+
+
+def test_pick_up_three_hop_chain(store: SlotStore, tmp_path: Path):
+    """AC6: after a 3-hop machine-to-machine handoff there are 3 linked slots,
+    each hop's contributor owns its own slot, origin_intent + full author chain
+    queryable from the head slot."""
+    origin = {"author": "Erah", "intent": "three-hop relay", "source_pointer": "spec:2"}
+    f = tmp_path / "molecule.txt"
+    f.write_text("hop-0")
+
+    s0 = store.create_slot("proj-A", {"type": "fixer", "id": "hop-0"}, lineage={"origin_intent": origin})
+    store.set_down(s0, {"kind": "draft-file", "ref": str(f)}, by="hop-0", next_kind="bind-next")
+    s1 = store.pick_up(s0, contributor={"type": "fixer", "id": "hop-1"}, by="hop-0")
+    assert s1 is not None
+
+    store.set_down(s1, {"kind": "draft-file", "ref": str(f)}, by="hop-1", next_kind="bind-next")
+    s2 = store.pick_up(s1, contributor={"type": "fixer", "id": "hop-2"}, by="hop-1")
+    assert s2 is not None
+
+    store.set_down(s2, {"kind": "draft-file", "ref": str(f)}, by="hop-2", next_kind="done")
+    s3 = store.pick_up(s2, contributor={"type": "fixer", "id": "hop-3"}, by="hop-2")
+    assert s3 is not None
+
+    # 3 distinct new slots minted (s1, s2, s3), each chained to its predecessor.
+    assert len({s0, s1, s2, s3}) == 4
+    assert store.get(s1)["lineage"]["predecessor_slot_id"] == s0
+    assert store.get(s2)["lineage"]["predecessor_slot_id"] == s1
+    assert store.get(s3)["lineage"]["predecessor_slot_id"] == s2
+
+    head = store.get(s3)
+    assert head["lineage"]["origin_intent"] == origin  # null-or-real, never invented, never dropped
+    author_ids = [a["id"] for a in head["lineage"]["authors"]]
+    # set_down appends the sender, pick_up appends the receiver, at every hop —
+    # no earlier author dropped.
+    assert author_ids == ["hop-0", "hop-1", "hop-1", "hop-2", "hop-2", "hop-3"]
+
+    # Each hop's contributor owns only its own slot.
+    for sid, owner in ((s0, "hop-0"), (s1, "hop-1"), (s2, "hop-2"), (s3, "hop-3")):
+        assert store.get(sid)["contributor_id"] == owner
+    # Prior-hop slots are all landed (handed off), never mutated by later owners.
+    assert store.get(s0)["status"] == "landed"
+    assert store.get(s1)["status"] == "landed"
+    assert store.get(s2)["status"] == "landed"
+
+
+# --- pick_up: Reality Snap failure -> withheld + active flame escalation ---
+
+def test_pick_up_hash_mismatch_withholds_and_escalates(store: SlotStore, tmp_path: Path, monkeypatch):
+    """AC3/AC4: a force-pushed/edited artifact fails the Snap; pick_up withholds
+    the OLD slot, fires a flame notification, and does NOT resume (returns None)."""
+    f = tmp_path / "draft.md"
+    f.write_text("original")
+    old = store.create_slot("proj-A", CONTRIB)
+    store.set_down(old, {"kind": "draft-file", "ref": str(f)}, by="agent-1", next_kind="bind-next")
+
+    # Simulate a silent edit after set_down.
+    f.write_text("tampered")
+
+    sent = []
+    monkeypatch.setattr(
+        "agents_core.slots.send_notification",
+        lambda message, **kw: sent.append((message, kw)) or True,
+    )
+
+    result = store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"}, by="agent-1")
+    assert result is None  # never resumes
+
+    slot = store.get(old)
+    assert slot["status"] == "withheld"  # NOT clobbered to "escalated"
+    assert slot["escalation"]["to"] == "flame"
+    assert "content_hash mismatch" in slot["escalation"]["reason"]
+    assert any(cp["kind"] == "reality-snap" and "FAILED" in cp["note"] for cp in slot["checkpoints"])
+
+    # Notification fired on the flame channel.
+    assert len(sent) == 1
+    message, kwargs = sent[0]
+    assert "withheld" in message.lower()
+    assert kwargs["priority"] == Priority.HIGH
+
+    # Old slot stays owned by its current contributor-of-record (no handoff).
+    assert slot["contributor_id"] == "agent-1"
+
+
+def test_pick_up_missing_artifact_withholds(store: SlotStore, monkeypatch):
+    """No artifact on record at all -> Snap fails, withheld (not a crash)."""
+    old = store.create_slot("proj-A", CONTRIB)
+    monkeypatch.setattr("agents_core.slots.send_notification", lambda *a, **k: True)
+    result = store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"}, by="agent-1")
+    assert result is None
+    assert store.get(old)["status"] == "withheld"
+
+
+def test_pick_up_join_check_failure_withholds(store: SlotStore, tmp_path: Path, monkeypatch):
+    """Hash matches but the live-join leg fails -> still withheld."""
+    f = tmp_path / "draft.md"
+    f.write_text("stable content")
+    old = store.create_slot("proj-A", CONTRIB)
+    store.set_down(old, {"kind": "draft-file", "ref": str(f)}, by="agent-1", next_kind="bind-next")
+    monkeypatch.setattr("agents_core.slots.send_notification", lambda *a, **k: True)
+
+    result = store.pick_up(
+        old, contributor={"type": "fixer", "id": "agent-2"}, by="agent-1", join_check=lambda: False,
+    )
+    assert result is None
+    slot = store.get(old)
+    assert slot["status"] == "withheld"
+    assert "live-join" in slot["escalation"]["reason"]
+
+
+def test_pick_up_withheld_leaves_other_slots_untouched(store: SlotStore, monkeypatch):
+    """A withheld pick_up on one slot must not affect unrelated slots."""
+    other = store.create_slot("proj-B", {"type": "fixer", "id": "bystander"})
+    old = store.create_slot("proj-A", CONTRIB)
+    monkeypatch.setattr("agents_core.slots.send_notification", lambda *a, **k: True)
+    store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"}, by="agent-1")
+    assert store.get(other)["status"] == "dispatched"  # unrelated slot untouched
+
+
+def test_pick_up_missing_slot_raises(store: SlotStore):
+    with pytest.raises(SlotNotFoundError):
+        store.pick_up("nope", contributor={"type": "fixer", "id": "a"}, by="agent-1")
+
+
+def test_pick_up_rejects_non_owner_caller(store: SlotStore, tmp_path: Path):
+    """med finding: pick_up must not derive `by` from the row itself for its
+    owner-guarded writes -- an unrelated caller (who does not own the slot)
+    must be rejected exactly like a direct update_status() call would be,
+    not silently allowed to force the slot into withheld/landed."""
+    f = tmp_path / "draft.md"
+    f.write_text("content")
+    old = store.create_slot("proj-A", CONTRIB)  # owned by "agent-1"
+    store.set_down(old, {"kind": "draft-file", "ref": str(f)}, by="agent-1", next_kind="bind-next")
+
+    with pytest.raises(SlotOwnershipError):
+        store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"}, by="unrelated-caller")
+
+    # Untouched: still owned by agent-1, still dispatched, no handoff occurred.
+    slot = store.get(old)
+    assert slot["contributor_id"] == "agent-1"
+    assert slot["status"] == "dispatched"
+
+
+def test_pick_up_concurrent_double_pickup_does_not_double_mint(store: SlotStore, tmp_path: Path):
+    """low finding: if the baton was already actuated (e.g. by a concurrent
+    pick_up), a second pick_up on the same slot must refuse to mint a second
+    new slot from the same predecessor rather than proceeding regardless."""
+    f = tmp_path / "draft.md"
+    f.write_text("content")
+    old = store.create_slot("proj-A", CONTRIB)
+    store.set_down(old, {"kind": "draft-file", "ref": str(f)}, by="agent-1", next_kind="bind-next")
+
+    # Simulate a concurrent pick_up having already claimed the baton.
+    assert store.set_actuated(old, by="someone-else") is True
+
+    result = store.pick_up(old, contributor={"type": "fixer", "id": "agent-2"}, by="agent-1")
+    assert result is None  # refused to mint a duplicate slot
+    assert store.query(project_id="proj-A", contributor_id="agent-2") == []
+
+
+# --- escalate() preserve_status -----------------------------------------
+
+def test_escalate_preserve_status_does_not_clobber(store: SlotStore):
+    sid = store.create_slot("proj-A", CONTRIB)
+    store.update_status(sid, "withheld", by="agent-1")
+    store.escalate(sid, to="flame", reason="test", by="agent-1", preserve_status=True)
+    slot = store.get(sid)
+    assert slot["status"] == "withheld"  # unchanged
+    assert slot["escalation"] == {"to": "flame", "reason": "test"}
+
+
+def test_escalate_default_still_forces_escalated(store: SlotStore):
+    """Backward-compat: default behavior (preserve_status=False) is unchanged."""
+    sid = store.create_slot("proj-A", CONTRIB)
+    store.escalate(sid, to="facets", reason="x", by="agent-1")
+    assert store.get(sid)["status"] == "escalated"
+
+
+# --- withheld fate: expire() retires withheld -> abandoned, scar preserved -
+
+def test_expire_retires_withheld_to_abandoned_preserving_lineage(store: SlotStore):
+    """AC5: an unanswered withheld slot past threshold retires to abandoned via
+    the extended expire(); it's a status transition, not a delete — checkpoints
+    and lineage remain queryable (scar preserved)."""
+    origin = {"author": "Erah", "intent": "x", "source_pointer": "spec:3"}
+    sid = store.create_slot("proj-A", CONTRIB, lineage={"origin_intent": origin})
+    store.update_status(sid, "withheld", by="agent-1")
+    store.append_checkpoint(sid, "reality-snap", "pick_up FAILED: hash mismatch", by="agent-1")
+
+    old = (datetime.now(timezone.utc) - timedelta(days=WITHHELD_AGE_DAYS + 1)).isoformat()
+    with store._lock:
+        store._conn.execute("UPDATE slots SET last_update=? WHERE slot_id=?", (old, sid))
+        store._conn.commit()
+
+    counts = store.expire()
+    assert counts["withheld_retired"] == 1
+
+    slot = store.get(sid)
+    assert slot is not None  # retired, NOT deleted
+    assert slot["status"] == "abandoned"
+    assert slot["lineage"]["origin_intent"] == origin  # scar preserved
+    assert any("FAILED" in cp["note"] for cp in slot["checkpoints"])  # failure legible
+
+
+def test_expire_withheld_within_threshold_survives(store: SlotStore):
+    sid = store.create_slot("proj-A", CONTRIB)
+    store.update_status(sid, "withheld", by="agent-1")
+    counts = store.expire()
+    assert counts["withheld_retired"] == 0
+    assert store.get(sid)["status"] == "withheld"
+
+
+def test_expire_withheld_retired_row_survives_a_later_abandoned_sweep(store: SlotStore):
+    """high finding: a withheld slot retired to abandoned must stay PERMANENTLY
+    legible -- a second expire() pass, run after the row has also aged past
+    ABANDONED_AGE_DAYS since its retirement, must NOT hard-delete it the way an
+    ordinarily-abandoned slot would. The scar (lineage/checkpoints/escalation)
+    must survive every future expire() call, not just the first one."""
+    origin = {"author": "Erah", "intent": "x", "source_pointer": "spec:4"}
+    sid = store.create_slot("proj-A", CONTRIB, lineage={"origin_intent": origin})
+    store.update_status(sid, "withheld", by="agent-1")
+    store.append_checkpoint(sid, "reality-snap", "pick_up FAILED: hash mismatch", by="agent-1")
+
+    old = (datetime.now(timezone.utc) - timedelta(days=WITHHELD_AGE_DAYS + 1)).isoformat()
+    with store._lock:
+        store._conn.execute("UPDATE slots SET last_update=? WHERE slot_id=?", (old, sid))
+        store._conn.commit()
+
+    counts = store.expire()
+    assert counts["withheld_retired"] == 1
+    assert store.get(sid)["status"] == "abandoned"
+
+    # Now age the retired row itself well past ABANDONED_AGE_DAYS and run
+    # expire() again -- this is the pass that previously hard-deleted the row.
+    ancient = (datetime.now(timezone.utc) - timedelta(days=ABANDONED_AGE_DAYS + 100)).isoformat()
+    with store._lock:
+        store._conn.execute("UPDATE slots SET last_update=? WHERE slot_id=?", (ancient, sid))
+        store._conn.commit()
+
+    counts2 = store.expire()
+    assert counts2["abandoned_expired"] == 0  # the scarred row must not be swept
+
+    slot = store.get(sid)
+    assert slot is not None  # still queryable, NOT hard-deleted
+    assert slot["status"] == "abandoned"
+    assert slot["lineage"]["origin_intent"] == origin  # scar preserved
+    assert any("FAILED" in cp["note"] for cp in slot["checkpoints"])  # failure legible
+
+
+# --- Board read-view precedence (AC7) ---------------------------------------
+
+def test_board_bucket_mapping():
+    assert board_bucket("landed") == "built"
+    for s in ("dispatched", "in-progress", "escalated", "awaiting-input", "withheld"):
+        assert board_bucket(s) == "in-flight"
+    assert board_bucket("parked") == "parked"  # passthrough, not remapped
+
+
+def test_resolve_build_state_artifact_wins_over_lagging_status():
+    """AC7: a merged PR (artifact present) reports built even though the slot's
+    own status lags behind — the bakeoff mis-scrape case."""
+    artifact = {"kind": "pr", "ref": "agents-core#1", "content_hash": "abc"}
+    assert resolve_build_state(artifact, "in-progress") == "built"
+
+
+def test_resolve_build_state_unmerged_pr_falls_through_to_status():
+    artifact = {"kind": "pr", "ref": "agents-core#1", "content_hash": "abc"}
+    assert resolve_build_state(artifact, "in-progress", pr_merged=False) == "in-flight"
+
+
+def test_resolve_build_state_no_artifact_uses_status_bucket():
+    assert resolve_build_state(None, "landed") == "built"
+    assert resolve_build_state({}, "dispatched") == "in-flight"
+
+
+def test_artifact_kinds_frozenset_matches_spec():
+    assert ARTIFACT_KINDS == {"pr", "spec", "atom-output", "draft-file"}

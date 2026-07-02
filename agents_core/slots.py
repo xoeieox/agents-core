@@ -41,6 +41,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from agents_core.notify import Priority, send_notification
+
 # --- Configuration ---
 
 DB_DIR = Path("/data/slots")
@@ -57,13 +59,20 @@ IS_MASTER = HOSTNAME == SLOTS_MASTER_HOST
 SLOTS_MASTER_URL = os.environ.get("SLOTS_MASTER_URL", "http://203.0.113.10:8405")
 
 # Slot lifecycle vocabulary (design doc "Proposed minimum slot state schema").
+# ``withheld`` (baton-lineage-verified-handoff-v0): a pick_up whose Reality Snap
+# failed. Deliberately NOT in TERMINAL_STATUSES / INACTIVE_STATUSES — it does not
+# age out silently like parked/abandoned; it retires to abandoned only via the
+# explicit withheld-aging branch in expire() (see WITHHELD_AGE_DAYS).
 STATUSES = frozenset({
     "dispatched", "in-progress", "awaiting-input",
-    "escalated", "parked", "landed", "abandoned",
+    "escalated", "parked", "landed", "abandoned", "withheld",
 })
 # Slots no longer actively contributing — excluded from adjacency by default.
 TERMINAL_STATUSES = frozenset({"landed", "abandoned"})
 INACTIVE_STATUSES = frozenset({"landed", "abandoned", "parked"})
+
+# Artifact kinds a handoff baton can point at (baton-lineage-verified-handoff-v0).
+ARTIFACT_KINDS = frozenset({"pr", "spec", "atom-output", "draft-file"})
 
 # Handoff-baton kinds that a controller (Morph) can dispatch on without parsing prose.
 # Closed set: exactly these dispatch verbs; anything else is a ValueError.
@@ -80,6 +89,10 @@ CONTRIBUTOR_TYPES = frozenset({
 # abandoned after 7d. Tunable.
 PARKED_AGE_DAYS = 30
 ABANDONED_AGE_DAYS = 7
+# Withheld fate (Erah-ratified, baton-lineage-verified-handoff-v0): an unanswered
+# withheld slot retires to abandoned after this many days. Aligned to
+# ABANDONED_AGE_DAYS by default per spec ("Withheld fate"); tunable independently.
+WITHHELD_AGE_DAYS = ABANDONED_AGE_DAYS
 
 
 # --- Database Schema ---
@@ -110,6 +123,15 @@ CREATE TABLE IF NOT EXISTS slots (
     -- the store records the verdict, the contributor decides whether to act on it.
     facets_verdict      TEXT,
     facets_last_update  TEXT,
+    -- baton-lineage-verified-handoff-v0: intent/authorship that travels across
+    -- handoffs (appends, never resets) and the frozen artifact pointer + hash
+    -- verified at pick_up. See SlotStore.create_slot / set_down / pick_up.
+    lineage            TEXT NOT NULL DEFAULT '{}',
+    artifact           TEXT NOT NULL DEFAULT '{}',
+    -- set when expire() retires a withheld slot to abandoned (see expire());
+    -- marks the row as scar-bearing so the ordinary abandoned-deletion sweep
+    -- never hard-deletes it. NULL for slots abandoned by the normal path.
+    withheld_retired_at TEXT,
     created_at         TEXT NOT NULL
 );
 
@@ -119,7 +141,10 @@ CREATE INDEX IF NOT EXISTS slots_contrib ON slots(contributor_id);
 """
 
 # JSON-encoded columns, parsed back to objects on read.
-_JSON_FIELDS = ("domain_touch", "horizon", "checkpoints", "escalation", "facets_verdict", "next")
+_JSON_FIELDS = (
+    "domain_touch", "horizon", "checkpoints", "escalation", "facets_verdict",
+    "next", "lineage", "artifact",
+)
 
 # Observer-namespace columns added after the initial gate-5 schema. CREATE TABLE
 # IF NOT EXISTS won't add columns to a pre-existing table, so they are applied as
@@ -130,6 +155,9 @@ _ADDED_COLUMNS = (
     ("next", "TEXT NOT NULL DEFAULT '{}'"),
     ("next_actuated", "INTEGER DEFAULT 0"),
     ("next_actuated_at", "TEXT"),
+    ("lineage", "TEXT NOT NULL DEFAULT '{}'"),
+    ("artifact", "TEXT NOT NULL DEFAULT '{}'"),
+    ("withheld_retired_at", "TEXT"),
 )
 
 
@@ -296,12 +324,25 @@ class SlotStore:
         slot_id: str | None = None,
         status: str = "dispatched",
         domain_touch: dict | None = None,
+        lineage: dict | None = None,
+        artifact: dict | None = None,
     ) -> str:
         """Create a slot for ``project_id`` assigned to ``contributor``.
 
         ``contributor`` is ``{"type": <contributor-type>, "id": <agent run/session id>}``.
         ``horizon`` is the vision-propagation field (``project_summary``,
         ``immediate_goal``, ``adjacent_slots``). Returns the slot_id.
+
+        ``lineage`` (baton-lineage-verified-handoff-v0) is the intent/authorship
+        record: ``{origin_intent: {author, intent, source_pointer}|None, authors:
+        [...], atoms: [...]}``. Normalized to that shape here regardless of what's
+        passed in — ``origin_intent`` defaults to ``None`` (NEVER fabricated) and
+        ``authors``/``atoms`` default to ``[]``. Callers doing a handoff pass the
+        prior slot's lineage forward (with the new contributor appended) via
+        ``pick_up``; fresh authoring passes ``origin_intent`` if a real pointer to
+        the human "why" is known, or omits it.
+        ``artifact`` is the frozen work-product pointer (``{kind, ref,
+        content_hash}``); normally set later via ``set_down``, empty at authoring.
         """
         self._check_writable()
         self._validate_status(status)
@@ -312,6 +353,15 @@ class SlotStore:
         started = contributor.get("started_at") or now
         horizon = horizon or {}
         domain_touch = domain_touch or {}
+        lineage_in = lineage or {}
+        lineage_record = {
+            "origin_intent": lineage_in.get("origin_intent"),
+            "authors": list(lineage_in.get("authors") or []),
+            "atoms": list(lineage_in.get("atoms") or []),
+        }
+        if "predecessor_slot_id" in lineage_in:
+            lineage_record["predecessor_slot_id"] = lineage_in["predecessor_slot_id"]
+        artifact_record = dict(artifact or {})
         with self._lock:
             exists = self._conn.execute(
                 "SELECT 1 FROM slots WHERE slot_id = ?", (sid,)
@@ -321,13 +371,16 @@ class SlotStore:
             self._conn.execute(
                 "INSERT INTO slots (slot_id, project_id, contributor_type, contributor_id, "
                 " started_at, status, last_update, domain_touch, horizon, checkpoints, "
-                " escalation, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " escalation, lineage, artifact, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     sid, project_id, ctype, cid, started, status, now,
                     json.dumps(domain_touch, sort_keys=True),
                     json.dumps(horizon, sort_keys=True),
-                    "[]", "{}", now,
+                    "[]", "{}",
+                    json.dumps(lineage_record, sort_keys=True),
+                    json.dumps(artifact_record, sort_keys=True),
+                    now,
                 ),
             )
             self._conn.commit()
@@ -415,18 +468,27 @@ class SlotStore:
             self._conn.commit()
         return True
 
-    def escalate(self, slot_id: str, to: str, reason: str, *, by: str) -> bool:
-        """Escalate the slot (status -> escalated, populate escalation field).
+    def escalate(
+        self, slot_id: str, to: str, reason: str, *, by: str, preserve_status: bool = False
+    ) -> bool:
+        """Escalate the slot (by default status -> escalated, populate escalation field).
 
         ``to`` is facets | flame | none. Contributor-of-record only.
+
+        ``preserve_status`` (baton-lineage-verified-handoff-v0): if True, write only
+        the ``escalation`` field and leave ``status`` as-is — does NOT force it to
+        ``"escalated"``. Used by the withheld handoff path (``pick_up`` Reality-Snap
+        failure), where the status of record must stay ``"withheld"``, not get
+        clobbered by this method's default status mutation.
         """
         self._check_writable()
         now = _now()
         with self._lock:
-            self._require_owner(slot_id, by)
+            row = self._require_owner(slot_id, by)
+            status = row["status"] if preserve_status else "escalated"
             self._conn.execute(
                 "UPDATE slots SET status=?, escalation=?, last_update=? WHERE slot_id=?",
-                ("escalated", json.dumps({"to": to, "reason": reason}, sort_keys=True),
+                (status, json.dumps({"to": to, "reason": reason}, sort_keys=True),
                  now, slot_id),
             )
             self._conn.commit()
@@ -478,6 +540,194 @@ class SlotStore:
             )
             self._conn.commit()
         return True
+
+    # -- verified handoff (baton-lineage-verified-handoff-v0) ---------------
+    # set_down / pick_up WRAP set_next / set_actuated (unchanged baton semantics)
+    # with lineage + artifact-hash verification. Library functions only — no CLI
+    # (repo purity rule); the conductor's night_coordinator.py is the consumer.
+
+    def set_down(
+        self,
+        slot_id: str,
+        artifact: dict,
+        *,
+        by: str,
+        next_kind: str,
+        next_ref: str | None = None,
+        next_blocked_on: list[str] | None = None,
+        next_proposal: str = "",
+        by_kind: str = "agent",
+        forgejo_owner: str | None = None,
+    ) -> bool:
+        """Set a slot down for handoff: freeze the artifact pointer + hash, append
+        ``by`` to the lineage author chain, and publish the next baton.
+
+        ``artifact`` is ``{"kind": pr|spec|atom-output|draft-file, "ref": <pointer>}``
+        — ``content_hash`` is computed here (v0 scheme: whole-body sha256 for
+        spec/atom-output/draft-file, head commit sha for pr), never supplied by the
+        caller. Wraps ``set_next`` for the baton itself. Contributor-of-record only
+        (delegates the ownership check to ``set_next``'s ``_require_owner``).
+        """
+        self._check_writable()
+        kind = artifact.get("kind")
+        ref = artifact.get("ref")
+        if kind not in ARTIFACT_KINDS:
+            raise ValueError(
+                f"invalid artifact kind {kind!r}; must be one of {sorted(ARTIFACT_KINDS)}"
+            )
+        content_hash = _compute_content_hash(kind, ref, owner=forgejo_owner)
+        now = _now()
+        artifact_record = {"kind": kind, "ref": ref, "content_hash": content_hash}
+        with self._lock:
+            row = self._require_owner(slot_id, by)
+            lineage = json.loads(row["lineage"]) if row["lineage"] else {}
+            lineage.setdefault("origin_intent", None)
+            authors = list(lineage.get("authors") or [])
+            authors.append({"id": by, "kind": by_kind, "role": "set-down", "at": now})
+            lineage["authors"] = authors
+            lineage.setdefault("atoms", [])
+            self._conn.execute(
+                "UPDATE slots SET artifact=?, lineage=?, last_update=? WHERE slot_id=?",
+                (
+                    json.dumps(artifact_record, sort_keys=True),
+                    json.dumps(lineage, sort_keys=True),
+                    now, slot_id,
+                ),
+            )
+            self._conn.commit()
+        self.set_next(
+            slot_id, by=by, kind=next_kind, ref=next_ref,
+            blocked_on=next_blocked_on, proposal=next_proposal,
+        )
+        return True
+
+    def pick_up(
+        self,
+        slot_id: str,
+        *,
+        contributor: dict,
+        by: str,
+        forgejo_owner: str | None = None,
+        join_check=None,
+    ) -> str | None:
+        """Attempt to pick up ``slot_id``'s baton via the Reality Snap.
+
+        ``by`` must be ``slot_id``'s current contributor-of-record (mirrors
+        ``set_down``'s ownership contract — only the owner who published the
+        baton may trigger its own withheld/landed transitions). Raises
+        ``SlotOwnershipError`` otherwise: without this check any caller could
+        force an unrelated slot into ``withheld``/``landed`` regardless of who
+        actually owns it, even though a direct ``update_status()`` call from
+        that same caller would be correctly rejected.
+
+        On success: acknowledges the old baton (``set_actuated`` — a legal
+        non-owner write, per the module's ownership design), mints a NEW slot for
+        ``contributor`` (ownership never transfers between slots — see module
+        docstring), carrying forward horizon/artifact/lineage with ``contributor``
+        appended to the author chain and ``lineage.predecessor_slot_id`` set to
+        ``slot_id``, marks the OLD slot ``landed`` (old slot is never otherwise
+        mutated by the new owner), and returns the new slot_id.
+
+        The mint is gated on ``set_actuated``'s compare-and-swap: it returns
+        False if the baton was already actuated by a concurrent ``pick_up`` on
+        the same slot, in which case this call refuses to mint a second new
+        slot from the same predecessor and returns ``None``.
+
+        On failure (hash mismatch, artifact unresolvable, or ``join_check`` fails):
+        WITHHOLDS the old slot (``status="withheld"``), records what failed in a
+        checkpoint, fires an active flame-channel notification directly via
+        ``notify.send_notification`` (NOT via ``escalate()``'s status mutation —
+        flame is a notification; ``withheld`` stays the status of record), and
+        returns ``None`` without resuming. Only this slot is touched; the rest of
+        the relay proceeds untouched.
+
+        ``join_check``: optional ``() -> bool`` for the live-join Snap leg (build-
+        state / mem / slot-status corroboration). v0 callers with no join source
+        wired up yet may omit it — artifact-hash verification alone still gates
+        the handoff.
+        """
+        self._check_writable()
+        with self._lock:
+            row = self._require_owner(slot_id, by)
+        old = self._row_to_dict(row)
+        old_owner = by
+        artifact = old.get("artifact") or {}
+        now = _now()
+
+        failure_reason = None
+        if not artifact or not artifact.get("ref"):
+            failure_reason = "no artifact on record to verify"
+        else:
+            try:
+                current_hash = _compute_content_hash(
+                    artifact["kind"], artifact["ref"], owner=forgejo_owner
+                )
+            except Exception as exc:
+                failure_reason = f"artifact unresolvable: {exc!r}"
+            else:
+                if current_hash != artifact.get("content_hash"):
+                    failure_reason = (
+                        f"content_hash mismatch: stored={artifact.get('content_hash')!r} "
+                        f"current={current_hash!r}"
+                    )
+        if failure_reason is None and join_check is not None:
+            try:
+                if not join_check():
+                    failure_reason = "live-join failed or timed out"
+            except Exception as exc:
+                failure_reason = f"live-join error: {exc!r}"
+
+        if failure_reason is not None:
+            self.append_checkpoint(
+                slot_id, "reality-snap", f"pick_up FAILED: {failure_reason}", by=old_owner,
+            )
+            self.update_status(slot_id, "withheld", by=old_owner)
+            self.escalate(
+                slot_id, to="flame", reason=failure_reason, by=old_owner,
+                preserve_status=True,
+            )
+            send_notification(
+                f"Slot {slot_id} withheld — Reality Snap failed: {failure_reason}",
+                title="Baton withheld",
+                priority=Priority.HIGH,
+            )
+            return None
+
+        won = self.set_actuated(slot_id, by=contributor.get("id", "pick_up"))
+        if not won:
+            # A concurrent pick_up already claimed this baton — refuse to mint a
+            # second new slot from the same predecessor.
+            return None
+
+        lineage = dict(old.get("lineage") or {})
+        lineage.setdefault("origin_intent", None)
+        authors = list(lineage.get("authors") or [])
+        authors.append({
+            "id": contributor.get("id"),
+            "kind": contributor.get("type", "agent"),
+            "role": "pickup",
+            "at": now,
+        })
+        lineage["authors"] = authors
+        lineage.setdefault("atoms", [])
+        lineage["predecessor_slot_id"] = slot_id
+
+        new_sid = self.create_slot(
+            project_id=old["project_id"],
+            contributor=contributor,
+            horizon=old.get("horizon") or {},
+            domain_touch=old.get("domain_touch") or {},
+            lineage=lineage,
+            artifact=artifact,
+        )
+        self.append_checkpoint(
+            new_sid, "handoff",
+            f"picked up from {slot_id}; reality_snap_ref={slot_id}; "
+            f"artifact_hash={artifact.get('content_hash')}",
+            by=contributor.get("id"),
+        )
+        self.update_status(slot_id, "landed", by=old_owner)
+        return new_sid
 
     # -- observer writes (separate column namespace; not owner-guarded) ------
 
@@ -544,30 +794,34 @@ class SlotStore:
         False without error (safe for at-least-once retry). On successful actuation of
         a fresh baton, returns True.
 
+        The actual flip is a single conditional ``UPDATE ... WHERE next_actuated=0``
+        (compare-and-swap on ``rowcount``), not a check-then-write — so two
+        concurrent callers racing to actuate the same baton can never both observe
+        True; exactly one wins. Callers that mint follow-on state (e.g. ``pick_up``)
+        MUST treat a False return as "someone else already claimed this baton" and
+        refuse to proceed, not just as an idempotent no-op.
+
         Raises SlotNotFoundError if the slot does not exist.
         """
         self._check_writable()
         now = _now()
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM slots WHERE slot_id=?", (slot_id,)
+                "SELECT next FROM slots WHERE slot_id=?", (slot_id,)
             ).fetchone()
             if row is None:
                 raise SlotNotFoundError(slot_id)
-            # Idempotent: if no next baton or already actuated, return False.
+            # If there's no next baton at all, there's nothing to claim.
             next_data = json.loads(row["next"]) if row["next"] else {}
             if not next_data:
                 return False
-            # Check if already actuated (via the separate next_actuated column).
-            if row["next_actuated"]:
-                return False
-            # Mark as actuated in the separate column namespace.
-            self._conn.execute(
-                "UPDATE slots SET next_actuated=1, next_actuated_at=? WHERE slot_id=?",
+            cur = self._conn.execute(
+                "UPDATE slots SET next_actuated=1, next_actuated_at=? "
+                "WHERE slot_id=? AND (next_actuated IS NULL OR next_actuated=0)",
                 (now, slot_id),
             )
             self._conn.commit()
-        return True
+        return cur.rowcount > 0
 
     # -- reads --------------------------------------------------------------
 
@@ -735,25 +989,46 @@ class SlotStore:
     # -- maintenance --------------------------------------------------------
 
     def expire(self, now: datetime | None = None) -> dict:
-        """Age out stale slots: parked > 30d, abandoned > 7d (design doc defaults).
+        """Age out stale slots: parked > 30d, abandoned > 7d (design doc defaults),
+        withheld > WITHHELD_AGE_DAYS retires to abandoned (baton-lineage-verified-
+        handoff-v0 "Withheld fate").
 
-        Blackboards accumulate cruft fast — cleanup discipline matters. Returns counts.
+        The withheld retirement is a STATUS TRANSITION, not a delete: the scar
+        (failure checkpoint, reality-snap result, full lineage) stays PERMANENTLY
+        legible in the row — it stamps ``withheld_retired_at`` so the ordinary
+        abandoned-deletion sweep below (and every future run of it) skips these
+        rows forever, instead of hard-deleting them once they cross
+        ABANDONED_AGE_DAYS the way an originally-abandoned slot would. It rides
+        this already-running mechanism rather than a new cron, per spec's
+        extension-point note. Blackboards accumulate cruft fast — cleanup
+        discipline matters, but not at the cost of erasing the scar.
+        Returns counts.
         """
         self._check_writable()
         now = now or datetime.now(timezone.utc)
         parked_cut = (now - timedelta(days=PARKED_AGE_DAYS)).isoformat()
         abandoned_cut = (now - timedelta(days=ABANDONED_AGE_DAYS)).isoformat()
+        withheld_cut = (now - timedelta(days=WITHHELD_AGE_DAYS)).isoformat()
         with self._lock:
+            # Retire unanswered withheld slots FIRST, marking them scar-bearing
+            # (withheld_retired_at) so they're excluded from the abandoned-deletion
+            # sweep below, permanently — not just for this pass.
+            w = self._conn.execute(
+                "UPDATE slots SET status='abandoned', last_update=?, withheld_retired_at=? "
+                "WHERE status='withheld' AND last_update < ?",
+                (now.isoformat(), now.isoformat(), withheld_cut),
+            ).rowcount
             p = self._conn.execute(
                 "DELETE FROM slots WHERE status='parked' AND last_update < ?",
                 (parked_cut,),
             ).rowcount
             a = self._conn.execute(
-                "DELETE FROM slots WHERE status='abandoned' AND last_update < ?",
+                "DELETE FROM slots WHERE status='abandoned' AND last_update < ? "
+                "AND withheld_retired_at IS NULL",
                 (abandoned_cut,),
             ).rowcount
             self._conn.commit()
-        return {"parked_expired": p, "abandoned_expired": a}
+        return {"parked_expired": p, "abandoned_expired": a, "withheld_retired": w}
 
     def checkpoint_wal(self):
         """Force WAL checkpoint for a clean sync copy."""
@@ -817,3 +1092,67 @@ class SlotStore:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _compute_content_hash(kind: str, ref: str, *, owner: str | None = None) -> str:
+    """Resolve an artifact's current content hash for Reality-Snap verification
+    (baton-lineage-verified-handoff-v0).
+
+    ``pr``: ``ref`` is ``"<repo>#<number>"``; hash is the PR's head commit sha
+    (git already content-hashes, so no need to re-hash the diff). Fetched lazily
+    via ``agents_core.forgejo.get_pr`` — only pr-kind artifacts pull in Forgejo.
+    ``spec`` / ``atom-output`` / ``draft-file``: ``ref`` is a filesystem path;
+    hash is whole-body sha256 (catches silent edits to files that don't move).
+
+    Raises on an unresolvable artifact (missing file, 404 PR, ...) — callers
+    (``pick_up``) treat any exception as a Reality-Snap failure, never a silent
+    pass.
+    """
+    if kind == "pr":
+        from agents_core.forgejo import get_pr
+        repo, _, number = ref.partition("#")
+        pr = get_pr(repo, int(number), owner=owner)
+        return pr["head"]["sha"]
+    if kind in ("spec", "atom-output", "draft-file"):
+        return hashlib.sha256(Path(ref).read_bytes()).hexdigest()
+    raise ValueError(f"invalid artifact kind {kind!r}; must be one of {sorted(ARTIFACT_KINDS)}")
+
+
+# -- Board read-view mapping (v0 mapping only — NOT new status values, NOT a
+# schema change; see spec "Status vocabulary reconciliation" / "Build-state join
+# precedence"). The Board itself is v1, out of scope here; this store only
+# guarantees the fields the join needs are present. Pure functions, no I/O.
+
+def board_bucket(status: str) -> str:
+    """Map a slot's operational status to the Board's idea-pipeline bucket.
+
+    ``landed`` -> ``built``; ``dispatched|in-progress|escalated|awaiting-input|
+    withheld`` -> ``in-flight`` (withheld shown as an in-flight break, per spec);
+    anything else passes through unchanged (``captured``/``designed`` are
+    pre-dispatch buckets sourced from mem/spec state, not this store).
+    """
+    if status == "landed":
+        return "built"
+    if status in ("dispatched", "in-progress", "escalated", "awaiting-input", "withheld"):
+        return "in-flight"
+    return status
+
+
+def resolve_build_state(
+    artifact: dict | None, status: str, *, pr_merged: bool | None = None
+) -> str:
+    """Precedence resolver for "is this built": artifact/PR state > slot status
+    > mem (spec "Build-state join precedence").
+
+    A recorded artifact (only ever written at ``set_down`` — i.e. completed work)
+    reports ``"built"`` even when the slot's own status lags behind, which is the
+    bakeoff mis-scrape case this guards against. ``pr_merged``: for pr-kind
+    artifacts, pass the live merged-state if known — ``False`` falls through to
+    the status bucket (not yet merged, so not built by PR authority); ``None``
+    (default) trusts artifact presence alone.
+    """
+    if artifact and artifact.get("ref"):
+        if artifact.get("kind") == "pr" and pr_merged is False:
+            return board_bucket(status)
+        return "built"
+    return board_bucket(status)
