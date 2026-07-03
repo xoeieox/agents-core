@@ -8,8 +8,10 @@ argv, and the parse-contract must hold:
 """
 
 import json
+import os
 import subprocess
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from agents_core import mcp_lapispm
 
@@ -288,3 +290,231 @@ def test_lapispm_tick_cli_error():
         result = mcp_lapispm.lapispm_tick(target_id="my-target")
     assert result["parse_status"] == "cli_error"
     assert "ticks" not in result
+
+
+# ---------------------------------------------------------------------------
+# spec-review: background-launch + poll pair
+# ---------------------------------------------------------------------------
+
+SPEC_REVIEW_DONE_LOG = """# Spec Review: my-target
+
+**Spec:** /srv/lapis/planning/specs/my-target.md
+**Repo:** agents-core
+**Elapsed:** 123.4s
+**Recommendation:** proceed-to-bind
+
+## Mirror Council deliberation
+- **Status:** resolved, confidence converged
+- **Run ID:** council-abc123
+- **Landing:** ship it
+- **Positions:**
+    - (none)
+- **Open questions:**
+    - (none)
+
+## Suggested next step
+Both passes returned clean signals. Proceed to `lapis-pm bind` after Erah confirms.
+"""
+
+
+def _patch_spec_review_dirs(tmp_path):
+    runs_dir = tmp_path / "runs"
+    lock_path = tmp_path / "lock"
+    return (
+        patch.object(mcp_lapispm, "_spec_review_runs_dir", return_value=runs_dir),
+        patch.object(mcp_lapispm, "_spec_review_lock_path", return_value=lock_path),
+        runs_dir,
+        lock_path,
+    )
+
+
+def _write_registry_entry(runs_dir, run_id, **overrides):
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "run_id": run_id,
+        "pid": 424242,
+        "spec_path": "/srv/lapis/planning/specs/my-target.md",
+        "log_path": str(runs_dir / f"{run_id}.log"),
+        "started_at": "2026-07-03T10:00:00Z",
+        "cli_argv": ["lapis-pm", "spec-review", "/srv/lapis/planning/specs/my-target.md"],
+    }
+    entry.update(overrides)
+    (runs_dir / f"{run_id}.json").write_text(json.dumps(entry), encoding="utf-8")
+    return entry
+
+
+def test_lapispm_spec_review_start_argv_and_returns_immediately(tmp_path):
+    p_runs, p_lock, runs_dir, lock_path = _patch_spec_review_dirs(tmp_path)
+    fake_proc = MagicMock()
+    fake_proc.pid = 5555
+    with p_runs, p_lock, \
+         patch.object(mcp_lapispm.subprocess, "Popen", return_value=fake_proc) as popen:
+        result = mcp_lapispm.lapispm_spec_review_start(
+            spec_path="/srv/lapis/planning/specs/my-target.md",
+            council_voicing="gravitywell",
+            facets_operator="gravitywell",
+            no_sonnet_reviewer=True,
+            no_facets=False,
+            authority="advisory",
+            timeout_s=900,
+        )
+
+    assert popen.call_count == 1
+    call_args, call_kwargs = popen.call_args
+    argv = call_args[0]
+    assert argv == [
+        "lapis-pm", "spec-review", "/srv/lapis/planning/specs/my-target.md",
+        "--council-voicing", "gravitywell",
+        "--facets-operator", "gravitywell",
+        "--timeout", "900",
+        "--no-sonnet-reviewer",
+        "--authority", "advisory",
+    ]
+    assert call_kwargs["start_new_session"] is True
+    assert call_kwargs["env"]["PYTHONUNBUFFERED"] == "1"
+
+    fake_proc.wait.assert_not_called()
+    fake_proc.communicate.assert_not_called()
+
+    assert result["status"] == "started"
+    assert result["pid"] == 5555
+    assert "run_id" in result
+    assert "log_path" in result
+    assert (runs_dir / f"{result['run_id']}.json").exists()
+
+
+def test_lapispm_spec_review_start_durability_env_unbuffered(tmp_path):
+    p_runs, p_lock, runs_dir, lock_path = _patch_spec_review_dirs(tmp_path)
+    fake_proc = MagicMock()
+    fake_proc.pid = 5556
+    with p_runs, p_lock, \
+         patch.object(mcp_lapispm.subprocess, "Popen", return_value=fake_proc) as popen:
+        mcp_lapispm.lapispm_spec_review_start(spec_path="/srv/lapis/planning/specs/x.md")
+    _, call_kwargs = popen.call_args
+    assert call_kwargs["env"]["PYTHONUNBUFFERED"] == "1"
+
+
+def test_lapispm_spec_review_start_collision_own_registry(tmp_path):
+    p_runs, p_lock, runs_dir, lock_path = _patch_spec_review_dirs(tmp_path)
+    entry = _write_registry_entry(runs_dir, "run-1", pid=os.getpid())
+    with p_runs, p_lock, \
+         patch.object(mcp_lapispm.subprocess, "Popen") as popen:
+        result = mcp_lapispm.lapispm_spec_review_start(spec_path=entry["spec_path"])
+    popen.assert_not_called()
+    assert result == {
+        "status": "already_running",
+        "held_by_pid": os.getpid(),
+        "spec_path": entry["spec_path"],
+        "started_at": entry["started_at"],
+        "run_id": "run-1",
+    }
+
+
+def test_lapispm_spec_review_start_collision_cli_lock_file(tmp_path):
+    p_runs, p_lock, runs_dir, lock_path = _patch_spec_review_dirs(tmp_path)
+    lock_path.write_text(json.dumps({
+        "pid": os.getpid(),
+        "spec_path": "/srv/lapis/planning/specs/other-target.md",
+        "started_at": "2026-07-03T09:00:00Z",
+        "host": "brix",
+    }), encoding="utf-8")
+    with p_runs, p_lock, \
+         patch.object(mcp_lapispm.subprocess, "Popen") as popen:
+        result = mcp_lapispm.lapispm_spec_review_start(spec_path="/srv/lapis/planning/specs/my-target.md")
+    popen.assert_not_called()
+    assert result == {
+        "status": "already_running",
+        "held_by_pid": os.getpid(),
+        "spec_path": "/srv/lapis/planning/specs/other-target.md",
+        "started_at": "2026-07-03T09:00:00Z",
+        "run_id": None,
+    }
+
+
+def test_lapispm_spec_review_start_stale_lock_never_deletes_lock(tmp_path):
+    p_runs, p_lock, runs_dir, lock_path = _patch_spec_review_dirs(tmp_path)
+    original_lock_bytes = json.dumps({
+        "pid": 999999,
+        "spec_path": "/srv/lapis/planning/specs/other-target.md",
+        "started_at": "2026-07-03T09:00:00Z",
+        "host": "brix",
+    }).encode()
+    lock_path.write_bytes(original_lock_bytes)
+    with p_runs, p_lock, \
+         patch.object(mcp_lapispm, "_pid_alive", return_value=False), \
+         patch.object(
+             mcp_lapispm, "_try_nonblocking_flock",
+             return_value=(False, "[Errno 11] Resource temporarily unavailable"),
+         ), \
+         patch.object(mcp_lapispm.subprocess, "Popen") as popen:
+        result = mcp_lapispm.lapispm_spec_review_start(spec_path="/srv/lapis/planning/specs/my-target.md")
+    popen.assert_not_called()
+    assert result == {
+        "status": "stale_lock",
+        "held_by_pid": 999999,
+        "spec_path": "/srv/lapis/planning/specs/other-target.md",
+        "flock_error": "[Errno 11] Resource temporarily unavailable",
+    }
+    # never deleted or rewritten — kernel owns lock state
+    assert lock_path.read_bytes() == original_lock_bytes
+
+
+def test_lapispm_spec_review_poll_running(tmp_path):
+    p_runs, p_lock, runs_dir, lock_path = _patch_spec_review_dirs(tmp_path)
+    entry = _write_registry_entry(runs_dir, "run-2", pid=os.getpid())
+    Path(entry["log_path"]).write_text("partial output so far...\n", encoding="utf-8")
+    with p_runs, p_lock:
+        result = mcp_lapispm.lapispm_spec_review_poll(run_id="run-2")
+    assert result["status"] == "running"
+    assert "elapsed_s" in result
+    assert result["tail"] == "partial output so far...\n"
+
+
+def test_lapispm_spec_review_poll_done_parses_brief(tmp_path):
+    p_runs, p_lock, runs_dir, lock_path = _patch_spec_review_dirs(tmp_path)
+    entry = _write_registry_entry(runs_dir, "run-3", pid=999999)
+    Path(entry["log_path"]).write_text(SPEC_REVIEW_DONE_LOG, encoding="utf-8")
+    with p_runs, p_lock, patch.object(mcp_lapispm, "_pid_alive", return_value=False):
+        result = mcp_lapispm.lapispm_spec_review_poll(run_id="run-3")
+    assert result["status"] == "done"
+    assert result["exit_code"] == 0
+    assert result["parse_status"] == "ok"
+    assert result["raw_output"] == SPEC_REVIEW_DONE_LOG
+    assert result["recommendation"] == "proceed-to-bind"
+    assert result["target_id"] == "my-target"
+    assert result["council_status"] == "resolved"
+    assert result["council_run_id"] == "council-abc123"
+    # strictly exit_code + raw_output + the existing ok/partial parsed-brief contract —
+    # never an invented soft/hard-failure classification (spec-review round 2)
+    assert "assessment" not in result
+    assert not any("assessment" in str(k).lower() for k in result)
+
+
+def test_lapispm_spec_review_poll_not_found(tmp_path):
+    p_runs, p_lock, runs_dir, lock_path = _patch_spec_review_dirs(tmp_path)
+    with p_runs, p_lock:
+        result = mcp_lapispm.lapispm_spec_review_poll(run_id="does-not-exist")
+    assert result == {"status": "not_found"}
+
+
+def test_lapispm_spec_review_poll_stale_lock_by_spec_path(tmp_path):
+    p_runs, p_lock, runs_dir, lock_path = _patch_spec_review_dirs(tmp_path)
+    lock_path.write_text(json.dumps({
+        "pid": 999999,
+        "spec_path": "/srv/lapis/planning/specs/my-target.md",
+        "started_at": "2026-07-03T09:00:00Z",
+        "host": "brix",
+    }), encoding="utf-8")
+    with p_runs, p_lock, \
+         patch.object(mcp_lapispm, "_pid_alive", return_value=False), \
+         patch.object(
+             mcp_lapispm, "_try_nonblocking_flock",
+             return_value=(False, "[Errno 11] Resource temporarily unavailable"),
+         ):
+        result = mcp_lapispm.lapispm_spec_review_poll(spec_path="/srv/lapis/planning/specs/my-target.md")
+    assert result == {
+        "status": "stale_lock",
+        "held_by_pid": 999999,
+        "spec_path": "/srv/lapis/planning/specs/my-target.md",
+        "flock_error": "[Errno 11] Resource temporarily unavailable",
+    }
