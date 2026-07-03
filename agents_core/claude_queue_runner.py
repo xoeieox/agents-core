@@ -34,7 +34,7 @@ import psutil
 
 from agents_core.claude_queue import CLAUDE_QUEUE_DIR, ClaudeQueue
 from agents_core.gpu import PACIFIC, Priority as QueuePriority  # noqa: F401
-from agents_core.notify import Priority as PushoverPriority, send_notification
+from agents_core.notify import Priority as PushoverPriority, _capture_event, send_notification
 from agents_core.room_paths import room_path
 from agents_core.worktree import WORKTREE_ROOT
 
@@ -156,6 +156,20 @@ def _log_silenced(event: str, task: dict, *, failure_class: str | None,
         }
         with open(SILENCED_LOG, "a") as f:
             f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+        _capture_event(
+            source="claude_queue_runner",
+            message=result_head,
+            title="claude-queue",
+            priority=PushoverPriority[demoted_from],
+            delivered=None,
+            extra={
+                "task_id": task.get("id"),
+                "description": _fmt_task_label(task),
+                "event": event,
+                "failure_class": failure_class,
+                "demoted_from": demoted_from,
+            },
+        )
     except Exception as e:
         log.warning(f"failed to log silenced event: {e}")
 
@@ -178,6 +192,14 @@ def _fmt_task_label(task: dict) -> str:
 
 def notify_completion(task: dict, output_path: str) -> None:
     if not task.get("notify"):
+        _capture_event(
+            source="claude_queue_runner",
+            message=f"Claude task completed: {_fmt_task_label(task)}\nOutput: {output_path}",
+            title="claude-queue",
+            priority=PushoverPriority.NORMAL,
+            delivered=None,
+            extra={"task_id": task.get("id"), "description": _fmt_task_label(task), "notify_flag": False},
+        )
         return
     policy = task.get("notify_policy", "always")
     if policy == "infra-only":
@@ -193,6 +215,15 @@ def notify_completion(task: dict, output_path: str) -> None:
 
 def notify_failure(task: dict, result: str) -> None:
     if not task.get("notify"):
+        summary = result.splitlines()[0][:300] if result else "(no output)"
+        _capture_event(
+            source="claude_queue_runner",
+            message=f"Claude task FAILED: {_fmt_task_label(task)}\n{summary}",
+            title="claude-queue",
+            priority=PushoverPriority.HIGH,
+            delivered=None,
+            extra={"task_id": task.get("id"), "description": _fmt_task_label(task), "notify_flag": False},
+        )
         return
     policy = task.get("notify_policy", "always")
     if policy == "infra-only":

@@ -161,6 +161,37 @@ class TestLogSilenced:
         # A warning should be logged.
         assert "failed to log silenced event" in caplog.text.lower()
 
+    def test_log_silenced_also_writes_capture_log(self, tmp_path, monkeypatch):
+        """_log_silenced additionally writes a CAPTURE_LOG entry (AC3)."""
+        silenced_path = tmp_path / "silenced.jsonl"
+        captured_path = tmp_path / "captured.jsonl"
+        monkeypatch.setattr(runner_mod, "SILENCED_LOG", silenced_path)
+        import agents_core.notify as notify_mod
+        monkeypatch.setattr(notify_mod, "CAPTURE_LOG", captured_path)
+
+        task = {"id": "task_both_logs", "description": "fixer:target_x"}
+        runner_mod._log_silenced(
+            "failure",
+            task,
+            failure_class="execution",
+            demoted_from="HIGH",
+            result="EXIT 1:\nsome stderr",
+        )
+
+        # Existing SILENCED_LOG write is unaffected.
+        silenced_entry = json.loads(silenced_path.read_text())
+        assert silenced_entry["task_id"] == "task_both_logs"
+
+        # New CAPTURE_LOG write mirrors the same task_id/event/failure_class.
+        captured_entry = json.loads(captured_path.read_text())
+        assert captured_entry["source"] == "claude_queue_runner"
+        assert captured_entry["extra"]["task_id"] == "task_both_logs"
+        assert captured_entry["extra"]["event"] == "failure"
+        assert captured_entry["extra"]["failure_class"] == "execution"
+        assert captured_entry["extra"]["demoted_from"] == "HIGH"
+        assert captured_entry["delivered"] is None
+        assert captured_entry["priority"] == "HIGH"
+
 
 class TestNotifyFailure:
     """Tests for notify_failure with notify_policy."""
@@ -268,6 +299,25 @@ class TestNotifyFailure:
 
         assert len(sent) == 0
 
+    def test_notify_failure_disabled_still_writes_capture_log(self, tmp_path, monkeypatch):
+        """notify=False produces a CAPTURE_LOG entry with delivered=null (AC2)."""
+        import agents_core.notify as notify_mod
+        captured_path = tmp_path / "captured.jsonl"
+        monkeypatch.setattr(notify_mod, "CAPTURE_LOG", captured_path)
+
+        task = {
+            "notify": False,
+            "id": "task_scout",
+            "description": "scout:target_y",
+        }
+        runner_mod.notify_failure(task, "EXIT 1:\nstderr")
+
+        entry = json.loads(captured_path.read_text())
+        assert entry["source"] == "claude_queue_runner"
+        assert entry["delivered"] is None
+        assert entry["extra"]["task_id"] == "task_scout"
+        assert entry["extra"]["notify_flag"] is False
+
 
 class TestNotifyCompletion:
     """Tests for notify_completion with notify_policy."""
@@ -355,6 +405,25 @@ class TestNotifyCompletion:
         runner_mod.notify_completion(task, "/path/to/output.md")
 
         assert len(sent) == 0
+
+    def test_notify_completion_disabled_still_writes_capture_log(self, tmp_path, monkeypatch):
+        """notify=False produces a CAPTURE_LOG entry with delivered=null (AC2)."""
+        import agents_core.notify as notify_mod
+        captured_path = tmp_path / "captured.jsonl"
+        monkeypatch.setattr(notify_mod, "CAPTURE_LOG", captured_path)
+
+        task = {
+            "notify": False,
+            "id": "task_scout2",
+            "description": "scout:target_z",
+        }
+        runner_mod.notify_completion(task, "/path/to/output.md")
+
+        entry = json.loads(captured_path.read_text())
+        assert entry["source"] == "claude_queue_runner"
+        assert entry["delivered"] is None
+        assert entry["extra"]["task_id"] == "task_scout2"
+        assert entry["extra"]["notify_flag"] is False
 
 
 class TestShaperNotifyPolicy:
