@@ -234,6 +234,11 @@ subpath = "notify-audit/silenced.jsonl"
 class = "B"
 access = "write"
 
+[keys."notify_audit.captured"]
+subpath = "notify-audit/captured.jsonl"
+class = "B"
+access = "write"
+
 # Class C — Agent/infra support
 [keys.council]
 subpath = "council"
