@@ -99,6 +99,29 @@ class CreativeOperatorUnavailable(Exception):
         super().__init__(f"Creative operator (Llama-70B) unreachable at {url}: {last_error}")
 
 
+class GWServingModeMismatchError(Exception):
+    """Raised when the GravityWell endpoint serves a different model than GW_BACKEND/GW_MODEL
+    claim (config/serving-mode drift) — e.g. GW_BACKEND=vllm resolves to gravitywell-27b but
+    the port is still serving the llama.cpp 122B. This is a *misconfiguration*, distinct from
+    genuine GW unavailability (box asleep, doorman down, HTTP exhausted), which keeps its
+    existing on_wake_fail behavior unchanged.
+
+    Per Erah's ruling (2026-07-07, decision/gw-voicing-drift-hard-fail-not-fallback-2026-07-07):
+    "the issuing session restores the right model and re-runs; fallback should be a deliberate
+    choice, not an automatic affordance." Callers must NOT catch this alongside
+    OperatorUnreachableError / route it through on_wake_fail.
+    """
+
+    def __init__(self, url: str, expected_model: str, actual_model: str):
+        self.url = url
+        self.expected_model = expected_model
+        self.actual_model = actual_model
+        super().__init__(
+            f"GravityWell serving-mode mismatch at {url}: expected {expected_model!r}, "
+            f"port serves {actual_model!r} — restore the serving mode and re-run."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Multi-operator routing
 # ---------------------------------------------------------------------------
@@ -112,6 +135,83 @@ OPERATOR_DEFAULTS: dict[str, str] = {
     "gravitywell":          "gravitywell-122b",
     "gravitywell-creative": "gravitywell-llama-70b",
 }
+
+
+def _gw_backend() -> str:
+    """Resolve GW_BACKEND: unset -> "llamacpp" (today's default, not a misconfig).
+
+    A *set-but-unrecognized* value raises ValueError at resolution time — per Erah's ruling,
+    a misconfigured switch must force a deliberate fix, never silently normalize to llamacpp.
+    """
+    val = os.environ.get("GW_BACKEND")
+    if val is None:
+        return "llamacpp"
+    if val not in ("llamacpp", "vllm"):
+        raise ValueError(
+            f"Unknown GW_BACKEND={val!r}. Must be 'llamacpp' or 'vllm' (or unset, which "
+            "defaults to 'llamacpp'). An unrecognized backend is a misconfiguration and is "
+            "not silently normalized — fix the environment variable and re-run."
+        )
+    return val
+
+
+def _gw_default_model() -> str:
+    """Resolve the default gravitywell model name, read at call time (not module-load).
+
+    Explicit GW_MODEL always wins. Otherwise: GW_BACKEND=vllm -> "gravitywell-27b";
+    GW_BACKEND=llamacpp (default) -> OPERATOR_DEFAULTS["gravitywell"] ("gravitywell-122b").
+    """
+    explicit = os.environ.get("GW_MODEL")
+    if explicit:
+        return explicit
+    if _gw_backend() == "vllm":
+        return "gravitywell-27b"
+    return OPERATOR_DEFAULTS["gravitywell"]
+
+
+# Pre-flight serving-mode handshake cache (1d.1): (url, resolved-model) -> verified.
+# Holds only a positive "verified" marker; elides the redundant startup /v1/models probe.
+# It never suppresses the per-call response-echo check (_call_gravitywell_backend re-verifies
+# model identity from the actual response on every call, unconditionally — see 1d.2).
+_gw_handshake_cache: dict[tuple[str, str], bool] = {}
+_gw_handshake_lock = threading.Lock()
+
+
+def _gw_verify_serving_mode(url: str, model: str, log=None) -> None:
+    """Pre-flight handshake (once per process, cached): assert {url}/v1/models serves `model`.
+
+    Reachable-but-wrong-name -> raises GWServingModeMismatchError (drift; Erah ruling
+    2026-07-07: hard-fail, not fallback). A *connect failure* on the probe is unavailability,
+    not drift — silently returns so the caller's normal call/retry path runs and raises
+    OperatorUnreachableError (routed to on_wake_fail) exactly as it does today.
+
+    Facets fans 4 personas out via ThreadPoolExecutor, so the first call in a fresh process
+    can race across threads; the lock guards cache reads/writes only (redundant concurrent
+    probes are idempotent and harmless — the /v1/models GET is read-only).
+    """
+    cache_key = (url, model)
+    with _gw_handshake_lock:
+        if _gw_handshake_cache.get(cache_key):
+            return
+
+    try:
+        resp = requests.get(f"{url}/v1/models", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        served = None
+        if data.get("data"):
+            served = data["data"][0].get("id")
+    except Exception as e:
+        if log:
+            log(f"[gravitywell] serving-mode handshake probe unreachable (treated as "
+                f"availability, not drift): {e}")
+        return
+
+    if served is not None and served != model:
+        raise GWServingModeMismatchError(url, model, served)
+
+    with _gw_handshake_lock:
+        _gw_handshake_cache[cache_key] = True
 
 
 def _call_qwen_backend(prompt: str, system: str = None, timeout: int = 600,
@@ -256,10 +356,12 @@ def _post_chat_completion(
 
 
 def _gw_stream_attempt(base_url, model, payload, idle_gap, first_token_gap, hard_ceiling, call_start, log):
-    """One streaming attempt. Returns (text_or_None, cull_tuple_or_None).
+    """One streaming attempt. Returns (text_or_None, cull_tuple_or_None, served_model_or_None).
 
     Raises requests exceptions on connect failure (for caller to retry).
     cull_tuple = (reason_str, elapsed_secs, idle_secs) or None.
+    served_model_or_None is the "model" field echoed by the response's SSE chunks (1c/1d.2
+    true-mirror provenance) — None if the response never echoed one (e.g. a test double).
     """
     # Socket must outlast all Python timers so the watchdog fires first.
     # idle_gap * 2 would cause ReadTimeout before phase-1 first_token_gap (600s default).
@@ -277,6 +379,7 @@ def _gw_stream_attempt(base_url, model, payload, idle_gap, first_token_gap, hard
         "cull": None,          # (reason, elapsed, idle) when fired
         "first_token_at": None,
         "last_chunk_at": time.monotonic(),
+        "served_model": None,  # "model" field echoed by the response (1c/1d.2)
     }
     _done_event = threading.Event()
 
@@ -326,6 +429,10 @@ def _gw_stream_attempt(base_url, model, payload, idle_gap, first_token_gap, hard
                 break
             try:
                 chunk = json.loads(data_str)
+                if _state["served_model"] is None:
+                    chunk_model = chunk.get("model")
+                    if chunk_model:
+                        _state["served_model"] = chunk_model
                 delta = chunk["choices"][0].get("delta", {})
                 content = delta.get("content") or ""
                 reasoning = delta.get("reasoning_content") or ""
@@ -350,14 +457,14 @@ def _gw_stream_attempt(base_url, model, payload, idle_gap, first_token_gap, hard
     # If stream ended cleanly, ignore any watchdog cull (race condition safe-fallback)
     if clean_end:
         text = "".join(content_parts) or "".join(reasoning_parts)
-        return (text if text.strip() else None, None)
+        return (text if text.strip() else None, None, _state["served_model"])
 
     if _state["cull"]:
-        return (None, _state["cull"])
+        return (None, _state["cull"], _state["served_model"])
 
     # Stream ended without [DONE] and no cull - return what we have
     text = "".join(content_parts) or "".join(reasoning_parts)
-    return (text if text.strip() else None, None)
+    return (text if text.strip() else None, None, _state["served_model"])
 
 
 def _call_gravitywell_backend(
@@ -371,17 +478,30 @@ def _call_gravitywell_backend(
     _url: str = None,
     _model: str = None,
     _no_thinking: bool = False,
+    _served_model_out: list | None = None,
 ) -> str | None:
-    """Send a completion request to a GravityWell llama.cpp endpoint via streaming SSE.
+    """Send a completion request to a GravityWell endpoint via streaming SSE.
 
-    By default targets GW_URL (:8081) with the 122B model. Internal _url/_model params
-    route to alternate endpoints (e.g. the creative Llama-70B at :8093) without exposing
+    By default targets GW_URL (:8081) with the model resolved by _gw_default_model()
+    (GW_MODEL / GW_BACKEND env-driven; "gravitywell-122b" when unset). Internal _url/_model
+    params route to alternate endpoints (e.g. the creative Llama-70B at :8093) without exposing
     that routing on the public 122B operator path.
+
+    The default GW path (_url is None and _model is None) only:
+    - Payload dialect gates on GW_BACKEND (default "llamacpp", byte-identical to today;
+      "vllm" omits the llama.cpp-only cache_prompt field — see _gw_backend()).
+    - Runs the pre-flight serving-mode handshake (cached) and the per-call response-echo
+      assertion, raising GWServingModeMismatchError on reachable-but-wrong-model drift.
+    The gravitywell-creative path (_url/_model explicit) is untouched by either: always
+    llama.cpp cache_prompt dialect, no handshake, no GW_BACKEND coupling.
 
     think=False (default) injects chat_template_kwargs={"enable_thinking": false} to
     suppress the think-trace. Callers may pass think=True for quality-mode reasoning.
     _no_thinking=True structurally omits chat_template_kwargs entirely (for models that
     do not support the thinking knob, e.g. Llama-3.3-70B-Instruct).
+    _served_model_out: optional list to append the response-echoed "model" field to (1c
+    true-mirror provenance) — the model the server actually reported serving, not merely
+    the request's model field.
 
     Dual-timer liveness model:
     - Phase 1 (pre-first-token): cull after GW_FIRST_TOKEN_GAP_SECS (default 600).
@@ -391,9 +511,17 @@ def _call_gravitywell_backend(
 
     Connection-level retry: 3 attempts, 2s/4s backoff on network errors.
     Persistent errors raise OperatorUnreachableError; parse errors return None.
+    Serving-mode drift raises GWServingModeMismatchError (never caught by on_wake_fail).
     """
     url = _url if _url is not None else GW_URL
-    model = _model if _model is not None else OPERATOR_DEFAULTS["gravitywell"]
+    is_default_gw_path = _url is None and _model is None
+    model = _model if _model is not None else _gw_default_model()
+
+    if is_default_gw_path:
+        _gw_verify_serving_mode(url, model, log=log)
+        backend = _gw_backend()
+    else:
+        backend = "llamacpp"
 
     idle_gap = float(os.environ.get("GW_IDLE_GAP_SECS", "45"))
     first_token_gap = float(os.environ.get("GW_FIRST_TOKEN_GAP_SECS", "600"))
@@ -412,9 +540,10 @@ def _call_gravitywell_backend(
         "model": model,
         "messages": messages,
         "temperature": temperature,
-        "cache_prompt": True,
-        "stream": True,
     }
+    if backend == "llamacpp":
+        payload["cache_prompt"] = True
+    payload["stream"] = True
     if not _no_thinking:
         payload["chat_template_kwargs"] = {"enable_thinking": think}
     if json_mode:
@@ -443,7 +572,7 @@ def _call_gravitywell_backend(
                     raise OperatorUnreachableError(url, e)
 
     # First attempt
-    text, cull = _attempt_with_connect_retry()
+    text, cull, served_model = _attempt_with_connect_retry()
 
     # Stall retry: if idle_gap_exceeded, retry once within the same ceiling budget
     if cull is not None and cull[0] == "idle_gap_exceeded":
@@ -452,7 +581,7 @@ def _call_gravitywell_backend(
             "[gw-liveness] cull on first attempt reason=%s elapsed=%.1fs idle=%.1fs — retrying",
             cull_reason, cull_elapsed, cull_idle,
         )
-        text, cull = _attempt_with_connect_retry()
+        text, cull, served_model = _attempt_with_connect_retry()
 
     if cull is not None:
         cull_reason, cull_elapsed, cull_idle = cull
@@ -461,6 +590,17 @@ def _call_gravitywell_backend(
             cull_reason, cull_elapsed, cull_idle,
         )
         return None
+
+    # Per-call response-echo assertion (1d.2) — runs on every call, never cached, so a
+    # mid-flight serving-mode flip is caught on the very next call even after a cached
+    # handshake. Silent (no signal) when the response never echoed a model field at all.
+    if is_default_gw_path and served_model is not None and served_model != model:
+        raise GWServingModeMismatchError(url, model, served_model)
+
+    if served_model is not None:
+        _log.info("[gravitywell] voicing ok model=%s", served_model)
+        if _served_model_out is not None:
+            _served_model_out.append(served_model)
 
     return text
 
@@ -622,11 +762,12 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
             )
 
     if operator_class == "gravitywell":
-        if model is not None and model != OPERATOR_DEFAULTS["gravitywell"]:
+        _gw_resolved_default = _gw_default_model()
+        if model is not None and model != _gw_resolved_default:
             raise ValueError(
                 f"call_operator(operator_class='gravitywell', model={model!r}): "
                 "the GravityWell endpoint serves a single fixed model "
-                f"({OPERATOR_DEFAULTS['gravitywell']!r}); model swaps are an "
+                f"({_gw_resolved_default!r}); model swaps are an "
                 "infrastructure operation (gw-serve), "
                 "not a per-call parameter. Either pass model=None to use the "
                 "default, or do the model swap out-of-band first."

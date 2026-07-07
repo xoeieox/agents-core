@@ -98,7 +98,7 @@ def test_ac1_steady_stream_completes(monkeypatch):
         hard_ceiling = 30.0
         call_start = time.monotonic()
         payload = {"model": "gravitywell-122b", "messages": [], "stream": True}
-        text, cull = _gw_stream_attempt(
+        text, cull, _served_model = _gw_stream_attempt(
             "http://gw", "gravitywell-122b", payload,
             idle_gap, first_token_gap, hard_ceiling, call_start, None,
         )
@@ -126,7 +126,7 @@ def test_ac2_idle_silence_culled(monkeypatch):
         hard_ceiling = 30.0
         call_start = time.monotonic()
         payload = {"model": "gravitywell-122b", "messages": [], "stream": True}
-        text, cull = _gw_stream_attempt(
+        text, cull, _served_model = _gw_stream_attempt(
             "http://gw", "gravitywell-122b", payload,
             idle_gap, first_token_gap, hard_ceiling, call_start, None,
         )
@@ -183,7 +183,7 @@ def test_ac3_phase1_silence_longer_than_idle_gap_not_culled(monkeypatch):
         hard_ceiling = 30.0
         call_start = time.monotonic()
         payload = {"model": "gravitywell-122b", "messages": [], "stream": True}
-        text, cull = _gw_stream_attempt(
+        text, cull, _served_model = _gw_stream_attempt(
             "http://gw", "gravitywell-122b", payload,
             idle_gap, first_token_gap, hard_ceiling, call_start, None,
         )
@@ -206,7 +206,7 @@ def test_ac3_phase1_silence_exceeds_first_token_gap_culled(monkeypatch):
         hard_ceiling = 30.0
         call_start = time.monotonic()
         payload = {"model": "gravitywell-122b", "messages": [], "stream": True}
-        text, cull = _gw_stream_attempt(
+        text, cull, _served_model = _gw_stream_attempt(
             "http://gw", "gravitywell-122b", payload,
             idle_gap, first_token_gap, hard_ceiling, call_start, None,
         )
@@ -246,7 +246,7 @@ def test_ac4_reasoning_content_resets_idle(monkeypatch):
         hard_ceiling = 30.0
         call_start = time.monotonic()
         payload = {"model": "gravitywell-122b", "messages": [], "stream": True}
-        text, cull = _gw_stream_attempt(
+        text, cull, _served_model = _gw_stream_attempt(
             "http://gw", "gravitywell-122b", payload,
             idle_gap, first_token_gap, hard_ceiling, call_start, None,
         )
@@ -290,7 +290,7 @@ def test_ac4b_pre_first_token_silence_then_token_then_phase2(monkeypatch):
         hard_ceiling = 30.0
         call_start = time.monotonic()
         payload = {"model": "gravitywell-122b", "messages": [], "stream": True}
-        text, cull = _gw_stream_attempt(
+        text, cull, _served_model = _gw_stream_attempt(
             "http://gw", "gravitywell-122b", payload,
             idle_gap, first_token_gap, hard_ceiling, call_start, None,
         )
@@ -319,7 +319,7 @@ def test_ac5_clean_stream_returns_text(monkeypatch):
         hard_ceiling = 1800.0
         call_start = time.monotonic()
         payload = {"model": "gravitywell-122b", "messages": [], "stream": True}
-        text, cull = _gw_stream_attempt(
+        text, cull, _served_model = _gw_stream_attempt(
             "http://gw", "gravitywell-122b", payload,
             idle_gap, first_token_gap, hard_ceiling, call_start, None,
         )
@@ -343,7 +343,7 @@ def test_ac5_reasoning_content_fallback(monkeypatch):
         hard_ceiling = 1800.0
         call_start = time.monotonic()
         payload = {"model": "gravitywell-122b", "messages": [], "stream": True}
-        text, cull = _gw_stream_attempt(
+        text, cull, _served_model = _gw_stream_attempt(
             "http://gw", "gravitywell-122b", payload,
             idle_gap, first_token_gap, hard_ceiling, call_start, None,
         )
@@ -367,7 +367,7 @@ def test_ac5_empty_content_returns_none(monkeypatch):
         hard_ceiling = 1800.0
         call_start = time.monotonic()
         payload = {"model": "gravitywell-122b", "messages": [], "stream": True}
-        text, cull = _gw_stream_attempt(
+        text, cull, _served_model = _gw_stream_attempt(
             "http://gw", "gravitywell-122b", payload,
             idle_gap, first_token_gap, hard_ceiling, call_start, None,
         )
@@ -634,9 +634,9 @@ def test_ac8_stall_retry_transparent_to_admission(monkeypatch):
     def mock_gw_stream_attempt(*args, **kwargs):
         attempt[0] += 1
         if attempt[0] == 1:
-            return (None, ("idle_gap_exceeded", 2.0, 1.0))
+            return (None, ("idle_gap_exceeded", 2.0, 1.0), None)
         else:
-            return ("final answer", None)
+            return ("final answer", None, None)
 
     with patch("agents_core.doorman_client.DoormanClient", mock_dc_class), \
          patch("agents_core.doorman_client._gw_acquire_timeout", return_value=10.0), \
