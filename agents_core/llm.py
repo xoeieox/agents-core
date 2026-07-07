@@ -192,6 +192,7 @@ def _post_chat_completion(
     log=None,
     cache_prompt: bool | None = None,
     chat_template_kwargs: dict | None = None,
+    _no_thinking: bool = False,
 ) -> str | None:
     """Shared POST core for OpenAI-compatible chat/completions endpoints.
 
@@ -199,6 +200,10 @@ def _post_chat_completion(
     Retries up to max_retries on transient errors (timeout, connection, chunked encoding).
     Returns response text on success, None on parse errors, raises OperatorUnreachableError
     on persistent HTTP/network failures.
+
+    think=False (default) sends chat_template_kwargs={"enable_thinking": false} explicitly,
+    matching _call_gravitywell_backend's pattern. _no_thinking=True structurally omits
+    chat_template_kwargs entirely, for models that do not support the thinking knob.
 
     Used by _call_gravitywell_backend, call_swarm, and other chat-completion callers.
     """
@@ -211,7 +216,7 @@ def _post_chat_completion(
         payload["cache_prompt"] = cache_prompt
     if chat_template_kwargs is not None:
         payload["chat_template_kwargs"] = chat_template_kwargs
-    elif think:
+    elif not _no_thinking:
         payload["chat_template_kwargs"] = {"enable_thinking": think}
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
@@ -601,6 +606,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                 json_mode=bool(quest_kwargs.get("json_mode", False)),
                 temperature=float(quest_kwargs.get("temperature", 0.7)),
                 log=quest_kwargs.get("log"),
+                _no_thinking=True,
             )
         except OperatorUnreachableError:
             if on_wake_fail == "skip" or on_wake_fail is None:
@@ -1259,6 +1265,7 @@ def call_swarm(
     temperature: float = 0.7,
     model: str | None = None,
     swarm_url: str = SWARM_URL,
+    think: bool = False,
     log=None,
 ) -> list[str | None]:
     """Lease-free N-wide completion client for the swarm endpoint.
@@ -1276,6 +1283,9 @@ def call_swarm(
         temperature: Sampling temperature (default 0.7).
         model: Model name (default None → resolve from /v1/models, model-agnostic).
         swarm_url: Swarm endpoint URL (default SWARM_URL env).
+        think: Enable thinking/CoT mode (default False — structured/dispatch work
+            wants clean output, not reasoning traces). Pass True to opt into
+            quality-mode reasoning.
         log: Optional logging function.
 
     Returns:
@@ -1320,7 +1330,7 @@ def call_swarm(
                 timeout=timeout,
                 json_mode=False,
                 temperature=temperature,
-                think=False,
+                think=think,
                 max_retries=3,
                 log=log,
             )

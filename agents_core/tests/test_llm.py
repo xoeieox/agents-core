@@ -784,3 +784,93 @@ def test_call_swarm_post_includes_system_prompt():
     messages = posted_data["messages"]
     assert messages[0] == {"role": "system", "content": "You are helpful."}
     assert messages[1] == {"role": "user", "content": "hello"}
+
+
+# ---------------------------------------------------------------------------
+# debt/call-swarm-cannot-disable-thinking-2026-06-22 regression guards
+# ---------------------------------------------------------------------------
+
+def test_call_swarm_default_sends_enable_thinking_false():
+    """call_swarm() default (think=False) explicitly sends enable_thinking:false."""
+    from agents_core.llm import call_swarm
+
+    models_resp = _make_models_response(["Qwen2.5-3B"])
+    completion_resp = _make_swarm_response("answer")
+
+    with patch("agents_core.llm.requests.get", return_value=models_resp), \
+         patch("agents_core.llm.requests.post", return_value=completion_resp) as mock_post:
+        call_swarm(["hello"])
+
+    posted_data = mock_post.call_args[1]["json"]
+    assert posted_data["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_call_swarm_think_true_sends_enable_thinking_true():
+    """call_swarm(think=True) sends enable_thinking:true."""
+    from agents_core.llm import call_swarm
+
+    models_resp = _make_models_response(["Qwen2.5-3B"])
+    completion_resp = _make_swarm_response("answer")
+
+    with patch("agents_core.llm.requests.get", return_value=models_resp), \
+         patch("agents_core.llm.requests.post", return_value=completion_resp) as mock_post:
+        call_swarm(["hello"], think=True)
+
+    posted_data = mock_post.call_args[1]["json"]
+    assert posted_data["chat_template_kwargs"] == {"enable_thinking": True}
+
+
+def test_post_chat_completion_think_false_sends_enable_thinking_false():
+    """_post_chat_completion(think=False) sends enable_thinking:false (not omitted)."""
+    from agents_core.llm import _post_chat_completion
+
+    completion_resp = _make_swarm_response("answer")
+
+    with patch("agents_core.llm.requests.post", return_value=completion_resp) as mock_post:
+        _post_chat_completion(
+            base_url="http://fake:8080",
+            model="fake-model",
+            messages=[{"role": "user", "content": "hello"}],
+            think=False,
+        )
+
+    posted_data = mock_post.call_args[1]["json"]
+    assert posted_data["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_post_chat_completion_no_thinking_omits_chat_template_kwargs():
+    """_post_chat_completion(_no_thinking=True) structurally omits chat_template_kwargs."""
+    from agents_core.llm import _post_chat_completion
+
+    completion_resp = _make_swarm_response("answer")
+
+    with patch("agents_core.llm.requests.post", return_value=completion_resp) as mock_post:
+        _post_chat_completion(
+            base_url="http://fake:8080",
+            model="fake-model",
+            messages=[{"role": "user", "content": "hello"}],
+            think=False,
+            _no_thinking=True,
+        )
+
+    posted_data = mock_post.call_args[1]["json"]
+    assert "chat_template_kwargs" not in posted_data
+
+
+def test_call_operator_quest_omits_chat_template_kwargs():
+    """call_operator('quest') pins _no_thinking=True — payload stays byte-identical
+    to pre-fix behavior (no chat_template_kwargs), a deterministic guard against
+    silently re-drifting QUEST into thinking-off without a decision."""
+    from agents_core import llm as llm_mod
+
+    completion_resp = _make_swarm_response("quest answer")
+
+    with patch("agents_core.llm.requests.post", return_value=completion_resp) as mock_post:
+        result = llm_mod.call_operator(
+            "quest",
+            prompt="hello",
+        )
+
+    assert result == "quest answer"
+    posted_data = mock_post.call_args[1]["json"]
+    assert "chat_template_kwargs" not in posted_data
