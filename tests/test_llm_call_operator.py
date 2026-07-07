@@ -1067,3 +1067,447 @@ def test_gravitywell_122b_default_url_is_8081():
 
     assert ":8081" in captured["url"]
     assert ":8093" not in captured["url"]
+
+
+# ---------------------------------------------------------------------------
+# agents-core-gw-voicing-vllm-repoint-v0: GW_BACKEND / GW_MODEL vLLM repoint
+# ---------------------------------------------------------------------------
+#
+# Helpers below pre-seed agents_core.llm._gw_handshake_cache directly for the
+# (url, resolved-model) tuple under test, sidestepping the pre-flight handshake's
+# live GET {url}/v1/models probe for tests that only care about payload shape /
+# delegation. Tests that exercise the handshake itself (AC6) clear the cache and
+# mock requests.get explicitly.
+
+def _gw_precache(model, url=None):
+    """Mark (url or GW_URL, model) as handshake-verified so the real call under test
+    doesn't trigger a live /v1/models probe."""
+    from agents_core.llm import _gw_handshake_cache, _gw_handshake_lock, GW_URL
+    with _gw_handshake_lock:
+        _gw_handshake_cache[(url or GW_URL, model)] = True
+
+
+# --- AC1: regression-locked default (byte-identical payload) ---------------
+
+def test_ac1_default_payload_byte_identical(monkeypatch):
+    """AC1: no env set -> _call_gravitywell_backend's payload is byte-identical to today."""
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    _gw_precache("gravitywell-122b")
+
+    captured = {}
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.post", side_effect=_make_gw_sse_resp("ok", captured)):
+        result = call_operator("gravitywell", prompt="hi")
+
+    assert result == "ok"
+    assert captured["payload"] == {
+        "model": "gravitywell-122b",
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.7,
+        "cache_prompt": True,
+        "stream": True,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+
+def test_ac1_gw_backend_llamacpp_explicit_same_as_unset(monkeypatch):
+    """Explicit GW_BACKEND=llamacpp behaves identically to unset."""
+    monkeypatch.setenv("GW_BACKEND", "llamacpp")
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    _gw_precache("gravitywell-122b")
+
+    captured = {}
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.post", side_effect=_make_gw_sse_resp("ok", captured)):
+        call_operator("gravitywell", prompt="hi")
+
+    assert captured["payload"]["cache_prompt"] is True
+    assert captured["payload"]["model"] == "gravitywell-122b"
+
+
+# --- AC2: vLLM dialect -------------------------------------------------------
+
+def test_ac2_gw_backend_vllm_omits_cache_prompt_default_model(monkeypatch):
+    """GW_BACKEND=vllm + no GW_MODEL -> omits cache_prompt, model=gravitywell-27b."""
+    monkeypatch.setenv("GW_BACKEND", "vllm")
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    _gw_precache("gravitywell-27b")
+
+    captured = {}
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.post", side_effect=_make_gw_sse_resp("ok", captured)):
+        result = call_operator("gravitywell", prompt="hi", json_mode=True)
+
+    assert result == "ok"
+    assert "cache_prompt" not in captured["payload"]
+    assert captured["payload"]["model"] == "gravitywell-27b"
+    assert captured["payload"]["stream"] is True
+    assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert captured["payload"]["response_format"] == {"type": "json_object"}
+
+
+def test_ac2_gw_backend_vllm_with_explicit_gw_model_override(monkeypatch):
+    """GW_BACKEND=vllm + explicit GW_MODEL overrides the gravitywell-27b convenience default."""
+    monkeypatch.setenv("GW_BACKEND", "vllm")
+    monkeypatch.setenv("GW_MODEL", "gravitywell-27b-quant")
+    _gw_precache("gravitywell-27b-quant")
+
+    captured = {}
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.post", side_effect=_make_gw_sse_resp("ok", captured)):
+        call_operator("gravitywell", prompt="hi")
+
+    assert "cache_prompt" not in captured["payload"]
+    assert captured["payload"]["model"] == "gravitywell-27b-quant"
+
+
+# --- AC3: model override + guard consistency --------------------------------
+
+def test_ac3_gw_model_override_honored_under_llamacpp_backend(monkeypatch):
+    """GW_MODEL is honored under the llamacpp (default) backend too — cache_prompt stays."""
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    monkeypatch.setenv("GW_MODEL", "gravitywell-custom")
+    _gw_precache("gravitywell-custom")
+
+    captured = {}
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.post", side_effect=_make_gw_sse_resp("ok", captured)):
+        result = call_operator("gravitywell", prompt="hi", model="gravitywell-custom")
+
+    assert result == "ok"
+    assert captured["payload"]["model"] == "gravitywell-custom"
+    assert captured["payload"]["cache_prompt"] is True
+
+
+def test_ac3_model_override_accepted_when_matches_resolved_default(monkeypatch):
+    """An explicit model= matching the GW_BACKEND/GW_MODEL-resolved default is accepted."""
+    monkeypatch.setenv("GW_BACKEND", "vllm")
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    _gw_precache("gravitywell-27b")
+
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.post", side_effect=_make_gw_sse_resp("ok")):
+        result = call_operator("gravitywell", prompt="hi", model="gravitywell-27b")
+
+    assert result == "ok"
+
+
+def test_ac3_stale_model_override_raises_under_vllm_backend(monkeypatch):
+    """A stale model= ("gravitywell-122b") raises once GW_BACKEND=vllm changes the default."""
+    monkeypatch.setenv("GW_BACKEND", "vllm")
+    monkeypatch.delenv("GW_MODEL", raising=False)
+
+    with pytest.raises(ValueError) as exc_info:
+        call_operator("gravitywell", prompt="hi", model="gravitywell-122b")
+    assert "gravitywell-27b" in str(exc_info.value)
+
+
+# --- AC4: delegation preserved (Council adapter, zero adapter changes) -----
+
+def test_ac4_council_adapter_delegates_model_to_seam_under_vllm(monkeypatch):
+    """GravityWellAdapter (unmodified) sends whatever GW_BACKEND/GW_MODEL resolve to —
+    proves Council's adapter needs zero changes to inherit the repoint."""
+    from agents_core.council.gravitywell_adapter import GravityWellAdapter
+
+    monkeypatch.setenv("GW_BACKEND", "vllm")
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    _gw_precache("gravitywell-27b")
+
+    class _Msg:
+        role = "user"
+        content = "hello"
+
+    captured = {}
+    dc, _mock_client = _gw_dc()
+    adapter = GravityWellAdapter(on_wake_fail="skip")
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.post", side_effect=_make_gw_sse_resp("voiced", captured)):
+        result = adapter.chat(system="persona", messages=[_Msg()])
+
+    assert result == "voiced"
+    assert captured["payload"]["model"] == "gravitywell-27b"
+    assert "cache_prompt" not in captured["payload"]
+    assert adapter.voicing_events[-1]["effective_operator"] == "gravitywell"
+
+
+# --- AC5: true-mirror provenance --------------------------------------------
+
+def test_ac5_served_model_recorded_from_response_not_request():
+    """The recorded served-model comes from the response's "model" field, not the request's —
+    proven by sending a different requested model than the response echoes back."""
+    from agents_core.llm import _call_gravitywell_backend
+    import json as _json
+
+    def fake_post(url, json=None, timeout=None, stream=None, **kw):
+        assert json["model"] == "requested-model-name"
+
+        def lines():
+            chunk = {
+                "model": "actually-served-model",
+                "choices": [{"delta": {"content": "hi"}, "finish_reason": None}],
+            }
+            yield f"data: {_json.dumps(chunk)}"
+            yield "data: [DONE]"
+
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.iter_lines = MagicMock(return_value=lines())
+        resp.close = MagicMock()
+        return resp
+
+    out = []
+    with patch("requests.post", side_effect=fake_post):
+        result = _call_gravitywell_backend(
+            prompt="hi", _url="http://alt-endpoint:9999", _model="requested-model-name",
+            _served_model_out=out,
+        )
+
+    assert result == "hi"
+    assert out == ["actually-served-model"]
+
+
+# --- AC6: serving-mode drift hard-fails, distinctly from unavailability ----
+
+def test_ac6a_handshake_wrong_model_raises_mismatch_no_fallback(monkeypatch):
+    """Reachable /v1/models reporting the wrong name raises GWServingModeMismatchError and
+    never reaches the paid on_wake_fail fallback."""
+    from agents_core.llm import GWServingModeMismatchError, _gw_handshake_cache, _gw_handshake_lock
+
+    monkeypatch.setenv("GW_BACKEND", "vllm")
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    with _gw_handshake_lock:
+        _gw_handshake_cache.clear()
+
+    def fake_get(url, timeout=None):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {"data": [{"id": "gravitywell-122b"}]}
+        return resp
+
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.get", side_effect=fake_get), \
+         patch("agents_core.claude_queue_sync.submit_and_wait") as mock_saw:
+        with pytest.raises(GWServingModeMismatchError) as exc_info:
+            call_operator("gravitywell", prompt="test", on_wake_fail="sonnet")
+
+    assert "gravitywell-27b" in str(exc_info.value)
+    assert "gravitywell-122b" in str(exc_info.value)
+    mock_saw.assert_not_called()
+
+
+def test_ac6b_response_echo_mismatch_raises_mid_call(monkeypatch):
+    """A response whose echoed model != expected raises mid-call, even with an already-
+    verified (cached) handshake — the per-call check is never cached (1d.2)."""
+    from agents_core.llm import GWServingModeMismatchError, _gw_handshake_cache, _gw_handshake_lock, GW_URL
+    import json as _json
+
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    with _gw_handshake_lock:
+        _gw_handshake_cache.clear()
+        _gw_handshake_cache[(GW_URL, "gravitywell-122b")] = True  # already verified
+
+    def fake_post(url, json=None, timeout=None, stream=None, **kw):
+        def lines():
+            chunk = {
+                "model": "gravitywell-27b",
+                "choices": [{"delta": {"content": "hi"}, "finish_reason": None}],
+            }
+            yield f"data: {_json.dumps(chunk)}"
+            yield "data: [DONE]"
+
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.iter_lines = MagicMock(return_value=lines())
+        resp.close = MagicMock()
+        return resp
+
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.get") as mock_get, \
+         patch("requests.post", side_effect=fake_post):
+        with pytest.raises(GWServingModeMismatchError):
+            call_operator("gravitywell", prompt="test")
+
+    # Cached handshake means no /v1/models probe on this call.
+    mock_get.assert_not_called()
+
+
+def test_ac6c_handshake_cached_second_call_does_not_reprobe(monkeypatch):
+    """The pre-flight handshake probes /v1/models once per (url, model); a second call
+    with the same tuple does not re-probe."""
+    from agents_core.llm import _gw_handshake_cache, _gw_handshake_lock
+
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    with _gw_handshake_lock:
+        _gw_handshake_cache.clear()
+
+    def fake_get(url, timeout=None):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {"data": [{"id": "gravitywell-122b"}]}
+        return resp
+
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.get", side_effect=fake_get) as mock_get, \
+         patch("requests.post", side_effect=_make_gw_sse_resp("ok")):
+        call_operator("gravitywell", prompt="one")
+        call_operator("gravitywell", prompt="two")
+
+    assert mock_get.call_count == 1
+
+
+def test_ac6d_handshake_connect_failure_is_unavailability_not_drift(monkeypatch):
+    """A connect failure on the /v1/models probe is treated as unavailability (not drift):
+    it does not raise GWServingModeMismatchError, and the real call proceeds normally."""
+    from agents_core.llm import _gw_handshake_cache, _gw_handshake_lock
+    import requests as req
+
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    with _gw_handshake_lock:
+        _gw_handshake_cache.clear()
+
+    dc, _mock_client = _gw_dc(status="serving")
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.get", side_effect=req.exceptions.ConnectionError("no route to host")), \
+         patch("requests.post", side_effect=_make_gw_sse_resp("recovered")):
+        result = call_operator("gravitywell", prompt="test")
+
+    assert result == "recovered"
+
+
+def test_ac6d_genuine_unavailability_still_routes_on_wake_fail(monkeypatch):
+    """A genuine wake-fail (real call unreachable), distinct from served-wrong-model drift,
+    keeps the existing on_wake_fail behavior unchanged — even with a handshake probe
+    connect-failure in the mix."""
+    from agents_core.llm import _gw_handshake_cache, _gw_handshake_lock
+    import requests as req
+
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    with _gw_handshake_lock:
+        _gw_handshake_cache.clear()
+
+    dc, _mock_client = _gw_dc(status="serving")
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.get", side_effect=req.exceptions.ConnectionError("no route to host")), \
+         patch("requests.post", side_effect=req.exceptions.ConnectionError("gw down")), \
+         patch("time.sleep"):
+        result = call_operator("gravitywell", prompt="test", on_wake_fail="skip")
+
+    assert result is None
+
+
+# --- AC7: unknown-backend hard-fails ----------------------------------------
+
+def test_ac7_gw_backend_unset_resolves_llamacpp(monkeypatch):
+    from agents_core.llm import _gw_backend
+
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    assert _gw_backend() == "llamacpp"
+
+
+def test_ac7_gw_backend_unrecognized_raises_value_error(monkeypatch):
+    from agents_core.llm import _gw_backend
+
+    monkeypatch.setenv("GW_BACKEND", "vllm2")
+    with pytest.raises(ValueError, match="Unknown GW_BACKEND"):
+        _gw_backend()
+
+
+# --- AC8: creative-path isolation (scope guard) -----------------------------
+
+def test_ac8_creative_path_unaffected_by_gw_backend_vllm(monkeypatch):
+    """GW_BACKEND=vllm set process-wide leaves the gravitywell-creative (:8093) path
+    unchanged: cache_prompt retained, no handshake probe, no GWServingModeMismatchError."""
+    monkeypatch.setenv("GW_BACKEND", "vllm")
+    import json as _json
+
+    def fake_get(url, timeout=None):
+        raise AssertionError("creative path must never probe /v1/models")
+
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None, stream=None, **kw):
+        captured["payload"] = json
+
+        def lines():
+            yield f"data: {_json.dumps({'choices': [{'delta': {'content': 'ok'}, 'finish_reason': None}]})}"
+            yield "data: [DONE]"
+
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.iter_lines = MagicMock(return_value=lines())
+        resp.close = MagicMock()
+        return resp
+
+    with patch("requests.get", side_effect=fake_get), \
+         patch("requests.post", side_effect=fake_post):
+        result = call_operator("gravitywell-creative", prompt="test")
+
+    assert result == "ok"
+    assert captured["payload"]["cache_prompt"] is True
+    assert captured["payload"]["model"] == "gravitywell-llama-70b"
+    assert "chat_template_kwargs" not in captured["payload"]
+
+
+def test_ac8_creative_path_unaffected_by_invalid_gw_backend(monkeypatch):
+    """An invalid GW_BACKEND value never reaches the creative path's _gw_backend() call at
+    all — no ValueError, no coupling — because the scope guard checks _url/_model first."""
+    monkeypatch.setenv("GW_BACKEND", "not-a-real-backend")
+
+    with patch("requests.post", side_effect=_make_gw_sse_resp("ok")):
+        result = call_operator("gravitywell-creative", prompt="test")
+
+    assert result == "ok"
+
+
+def test_ac8_creative_payload_identical_with_and_without_gw_backend_vllm():
+    """Extends test_creative_no_thinking_knob_in_payload: the creative payload is byte-
+    identical whether or not GW_BACKEND=vllm is set process-wide."""
+    import json as _json
+
+    def _capture_creative_payload():
+        captured = {}
+
+        def fake_post(url, json=None, timeout=None, stream=None, **kw):
+            captured["payload"] = json
+
+            def lines():
+                yield f"data: {_json.dumps({'choices': [{'delta': {'content': 'ok'}, 'finish_reason': None}]})}"
+                yield "data: [DONE]"
+
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.iter_lines = MagicMock(return_value=lines())
+            resp.close = MagicMock()
+            return resp
+
+        with patch("requests.post", side_effect=fake_post):
+            call_operator("gravitywell-creative", prompt="test")
+        return captured["payload"]
+
+    import os as _os
+    prior = _os.environ.pop("GW_BACKEND", None)
+    try:
+        without_env = _capture_creative_payload()
+        _os.environ["GW_BACKEND"] = "vllm"
+        with_env = _capture_creative_payload()
+    finally:
+        if prior is None:
+            _os.environ.pop("GW_BACKEND", None)
+        else:
+            _os.environ["GW_BACKEND"] = prior
+
+    assert without_env == with_env
