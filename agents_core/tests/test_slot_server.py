@@ -16,6 +16,7 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 import multiprocessing
 import os
 from pathlib import Path
@@ -564,3 +565,212 @@ class TestETags:
         r2 = client.get(f"/v0/slots/{sid}")
         etag2 = r2.headers["ETag"]
         assert etag1 != etag2
+
+
+# ---------------------------------------------------------------------------
+# Mailbox HTTP surface (agents-core-slot1-mailbox-v0)
+# ---------------------------------------------------------------------------
+
+class TestMailboxNoToken:
+    """No-token (loopback) mode — mirrors TestCRUD's client setup."""
+
+    @pytest.fixture
+    def client(self, db):
+        return _client(db, "")
+
+    @pytest.fixture
+    def mailbox_id(self, client):
+        r = client.post("/v0/mailbox/open", json={"by": "Erah", "window_ref": "w1"})
+        assert r.status_code == 201
+        return r.json()["slot_id"]
+
+    def test_open_returns_slot_id_only(self, client):
+        r = client.post("/v0/mailbox/open", json={"by": "Erah"})
+        assert r.status_code == 201
+        assert set(r.json().keys()) == {"slot_id"}
+
+    def test_open_missing_by_400(self, client):
+        r = client.post("/v0/mailbox/open", json={})
+        assert r.status_code == 400
+        assert r.json()["detail"]["error"]["code"] == "bad_request"
+
+    def test_open_window_ref_persisted(self, client, mailbox_id):
+        r = client.get(f"/v0/slots/{mailbox_id}")
+        assert r.status_code == 200
+        assert r.json()["horizon"]["window_ref"] == "w1"
+
+    def test_bank_happy_path(self, client, mailbox_id):
+        r = client.post(f"/v0/mailbox/{mailbox_id}/bank", json={"text": "hello", "by": "Erah"})
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+
+    def test_bank_missing_text_400(self, client, mailbox_id):
+        r = client.post(f"/v0/mailbox/{mailbox_id}/bank", json={"by": "Erah"})
+        assert r.status_code == 400
+        assert r.json()["detail"]["error"]["code"] == "bad_request"
+
+    def test_bank_not_found_404(self, client):
+        r = client.post("/v0/mailbox/nope/bank", json={"text": "hi", "by": "Erah"})
+        assert r.status_code == 404
+        assert r.json()["detail"]["error"]["code"] == "not_found"
+
+    def test_bank_wrong_owner_403_not_owner(self, client, mailbox_id):
+        """store-layer SlotOwnershipError -> not_owner (loopback mode has no
+        principal binding, so this exercises the store-layer 403 cause)."""
+        r = client.post(f"/v0/mailbox/{mailbox_id}/bank", json={"text": "hi", "by": "intruder"})
+        assert r.status_code == 403
+        assert r.json()["detail"]["error"]["code"] == "not_owner"
+
+    def test_drain_happy_path_and_order(self, client, mailbox_id):
+        client.post(f"/v0/mailbox/{mailbox_id}/bank", json={"text": "one", "by": "Erah"})
+        client.post(f"/v0/mailbox/{mailbox_id}/bank", json={"text": "two", "by": "Erah"})
+        r = client.get(f"/v0/mailbox/{mailbox_id}/drain")
+        assert r.status_code == 200
+        prompts = r.json()["prompts"]
+        assert [p["text"] for p in prompts] == ["one", "two"]
+
+    def test_drain_not_found_404(self, client):
+        r = client.get("/v0/mailbox/nope/drain")
+        assert r.status_code == 404
+        assert r.json()["detail"]["error"]["code"] == "not_found"
+
+    def test_close_happy_path(self, client, mailbox_id):
+        r = client.post(f"/v0/mailbox/{mailbox_id}/close", json={"by": "Erah"})
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+        assert client.get(f"/v0/slots/{mailbox_id}").json()["status"] == "landed"
+
+    def test_close_not_found_404(self, client):
+        r = client.post("/v0/mailbox/nope/close", json={"by": "Erah"})
+        assert r.status_code == 404
+        assert r.json()["detail"]["error"]["code"] == "not_found"
+
+    def test_close_wrong_owner_403_not_owner(self, client, mailbox_id):
+        r = client.post(f"/v0/mailbox/{mailbox_id}/close", json={"by": "intruder"})
+        assert r.status_code == 403
+        assert r.json()["detail"]["error"]["code"] == "not_owner"
+
+    def test_current_none_when_no_mailbox_open(self, client):
+        r = client.get("/v0/mailbox/current")
+        assert r.status_code == 200
+        assert r.json() == {"slot_id": None, "count": 0}
+
+    def test_current_returns_open_slot_and_count(self, client, mailbox_id):
+        client.post(f"/v0/mailbox/{mailbox_id}/bank", json={"text": "one", "by": "Erah"})
+        client.post(f"/v0/mailbox/{mailbox_id}/bank", json={"text": "two", "by": "Erah"})
+        r = client.get("/v0/mailbox/current")
+        assert r.status_code == 200
+        assert r.json() == {"slot_id": mailbox_id, "count": 2}
+
+    def test_current_excludes_closed_mailbox(self, client, mailbox_id):
+        client.post(f"/v0/mailbox/{mailbox_id}/close", json={"by": "Erah"})
+        r = client.get("/v0/mailbox/current")
+        assert r.status_code == 200
+        assert r.json() == {"slot_id": None, "count": 0}
+
+
+class TestMailboxPrincipalBinding:
+    """Per-principal token — the OTHER 403 cause on bank/close: auth-layer
+    _check_by_principal rejecting an impersonated `by` before the store layer
+    is even reached (not_authorized, not not_owner)."""
+
+    TOKEN = "Erah:mysecret"
+
+    @pytest.fixture
+    def client(self, db):
+        return _client(db, self.TOKEN)
+
+    @pytest.fixture
+    def mailbox_id(self, client):
+        r = client.post("/v0/mailbox/open", json={"by": "Erah"}, headers=_auth("mysecret"))
+        assert r.status_code == 201
+        return r.json()["slot_id"]
+
+    def test_open_impersonation_rejected(self, client):
+        r = client.post("/v0/mailbox/open", json={"by": "someone-else"}, headers=_auth("mysecret"))
+        assert r.status_code == 403
+        assert r.json()["detail"]["error"]["code"] == "not_authorized"
+
+    def test_bank_impersonation_rejected_not_authorized(self, client, mailbox_id):
+        r = client.post(
+            f"/v0/mailbox/{mailbox_id}/bank",
+            json={"text": "hi", "by": "someone-else"},
+            headers=_auth("mysecret"),
+        )
+        assert r.status_code == 403
+        assert r.json()["detail"]["error"]["code"] == "not_authorized"
+
+    def test_close_impersonation_rejected_not_authorized(self, client, mailbox_id):
+        r = client.post(
+            f"/v0/mailbox/{mailbox_id}/close",
+            json={"by": "someone-else"},
+            headers=_auth("mysecret"),
+        )
+        assert r.status_code == 403
+        assert r.json()["detail"]["error"]["code"] == "not_authorized"
+
+    def test_bank_correct_principal_ok(self, client, mailbox_id):
+        r = client.post(
+            f"/v0/mailbox/{mailbox_id}/bank",
+            json={"text": "hi", "by": "Erah"},
+            headers=_auth("mysecret"),
+        )
+        assert r.status_code == 200
+
+
+class TestMailboxGenericRouteBypass:
+    """§1d: the generic /status, /escalate, /domain routes still work unchanged
+    against a mailbox slot_id (backward-compat), but log a bypass warning."""
+
+    @pytest.fixture
+    def client(self, db):
+        return _client(db, "")
+
+    @pytest.fixture
+    def mailbox_id(self, client):
+        r = client.post("/v0/mailbox/open", json={"by": "Erah"})
+        assert r.status_code == 201
+        return r.json()["slot_id"]
+
+    def test_status_route_unchanged_response_and_logs_bypass(self, client, mailbox_id, caplog):
+        with caplog.at_level(logging.WARNING):
+            r = client.post(
+                f"/v0/slots/{mailbox_id}/status", json={"status": "in-progress", "by": "Erah"}
+            )
+        assert r.status_code == 200
+        assert r.json()["status"] == "in-progress"
+        assert any("bypassing mailbox verbs" in rec.message for rec in caplog.records)
+        assert any("/status" in rec.message for rec in caplog.records)
+
+    def test_escalate_route_unchanged_response_and_logs_bypass(self, client, mailbox_id, caplog):
+        with caplog.at_level(logging.WARNING):
+            r = client.post(
+                f"/v0/slots/{mailbox_id}/escalate",
+                json={"to": "facets", "reason": "test", "by": "Erah"},
+            )
+        assert r.status_code == 200
+        assert r.json()["status"] == "escalated"
+        assert any("bypassing mailbox verbs" in rec.message for rec in caplog.records)
+        assert any("/escalate" in rec.message for rec in caplog.records)
+
+    def test_domain_route_unchanged_response_and_logs_bypass(self, client, mailbox_id, caplog):
+        with caplog.at_level(logging.WARNING):
+            r = client.post(
+                f"/v0/slots/{mailbox_id}/domain",
+                json={"files": ["x.py"], "by": "Erah"},
+            )
+        assert r.status_code == 200
+        assert any("bypassing mailbox verbs" in rec.message for rec in caplog.records)
+        assert any("/domain" in rec.message for rec in caplog.records)
+
+    def test_non_mailbox_slot_status_route_no_bypass_log(self, client, caplog):
+        """Regression guard: a normal (non-mailbox) slot must NOT trigger the
+        bypass warning — only project_id=="slot1-mailbox" rows do."""
+        r = client.post(
+            "/v0/slots", json={"project_id": "proj-A", "contributor": {"type": "fixer", "id": "agent-1"}}
+        )
+        sid = r.json()["slot_id"]
+        with caplog.at_level(logging.WARNING):
+            r2 = client.post(f"/v0/slots/{sid}/status", json={"status": "in-progress", "by": "agent-1"})
+        assert r2.status_code == 200
+        assert not any("bypassing mailbox verbs" in rec.message for rec in caplog.records)

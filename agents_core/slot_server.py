@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import hmac
 import ipaddress
+import logging
 import os
 import sys
 from pathlib import Path
@@ -74,6 +75,7 @@ from agents_core.elevator import (
 )
 from agents_core.interactive_submit import submit
 from agents_core.slots import (
+    MAILBOX_PROJECT_ID,
     SlotNotFoundError,
     SlotOwnershipError,
     SlotStore,
@@ -265,9 +267,11 @@ def create_app(db_path: Path, elevator_db_path: Path | None = None) -> FastAPI:
 
     @app.post("/v0/slots/{slot_id}/status")
     def update_status(slot_id: str, body: dict[str, Any]):
-        return _guarded(lambda: store.update_status(
+        result = _guarded(lambda: store.update_status(
             slot_id, body["status"], by=body["by"]), slot_id,
             by=body.get("by"))
+        _log_mailbox_bypass("/status", slot_id, result)
+        return result
 
     @app.post("/v0/slots/{slot_id}/checkpoint")
     def append_checkpoint(slot_id: str, body: dict[str, Any]):
@@ -277,16 +281,20 @@ def create_app(db_path: Path, elevator_db_path: Path | None = None) -> FastAPI:
 
     @app.post("/v0/slots/{slot_id}/domain")
     def set_domain(slot_id: str, body: dict[str, Any]):
-        return _guarded(lambda: store.set_domain_touch(
+        result = _guarded(lambda: store.set_domain_touch(
             slot_id, files=body.get("files"), mem_keys=body.get("mem_keys"),
             scopes=body.get("scopes"), by=body["by"]), slot_id,
             by=body.get("by"))
+        _log_mailbox_bypass("/domain", slot_id, result)
+        return result
 
     @app.post("/v0/slots/{slot_id}/escalate")
     def escalate(slot_id: str, body: dict[str, Any]):
-        return _guarded(lambda: store.escalate(
+        result = _guarded(lambda: store.escalate(
             slot_id, to=body.get("to", "facets"), reason=body.get("reason", ""), by=body["by"]), slot_id,
             by=body.get("by"))
+        _log_mailbox_bypass("/escalate", slot_id, result)
+        return result
 
     @app.post("/v0/slots/{slot_id}/observer")
     def observer_update(slot_id: str, body: dict[str, Any]):
@@ -312,6 +320,49 @@ def create_app(db_path: Path, elevator_db_path: Path | None = None) -> FastAPI:
         except KeyError as e:
             raise HTTPException(status_code=400, detail=_error("bad_request", f"missing field {e}"))
         return store.get(slot_id)
+
+    # ------------------------------------------------------------------
+    # Mailbox (agents-core-slot1-mailbox-v0) — bank raw prompts while Slot 1
+    # is out of seat. Layer-1-only: no set_down/pick_up, no artifact/hash.
+    # ------------------------------------------------------------------
+
+    @app.post("/v0/mailbox/open", status_code=201)
+    def mailbox_open(body: dict[str, Any]):
+        by = body.get("by")
+        if by is not None:
+            _check_by_principal(by)
+        try:
+            slot_id = store.open_mailbox(by=body["by"], window_ref=body.get("window_ref"))
+        except KeyError as e:
+            raise HTTPException(status_code=400, detail=_error("bad_request", f"missing field {e}"))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=_error("bad_request", str(e)))
+        return {"slot_id": slot_id}
+
+    @app.post("/v0/mailbox/{slot_id}/bank")
+    def mailbox_bank(slot_id: str, body: dict[str, Any]):
+        _guarded(lambda: store.bank_prompt(slot_id, body["text"], by=body["by"]), slot_id,
+                 by=body.get("by"))
+        return {"ok": True}
+
+    @app.get("/v0/mailbox/{slot_id}/drain")
+    def mailbox_drain(slot_id: str):
+        prompts = store.drain_mailbox(slot_id)
+        if prompts is None:
+            raise HTTPException(status_code=404, detail=_error("not_found", f"Slot '{slot_id}' not found"))
+        return {"prompts": prompts}
+
+    @app.post("/v0/mailbox/{slot_id}/close")
+    def mailbox_close(slot_id: str, body: dict[str, Any]):
+        _guarded(lambda: store.close_mailbox(slot_id, by=body["by"]), slot_id,
+                 by=body.get("by"))
+        return {"ok": True}
+
+    @app.get("/v0/mailbox/current")
+    def mailbox_current():
+        slot_id = store.current_mailbox()
+        count = len(store.drain_mailbox(slot_id)) if slot_id else 0
+        return {"slot_id": slot_id, "count": count}
 
     # ------------------------------------------------------------------
     # Maintenance
@@ -346,6 +397,16 @@ def create_app(db_path: Path, elevator_db_path: Path | None = None) -> FastAPI:
         except ValueError as e:
             raise HTTPException(status_code=400, detail=_error("bad_request", str(e)))
         return store.get(slot_id)
+
+    def _log_mailbox_bypass(route: str, slot_id: str, result: dict | None) -> None:
+        """Log when a mailbox slot is mutated via a generic route instead of the
+        mailbox verbs (agents-core-slot1-mailbox-v0 §1d). Response/status code for
+        the generic route is unchanged for every slot type — this only logs."""
+        if result and result.get("project_id") == MAILBOX_PROJECT_ID:
+            logging.warning(
+                f"mailbox slot {slot_id} mutated via generic {route} route, "
+                "bypassing mailbox verbs"
+            )
 
     # ------------------------------------------------------------------
     # Elevator queue routes

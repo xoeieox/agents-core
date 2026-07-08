@@ -16,6 +16,7 @@ Covers:
 from __future__ import annotations
 
 import hashlib
+import logging
 import multiprocessing
 import sqlite3
 import threading
@@ -28,13 +29,16 @@ from agents_core.notify import Priority
 from agents_core.slots import (
     ABANDONED_AGE_DAYS,
     ARTIFACT_KINDS,
+    MAILBOX_PROJECT_ID,
     NEXT_KINDS,
     SCHEMA,
     WITHHELD_AGE_DAYS,
     OffMasterWriteError,
+    SlotInertViolation,
     SlotNotFoundError,
     SlotOwnershipError,
     SlotStore,
+    _assert_mailbox_domain_touch_empty,
     board_bucket,
     resolve_build_state,
 )
@@ -1302,3 +1306,158 @@ def test_resolve_build_state_no_artifact_uses_status_bucket():
 
 def test_artifact_kinds_frozenset_matches_spec():
     assert ARTIFACT_KINDS == {"pr", "spec", "atom-output", "draft-file"}
+
+
+# --- mailbox (agents-core-slot1-mailbox-v0) ---------------------------------
+# Layer-1-only: bank raw prompts, drain fresh on flip-back. No set_down/pick_up,
+# no artifact/content_hash, no withheld — see module docstring §1c.
+
+def test_open_mailbox_basic_shape(store: SlotStore):
+    sid = store.open_mailbox(by="Erah", window_ref="w1")
+    slot = store.get(sid)
+    assert slot["project_id"] == MAILBOX_PROJECT_ID
+    assert slot["contributor_type"] == "human"
+    assert slot["contributor_id"] == "Erah"
+    assert slot["status"] == "dispatched"
+    assert slot["domain_touch"] == {}
+
+
+def test_open_mailbox_window_ref_persisted(store: SlotStore):
+    sid = store.open_mailbox(by="Erah", window_ref="window-42")
+    assert store.get(sid)["horizon"]["window_ref"] == "window-42"
+
+
+def test_open_mailbox_window_ref_omitted_when_none(store: SlotStore):
+    sid = store.open_mailbox(by="Erah")
+    assert "window_ref" not in store.get(sid)["horizon"]
+
+
+def test_bank_then_drain_returns_verbatim_in_bank_order(store: SlotStore):
+    sid = store.open_mailbox(by="Erah")
+    payloads = [
+        "first prompt",
+        "unicode: héllo wörld 日本語 🎉",
+        "line1\nline2\x00embedded-nul",
+        "",
+        "x" * 20000,  # long text
+    ]
+    for text in payloads:
+        assert store.bank_prompt(sid, text, by="Erah") is True
+    prompts = store.drain_mailbox(sid)
+    assert [p["text"] for p in prompts] == payloads  # verbatim, bank order
+    assert all("at" in p for p in prompts)
+
+
+def test_drain_mailbox_missing_slot_returns_none(store: SlotStore):
+    assert store.drain_mailbox("nope") is None
+
+
+def test_drain_mailbox_is_pure_read_no_by_idempotent(store: SlotStore):
+    sid = store.open_mailbox(by="Erah")
+    store.bank_prompt(sid, "hello", by="Erah")
+    first = store.drain_mailbox(sid)
+    second = store.drain_mailbox(sid)
+    assert first == second
+    # No row mutation: last_update unchanged across repeated drains.
+    before = store.get(sid)["last_update"]
+    store.drain_mailbox(sid)
+    after = store.get(sid)["last_update"]
+    assert before == after
+
+
+def test_drain_mailbox_returns_deep_copies(store: SlotStore):
+    sid = store.open_mailbox(by="Erah")
+    store.bank_prompt(sid, "original", by="Erah")
+    prompts = store.drain_mailbox(sid)
+    assert len(prompts) == 1
+    prompts[0]["text"] = "mutated"
+    prompts.append({"at": "x", "text": "injected"})
+    redrained = store.drain_mailbox(sid)
+    assert len(redrained) == 1  # underlying store unaffected by caller mutation
+    assert redrained[0]["text"] == "original"
+
+
+def test_bank_prompt_owner_guarded(store: SlotStore):
+    sid = store.open_mailbox(by="Erah")
+    with pytest.raises(SlotOwnershipError):
+        store.bank_prompt(sid, "intruder text", by="intruder")
+    assert store.drain_mailbox(sid) == []
+
+
+def test_close_mailbox_lands_and_owner_guarded(store: SlotStore):
+    sid = store.open_mailbox(by="Erah")
+    with pytest.raises(SlotOwnershipError):
+        store.close_mailbox(sid, by="intruder")
+    assert store.close_mailbox(sid, by="Erah") is True
+    assert store.get(sid)["status"] == "landed"
+    assert store.current_mailbox() is None  # excluded once closed
+
+
+def test_current_mailbox_none_when_none_open(store: SlotStore):
+    assert store.current_mailbox() is None
+
+
+def test_current_mailbox_returns_open_slot_id(store: SlotStore):
+    sid = store.open_mailbox(by="Erah")
+    assert store.current_mailbox() == sid
+
+
+def test_current_mailbox_tiebreak_by_started_at_not_last_update(store: SlotStore, caplog):
+    """Constructs the ordering trap: bank a checkpoint into the OLDER mailbox
+    after the newer one opens, bumping the older mailbox's last_update to be
+    the most recent write in the whole table. current_mailbox must still
+    return the NEWER mailbox (by started_at), not last-write-wins, and must
+    log a warning about the multi-open condition."""
+    older = store.open_mailbox(by="Erah-1")
+    newer = store.open_mailbox(by="Erah-2")
+    with store._lock:
+        store._conn.execute(
+            "UPDATE slots SET started_at=? WHERE slot_id=?",
+            ("2020-01-01T00:00:00+00:00", older),
+        )
+        store._conn.execute(
+            "UPDATE slots SET started_at=? WHERE slot_id=?",
+            ("2025-01-01T00:00:00+00:00", newer),
+        )
+        store._conn.commit()
+    store.bank_prompt(older, "late prompt", by="Erah-1")
+    assert store.get(older)["last_update"] > store.get(newer)["last_update"]
+
+    with caplog.at_level(logging.WARNING):
+        result = store.current_mailbox()
+    assert result == newer
+    assert any("should never happen" in r.message for r in caplog.records)
+
+
+def test_mailbox_full_cycle_no_artifact_no_hash_no_withheld(store: SlotStore):
+    """Negative guard: the §1c invariant as a deterministic test — a full
+    open/bank/drain/close cycle never touches artifact/content_hash/withheld."""
+    sid = store.open_mailbox(by="Erah")
+    store.bank_prompt(sid, "prompt one", by="Erah")
+    store.bank_prompt(sid, "prompt two", by="Erah")
+    store.drain_mailbox(sid)
+    store.close_mailbox(sid, by="Erah")
+    slot = store.get(sid)
+    assert slot["artifact"] == {}
+    assert "content_hash" not in slot["artifact"]
+    assert slot["status"] == "landed"
+    assert slot["status"] != "withheld"
+
+
+def test_assert_mailbox_domain_touch_empty_strict():
+    """§1e runtime guard, tested directly against the internal helper (not
+    reachable through open_mailbox's public signature, which has no parameter
+    that could trigger it)."""
+    _assert_mailbox_domain_touch_empty({})
+    _assert_mailbox_domain_touch_empty([])
+    with pytest.raises(SlotInertViolation):
+        _assert_mailbox_domain_touch_empty({"placeholder": True})
+    with pytest.raises(SlotInertViolation):
+        _assert_mailbox_domain_touch_empty([1])
+
+
+def test_mailbox_invisible_to_adjacent_but_visible_in_query(store: SlotStore):
+    sid = store.open_mailbox(by="Erah")
+    hits = store.adjacent(files=["any.py"], mem_keys=["any/key"], include_inactive=True)
+    assert sid not in {h["slot_id"] for h in hits}  # invisible: empty domain_touch
+    assert sid in {s["slot_id"] for s in store.query(project_id=MAILBOX_PROJECT_ID)}  # still listed
