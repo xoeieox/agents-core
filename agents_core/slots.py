@@ -74,6 +74,13 @@ INACTIVE_STATUSES = frozenset({"landed", "abandoned", "parked"})
 # Artifact kinds a handoff baton can point at (baton-lineage-verified-handoff-v0).
 ARTIFACT_KINDS = frozenset({"pr", "spec", "atom-output", "draft-file"})
 
+# Mailbox convention (agents-core-slot1-mailbox-v0): a mailbox IS a slot whose
+# checkpoints are banked raw prompts — layer-1-only, deliberately NOT reusing
+# set_down/pick_up's verified-handoff machinery (see SlotStore.open_mailbox /
+# bank_prompt / drain_mailbox / close_mailbox / current_mailbox below).
+MAILBOX_PROJECT_ID = "slot1-mailbox"
+MAILBOX_CHECKPOINT_KIND = "banked-prompt"
+
 # Handoff-baton kinds that a controller (Morph) can dispatch on without parsing prose.
 # Closed set: exactly these dispatch verbs; anything else is a ValueError.
 NEXT_KINDS = frozenset({
@@ -272,6 +279,28 @@ class OffMasterWriteError(RuntimeError):
     Off-master writers must POST to SLOTS_MASTER_URL instead of writing a
     divergent local sqlite — the docstring contract enforced loudly.
     """
+
+
+class SlotInertViolation(ValueError):
+    """Raised by the mailbox's runtime inertness guard (agents-core-slot1-mailbox-v0
+    §1e) when a non-empty ``domain_touch`` is about to be attached to a mailbox slot
+    at creation. Guards against code drift in ``open_mailbox()``'s own body — not
+    caller input, since its public signature has no parameter that could trigger
+    this. Subclasses ``ValueError`` to match the existing ``ValueError`` -> 400
+    precedent in ``slot_server.py``'s ``_guarded()``.
+    """
+
+
+def _assert_mailbox_domain_touch_empty(domain_touch: dict | list) -> None:
+    """Strict-emptiness check for the mailbox inertness guard: only exactly ``[]``
+    or ``{}`` pass — a placeholder dict or a single-element list must also raise
+    ``SlotInertViolation`` (truthiness alone is not enough; e.g. ``{"a": 1}`` is
+    falsy-adjacent in intent but must still be rejected).
+    """
+    if domain_touch != {} and domain_touch != []:
+        raise SlotInertViolation(
+            f"mailbox domain_touch must be strictly empty ([] or {{}}), got {domain_touch!r}"
+        )
 
 
 class SlotStore:
@@ -728,6 +757,97 @@ class SlotStore:
         )
         self.update_status(slot_id, "landed", by=old_owner)
         return new_sid
+
+    # -- mailbox (agents-core-slot1-mailbox-v0) ------------------------------
+    # Layer-1-only: bank the raw prompt, drain it fresh on flip-back. Deliberately
+    # does NOT touch set_down/pick_up, artifact, content_hash, or withheld — there
+    # is nothing derived here to reality-snap (see module docstring §1c).
+
+    def open_mailbox(self, *, by: str, window_ref: str | None = None) -> str:
+        """Open a Slot-1 mailbox: a slot whose checkpoints are banked raw prompts.
+
+        Wraps ``create_slot`` with the mailbox convention — fixed
+        ``project_id="slot1-mailbox"``, ``contributor={"type": "human", "id": by}``,
+        status ``"dispatched"`` (reads as "open"), and an always-empty
+        ``domain_touch`` (keeps the mailbox invisible to work-adjacency; guarded
+        against drift by ``_assert_mailbox_domain_touch_empty``). ``window_ref``,
+        if given, records which flip window this mailbox belongs to at
+        ``horizon["window_ref"]`` — omitted entirely (not set to ``null``) when
+        not given. Returns the new mailbox's slot_id.
+        """
+        domain_touch: dict = {}
+        _assert_mailbox_domain_touch_empty(domain_touch)
+        horizon: dict = {}
+        if window_ref is not None:
+            horizon["window_ref"] = window_ref
+        return self.create_slot(
+            project_id=MAILBOX_PROJECT_ID,
+            contributor={"type": "human", "id": by},
+            horizon=horizon,
+            status="dispatched",
+            domain_touch=domain_touch,
+        )
+
+    def bank_prompt(self, slot_id: str, text: str, *, by: str) -> bool:
+        """Bank one raw prompt into the mailbox, verbatim — no transformation, no
+        truncation. Wraps ``append_checkpoint`` unchanged (owner-guarded: only the
+        mailbox's contributor-of-record banks).
+        """
+        return self.append_checkpoint(slot_id, kind=MAILBOX_CHECKPOINT_KIND, note=text, by=by)
+
+    def drain_mailbox(self, slot_id: str) -> list[dict] | None:
+        """Pure read (no ownership check): the banked prompts in bank order as
+        ``[{at, text}]``. Mirrors ``get()``'s behavior of returning ``None`` rather
+        than raising on a missing ``slot_id``. Ordering is append order alone (the
+        store's single in-process lock already makes concurrent appends
+        deterministic). Does not mutate — the returning 27B reads without owning.
+
+        Returns fresh dicts built from ``get()``'s already-freshly-parsed-from-JSON
+        checkpoints, so the result is a deep copy: mutating it can never corrupt
+        the underlying append-only store.
+        """
+        slot = self.get(slot_id)
+        if slot is None:
+            return None
+        checkpoints = slot.get("checkpoints") or []
+        return [
+            {"at": cp["at"], "text": cp["note"]}
+            for cp in checkpoints
+            if cp.get("kind") == MAILBOX_CHECKPOINT_KIND
+        ]
+
+    def close_mailbox(self, slot_id: str, *, by: str) -> bool:
+        """Owner marks a drained mailbox ``landed`` via the existing ``update_status``
+        path. Owner-guarded. Called on flip-back once drained."""
+        return self.update_status(slot_id, "landed", by=by)
+
+    def current_mailbox(self) -> str | None:
+        """Find the single open mailbox (``status="dispatched"``, ``project_id=
+        "slot1-mailbox"``), or ``None`` if none is open — the stable handle a
+        caller uses to bank without knowing the slot_id.
+
+        If more than one is somehow open (should never happen — one window at a
+        time), returns the one with the latest creation time (``started_at``, NOT
+        ``last_update`` — ``query()``'s default ``last_update DESC`` sort changes on
+        any write, including a stray ``bank_prompt`` on the older mailbox, which
+        would wrongly surface the older slot as "most recent") and logs a warning.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM slots WHERE project_id=? AND status='dispatched'",
+                (MAILBOX_PROJECT_ID,),
+            ).fetchall()
+        if not rows:
+            return None
+        slots = [self._row_to_dict(r) for r in rows]
+        if len(slots) > 1:
+            logging.warning(
+                f"current_mailbox: {len(slots)} open {MAILBOX_PROJECT_ID!r} slots found "
+                "(should never happen — one window at a time); returning the most "
+                "recently opened (by started_at, not last_update)"
+            )
+        slots.sort(key=lambda s: s.get("started_at") or "", reverse=True)
+        return slots[0]["slot_id"]
 
     # -- observer writes (separate column namespace; not owner-guarded) ------
 
