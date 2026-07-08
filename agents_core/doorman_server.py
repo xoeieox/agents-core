@@ -199,7 +199,7 @@ class _NodeState:
     def _is_serving(self, timeout: float = 3.0) -> bool:
         try:
             resp = requests.get(f"{self.gw_url}/health", timeout=timeout)
-            return resp.status_code == 200 and resp.json().get("status") == "ok"
+            return resp.status_code == 200
         except Exception:
             return False
 

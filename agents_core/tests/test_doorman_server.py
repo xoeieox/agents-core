@@ -64,6 +64,61 @@ def _make_state(gw_url: str = GW_URL_DEFAULT) -> _NodeState:
 # _NodeState unit tests
 # ---------------------------------------------------------------------------
 
+class TestIsServing:
+    """Tests for _is_serving() (doorman-dual-vllm-serving-probe-gap-v0).
+
+    _is_serving() must treat any 200 from /health as serving, regardless of
+    body shape - llama.cpp returns {"status": "ok"}, vLLM returns an empty
+    (non-JSON) 200 body.
+    """
+
+    def test_llamacpp_shaped_response_is_serving(self):
+        state = _make_state()
+
+        def mock_health(url, **kwargs):
+            m = MagicMock()
+            m.status_code = 200
+            m.json.return_value = {"status": "ok"}
+            return m
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_health):
+            assert state._is_serving() is True
+
+    def test_vllm_shaped_response_is_serving(self):
+        state = _make_state()
+
+        def mock_health(url, **kwargs):
+            m = MagicMock()
+            m.status_code = 200
+            m.json.side_effect = ValueError("no json")
+            return m
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_health):
+            assert state._is_serving() is True
+
+    def test_non_200_status_is_not_serving(self):
+        state = _make_state()
+
+        def mock_health(url, **kwargs):
+            m = MagicMock()
+            m.status_code = 503
+            m.json.return_value = {"status": "loading model"}
+            return m
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_health):
+            assert state._is_serving() is False
+
+    def test_connection_error_is_not_serving(self):
+        state = _make_state()
+        import requests as req_lib
+
+        def mock_health(url, **kwargs):
+            raise req_lib.exceptions.ConnectionError("simulated connection error")
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_health):
+            assert state._is_serving() is False
+
+
 class TestEnsureServing:
     def test_already_serving_skips_wake(self):
         state = _make_state()
