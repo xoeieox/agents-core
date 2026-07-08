@@ -21,8 +21,20 @@ Environment variables:
   GW_URL                 — GravityWell base URL (default http://203.0.113.11:8081)
                            NOTE: must match the GW_URL configured for agents_core.llm
                            (the operator reads the same env var for inference POSTs).
-  GW_WAKE_DEADLINE_SEC   — max seconds to wait for GW to serve (default 180;
+                           Also Slot 1 of dual mode; Slot 2 is derived by swapping the
+                           port to GW_SLOT2_PORT (default 8082) — see DOORMAN_DEFAULT_SERVE_MODE.
+  GW_WAKE_DEADLINE_SEC   — max seconds to wait for GW to serve in big mode (default 180;
                            cold 77GB model load backstop — typical warm wake is ~10s)
+  DOORMAN_DEFAULT_SERVE_MODE — cold-wake serving target when no controller owns the mode
+                           and GW is not serving: "dual" (default) or "big". "dual" issues
+                           `gw-serve dual` (both vLLM slots, :8081 27B + :8082 Devstral);
+                           "big" restores the prior byte-identical `gw-serve big` (122B)
+                           behavior — set this for an exact rollback to pre-dual-default
+                           wake behavior (gw-doorman-wake-to-default-mode-v0).
+  GW_DUAL_WAKE_DEADLINE_SEC — max seconds to wait for BOTH dual slots to serve (default
+                           720; safely above Devstral's measured ~488s cold-init and
+                           under gw-dual's own TimeoutStartSec=900). Only used when
+                           DOORMAN_DEFAULT_SERVE_MODE=dual.
   GW_HOLD_TTL_SEC        — keepawake hold TTL in seconds (default 120)
   GW_HOLD_REFRESH_SEC    — refresh interval for the keepawake hold (default 45)
   GW_STOP_GRACE_SEC      — seconds after last-release before the refresh thread
@@ -85,6 +97,30 @@ GW_HOLD_REFRESH_SEC = int(os.environ.get("GW_HOLD_REFRESH_SEC", "45"))
 # Machine-economics boundary: amortizes the ~25s cold-load against burst gaps.
 # Calibrate from /var/log/doorman-idle.jsonl observations — never auto-tuned.
 GW_STOP_GRACE_SEC = int(os.environ.get("GW_STOP_GRACE_SEC", "600"))
+
+# Cold-wake serving target (gw-doorman-wake-to-default-mode-v0). "dual" is the default —
+# GW's boot-default resting posture is now dual (Slot 1 27B :8081 + Slot 2 Devstral :8082,
+# see gw-dual-boot.service); "big" restores the exact prior gw-serve big wake path.
+DOORMAN_DEFAULT_SERVE_MODE = os.environ.get("DOORMAN_DEFAULT_SERVE_MODE", "dual").strip().lower()
+
+# Both above Devstral's measured ~488s cold-init and under gw-dual's own TimeoutStartSec=900.
+# Only consulted when DOORMAN_DEFAULT_SERVE_MODE == "dual".
+GW_DUAL_WAKE_DEADLINE_SEC = int(os.environ.get("GW_DUAL_WAKE_DEADLINE_SEC", "720"))
+
+# Slot 2's port — Slot 2's base host is derived from GW_URL (Slot 1), not re-hardcoded.
+GW_SLOT2_PORT = int(os.environ.get("GW_SLOT2_PORT", "8082"))
+
+# The async-initiate ssh call for dual mode only needs to spawn the backgrounded
+# `gw-serve dual` remotely and return — it must NOT block for the ~488s bring-up
+# (that's what the health-poll loop in _wake_dual is for). A short timeout here
+# only bounds the ssh-connect + background-spawn round trip.
+GW_DUAL_INITIATE_TIMEOUT_SEC = 20
+
+# Deterministic exponential backoff for the dual readiness poll — a single-consumer
+# cold wake has no thundering-herd concern that jitter would address.
+GW_DUAL_POLL_INITIAL_SEC = 5.0
+GW_DUAL_POLL_BACKOFF_FACTOR = 1.5
+GW_DUAL_POLL_MAX_SEC = 30.0
 
 DOORMAN_DEFER_TO_CONTROLLER = os.environ.get("DOORMAN_DEFER_TO_CONTROLLER", "true").lower() == "true"
 DOORMAN_CONTROLLER_NAME = os.environ.get("DOORMAN_CONTROLLER_NAME", "flip-controller")
@@ -379,10 +415,13 @@ class _NodeState:
           1. Fast-path: _is_serving() → return True (service already up).
           2. wake-gravitywell: idempotent host-wake (no-op if already up).
           3. Check deference: if DOORMAN_DEFER_TO_CONTROLLER and (role=="mode-controller"
-             or an active mode-controller lease exists), return DEFERRED (no gw-serve big).
-          4. gw-serve big: start llama-server.service if stopped (idempotent).
-          5. Poll /health until serving or GW_WAKE_DEADLINE_SEC (covers ~25s
-             cold-load after gw-serve big).
+             or an active mode-controller lease exists), return DEFERRED (no wake issued).
+          4. Issue gw-serve ${DOORMAN_DEFAULT_SERVE_MODE} (gw-doorman-wake-to-default-mode-v0):
+             "big" (_wake_big) — start llama-server.service if stopped (idempotent),
+             synchronous ~60s subprocess, poll until serving or GW_WAKE_DEADLINE_SEC.
+             "dual" (_wake_dual, default) — async-initiate gw-serve dual (fast-returning
+             backgrounded launch; the ~488s Devstral cold-init happens off the subprocess),
+             then poll both slots until GW_DUAL_WAKE_DEADLINE_SEC.
         """
         # Block co-load if creative 70B holds the GPU lane
         if self._is_creative_serving():
@@ -432,6 +471,17 @@ class _NodeState:
                 )
                 return DEFERRED
 
+        # Issue the configured cold-wake serving target (gw-doorman-wake-to-default-mode-v0).
+        # DOORMAN_DEFAULT_SERVE_MODE=big is byte-identical to the pre-dual-default behavior.
+        if DOORMAN_DEFAULT_SERVE_MODE == "big":
+            return self._wake_big()
+        return self._wake_dual()
+
+    def _wake_big(self) -> bool:
+        """Synchronous gw-serve big wake — unchanged timings (~60s subprocess,
+        poll until GW_WAKE_DEADLINE_SEC). Must be called from ensure_serving()
+        under self.lock, after wake-gravitywell + deference checks.
+        """
         # Ensure the serving unit is up (idempotent — fast no-op if already active)
         log.info(f"[{self.node_name}] running gw-serve big to ensure llama-server.service is up")
         try:
@@ -472,6 +522,105 @@ class _NodeState:
         log.error(f"[{self.node_name}] {err}")
         self.last_error = err
         return False
+
+    def _wake_dual(self) -> bool:
+        """Async-initiate gw-serve dual, then poll both slots with backoff.
+
+        gw-serve dual (-> gw-dual up) blocks ~488s for the staggered health-gated
+        bring-up (Devstral dense-FP8 init on Slot 2; Slot 1's 27B is fast). Running
+        that as one long blocking subprocess would conflict with any short subprocess
+        timeout, so instead this fires the launch backgrounded on the remote host
+        (fast-returning ssh call) and treats this method's own poll loop as the single
+        source of wake-completion truth, bounded by GW_DUAL_WAKE_DEADLINE_SEC.
+
+        gw-dual has its own staggered health-gating + rollback-to-big watchdog on the
+        host side — this method does not duplicate that logic, it only detects (a) a
+        failed *launch* (caught immediately, distinct from a merely slow init) and
+        (b) deadline exhaustion (transient — caller retries/degrades). Must be called
+        from ensure_serving() under self.lock, after wake-gravitywell + deference checks.
+        """
+        log.info(f"[{self.node_name}] issuing async-initiated gw-serve dual")
+        try:
+            proc = subprocess.run(
+                ["ssh", "gravitywell",
+                 "nohup gw-serve dual </dev/null >/tmp/gw-serve-dual-wake.log 2>&1 & disown"],
+                capture_output=True, text=True, timeout=GW_DUAL_INITIATE_TIMEOUT_SEC,
+            )
+            if proc.returncode != 0:
+                err = f"gw-serve dual initiation failed rc={proc.returncode}: {proc.stderr[:300]}"
+                log.error(f"[{self.node_name}] {err}")
+                self.last_error = err
+                self._cleanup_failed_dual_initiation()
+                return False
+        except Exception as e:
+            err = f"gw-serve dual initiation subprocess error: {e}"
+            log.error(f"[{self.node_name}] {err}")
+            self.last_error = err
+            self._cleanup_failed_dual_initiation()
+            return False
+
+        # Poll both slots until both show two consecutive healthy 200s, or deadline.
+        deadline = time.time() + GW_DUAL_WAKE_DEADLINE_SEC
+        poll_interval = GW_DUAL_POLL_INITIAL_SEC
+        slot1_streak = 0
+        slot2_streak = 0
+        while time.time() < deadline:
+            slot1_streak = slot1_streak + 1 if self._is_serving() else 0
+            slot2_streak = slot2_streak + 1 if self._is_slot2_serving() else 0
+            if slot1_streak >= 2 and slot2_streak >= 2:
+                elapsed = GW_DUAL_WAKE_DEADLINE_SEC - (deadline - time.time())
+                log.info(f"[{self.node_name}] dual serving (both slots) after ~{elapsed:.0f}s")
+                self.last_wake_at = time.time()
+                self.last_error = None
+                self.service_stopped = False
+                self._cached_serving = True
+                self._serving_checked_at = time.time()
+                self._place_hold()
+                return True
+            time.sleep(poll_interval)
+            poll_interval = min(poll_interval * GW_DUAL_POLL_BACKOFF_FACTOR, GW_DUAL_POLL_MAX_SEC)
+
+        # Deadline exhausted — transient (caller retries/degrades via wake_failed).
+        # Genuine Slot-2 failure is gw-dual's own rollback-to-big watchdog's concern;
+        # this is just the correctly-sized deadline observing it didn't reach dual.
+        err = (
+            f"GW dual did not reach both-slot readiness within "
+            f"{GW_DUAL_WAKE_DEADLINE_SEC}s after wake "
+            f"(slot1_ready={slot1_streak >= 2}, slot2_ready={slot2_streak >= 2})"
+        )
+        log.error(f"[{self.node_name}] {err}")
+        self.last_error = err
+        return False
+
+    def _is_slot2_serving(self, timeout: float = 3.0) -> bool:
+        try:
+            resp = requests.get(f"{self._slot2_url()}/health", timeout=timeout)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def _slot2_url(self) -> str:
+        """Derive Slot 2's base URL from the configured Slot 1 gw_url — same host,
+        GW_SLOT2_PORT instead of Slot 1's port. Not a newly hardcoded IP."""
+        from urllib.parse import urlsplit, urlunsplit
+        parts = urlsplit(self.gw_url)
+        netloc = f"{parts.hostname}:{GW_SLOT2_PORT}"
+        return urlunsplit((parts.scheme, netloc, "", "", ""))
+
+    def _cleanup_failed_dual_initiation(self) -> None:
+        """Best-effort cleanup after a failed dual-mode launch, so a launch error
+        never leaves an orphaned gw-dual/vllm process or half-state behind. Reuses
+        the existing gw-serve stop verb (already safe/idempotent per
+        gravitywell-doorman-clean-stop-v0) rather than inventing a new host-script
+        surface. Errors are swallowed — this is a safety net, not the primary path.
+        """
+        try:
+            subprocess.run(
+                ["ssh", "gravitywell", "gw-serve stop"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except Exception as e:
+            log.warning(f"[{self.node_name}] dual-initiation cleanup (gw-serve stop) failed: {e}")
 
     # ------------------------------------------------------------------
     # Keepawake hold helpers — must be called under lock

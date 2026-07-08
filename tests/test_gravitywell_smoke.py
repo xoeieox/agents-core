@@ -10,6 +10,7 @@ Excluded from the default suite (no -m smoke flag).
 """
 
 import json
+import os
 import subprocess
 import time
 
@@ -20,6 +21,21 @@ from agents_core.llm import call_operator
 
 DOORMAN_URL = "http://127.0.0.1:8407"
 GW_SSH_HOST = "gravitywell"
+
+# Must match the doorman's own configuration (gw-doorman-wake-to-default-mode-v0) —
+# the smoke runner is expected to set this to whatever the live doorman is running,
+# same convention as GW_STOP_GRACE_SEC below. Default "dual" matches the doorman's
+# real default.
+DEFAULT_SERVE_MODE = os.environ.get("DOORMAN_DEFAULT_SERVE_MODE", "dual").strip().lower()
+# Cold-wake acquire timeout must accommodate whichever mode is under test — dual's
+# ~488s Devstral cold-init needs real headroom, big's ~25s cold-load does not.
+_COLD_ACQUIRE_TIMEOUT_SEC = 200 if DEFAULT_SERVE_MODE == "big" else 750
+
+
+def _services_for_mode() -> list[str]:
+    if DEFAULT_SERVE_MODE == "big":
+        return ["llama-server.service"]
+    return ["vllm-slot1.service", "vllm-slot2.service"]
 
 
 def _gw_ssh(cmd: str, timeout: int = 15) -> subprocess.CompletedProcess:
@@ -61,13 +77,17 @@ def test_gravitywell_wakes_returns_json_releases_hold():
 def test_cold_acquire_starts_service_and_release_with_grace_stops():
     """Full clean-stop lifecycle: cold acquire → serving; release + grace → stopped.
 
-    This test verifies gravitywell-doorman-clean-stop-v0:
-      1. acquire from stopped → doorman issues gw-serve big → llama-server active
+    This test verifies gravitywell-doorman-clean-stop-v0, mode-aware for
+    gw-doorman-wake-to-default-mode-v0 (DEFAULT_SERVE_MODE, from the
+    DOORMAN_DEFAULT_SERVE_MODE env var — must match the live doorman's config):
+      1. acquire from stopped → doorman issues gw-serve ${DEFAULT_SERVE_MODE} →
+         the mode's service(s) active (llama-server.service for big;
+         vllm-slot1.service + vllm-slot2.service for dual)
       2. release → idle_since set
       3. after GW_STOP_GRACE_SEC (injected low via doorman env), refresh thread
-         issues gw-serve stop → llama-server inactive
+         issues gw-serve stop → service(s) inactive
       4. /status shows service_stopped=True and serving_mode=stopped
-      5. guard now permits suspend (llama-server.service not active)
+      5. guard now permits suspend (no serving unit active)
 
     Does NOT assert actual S3 suspend (irreversible/slow) — inactive + guard-eligibility
     is sufficient proof.
@@ -91,20 +111,21 @@ def test_cold_acquire_starts_service_and_release_with_grace_stops():
         pytest.skip("gw-serve stop failed — cannot set up precondition")
     time.sleep(3)
 
-    # --- Step 2: cold acquire (doorman must issue gw-serve big) ---
+    # --- Step 2: cold acquire (doorman must issue gw-serve ${DEFAULT_SERVE_MODE}) ---
     acq = requests.post(
         f"{DOORMAN_URL}/lease/acquire",
         json={"node": "gravitywell", "work_id": "smoke-clean-stop", "ttl_sec": 120, "reason": "smoke"},
-        timeout=200,  # covers cold-load (~25s) + wake (~15s)
+        timeout=_COLD_ACQUIRE_TIMEOUT_SEC,
     )
     assert acq.status_code == 200, f"acquire failed: {acq.text}"
     assert acq.json().get("status") == "serving", f"unexpected status: {acq.json()}"
 
-    # Verify llama-server.service is now active on GW
-    is_active = _gw_ssh("systemctl is-active llama-server.service", timeout=10)
-    assert "active" in is_active.stdout, (
-        f"llama-server.service not active after acquire: {is_active.stdout!r}"
-    )
+    # Verify the mode's serving unit(s) are now active on GW
+    for svc in _services_for_mode():
+        is_active = _gw_ssh(f"systemctl is-active {svc}", timeout=10)
+        assert "active" in is_active.stdout, (
+            f"{svc} not active after acquire: {is_active.stdout!r}"
+        )
 
     # --- Step 3: inference still works ---
     result = call_operator(
@@ -152,11 +173,12 @@ def test_cold_acquire_starts_service_and_release_with_grace_stops():
             f"set GW_STOP_GRACE_SEC<=30 in doorman env for smoke runs"
         )
 
-    # llama-server.service must now be inactive
-    is_inactive = _gw_ssh("systemctl is-active llama-server.service", timeout=10)
-    assert "inactive" in is_inactive.stdout or is_inactive.returncode != 0, (
-        f"llama-server.service still active after gw-serve stop: {is_inactive.stdout!r}"
-    )
+    # The mode's serving unit(s) must now be inactive
+    for svc in _services_for_mode():
+        is_inactive = _gw_ssh(f"systemctl is-active {svc}", timeout=10)
+        assert "inactive" in is_inactive.stdout or is_inactive.returncode != 0, (
+            f"{svc} still active after gw-serve stop: {is_inactive.stdout!r}"
+        )
 
     # /status must reflect the stopped state
     final_status = requests.get(f"{DOORMAN_URL}/status", timeout=5).json()["nodes"]["gravitywell"]

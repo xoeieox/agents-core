@@ -60,6 +60,20 @@ def _make_state(gw_url: str = GW_URL_DEFAULT) -> _NodeState:
     return _NodeState(gw_url)
 
 
+@pytest.fixture(autouse=True)
+def _default_serve_mode_big(monkeypatch):
+    """Pin DOORMAN_DEFAULT_SERVE_MODE=big for this whole legacy suite.
+
+    Every test above predates gw-doorman-wake-to-default-mode-v0 (the doorman's
+    real default is now "dual") and asserts literal gw-serve big / GW_WAKE_DEADLINE_SEC
+    wake mechanics that are orthogonal to which mode gets woken. Pinning here keeps
+    them byte-identical instead of touching ~30 call sites individually. Dual-mode
+    wake behavior gets its own explicit tests in TestEnsureServingDualMode below,
+    which locally override this pin via their own patch() on DOORMAN_DEFAULT_SERVE_MODE.
+    """
+    monkeypatch.setattr("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "big")
+
+
 # ---------------------------------------------------------------------------
 # _NodeState unit tests
 # ---------------------------------------------------------------------------
@@ -2387,3 +2401,265 @@ class TestProbeActivityDwellStopIntegration:
         assert len(stop_calls) >= 1
         assert state.service_stopped is True
         assert state.idle_since is None
+
+
+# ---------------------------------------------------------------------------
+# Dual-mode cold-wake (gw-doorman-wake-to-default-mode-v0)
+# ---------------------------------------------------------------------------
+
+class TestEnsureServingDualMode:
+    """Tests for the dual-mode cold-wake path: DOORMAN_DEFAULT_SERVE_MODE's real
+    default is "dual" (this file's autouse fixture pins it to "big" for the legacy
+    suite above; these tests locally override back to "dual" or explicitly re-pin
+    "big" to demonstrate the rollback lever). Covers async-initiate + backoff poll,
+    both-slots (two-consecutive-200) readiness, the GW_DUAL_WAKE_DEADLINE_SEC bound,
+    and initiation-failure cleanup. All subprocess/HTTP mocked, no live GW.
+
+    _is_serving() backs BOTH ensure_serving()'s top-of-function fast path (before
+    any wake is issued) and _wake_dual()'s Slot-1 readiness probe. Tests that need
+    to exercise the wake path use _not_serving_then(...) so the very first call
+    (the fast path) returns False, forcing the cold-wake branch, while later calls
+    (the poll loop) return the caller-supplied readiness sequence.
+    """
+
+    @staticmethod
+    def _not_serving_then(*poll_values):
+        """Build an _is_serving side_effect: False on call 1 (fast path), then
+        poll_values in order for subsequent calls (repeating the last value once
+        exhausted)."""
+        state = {"n": 0}
+
+        def _side_effect(_timeout=3.0):
+            state["n"] += 1
+            if state["n"] == 1:
+                return False
+            idx = min(state["n"] - 2, len(poll_values) - 1)
+            return poll_values[idx]
+
+        return _side_effect
+
+    def test_dual_mode_cold_wake_issues_gw_serve_dual(self):
+        """Cold-wake with DOORMAN_DEFAULT_SERVE_MODE=dual must issue an async
+        `gw-serve dual` initiation, not gw-serve big."""
+        state = _make_state()
+
+        with patch.object(state, "_is_serving", side_effect=self._not_serving_then(True)), \
+             patch.object(state, "_is_slot2_serving", return_value=True), \
+             patch("subprocess.run") as mock_sub, \
+             patch("time.sleep"), \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "dual"):
+            mock_sub.return_value = MagicMock(returncode=0, stderr="")
+            result = state.ensure_serving()
+
+        assert result is True
+        all_cmds = [str(c) for c in mock_sub.call_args_list]
+        assert any("gw-serve" in c and "dual" in c for c in all_cmds)
+        assert not any("gw-serve" in c and "big" in c for c in all_cmds)
+
+    def test_big_mode_override_issues_gw_serve_big_not_dual(self):
+        """DOORMAN_DEFAULT_SERVE_MODE=big must restore the exact prior gw-serve big
+        wake (scope item 6 rollback lever), explicitly re-pinned independent of the
+        file-wide autouse fixture."""
+        state = _make_state()
+        serving_iter = iter([False, True])
+
+        def fake_is_serving(_timeout=3.0):
+            return next(serving_iter, True)
+
+        with patch.object(state, "_is_serving", side_effect=fake_is_serving), \
+             patch("subprocess.run") as mock_sub, \
+             patch("time.sleep"), \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "big"):
+            mock_sub.return_value = MagicMock(returncode=0, stderr="")
+            result = state.ensure_serving()
+
+        assert result is True
+        all_cmds = [str(c) for c in mock_sub.call_args_list]
+        assert any("gw-serve" in c and "big" in c for c in all_cmds)
+        assert not any("gw-serve" in c and "dual" in c for c in all_cmds)
+
+    def test_dual_initiation_failure_triggers_cleanup_no_zombie(self):
+        """A failed async-initiate launch (rc != 0) must trigger best-effort cleanup
+        (gw-serve stop) and return False - no orphaned half-started process left."""
+        state = _make_state()
+        call_log = []
+
+        def fake_run(cmd, **kwargs):
+            call_log.append(cmd)
+            cmd_str = str(cmd)
+            if "wake-gravitywell" in cmd_str:
+                return MagicMock(returncode=0, stderr="")
+            if "gw-serve" in cmd_str and "dual" in cmd_str:
+                return MagicMock(returncode=1, stderr="ssh connection refused")
+            return MagicMock(returncode=0, stderr="")  # cleanup gw-serve stop call
+
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "dual"):
+            result = state.ensure_serving()
+
+        assert result is False
+        assert state.last_error is not None
+        assert "gw-serve dual initiation failed" in state.last_error
+        cleanup_calls = [c for c in call_log if "gw-serve" in str(c) and "stop" in str(c)]
+        assert len(cleanup_calls) == 1  # cleanup issued exactly once, no zombie left
+
+    def test_dual_initiation_exception_triggers_cleanup(self):
+        """A launch subprocess exception (e.g. ssh hang/timeout) must also trigger
+        best-effort cleanup, not just a non-zero launch return code."""
+        state = _make_state()
+        cleanup_calls = []
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = str(cmd)
+            if "wake-gravitywell" in cmd_str:
+                return MagicMock(returncode=0, stderr="")
+            if "gw-serve" in cmd_str and "dual" in cmd_str:
+                raise TimeoutError("ssh hung")
+            cleanup_calls.append(cmd)  # only the cleanup call reaches here
+            return MagicMock(returncode=0, stderr="")
+
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "dual"):
+            result = state.ensure_serving()
+
+        assert result is False
+        assert "gw-serve dual initiation subprocess error" in state.last_error
+        assert any("gw-serve" in str(c) and "stop" in str(c) for c in cleanup_calls)
+
+    def test_dual_deadline_independent_of_big_deadline(self):
+        """Dual poll must be bounded by GW_DUAL_WAKE_DEADLINE_SEC, not GW_WAKE_DEADLINE_SEC -
+        a huge GW_WAKE_DEADLINE_SEC must not make the dual wait longer."""
+        state = _make_state()
+
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch.object(state, "_is_slot2_serving", return_value=False), \
+             patch("subprocess.run") as mock_sub, \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "dual"), \
+             patch("agents_core.doorman_server.GW_DUAL_WAKE_DEADLINE_SEC", 0), \
+             patch("agents_core.doorman_server.GW_WAKE_DEADLINE_SEC", 99999):
+            mock_sub.return_value = MagicMock(returncode=0, stderr="")
+            result = state.ensure_serving()
+
+        assert result is False
+        assert "GW dual did not reach both-slot readiness within 0s" in state.last_error
+
+    def test_dual_requires_both_slots_no_slot1_only_fast_path(self):
+        """Slot 1 alone reaching readiness must NOT short-circuit success - dual
+        'served' requires both slots (no Slot-1-only fast path, scope item 4)."""
+        state = _make_state()
+
+        with patch.object(state, "_is_serving", side_effect=self._not_serving_then(True)), \
+             patch.object(state, "_is_slot2_serving", return_value=False), \
+             patch("subprocess.run") as mock_sub, \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "dual"), \
+             patch("agents_core.doorman_server.GW_DUAL_WAKE_DEADLINE_SEC", 0.3), \
+             patch("agents_core.doorman_server.GW_DUAL_POLL_INITIAL_SEC", 0.05), \
+             patch("agents_core.doorman_server.GW_DUAL_POLL_MAX_SEC", 0.05):
+            mock_sub.return_value = MagicMock(returncode=0, stderr="")
+            result = state.ensure_serving()
+
+        assert result is False
+        assert "slot1_ready=True" in state.last_error
+        assert "slot2_ready=False" in state.last_error
+
+    def test_dual_readiness_requires_two_consecutive_200s_per_slot(self):
+        """A single healthy ping per slot must not be enough - readiness requires
+        two CONSECUTIVE 200s per slot (stability window, scope item 4). Slot 1 hits
+        its own 2-consecutive streak one iteration before Slot 2; success must wait
+        for Slot 2, proving there is no single-slot-streak fast path."""
+        state = _make_state()
+        slot2_calls = {"n": 0}
+
+        def fake_slot2(_timeout=3.0):
+            slot2_calls["n"] += 1
+            return slot2_calls["n"] >= 2  # slot2 unhealthy on probe 1, healthy from probe 2 on
+
+        with patch.object(state, "_is_serving", side_effect=self._not_serving_then(True)), \
+             patch.object(state, "_is_slot2_serving", side_effect=fake_slot2), \
+             patch("subprocess.run") as mock_sub, \
+             patch("time.sleep"), \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "dual"):
+            mock_sub.return_value = MagicMock(returncode=0, stderr="")
+            result = state.ensure_serving()
+
+        assert result is True
+        # slot1's streak would reach 2 after its 2nd poll-loop probe; slot2's streak
+        # reaches 2 only after its 3rd probe (1st was unhealthy). Exactly 3 slot2
+        # probes confirms success waited for slot2 rather than firing early.
+        assert slot2_calls["n"] == 3
+
+    def test_dual_poll_uses_exponential_backoff(self):
+        """Dual readiness poll must use growing (deterministic) backoff intervals -
+        not the constant 3.0s big-mode poll_interval."""
+        state = _make_state()
+        slot2_results = iter([False, True, True])
+
+        sleep_calls = []
+
+        with patch.object(state, "_is_serving", side_effect=self._not_serving_then(True)), \
+             patch.object(state, "_is_slot2_serving",
+                           side_effect=lambda _timeout=3.0: next(slot2_results, True)), \
+             patch("subprocess.run") as mock_sub, \
+             patch("time.sleep", side_effect=sleep_calls.append), \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "dual"):
+            mock_sub.return_value = MagicMock(returncode=0, stderr="")
+            result = state.ensure_serving()
+
+        assert result is True
+        assert len(sleep_calls) == 2
+        assert sleep_calls[0] == 5.0  # GW_DUAL_POLL_INITIAL_SEC
+        assert sleep_calls[1] == pytest.approx(7.5)  # 5.0 * GW_DUAL_POLL_BACKOFF_FACTOR
+
+    def test_dual_success_places_hold_and_clears_error(self):
+        """Successful dual wake must set last_wake_at, clear last_error, place hold,
+        and cache serving=True - same contract as big-mode success."""
+        state = _make_state()
+        state.last_error = "prior failure"
+
+        with patch.object(state, "_is_serving", side_effect=self._not_serving_then(True)), \
+             patch.object(state, "_is_slot2_serving", return_value=True), \
+             patch("subprocess.run") as mock_sub, \
+             patch("time.sleep"), \
+             patch.object(state, "_place_hold") as mock_hold, \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "dual"):
+            mock_sub.return_value = MagicMock(returncode=0, stderr="")
+            result = state.ensure_serving()
+
+        assert result is True
+        assert state.last_error is None
+        assert state._cached_serving is True
+        mock_hold.assert_called_once()
+
+    def test_deference_unchanged_under_dual_default(self):
+        """Controller-lease deference must still short-circuit BEFORE the mode
+        dispatch, unaffected by DOORMAN_DEFAULT_SERVE_MODE=dual."""
+        state = _make_state()
+        state.leases["flip-controller-gw"] = {
+            "acquired_at": time.time(), "ttl_sec": 240, "reason": "mode control",
+            "role": "mode-controller",
+        }
+
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch("subprocess.run") as mock_sub, \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "dual"), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            mock_sub.return_value = MagicMock(returncode=0, stderr="")
+            result = state.ensure_serving()
+
+        assert result is DEFERRED
+        all_cmds = [str(c) for c in mock_sub.call_args_list]
+        assert not any("gw-serve" in c for c in all_cmds)  # never reached the dispatch
+
+    def test_creative_occupied_unchanged_under_dual_default(self):
+        """Creative-70B-occupied short-circuit must still fire first, unaffected by
+        DOORMAN_DEFAULT_SERVE_MODE=dual."""
+        from agents_core.doorman_server import CREATIVE_OCCUPIED
+
+        state = _make_state()
+        with patch.object(state, "_is_creative_serving", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "dual"):
+            result = state.ensure_serving()
+
+        assert result is CREATIVE_OCCUPIED
