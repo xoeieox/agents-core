@@ -4,11 +4,21 @@ Reads configuration from environment:
   DOORMAN_SERVER         — base URL (default http://127.0.0.1:8407)
   DOORMAN_BEARER_TOKEN   — optional bearer token (must match server)
   DOORMAN_CLIENT_TIMEOUT — per-request timeout in seconds (default 30.0)
-  GW_WAKE_DEADLINE_SEC   — GravityWell wake deadline in seconds, used by doorman-server
-                           (default 180; also drives acquire timeout coupling)
+  GW_WAKE_DEADLINE_SEC   — GravityWell big-mode wake deadline in seconds, used by
+                           doorman-server (default 180; also drives acquire timeout
+                           coupling)
+  DOORMAN_DEFAULT_SERVE_MODE — must match doorman-server's setting ("dual" default,
+                           or "big"). When "dual", the acquire timeout also accounts
+                           for GW_DUAL_WAKE_DEADLINE_SEC (mode-aware coupling,
+                           gw-doorman-wake-to-default-mode-v0) — a real ~488s dual
+                           cold-wake must not trip DoormanUnreachable client-side
+                           before the server-side wake deadline.
+  GW_DUAL_WAKE_DEADLINE_SEC — GravityWell dual-mode wake deadline in seconds, used by
+                           doorman-server (default 720). Only consulted here when
+                           DOORMAN_DEFAULT_SERVE_MODE is "dual".
   GW_ACQUIRE_MARGIN_SEC  — margin for acquire timeout above wake deadline (default 30)
-  GW_ACQUIRE_TIMEOUT_SEC — (optional) override acquire timeout; if set below
-                           GW_WAKE_DEADLINE_SEC, a warning is emitted
+  GW_ACQUIRE_TIMEOUT_SEC — (optional) override acquire timeout; if set below the
+                           effective wake deadline, a warning is emitted
 
 Raises DoormanUnreachable when the HTTP layer itself fails (connection error,
 timeout). The operator treats DoormanUnreachable exactly like status:"wake_failed":
@@ -29,34 +39,48 @@ import httpx
 
 
 def _gw_acquire_timeout() -> float:
-    """Derive the GW acquire timeout from the server's wake deadline.
+    """Derive the GW acquire timeout from the server's (mode-aware) wake deadline.
 
-    Returns GW_WAKE_DEADLINE_SEC + GW_ACQUIRE_MARGIN_SEC (defaults to 180 + 30 = 210s).
+    Mode-aware (gw-doorman-wake-to-default-mode-v0): the doorman's default cold-wake
+    target is "dual" (both vLLM slots; Devstral's cold-init measures ~488s), bounded
+    server-side by GW_DUAL_WAKE_DEADLINE_SEC (default 720s), not the big-mode
+    GW_WAKE_DEADLINE_SEC (default 180s). When DOORMAN_DEFAULT_SERVE_MODE is "dual"
+    (the default — must match doorman-server's setting), the effective deadline is
+    max(GW_WAKE_DEADLINE_SEC, GW_DUAL_WAKE_DEADLINE_SEC); when "big", it is
+    GW_WAKE_DEADLINE_SEC alone (byte-identical to pre-dual-default behavior).
+
+    Returns effective_deadline_sec + GW_ACQUIRE_MARGIN_SEC (defaults to 720 + 30 = 750s
+    under the dual default; 180 + 30 = 210s with DOORMAN_DEFAULT_SERVE_MODE=big).
 
     The acquire HTTP request must outlive the doorman's wake deadline so that
-    successful cold wakes (which can take up to GW_WAKE_DEADLINE_SEC) are never
-    misread as DoormanUnreachable timeouts. This function reads the same
-    GW_WAKE_DEADLINE_SEC env var that doorman_server.py reads, ensuring coupling.
+    successful cold wakes are never misread as DoormanUnreachable timeouts. This
+    function reads the same env vars doorman_server.py reads, ensuring coupling.
 
-    If an explicit GW_ACQUIRE_TIMEOUT_SEC override is set below GW_WAKE_DEADLINE_SEC,
-    emits a loud RuntimeWarning (not an error) so that mis-configurations are
-    observable but not service-breaking.
+    If an explicit GW_ACQUIRE_TIMEOUT_SEC override is set below the effective
+    deadline, emits a loud RuntimeWarning (not an error) so that mis-configurations
+    are observable but not service-breaking.
     """
     gw_wake_deadline_sec = int(os.environ.get("GW_WAKE_DEADLINE_SEC", "180"))
+    default_serve_mode = os.environ.get("DOORMAN_DEFAULT_SERVE_MODE", "dual").strip().lower()
+    if default_serve_mode == "big":
+        effective_deadline_sec = gw_wake_deadline_sec
+    else:
+        gw_dual_wake_deadline_sec = int(os.environ.get("GW_DUAL_WAKE_DEADLINE_SEC", "720"))
+        effective_deadline_sec = max(gw_wake_deadline_sec, gw_dual_wake_deadline_sec)
     gw_acquire_margin_sec = int(os.environ.get("GW_ACQUIRE_MARGIN_SEC", "30"))
-    derived_timeout = gw_wake_deadline_sec + gw_acquire_margin_sec
+    derived_timeout = effective_deadline_sec + gw_acquire_margin_sec
 
     # Check for explicit override
     explicit_override = os.environ.get("GW_ACQUIRE_TIMEOUT_SEC")
     if explicit_override is not None:
         override_value = float(explicit_override)
-        if override_value < gw_wake_deadline_sec:
+        if override_value < effective_deadline_sec:
             warnings.warn(
-                f"GW_ACQUIRE_TIMEOUT_SEC={override_value} is below "
-                f"GW_WAKE_DEADLINE_SEC={gw_wake_deadline_sec}; acquire HTTP calls "
-                f"may timeout before the doorman completes the wake, causing silent "
-                f"fallback to on_wake_fail policy. Set GW_ACQUIRE_TIMEOUT_SEC >= "
-                f"{gw_wake_deadline_sec} to fix.",
+                f"GW_ACQUIRE_TIMEOUT_SEC={override_value} is below the effective wake "
+                f"deadline={effective_deadline_sec} (DOORMAN_DEFAULT_SERVE_MODE="
+                f"{default_serve_mode!r}); acquire HTTP calls may timeout before the "
+                f"doorman completes the wake, causing silent fallback to on_wake_fail "
+                f"policy. Set GW_ACQUIRE_TIMEOUT_SEC >= {effective_deadline_sec} to fix.",
                 RuntimeWarning,
                 stacklevel=2,
             )

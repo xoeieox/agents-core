@@ -245,38 +245,91 @@ def test_mode_owner_defaults_to_gravitywell():
 # ---------------------------------------------------------------------------
 
 def test_gw_acquire_timeout_default():
-    """_gw_acquire_timeout() must return GW_WAKE_DEADLINE_SEC + GW_ACQUIRE_MARGIN_SEC.
+    """_gw_acquire_timeout() must accommodate the dual wake deadline by default.
 
-    With defaults: 180 + 30 = 210s.
+    DOORMAN_DEFAULT_SERVE_MODE defaults to "dual" (gw-doorman-wake-to-default-mode-v0),
+    so the timeout derives from GW_DUAL_WAKE_DEADLINE_SEC (720) + GW_ACQUIRE_MARGIN_SEC
+    (30) = 750s, not the big-mode-only GW_WAKE_DEADLINE_SEC (180).
     """
     with mock.patch.dict(os.environ, {}, clear=False):
         # Clear any existing overrides
         os.environ.pop("GW_WAKE_DEADLINE_SEC", None)
+        os.environ.pop("GW_DUAL_WAKE_DEADLINE_SEC", None)
+        os.environ.pop("DOORMAN_DEFAULT_SERVE_MODE", None)
         os.environ.pop("GW_ACQUIRE_MARGIN_SEC", None)
         os.environ.pop("GW_ACQUIRE_TIMEOUT_SEC", None)
         timeout = _gw_acquire_timeout()
-        assert timeout == 210.0
+        assert timeout == 750.0
 
 
 def test_gw_acquire_timeout_custom_deadline():
-    """_gw_acquire_timeout() must respect custom GW_WAKE_DEADLINE_SEC."""
-    with mock.patch.dict(os.environ, {"GW_WAKE_DEADLINE_SEC": "120"}, clear=False):
+    """_gw_acquire_timeout() must respect custom GW_WAKE_DEADLINE_SEC under the big-mode
+    rollback (DOORMAN_DEFAULT_SERVE_MODE=big) — the dual default is covered separately
+    by test_gw_acquire_timeout_dual_default_uses_dual_deadline."""
+    with mock.patch.dict(
+        os.environ,
+        {"GW_WAKE_DEADLINE_SEC": "120", "DOORMAN_DEFAULT_SERVE_MODE": "big"},
+        clear=False,
+    ):
         os.environ.pop("GW_ACQUIRE_MARGIN_SEC", None)
         os.environ.pop("GW_ACQUIRE_TIMEOUT_SEC", None)
+        os.environ.pop("GW_DUAL_WAKE_DEADLINE_SEC", None)
         timeout = _gw_acquire_timeout()
         assert timeout == 150.0  # 120 + 30
 
 
 def test_gw_acquire_timeout_custom_margin():
-    """_gw_acquire_timeout() must respect custom GW_ACQUIRE_MARGIN_SEC."""
+    """_gw_acquire_timeout() must respect custom GW_ACQUIRE_MARGIN_SEC under the
+    big-mode rollback (DOORMAN_DEFAULT_SERVE_MODE=big)."""
     with mock.patch.dict(
         os.environ,
-        {"GW_WAKE_DEADLINE_SEC": "180", "GW_ACQUIRE_MARGIN_SEC": "60"},
+        {
+            "GW_WAKE_DEADLINE_SEC": "180",
+            "GW_ACQUIRE_MARGIN_SEC": "60",
+            "DOORMAN_DEFAULT_SERVE_MODE": "big",
+        },
         clear=False,
     ):
         os.environ.pop("GW_ACQUIRE_TIMEOUT_SEC", None)
+        os.environ.pop("GW_DUAL_WAKE_DEADLINE_SEC", None)
         timeout = _gw_acquire_timeout()
         assert timeout == 240.0  # 180 + 60
+
+
+def test_gw_acquire_timeout_dual_default_uses_dual_deadline():
+    """_gw_acquire_timeout() must derive from GW_DUAL_WAKE_DEADLINE_SEC + margin when
+    DOORMAN_DEFAULT_SERVE_MODE is dual (default), even if GW_WAKE_DEADLINE_SEC is smaller."""
+    with mock.patch.dict(
+        os.environ,
+        {
+            "DOORMAN_DEFAULT_SERVE_MODE": "dual",
+            "GW_DUAL_WAKE_DEADLINE_SEC": "720",
+            "GW_WAKE_DEADLINE_SEC": "180",
+        },
+        clear=False,
+    ):
+        os.environ.pop("GW_ACQUIRE_MARGIN_SEC", None)
+        os.environ.pop("GW_ACQUIRE_TIMEOUT_SEC", None)
+        timeout = _gw_acquire_timeout()
+        assert timeout == 750.0  # 720 + 30
+        assert timeout >= 720 + 30  # closes the coupled-timeout gap (scope item 5)
+
+
+def test_gw_acquire_timeout_dual_custom_deadline():
+    """_gw_acquire_timeout() must respect a custom GW_DUAL_WAKE_DEADLINE_SEC."""
+    with mock.patch.dict(
+        os.environ,
+        {
+            "DOORMAN_DEFAULT_SERVE_MODE": "dual",
+            "GW_DUAL_WAKE_DEADLINE_SEC": "500",
+            "GW_WAKE_DEADLINE_SEC": "180",
+        },
+        clear=False,
+    ):
+        os.environ.pop("GW_ACQUIRE_MARGIN_SEC", None)
+        os.environ.pop("GW_ACQUIRE_TIMEOUT_SEC", None)
+        timeout = _gw_acquire_timeout()
+        assert timeout == 530.0  # max(180, 500) + 30
 
 
 def test_gw_acquire_timeout_explicit_override():
