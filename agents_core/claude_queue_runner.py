@@ -27,6 +27,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -45,6 +46,10 @@ CLONE_ROOTS_GLOB = "/srv/git/*-working"
 
 POLL_INTERVAL_S = 2.0
 STARTUP_STALE_GRACE_S = 300
+
+# Distinct exit code so journalctl/systemctl show -p ExecMainStatus can tell
+# "claim loop crashed" apart from a generic uncaught startup error.
+_CLAIM_LOOP_CRASH_EXIT_CODE = 3
 
 # Council concurrency control — module-level, NOT on Daemon (see docstring).
 # asyncio.Semaphore is safe to create at module level in Python 3.10+.
@@ -1047,42 +1052,63 @@ class Daemon:
         startup_sweep(self.queue)
         log.info("startup sweep complete, entering claim loop")
         while not self.stop_claiming.is_set():
-            if os.environ.get("CLAUDE_QUEUE_ENABLED", "1") == "0":
-                log.info("CLAUDE_QUEUE_ENABLED=0 — exiting")
-                break
+            try:
+                if os.environ.get("CLAUDE_QUEUE_ENABLED", "1") == "0":
+                    log.info("CLAUDE_QUEUE_ENABLED=0 — exiting")
+                    break
 
-            if self.sem.locked():
-                await asyncio.sleep(POLL_INTERVAL_S)
-                continue
-
-            global _guard_blocking
-            if os.environ.get("CLAUDE_QUEUE_FREEZE_GUARD", "1") != "0":
-                block_reason = _spawn_freeze_guard_block_reason()
-                if block_reason is not None:
-                    if not _guard_blocking:
-                        _guard_blocking = True
-                        log.warning("claude-queue freeze-guard ENGAGED: withholding claims (%s)", block_reason)
-                    else:
-                        log.debug("claude-queue freeze-guard still engaged (%s)", block_reason)
+                if self.sem.locked():
                     await asyncio.sleep(POLL_INTERVAL_S)
                     continue
-                elif _guard_blocking:
-                    _guard_blocking = False
-                    log.warning("claude-queue freeze-guard CLEARED: resuming claims")
 
-            # Anti-spin: suppress claims during a cage-unavailable backoff window.
-            if time.monotonic() < _cage_unavail_hold_until:
-                await asyncio.sleep(POLL_INTERVAL_S)
-                continue
+                global _guard_blocking
+                if os.environ.get("CLAUDE_QUEUE_FREEZE_GUARD", "1") != "0":
+                    block_reason = _spawn_freeze_guard_block_reason()
+                    if block_reason is not None:
+                        if not _guard_blocking:
+                            _guard_blocking = True
+                            log.warning("claude-queue freeze-guard ENGAGED: withholding claims (%s)", block_reason)
+                        else:
+                            log.debug("claude-queue freeze-guard still engaged (%s)", block_reason)
+                        await asyncio.sleep(POLL_INTERVAL_S)
+                        continue
+                    elif _guard_blocking:
+                        _guard_blocking = False
+                        log.warning("claude-queue freeze-guard CLEARED: resuming claims")
 
-            task = self.queue.claim()
-            if task is None:
-                await asyncio.sleep(POLL_INTERVAL_S)
-                continue
+                # Anti-spin: suppress claims during a cage-unavailable backoff window.
+                if time.monotonic() < _cage_unavail_hold_until:
+                    await asyncio.sleep(POLL_INTERVAL_S)
+                    continue
 
-            t = asyncio.create_task(self._worker(task))
-            self.in_flight.add(t)
-            t.add_done_callback(self.in_flight.discard)
+                task = self.queue.claim()
+                if task is None:
+                    await asyncio.sleep(POLL_INTERVAL_S)
+                    continue
+
+                t = asyncio.create_task(self._worker(task))
+                self.in_flight.add(t)
+                t.add_done_callback(self.in_flight.discard)
+            except (asyncio.CancelledError, GeneratorExit):
+                # Legitimate shutdown-cancellation, not a crash - never route
+                # this through the crash-exit path below.
+                raise
+            except Exception:
+                pid = os.getpid()
+                run_id = str(uuid.uuid4())[:8]
+                log.critical(
+                    "claim loop crashed (pid=%d run_id=%s); exiting for systemd restart",
+                    pid, run_id, exc_info=True,
+                )
+                send_notification(
+                    message=(
+                        f"claude-queue-runner claim loop crashed (pid={pid}, "
+                        f"run_id={run_id}); exiting for systemd restart."
+                    ),
+                    title="claude-queue CRITICAL",
+                    priority=PushoverPriority.HIGH,
+                )
+                sys.exit(_CLAIM_LOOP_CRASH_EXIT_CODE)
 
         if self.in_flight:
             longest = max((int(self._task_timeout(t)) for t in self.in_flight),

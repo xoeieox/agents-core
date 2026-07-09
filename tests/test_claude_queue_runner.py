@@ -498,3 +498,111 @@ async def test_daemon_run_log_discipline_multi_tick(monkeypatch, caplog):
     assert "freeze-guard ENGAGED" in caplog.text, "Expected ENGAGED log"
     assert "freeze-guard CLEARED" in caplog.text, "Expected CLEARED log"
     assert "freeze-guard still engaged" in caplog.text, "Expected DEBUG per intermediate tick"
+
+
+@pytest.mark.asyncio
+async def test_daemon_claim_loop_crash_exits_loud(monkeypatch, caplog):
+    """agents-core-queue-runner-wedge-selfheal-v0: an exception escaping the
+    claim loop body (e.g. from queue.claim()) must log CRITICAL with a
+    traceback, fire exactly one HIGH-priority notification, and sys.exit
+    with the dedicated crash exit code, no swallow-and-loop."""
+    caplog.set_level(logging.DEBUG)
+
+    monkeypatch.setattr(runner_mod, "POLL_INTERVAL_S", 0.001)
+
+    class FakeQueue:
+        def claim(self):
+            raise RuntimeError("Event loop is closed")
+        active_dir = None
+        queue_dir = None
+
+    def fake_startup_sweep(q):
+        pass
+
+    monkeypatch.setattr(runner_mod, "startup_sweep", fake_startup_sweep)
+    monkeypatch.setattr(runner_mod, "_spawn_freeze_guard_block_reason", lambda: None)
+
+    notify_calls = []
+    monkeypatch.setattr(
+        runner_mod, "send_notification", lambda **kw: notify_calls.append(kw)
+    )
+
+    daemon = runner_mod.Daemon(workers=2)
+    daemon.queue = FakeQueue()
+
+    with pytest.raises(SystemExit) as exc_info:
+        await daemon.run()
+
+    assert exc_info.value.code == runner_mod._CLAIM_LOOP_CRASH_EXIT_CODE
+
+    critical_records = [r for r in caplog.records if r.levelno == logging.CRITICAL]
+    assert len(critical_records) == 1
+    assert critical_records[0].exc_info is not None
+
+    assert len(notify_calls) == 1
+    assert notify_calls[0]["priority"] == runner_mod.PushoverPriority.HIGH
+
+
+@pytest.mark.asyncio
+async def test_daemon_claim_loop_reraises_cancelled_error(monkeypatch, caplog):
+    """Scope item 2 guard-rail: CancelledError from queue.claim() must
+    propagate untouched, not be misclassified as the crash path."""
+    monkeypatch.setattr(runner_mod, "POLL_INTERVAL_S", 0.001)
+
+    class FakeQueue:
+        def claim(self):
+            raise asyncio.CancelledError()
+        active_dir = None
+        queue_dir = None
+
+    def fake_startup_sweep(q):
+        pass
+
+    monkeypatch.setattr(runner_mod, "startup_sweep", fake_startup_sweep)
+    monkeypatch.setattr(runner_mod, "_spawn_freeze_guard_block_reason", lambda: None)
+
+    notify_calls = []
+    monkeypatch.setattr(
+        runner_mod, "send_notification", lambda **kw: notify_calls.append(kw)
+    )
+
+    daemon = runner_mod.Daemon(workers=2)
+    daemon.queue = FakeQueue()
+
+    with pytest.raises(asyncio.CancelledError):
+        await daemon.run()
+
+    assert notify_calls == []
+
+
+@pytest.mark.asyncio
+async def test_daemon_claim_loop_reraises_generator_exit(monkeypatch, caplog):
+    """Scope item 2 guard-rail: GeneratorExit from queue.claim() must
+    propagate untouched, parallel case to CancelledError since the
+    guard-rail clause names both exception types."""
+    monkeypatch.setattr(runner_mod, "POLL_INTERVAL_S", 0.001)
+
+    class FakeQueue:
+        def claim(self):
+            raise GeneratorExit()
+        active_dir = None
+        queue_dir = None
+
+    def fake_startup_sweep(q):
+        pass
+
+    monkeypatch.setattr(runner_mod, "startup_sweep", fake_startup_sweep)
+    monkeypatch.setattr(runner_mod, "_spawn_freeze_guard_block_reason", lambda: None)
+
+    notify_calls = []
+    monkeypatch.setattr(
+        runner_mod, "send_notification", lambda **kw: notify_calls.append(kw)
+    )
+
+    daemon = runner_mod.Daemon(workers=2)
+    daemon.queue = FakeQueue()
+
+    with pytest.raises(GeneratorExit):
+        await daemon.run()
+
+    assert notify_calls == []
