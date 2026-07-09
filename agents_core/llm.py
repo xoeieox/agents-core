@@ -137,36 +137,45 @@ OPERATOR_DEFAULTS: dict[str, str] = {
 }
 
 
-def _gw_backend() -> str:
-    """Resolve GW_BACKEND: unset -> "llamacpp" (today's default, not a misconfig).
+def _gw_explicit_model() -> str | None:
+    """Return the explicit GW_MODEL value, or None if unset."""
+    return os.environ.get("GW_MODEL") or None
 
-    A *set-but-unrecognized* value raises ValueError at resolution time — per Erah's ruling,
-    a misconfigured switch must force a deliberate fix, never silently normalize to llamacpp.
+
+def _gw_explicit_backend() -> str | None:
+    """Return the validated explicit GW_BACKEND value, or None if unset.
+
+    Raises ValueError on a set-but-unrecognized value (unchanged from before this seam
+    existed - a misconfiguration is never silently normalized).
     """
     val = os.environ.get("GW_BACKEND")
     if val is None:
-        return "llamacpp"
+        return None
     if val not in ("llamacpp", "vllm"):
         raise ValueError(
             f"Unknown GW_BACKEND={val!r}. Must be 'llamacpp' or 'vllm' (or unset, which "
-            "defaults to 'llamacpp'). An unrecognized backend is a misconfiguration and is "
-            "not silently normalized — fix the environment variable and re-run."
+            "auto-detects the currently-served model)."
         )
     return val
 
 
-def _gw_default_model() -> str:
-    """Resolve the default gravitywell model name, read at call time (not module-load).
+def _gw_backend(discovered_model: str | None = None) -> str:
+    """Resolve the llama.cpp-vs-vLLM payload dialect.
 
-    Explicit GW_MODEL always wins. Otherwise: GW_BACKEND=vllm -> "gravitywell-27b";
-    GW_BACKEND=llamacpp (default) -> OPERATOR_DEFAULTS["gravitywell"] ("gravitywell-122b").
+    Explicit GW_BACKEND always wins (set-but-unrecognized raises ValueError - a
+    misconfigured switch must force a deliberate fix, never silently normalize).
+    Otherwise, when auto-detecting, `discovered_model` (the model _gw_discover_serving()
+    found being served) decides: "llamacpp" iff it equals OPERATOR_DEFAULTS["gravitywell"]
+    ("gravitywell-122b", the only llama.cpp-served model name in this ecosystem today),
+    else "vllm". With no explicit backend and no discovered_model (e.g. called standalone
+    with no call context), falls back to "llamacpp".
     """
-    explicit = os.environ.get("GW_MODEL")
-    if explicit:
+    explicit = _gw_explicit_backend()
+    if explicit is not None:
         return explicit
-    if _gw_backend() == "vllm":
-        return "gravitywell-27b"
-    return OPERATOR_DEFAULTS["gravitywell"]
+    if discovered_model is not None:
+        return "llamacpp" if discovered_model == OPERATOR_DEFAULTS["gravitywell"] else "vllm"
+    return "llamacpp"
 
 
 # Pre-flight serving-mode handshake cache (1d.1): (url, resolved-model) -> verified.
@@ -175,6 +184,26 @@ def _gw_default_model() -> str:
 # model identity from the actual response on every call, unconditionally — see 1d.2).
 _gw_handshake_cache: dict[tuple[str, str], bool] = {}
 _gw_handshake_lock = threading.Lock()
+
+
+def _gw_probe_served_model(url: str, timeout: int = 10, log=None) -> str | None:
+    """Pure transport: GET {url}/v1/models and return the served model id, or None on
+    any failure (connect error, timeout, malformed response, empty data). No caching, no
+    assertion - callers own both. Shared by _gw_verify_serving_mode (explicit-mode,
+    process-lifetime cache, hard-fail-on-drift) and _gw_discover_serving (auto-detect,
+    TTL-bounded cache, no assertion) so the two only differ in caching/assertion
+    semantics, not in how they talk to GW.
+    """
+    try:
+        resp = requests.get(f"{url}/v1/models", timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["data"][0].get("id") if data.get("data") else None
+    except Exception as e:
+        if log:
+            log(f"[gravitywell] /v1/models probe unreachable (treated as availability, "
+                f"not drift): {e}")
+        return None
 
 
 def _gw_verify_serving_mode(url: str, model: str, log=None) -> None:
@@ -194,24 +223,84 @@ def _gw_verify_serving_mode(url: str, model: str, log=None) -> None:
         if _gw_handshake_cache.get(cache_key):
             return
 
-    try:
-        resp = requests.get(f"{url}/v1/models", timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        served = None
-        if data.get("data"):
-            served = data["data"][0].get("id")
-    except Exception as e:
-        if log:
-            log(f"[gravitywell] serving-mode handshake probe unreachable (treated as "
-                f"availability, not drift): {e}")
+    served = _gw_probe_served_model(url, log=log)
+    if served is None:
         return
 
-    if served is not None and served != model:
+    if served != model:
         raise GWServingModeMismatchError(url, model, served)
 
     with _gw_handshake_lock:
         _gw_handshake_cache[cache_key] = True
+
+
+# TTL-bounded discovery cache (auto-detect case): url -> (served_model, discovered_at).
+# Deliberately NOT a process-lifetime cache like _gw_handshake_cache above - a long-lived
+# process (claude-queue-runner above all) must still notice a genuine mode flip within a
+# bounded window. See _gw_discover_serving() for the full rationale.
+_gw_discovery_cache: dict[str, tuple[str, float]] = {}
+GW_DISCOVERY_TTL_S_DEFAULT = 30.0
+
+
+def _gw_discovery_ttl_s() -> float:
+    """Read at call time (not module load) - matches every other tunable in this file
+    (GW_IDLE_GAP_SECS, GW_FIRST_TOKEN_GAP_SECS, etc.), and lets tests override via
+    monkeypatch.setenv."""
+    return float(os.environ.get("GW_DISCOVERY_TTL_S", str(GW_DISCOVERY_TTL_S_DEFAULT)))
+
+
+def _gw_discover_serving(url: str, log=None) -> str | None:
+    """Auto-detect (unset GW_MODEL and GW_BACKEND): return what `url` is currently
+    serving, probing at most once per _gw_discovery_ttl_s() seconds per url.
+
+    Deliberately NOT cached for a process's full lifetime the way the explicit-mode
+    handshake is cached (_gw_verify_serving_mode) - a long-lived process must still notice
+    a genuine mode flip within a bounded window. The TTL bounds re-probe frequency so a
+    burst of concurrent calls doesn't hammer /v1/models once per call.
+
+    A probe failure (GW unreachable) returns None and is never cached - the caller falls
+    back to the legacy 122b name, and the real completion call then also fails to
+    connect, raising OperatorUnreachableError via the existing connect-retry path exactly
+    as it does today. This fallback model name is never actually sent to a live server in
+    that case.
+
+    Lock scope matches _gw_verify_serving_mode's existing pattern: held only around the
+    cache dict read and the cache dict write, never across the network call itself -
+    redundant concurrent probes are idempotent and harmless (the /v1/models GET is
+    read-only), and holding the lock across the network call would serialize every
+    concurrent GW probe process-wide (both functions share _gw_handshake_lock).
+    """
+    now = time.monotonic()
+    with _gw_handshake_lock:
+        cached = _gw_discovery_cache.get(url)
+        if cached is not None and (now - cached[1]) < _gw_discovery_ttl_s():
+            return cached[0]
+    served = _gw_probe_served_model(url, log=log)
+    if served is not None:
+        with _gw_handshake_lock:
+            _gw_discovery_cache[url] = (served, now)
+    return served
+
+
+def _gw_default_model(url: str = None, log=None) -> str:
+    """Resolve the default gravitywell model name, read at call time (not module-load).
+
+    Explicit GW_MODEL always wins. Otherwise, explicit GW_BACKEND=vllm -> "gravitywell-27b",
+    GW_BACKEND=llamacpp -> OPERATOR_DEFAULTS["gravitywell"] ("gravitywell-122b"). With
+    neither set, auto-detects by asking `url` (or GW_URL) what it is currently serving via
+    _gw_discover_serving() - correct whether GW is resting in big (122B) or dual (27B), and
+    immune to the boot-default posture changing again without a code edit. Falls back to
+    OPERATOR_DEFAULTS["gravitywell"] if the discovery probe fails (GW unreachable); the
+    subsequent real call then fails to connect too, surfacing as OperatorUnreachableError.
+    """
+    explicit_model = _gw_explicit_model()
+    if explicit_model:
+        return explicit_model
+    explicit_backend = _gw_explicit_backend()
+    if explicit_backend is not None:
+        return "gravitywell-27b" if explicit_backend == "vllm" else OPERATOR_DEFAULTS["gravitywell"]
+    discovered = _gw_discover_serving(url or GW_URL, log=log)
+    return discovered if discovered is not None else OPERATOR_DEFAULTS["gravitywell"]
 
 
 def _call_qwen_backend(prompt: str, system: str = None, timeout: int = 600,
@@ -483,15 +572,21 @@ def _call_gravitywell_backend(
     """Send a completion request to a GravityWell endpoint via streaming SSE.
 
     By default targets GW_URL (:8081) with the model resolved by _gw_default_model()
-    (GW_MODEL / GW_BACKEND env-driven; "gravitywell-122b" when unset). Internal _url/_model
-    params route to alternate endpoints (e.g. the creative Llama-70B at :8093) without exposing
-    that routing on the public 122B operator path.
+    (GW_MODEL / GW_BACKEND env-driven when set; when both are unset, auto-detects the
+    currently-served model via _gw_discover_serving() instead of assuming a fixed
+    default). Internal _url/_model params route to alternate endpoints (e.g. the creative
+    Llama-70B at :8093) without exposing that routing on the public 122B operator path.
 
     The default GW path (_url is None and _model is None) only:
-    - Payload dialect gates on GW_BACKEND (default "llamacpp", byte-identical to today;
-      "vllm" omits the llama.cpp-only cache_prompt field — see _gw_backend()).
-    - Runs the pre-flight serving-mode handshake (cached) and the per-call response-echo
-      assertion, raising GWServingModeMismatchError on reachable-but-wrong-model drift.
+    - Payload dialect gates on GW_BACKEND when explicit ("llamacpp" byte-identical to
+      today; "vllm" omits the llama.cpp-only cache_prompt field), or on the auto-detected
+      model when GW_BACKEND/GW_MODEL are both unset - see _gw_backend().
+    - Runs the pre-flight serving-mode handshake (cached) when GW_BACKEND/GW_MODEL are
+      explicit - skipped when auto-detecting, since the discovery probe already
+      established what's served - and always runs the per-call response-echo assertion,
+      raising GWServingModeMismatchError on reachable-but-wrong-model drift (explicit
+      case) or a mid-flight flip between discovery and this call's response (auto-detect
+      case).
     The gravitywell-creative path (_url/_model explicit) is untouched by either: always
     llama.cpp cache_prompt dialect, no handshake, no GW_BACKEND coupling.
 
@@ -515,11 +610,15 @@ def _call_gravitywell_backend(
     """
     url = _url if _url is not None else GW_URL
     is_default_gw_path = _url is None and _model is None
-    model = _model if _model is not None else _gw_default_model()
+    is_auto_detecting = (
+        is_default_gw_path and _gw_explicit_model() is None and _gw_explicit_backend() is None
+    )
+    model = _model if _model is not None else _gw_default_model(url=url, log=log)
 
     if is_default_gw_path:
-        _gw_verify_serving_mode(url, model, log=log)
-        backend = _gw_backend()
+        if not is_auto_detecting:
+            _gw_verify_serving_mode(url, model, log=log)
+        backend = _gw_backend(discovered_model=model if is_auto_detecting else None)
     else:
         backend = "llamacpp"
 
