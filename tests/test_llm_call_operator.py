@@ -1087,33 +1087,78 @@ def _gw_precache(model, url=None):
         _gw_handshake_cache[(url or GW_URL, model)] = True
 
 
-# --- AC1: regression-locked default (byte-identical payload) ---------------
+def _gw_clear_auto_detect_caches():
+    """Clear both the handshake cache and the TTL-bounded discovery cache, overriding the
+    repo-root conftest's precache so a test can exercise its own discovery mock instead."""
+    from agents_core.llm import _gw_handshake_cache, _gw_handshake_lock, _gw_discovery_cache
+    with _gw_handshake_lock:
+        _gw_handshake_cache.clear()
+        _gw_discovery_cache.clear()
 
-def test_ac1_default_payload_byte_identical(monkeypatch):
-    """AC1: no env set -> _call_gravitywell_backend's payload is byte-identical to today."""
+
+def _fake_gw_models_get(served_model):
+    """A requests.get side_effect returning `served_model` from /v1/models."""
+    def fake_get(url, timeout=None):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {"data": [{"id": served_model}]}
+        return resp
+    return fake_get
+
+
+# --- unset GW_BACKEND/GW_MODEL: auto-detect (agents-core-gw-backend-auto-detect-when-unset-v0) --
+
+def test_default_unset_auto_detects_vllm_when_dual_serving(monkeypatch):
+    """No env set -> _gw_default_model() asks GW_URL what it is currently serving instead
+    of assuming the legacy 122b default. When GW is resting dual (27B, today's real
+    boot-default posture per infra/gw-dual-boot-default-promoted-2026-07-08), the payload
+    uses the vllm dialect (no cache_prompt)."""
     monkeypatch.delenv("GW_BACKEND", raising=False)
     monkeypatch.delenv("GW_MODEL", raising=False)
-    _gw_precache("gravitywell-122b")
+    _gw_clear_auto_detect_caches()
 
     captured = {}
     dc, _mock_client = _gw_dc()
     with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.get", side_effect=_fake_gw_models_get("gravitywell-27b")), \
          patch("requests.post", side_effect=_make_gw_sse_resp("ok", captured)):
         result = call_operator("gravitywell", prompt="hi")
 
     assert result == "ok"
     assert captured["payload"] == {
-        "model": "gravitywell-122b",
+        "model": "gravitywell-27b",
         "messages": [{"role": "user", "content": "hi"}],
         "temperature": 0.7,
-        "cache_prompt": True,
         "stream": True,
         "chat_template_kwargs": {"enable_thinking": False},
     }
 
 
+def test_default_unset_auto_detects_llamacpp_when_big_serving(monkeypatch):
+    """The other direction: discovery reporting gravitywell-122b (GW resting big) resolves
+    the llamacpp dialect (cache_prompt present) - proves genuine mode-agnosticism, not a
+    hardcoded flip from one fixed default to another."""
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    _gw_clear_auto_detect_caches()
+
+    captured = {}
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.get", side_effect=_fake_gw_models_get("gravitywell-122b")), \
+         patch("requests.post", side_effect=_make_gw_sse_resp("ok", captured)):
+        result = call_operator("gravitywell", prompt="hi")
+
+    assert result == "ok"
+    assert captured["payload"]["cache_prompt"] is True
+    assert captured["payload"]["model"] == "gravitywell-122b"
+
+
 def test_ac1_gw_backend_llamacpp_explicit_same_as_unset(monkeypatch):
-    """Explicit GW_BACKEND=llamacpp behaves identically to unset."""
+    """Explicit GW_BACKEND=llamacpp resolves the same payload shape as an unset env would
+    have resolved before this seam existed (gravitywell-122b, cache_prompt: True) - but
+    unlike unset, it is pinned and never auto-detects, so it stays correct even if GW is
+    actually resting dual at call time."""
     monkeypatch.setenv("GW_BACKEND", "llamacpp")
     monkeypatch.delenv("GW_MODEL", raising=False)
     _gw_precache("gravitywell-122b")
@@ -1304,16 +1349,17 @@ def test_ac6a_handshake_wrong_model_raises_mismatch_no_fallback(monkeypatch):
 
 
 def test_ac6b_response_echo_mismatch_raises_mid_call(monkeypatch):
-    """A response whose echoed model != expected raises mid-call, even with an already-
-    verified (cached) handshake — the per-call check is never cached (1d.2)."""
-    from agents_core.llm import GWServingModeMismatchError, _gw_handshake_cache, _gw_handshake_lock, GW_URL
+    """A response whose echoed model != the auto-detected model raises mid-call - the
+    per-call response-echo check fires for the auto-detected case too (agents-core-gw-
+    backend-auto-detect-when-unset-v0), catching a flip between the discovery probe and
+    this call's actual streamed response, exactly as it already did for the explicit-
+    handshake case."""
+    from agents_core.llm import GWServingModeMismatchError
     import json as _json
 
     monkeypatch.delenv("GW_BACKEND", raising=False)
     monkeypatch.delenv("GW_MODEL", raising=False)
-    with _gw_handshake_lock:
-        _gw_handshake_cache.clear()
-        _gw_handshake_cache[(GW_URL, "gravitywell-122b")] = True  # already verified
+    _gw_clear_auto_detect_caches()
 
     def fake_post(url, json=None, timeout=None, stream=None, **kw):
         def lines():
@@ -1332,34 +1378,31 @@ def test_ac6b_response_echo_mismatch_raises_mid_call(monkeypatch):
 
     dc, _mock_client = _gw_dc()
     with patch("agents_core.doorman_client.DoormanClient", dc), \
-         patch("requests.get") as mock_get, \
+         patch("requests.get", side_effect=_fake_gw_models_get("gravitywell-122b")) as mock_get, \
          patch("requests.post", side_effect=fake_post):
         with pytest.raises(GWServingModeMismatchError):
             call_operator("gravitywell", prompt="test")
 
-    # Cached handshake means no /v1/models probe on this call.
-    mock_get.assert_not_called()
+    # Auto-detect discovery probe does fire (there is no pre-flight verify to elide it
+    # when GW_BACKEND/GW_MODEL are unset), and only once (TTL-cached across the two
+    # _gw_default_model() call sites within this single call_operator() invocation).
+    assert mock_get.call_count == 1
 
 
-def test_ac6c_handshake_cached_second_call_does_not_reprobe(monkeypatch):
-    """The pre-flight handshake probes /v1/models once per (url, model); a second call
-    with the same tuple does not re-probe."""
-    from agents_core.llm import _gw_handshake_cache, _gw_handshake_lock
+def test_discovery_cached_second_call_within_ttl_does_not_reprobe(monkeypatch):
+    """Auto-detect discovery probes /v1/models once per url within the TTL window
+    (default 30s, GW_DISCOVERY_TTL_S); a second call_operator() invocation shortly after
+    the first reuses the cached discovery result instead of re-probing. Supersedes the
+    old per-process (url, model) handshake-cache framing - discovery is now per-url with
+    a TTL, not per-(url, model) for the process lifetime."""
+    _gw_clear_auto_detect_caches()
 
     monkeypatch.delenv("GW_BACKEND", raising=False)
     monkeypatch.delenv("GW_MODEL", raising=False)
-    with _gw_handshake_lock:
-        _gw_handshake_cache.clear()
-
-    def fake_get(url, timeout=None):
-        resp = MagicMock()
-        resp.raise_for_status = MagicMock()
-        resp.json.return_value = {"data": [{"id": "gravitywell-122b"}]}
-        return resp
 
     dc, _mock_client = _gw_dc()
     with patch("agents_core.doorman_client.DoormanClient", dc), \
-         patch("requests.get", side_effect=fake_get) as mock_get, \
+         patch("requests.get", side_effect=_fake_gw_models_get("gravitywell-122b")) as mock_get, \
          patch("requests.post", side_effect=_make_gw_sse_resp("ok")):
         call_operator("gravitywell", prompt="one")
         call_operator("gravitywell", prompt="two")
@@ -1367,16 +1410,34 @@ def test_ac6c_handshake_cached_second_call_does_not_reprobe(monkeypatch):
     assert mock_get.call_count == 1
 
 
+def test_discovery_ttl_reprobes_after_expiry(monkeypatch):
+    """Two calls to _gw_discover_serving for the same url more than GW_DISCOVERY_TTL_S
+    apart result in two separate requests.get calls - proves the TTL actually re-probes,
+    not just that it caches (test_discovery_cached_second_call_within_ttl_does_not_reprobe
+    only proves the caching half). GW_DISCOVERY_TTL_S is read at call time (not a
+    module-load constant), so monkeypatch.setenv works here."""
+    from agents_core.llm import _gw_discover_serving, GW_URL
+
+    monkeypatch.setenv("GW_DISCOVERY_TTL_S", "0")
+    _gw_clear_auto_detect_caches()
+
+    with patch("requests.get", side_effect=_fake_gw_models_get("gravitywell-122b")) as mock_get:
+        _gw_discover_serving(GW_URL)
+        _gw_discover_serving(GW_URL)
+
+    assert mock_get.call_count == 2
+
+
 def test_ac6d_handshake_connect_failure_is_unavailability_not_drift(monkeypatch):
-    """A connect failure on the /v1/models probe is treated as unavailability (not drift):
-    it does not raise GWServingModeMismatchError, and the real call proceeds normally."""
-    from agents_core.llm import _gw_handshake_cache, _gw_handshake_lock
+    """A connect failure on the /v1/models probe (both the explicit-mode handshake and
+    the auto-detect discovery probe route through the same shared transport helper) is
+    treated as unavailability (not drift): it does not raise GWServingModeMismatchError,
+    and the real call proceeds normally."""
     import requests as req
 
     monkeypatch.delenv("GW_BACKEND", raising=False)
     monkeypatch.delenv("GW_MODEL", raising=False)
-    with _gw_handshake_lock:
-        _gw_handshake_cache.clear()
+    _gw_clear_auto_detect_caches()
 
     dc, _mock_client = _gw_dc(status="serving")
     with patch("agents_core.doorman_client.DoormanClient", dc), \
@@ -1389,15 +1450,13 @@ def test_ac6d_handshake_connect_failure_is_unavailability_not_drift(monkeypatch)
 
 def test_ac6d_genuine_unavailability_still_routes_on_wake_fail(monkeypatch):
     """A genuine wake-fail (real call unreachable), distinct from served-wrong-model drift,
-    keeps the existing on_wake_fail behavior unchanged — even with a handshake probe
+    keeps the existing on_wake_fail behavior unchanged - even with a discovery probe
     connect-failure in the mix."""
-    from agents_core.llm import _gw_handshake_cache, _gw_handshake_lock
     import requests as req
 
     monkeypatch.delenv("GW_BACKEND", raising=False)
     monkeypatch.delenv("GW_MODEL", raising=False)
-    with _gw_handshake_lock:
-        _gw_handshake_cache.clear()
+    _gw_clear_auto_detect_caches()
 
     dc, _mock_client = _gw_dc(status="serving")
     with patch("agents_core.doorman_client.DoormanClient", dc), \
@@ -1409,9 +1468,79 @@ def test_ac6d_genuine_unavailability_still_routes_on_wake_fail(monkeypatch):
     assert result is None
 
 
+def test_discovery_probe_failure_falls_back_then_operator_unreachable(monkeypatch):
+    """A discovery probe failure (requests.get raises ConnectionError) with GW_BACKEND/
+    GW_MODEL unset makes _gw_default_model() fall back to OPERATOR_DEFAULTS["gravitywell"]
+    rather than raising or hanging. When the subsequent real call_operator("gravitywell",
+    ...) call's requests.post also fails to connect, it raises OperatorUnreachableError via
+    the existing connect-retry path - never GWServingModeMismatchError, never a hang."""
+    from agents_core.llm import (
+        _gw_default_model, _gw_handshake_lock, _gw_discovery_cache,
+        OPERATOR_DEFAULTS, OperatorUnreachableError,
+    )
+    import requests as req
+
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    _gw_clear_auto_detect_caches()
+
+    with patch("requests.get", side_effect=req.exceptions.ConnectionError("no route to host")):
+        assert _gw_default_model() == OPERATOR_DEFAULTS["gravitywell"]
+
+    # A failed probe is never cached - clear defensively so the assertion above's probe
+    # attempt doesn't leak into the real call below (it shouldn't have cached anything,
+    # but this keeps the test's intent explicit).
+    with _gw_handshake_lock:
+        _gw_discovery_cache.clear()
+
+    dc, _mock_client = _gw_dc(status="serving")
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.get", side_effect=req.exceptions.ConnectionError("no route to host")), \
+         patch("requests.post", side_effect=req.exceptions.ConnectionError("gw down")), \
+         patch("time.sleep"):
+        with pytest.raises(OperatorUnreachableError):
+            call_operator("gravitywell", prompt="test", on_wake_fail="error")
+
+
+def test_ac3_model_override_accepted_when_matches_auto_detected_default(monkeypatch):
+    """The override-validation call site (call_operator's own _gw_default_model() call,
+    used to validate a caller-supplied model= against the resolved default) composes
+    correctly with auto-detect, not just the explicit GW_BACKEND path: an explicit model=
+    matching the discovered model is accepted."""
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    _gw_clear_auto_detect_caches()
+
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.get", side_effect=_fake_gw_models_get("gravitywell-27b")), \
+         patch("requests.post", side_effect=_make_gw_sse_resp("ok")):
+        result = call_operator("gravitywell", prompt="hi", model="gravitywell-27b")
+
+    assert result == "ok"
+
+
+def test_ac3_stale_model_override_raises_under_auto_detect(monkeypatch):
+    """A stale model= override that doesn't match the auto-detected served model raises
+    the same ValueError this call site already raises today under the explicit path."""
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    _gw_clear_auto_detect_caches()
+
+    with patch("requests.get", side_effect=_fake_gw_models_get("gravitywell-27b")):
+        with pytest.raises(ValueError) as exc_info:
+            call_operator("gravitywell", prompt="hi", model="gravitywell-122b")
+    assert "gravitywell-27b" in str(exc_info.value)
+
+
 # --- AC7: unknown-backend hard-fails ----------------------------------------
 
 def test_ac7_gw_backend_unset_resolves_llamacpp(monkeypatch):
+    """_gw_backend() called with no discovered_model context (no real call site does this
+    once auto-detecting - they all pass discovered_model) falls back to "llamacpp". This
+    is the ultimate fallback value, not the value real call sites resolve to once
+    auto-detecting; see test_default_unset_auto_detects_vllm_when_dual_serving for the
+    discovered_model-aware resolution real calls actually use."""
     from agents_core.llm import _gw_backend
 
     monkeypatch.delenv("GW_BACKEND", raising=False)
