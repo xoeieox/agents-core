@@ -17,12 +17,21 @@ CLI:
   python -m agents_core.calibration.handler_agent_harness \\
     [--gw-agentworld-url URL] [--sh-pair-url URL] \\
     [--agentworld-model NAME] [--pair-model NAME] \\
+    [--agent-url URL] [--handler-url URL] \\
+    [--agent-model NAME] [--handler-model NAME] \\
     [--max-turns N] [--out PATH]
 
-Env var overrides: only --gw-agentworld-url (GW_AGENTWORLD_URL) and --sh-pair-url
-(SH_PAIR_URL) read an env var, and only as their *default* -- an explicit CLI
-flag always wins over the env var. The other four flags are CLI-only, no env
-var.
+Env var overrides: --gw-agentworld-url (GW_AGENTWORLD_URL), --sh-pair-url
+(SH_PAIR_URL), --agent-url (AGENT_URL), and --handler-url (HANDLER_URL) each
+read an env var, and only as their *default* -- an explicit CLI flag always
+wins over the env var. The model flags (--agentworld-model, --pair-model,
+--agent-model, --handler-model) are CLI-only, no env var.
+
+--sh-pair-url/--pair-model set the Agent+Handler pair default (both roles
+resolve to it when unset). --agent-url/--agent-model and --handler-url/
+--handler-model independently override a single role, falling back to the
+pair default for that role when unset. See _resolve_pair_endpoints for the
+exact precedence.
 
 A failed preflight, or a turn that dies mid-run, still writes a report to
 --out (with a `preflight_error` field or a per-turn `{"turn", "error"}`
@@ -152,7 +161,8 @@ def ask_json(endpoint, model, system, user, temp, label) -> dict:
 
 def _build_report(
     environment: str,
-    pair: str,
+    agent: str,
+    handler: str,
     transcript: list[dict],
     goal_met: bool,
     final_counts: dict | None,
@@ -161,7 +171,8 @@ def _build_report(
     report = {
         "smoke": "handler-agent-cross-box-topology-y",
         "environment": environment,
-        "pair": pair,
+        "agent": agent,
+        "handler": handler,
         "turns": len(transcript),
         "goal_met": goal_met,
         "final_counts": final_counts,
@@ -178,12 +189,33 @@ def _write_report(report: dict, out: Path) -> None:
         json.dump(report, fh, indent=2)
 
 
-def preflight(gw_agentworld_url: str, sh_pair_url: str, out: Path) -> None:
-    """Reachability check for both endpoints (10s timeout, unchanged).
+def preflight(
+    gw_agentworld_url: str,
+    agent_url: str,
+    agent_model: str,
+    handler_url: str,
+    handler_model: str,
+    out: Path,
+) -> None:
+    """Reachability check for the distinct endpoints among environment/agent/handler.
 
-    On failure, writes a preflight-failure report to `out` (§1e) and exits 1.
+    Probes GW/AgentWorld plus each *distinct* SH endpoint among {agent_url,
+    handler_url} (10s timeout each, unchanged) -- up to three probes total.
+    When agent_url == handler_url, SH is probed once, not twice, and that
+    dedup is logged. On failure, writes a preflight-failure report to `out`
+    (§1e), naming which role's endpoint failed, and exits 1.
     """
-    for name, ep in (("GW/AgentWorld", gw_agentworld_url), ("SH/handler-agent", sh_pair_url)):
+    if agent_url == handler_url:
+        log.info("agent and handler share endpoint %s - probing once", agent_url)
+
+    roles_by_url: dict[str, list[str]] = {}
+    for role, ep in (("agent", agent_url), ("handler", handler_url)):
+        roles_by_url.setdefault(ep, []).append(role)
+
+    probes = [("GW/AgentWorld", gw_agentworld_url)]
+    probes += [(f"SH/{'+'.join(roles)}", ep) for ep, roles in roles_by_url.items()]
+
+    for name, ep in probes:
         try:
             r = httpx.get(f"{ep}/models", timeout=10.0)
             r.raise_for_status()
@@ -192,7 +224,10 @@ def preflight(gw_agentworld_url: str, sh_pair_url: str, out: Path) -> None:
         except Exception as e:
             log.error("  [%s] UNREACHABLE: %s", name, e)
             report = _build_report(
-                gw_agentworld_url, sh_pair_url, transcript=[], goal_met=False,
+                gw_agentworld_url,
+                agent=f"{agent_url} ({agent_model})",
+                handler=f"{handler_url} ({handler_model})",
+                transcript=[], goal_met=False,
                 final_counts=None, preflight_error=f"{name}: {e}",
             )
             _write_report(report, out)
@@ -201,18 +236,24 @@ def preflight(gw_agentworld_url: str, sh_pair_url: str, out: Path) -> None:
 
 def run_smoke(
     gw_agentworld_url: str,
-    sh_pair_url: str,
     agentworld_model: str,
-    pair_model: str,
+    agent_url: str,
+    agent_model: str,
+    handler_url: str,
+    handler_model: str,
     max_turns: int,
     out: Path,
 ) -> None:
     """Run the Handler+Agent cross-box smoke loop and write the report to `out`."""
     log.info("=== Handler+Agent cross-box smoke (Topology Y) ===")
     log.info("  environment (AgentWorld) : %s", gw_agentworld_url)
-    log.info("  pair (Agent+Handler)     : %s", sh_pair_url)
+    log.info("  agent                    : %s (%s)", agent_url, agent_model)
+    log.info("  handler                  : %s (%s)", handler_url, handler_model)
     log.info("--- preflight ---")
-    preflight(gw_agentworld_url, sh_pair_url, out)
+    preflight(gw_agentworld_url, agent_url, agent_model, handler_url, handler_model, out)
+
+    agent_descriptor = f"{agent_url} ({agent_model})"
+    handler_descriptor = f"{handler_url} ({handler_model})"
 
     state = json.loads(json.dumps(INITIAL_STATE))
     transcript: list[dict] = []
@@ -225,7 +266,7 @@ def run_smoke(
             # 1. AGENT proposes an action (SH)
             t0 = time.monotonic()
             action = ask_json(
-                sh_pair_url, pair_model, AGENT_SYSTEM,
+                agent_url, agent_model, AGENT_SYSTEM,
                 f"Current queue state:\n{json.dumps(state, indent=2)}\n\nYour next action:",
                 temp=0.2, label="AGENT",
             )
@@ -249,7 +290,7 @@ def run_smoke(
             # 3. HANDLER observes + steers (SH)
             t0 = time.monotonic()
             obs = ask_json(
-                sh_pair_url, pair_model, HANDLER_SYSTEM,
+                handler_url, handler_model, HANDLER_SYSTEM,
                 f"state_before:\n{json.dumps(state)}\n\nagent_action:\n{json.dumps(action)}\n\nstate_after:\n{json.dumps(after)}\n\nAssess:",
                 temp=0.2, label="HANDLER",
             )
@@ -276,15 +317,15 @@ def run_smoke(
             log.error("  turn %d failed: %s", turn, e)
             transcript.append({"turn": turn, "error": str(e)})
             report = _build_report(
-                gw_agentworld_url, sh_pair_url, transcript, goal_met=False,
-                final_counts=state.get("counts"),
+                gw_agentworld_url, agent_descriptor, handler_descriptor, transcript,
+                goal_met=False, final_counts=state.get("counts"),
             )
             _write_report(report, out)
             sys.exit(1)
 
     report = _build_report(
-        gw_agentworld_url, sh_pair_url, transcript, goal_met=goal_met,
-        final_counts=state.get("counts"),
+        gw_agentworld_url, agent_descriptor, handler_descriptor, transcript,
+        goal_met=goal_met, final_counts=state.get("counts"),
     )
     _write_report(report, out)
     log.info("=== RESULT: goal_met=%s, turns=%d, final=%s ===",
@@ -318,6 +359,30 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Model name for the Handler+Agent pair (default: %(default)s)",
     )
     parser.add_argument(
+        "--agent-url", dest="agent_url",
+        default=os.environ.get("AGENT_URL"),
+        help="Agent-role endpoint override (env: AGENT_URL). Falls back to "
+             "--sh-pair-url/SH_PAIR_URL when unset. May be combined with "
+             "--sh-pair-url: this flag wins for the Agent role only.",
+    )
+    parser.add_argument(
+        "--handler-url", dest="handler_url",
+        default=os.environ.get("HANDLER_URL"),
+        help="Handler-role endpoint override (env: HANDLER_URL). Falls back "
+             "to --sh-pair-url/SH_PAIR_URL when unset. May be combined with "
+             "--sh-pair-url: this flag wins for the Handler role only.",
+    )
+    parser.add_argument(
+        "--agent-model", dest="agent_model", default=None,
+        help="Model name override for the Agent role. Falls back to "
+             "--pair-model when unset. CLI-only, no env var.",
+    )
+    parser.add_argument(
+        "--handler-model", dest="handler_model", default=None,
+        help="Model name override for the Handler role. Falls back to "
+             "--pair-model when unset. CLI-only, no env var.",
+    )
+    parser.add_argument(
         "--max-turns", dest="max_turns", type=int, default=8,
         help="Max turns before giving up (default: %(default)s)",
     )
@@ -329,6 +394,33 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_pair_endpoints(args: argparse.Namespace) -> tuple[str, str, str, str]:
+    """Resolve per-role (agent, handler) endpoint + model pairs.
+
+    Precedence per role url: explicit --agent-url/--handler-url flag >
+    AGENT_URL/HANDLER_URL env (empty or whitespace-only treated as unset) >
+    resolved --sh-pair-url (itself --sh-pair-url flag > SH_PAIR_URL env >
+    hardcoded default). Model precedence: explicit --agent-model/
+    --handler-model flag > --pair-model.
+
+    Passing both a legacy pair flag (--sh-pair-url/--pair-model) and a role
+    flag together is valid, not an error: the role flag wins for that one
+    role, and the pair default supplies the other role.
+
+    Caveat: a set-but-empty SH_PAIR_URL="" makes the pair default itself ""
+    -- a pre-existing edge in --sh-pair-url's own env resolution that this
+    function does not fix (out of scope).
+    """
+    def _norm(v: str | None) -> str | None:
+        return v if (v and v.strip()) else None
+
+    agent_url = _norm(args.agent_url) or args.sh_pair_url
+    handler_url = _norm(args.handler_url) or args.sh_pair_url
+    agent_model = _norm(args.agent_model) or args.pair_model
+    handler_model = _norm(args.handler_model) or args.pair_model
+    return agent_url, agent_model, handler_url, handler_model
+
+
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -336,12 +428,15 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     args = _build_parser().parse_args(argv)
+    agent_url, agent_model, handler_url, handler_model = _resolve_pair_endpoints(args)
 
     run_smoke(
         gw_agentworld_url=args.gw_agentworld_url,
-        sh_pair_url=args.sh_pair_url,
         agentworld_model=args.agentworld_model,
-        pair_model=args.pair_model,
+        agent_url=agent_url,
+        agent_model=agent_model,
+        handler_url=handler_url,
+        handler_model=handler_model,
         max_turns=args.max_turns,
         out=args.out,
     )
