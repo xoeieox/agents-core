@@ -135,8 +135,17 @@ def _make_gw_sse_resp(content_text, captured_dict=None):
     return fake_post
 
 
-def test_gravitywell_default_think_off():
-    """Default call injects enable_thinking=False into the payload."""
+def test_gravitywell_default_think_off(monkeypatch):
+    """Default call injects enable_thinking=False into the payload.
+
+    Pins GW_BACKEND=llamacpp explicitly (DoD: non-AC gravitywell tests that exercise the
+    real _call_gravitywell_backend must not rely on ambient env / conftest precache for
+    hermeticity - an ambient GW_BACKEND=vllm shell would otherwise resolve gravitywell-27b
+    here and miss the conftest's 122b-precached handshake cache, firing a live /v1/models
+    probe).
+    """
+    monkeypatch.setenv("GW_BACKEND", "llamacpp")
+    monkeypatch.delenv("GW_MODEL", raising=False)
     captured = {}
 
     dc, _mock_client = _gw_dc()
@@ -148,8 +157,14 @@ def test_gravitywell_default_think_off():
     assert captured["payload"]["chat_template_kwargs"]["enable_thinking"] is False
 
 
-def test_gravitywell_think_true():
-    """think=True injects enable_thinking=True."""
+def test_gravitywell_think_true(monkeypatch):
+    """think=True injects enable_thinking=True.
+
+    Pins GW_BACKEND=llamacpp for the same hermeticity reason as
+    test_gravitywell_default_think_off.
+    """
+    monkeypatch.setenv("GW_BACKEND", "llamacpp")
+    monkeypatch.delenv("GW_MODEL", raising=False)
     captured = {}
 
     dc, _mock_client = _gw_dc()
@@ -164,8 +179,14 @@ def test_gravitywell_think_true():
 # gravitywell: bundle_ids passed through call_operator does NOT raise TypeError
 # ---------------------------------------------------------------------------
 
-def test_gravitywell_bundle_ids_discarded_no_typeerror():
-    """bundle_ids kwarg is discarded before reaching _call_gravitywell_backend."""
+def test_gravitywell_bundle_ids_discarded_no_typeerror(monkeypatch):
+    """bundle_ids kwarg is discarded before reaching _call_gravitywell_backend.
+
+    Pins GW_BACKEND=llamacpp for the same hermeticity reason as
+    test_gravitywell_default_think_off.
+    """
+    monkeypatch.setenv("GW_BACKEND", "llamacpp")
+    monkeypatch.delenv("GW_MODEL", raising=False)
     dc, _mock_client = _gw_dc()
 
     with patch("agents_core.doorman_client.DoormanClient", dc), \
@@ -1026,8 +1047,18 @@ def test_creative_think_true_raises_value_error():
 # gravitywell-creative: 122B default path is byte-identical (regression guard)
 # ---------------------------------------------------------------------------
 
-def test_gravitywell_122b_default_path_unchanged():
-    """122B path still uses GW_URL (:8081) and gravitywell-122b; no url/model override."""
+def test_gravitywell_122b_default_path_unchanged(monkeypatch):
+    """122B path still uses GW_URL (:8081) and gravitywell-122b; no url/model override.
+
+    Pins GW_BACKEND=llamacpp explicitly rather than relying on ambient env / the conftest's
+    122b-precached discovery cache - under an ambient GW_BACKEND=vllm shell (this arc's own
+    documented workaround env) the unpinned test would resolve gravitywell-27b, fail this
+    test's gravitywell-122b assertion, and additionally miss the conftest precache (keyed to
+    122b) and fire a live /v1/models probe. Pinning makes this explicit-mode regression guard
+    correct under any ambient env.
+    """
+    monkeypatch.setenv("GW_BACKEND", "llamacpp")
+    monkeypatch.delenv("GW_MODEL", raising=False)
     captured = {}
 
     dc, _mock_client = _gw_dc()
@@ -1041,8 +1072,14 @@ def test_gravitywell_122b_default_path_unchanged():
     assert captured["payload"].get("chat_template_kwargs") is not None  # thinking knob present
 
 
-def test_gravitywell_122b_default_url_is_8081():
-    """122B operator hits :8081, not :8093."""
+def test_gravitywell_122b_default_url_is_8081(monkeypatch):
+    """122B operator hits :8081, not :8093.
+
+    Pins GW_BACKEND=llamacpp for the same hermeticity reason as
+    test_gravitywell_122b_default_path_unchanged.
+    """
+    monkeypatch.setenv("GW_BACKEND", "llamacpp")
+    monkeypatch.delenv("GW_MODEL", raising=False)
     import json as _json
 
     captured = {}
