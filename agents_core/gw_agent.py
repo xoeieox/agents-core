@@ -1246,9 +1246,12 @@ def call_gw_agent(
                         )
 
                 # Non-json_mode or writeable: byte-identical to previous behavior.
+                # reason="no_choices" reuses the closest existing category for a voluntary
+                # stop whose content came back empty (mirrors the json_mode re-emit fallback
+                # above, which reuses the same category for its analogous empty-content case).
                 return _finalize_writeable_or_readonly(
                     messages, content, return_transcript, transcript, writeable, cwd, concluded=True,
-                    reason_out=reason_out,
+                    reason_out=reason_out, reason="no_choices",
                 )
 
         # Interrupted: cancel_check or before_tool stop halted the loop.

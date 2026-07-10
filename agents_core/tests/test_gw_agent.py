@@ -1270,6 +1270,35 @@ class TestReasonOut:
             assert result is None
             assert reason_out == ["no_choices"]
 
+    def test_reason_out_voluntary_stop_empty_content(self):
+        """Plain voluntary stop (non-json_mode, non-writeable) with empty content
+        populates reason_out=["no_choices"] - the closest existing category, reused
+        the same way the json_mode re-emit fallback reuses it for its analogous case.
+        """
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+            mock_post.return_value.json.return_value = {
+                "choices": [
+                    {
+                        "message": {"content": "", "tool_calls": []},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 10},
+            }
+
+            reason_out = []
+            result = call_gw_agent(
+                prompt="Review this.",
+                reason_out=reason_out,
+            )
+
+            assert result is None
+            assert reason_out == ["no_choices"]
+
     def test_reason_out_stays_empty_on_success(self):
         """A genuinely successful call leaves reason_out == [] unchanged."""
         with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
