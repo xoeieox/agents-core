@@ -1185,3 +1185,307 @@ class TestForcedConclusion:
             assert result == "The code is good."
             # Should only have called GW once (no forced conclusion turn needed)
             assert mock_post.call_count == 1
+
+
+class TestReasonOut:
+    """Tests for the reason_out side-channel (agents-core-gw-agent-empty-result-reason-v0).
+
+    reason_out is only populated on the writeable=False (readonly/json_mode) leg. A caller
+    that never passes it sees zero behavior change (side-channel convention, see llm.py's
+    _provenance_out for prior art).
+    """
+
+    def test_reason_out_gw_unreachable(self):
+        """Doorman unreachable populates reason_out=["gw_unreachable"]."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class:
+            from agents_core.doorman_client import DoormanUnreachable
+
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.side_effect = DoormanUnreachable("connection failed")
+
+            reason_out = []
+            result = call_gw_agent(
+                prompt="Review this.",
+                on_wake_fail="skip",
+                reason_out=reason_out,
+            )
+
+            assert result is None
+            assert reason_out == ["gw_unreachable"]
+
+    def test_reason_out_gw_not_serving(self):
+        """Doorman reachable but not serving populates reason_out=["gw_not_serving"]."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "wake_failed"}
+
+            reason_out = []
+            result = call_gw_agent(
+                prompt="Review this.",
+                on_wake_fail="skip",
+                reason_out=reason_out,
+            )
+
+            assert result is None
+            assert reason_out == ["gw_not_serving"]
+
+    def test_reason_out_request_failed(self):
+        """A request exception talking to GW populates reason_out=["request_failed"]."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+            mock_post.side_effect = Exception("GW connection failed")
+
+            reason_out = []
+            result = call_gw_agent(
+                prompt="Review this.",
+                reason_out=reason_out,
+            )
+
+            assert result is None
+            assert reason_out == ["request_failed"]
+
+    def test_reason_out_no_choices(self):
+        """GW responding with no choices populates reason_out=["no_choices"]."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+            mock_post.return_value.json.return_value = {
+                "choices": [],
+                "usage": {"total_tokens": 10},
+            }
+
+            reason_out = []
+            result = call_gw_agent(
+                prompt="Review this.",
+                reason_out=reason_out,
+            )
+
+            assert result is None
+            assert reason_out == ["no_choices"]
+
+    def test_reason_out_stays_empty_on_success(self):
+        """A genuinely successful call leaves reason_out == [] unchanged."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+            mock_post.return_value.json.return_value = {
+                "choices": [
+                    {
+                        "message": {"content": "All good.", "tool_calls": []},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+
+            reason_out = []
+            result = call_gw_agent(
+                prompt="Review this.",
+                reason_out=reason_out,
+            )
+
+            assert result == "All good."
+            assert reason_out == []
+
+    def test_reason_out_omitted_backward_compatible(self):
+        """Calling call_gw_agent without reason_out at all behaves identically to today."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+            mock_post.return_value.json.return_value = {
+                "choices": [
+                    {
+                        "message": {"content": "All good.", "tool_calls": []},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+
+            # No TypeError, no return-shape change, when reason_out is not passed at all.
+            result = call_gw_agent(prompt="Review this.")
+
+            assert result == "All good."
+
+    def test_reason_out_interrupted(self):
+        """Interrupted run populates reason_out=["interrupted"] despite the non-empty marker text."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+
+            reason_out = []
+            result = call_gw_agent(
+                prompt="Review this.",
+                cancel_check=lambda: True,
+                reason_out=reason_out,
+            )
+
+            # Underlying content was empty, but the final text carries a synthesized marker.
+            assert result is not None
+            assert "interrupted" in result
+            assert reason_out == ["interrupted"]
+            mock_post.assert_not_called()
+
+    def test_reason_out_max_steps_exhausted(self):
+        """Max-steps exhaustion with an empty forced conclusion populates reason_out=["max_steps_exhausted"]."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+
+            # GW always returns a tool_call with empty content (never concludes).
+            infinite_response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_x",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": json.dumps({"path": "file.txt"}),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+            # Forced conclusion also comes back empty.
+            failed_conclusion = {
+                "choices": [
+                    {
+                        "message": {"content": "", "tool_calls": []},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 150},
+            }
+
+            mock_post.side_effect = [
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: failed_conclusion),
+            ]
+
+            reason_out = []
+            result = call_gw_agent(
+                prompt="Infinite loop test.",
+                max_steps=3,
+                reason_out=reason_out,
+            )
+
+            # Final text carries the bare "no verdict reached" marker (underlying content was empty).
+            assert "max_steps reached" in result
+            assert "no verdict reached" in result
+            assert reason_out == ["max_steps_exhausted"]
+
+    def test_reason_out_budget_exhausted(self, tmp_path):
+        """Budget-forced conclusion whose forced content itself is empty populates reason_out=["budget_exhausted"]."""
+        with patch("agents_core.gw_agent.time.monotonic", side_effect=[0.0, 250.0]), \
+             patch("agents_core.gw_agent.requests.post") as mock_post, \
+             patch("agents_core.gw_agent.DoormanClient") as mock_doorman_class:
+            mock_doorman_class.return_value = MagicMock()
+
+            empty_stop = MagicMock()
+            empty_stop.json.return_value = {
+                "choices": [
+                    {
+                        "message": {"content": "", "tool_calls": []},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 10},
+            }
+            mock_post.return_value = empty_stop
+
+            reason_out = []
+            result = call_gw_agent(
+                prompt="Review.",
+                cwd=str(tmp_path),
+                writeable=False,
+                acquire_lease=False,
+                backend_url="http://gw-test:8081",
+                max_steps=5,
+                timeout=300,
+                reason_out=reason_out,
+            )
+
+            # Final text carries the bare budget-forced suffix (underlying content was empty).
+            assert result is not None
+            assert "budget-forced conclusion" in result
+            assert reason_out == ["budget_exhausted"]
+
+    def test_reason_out_grounding_failed(self):
+        """Grounding guard's second ungrounded stop populates reason_out=["grounding_failed"]."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+
+            ungrounded_stop = {
+                "choices": [
+                    {
+                        "message": {"content": "no tools used", "tool_calls": []},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 50},
+            }
+            mock_post.side_effect = [
+                MagicMock(json=lambda: ungrounded_stop),
+                MagicMock(json=lambda: ungrounded_stop),
+            ]
+
+            reason_out = []
+            result = call_gw_agent(
+                prompt="Review this.",
+                json_mode=True,
+                reason_out=reason_out,
+            )
+
+            assert result is None
+            assert reason_out == ["grounding_failed"]
+
+    def test_reason_out_writeable_true_unaffected(self, tmp_path):
+        """writeable=True calls leave reason_out unpopulated and still return a FixerResult,
+        regardless of which underlying empty-collapse cause fires (scope boundary)."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class:
+            from agents_core.doorman_client import DoormanUnreachable
+
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.side_effect = DoormanUnreachable("connection failed")
+
+            reason_out = []
+            result = call_gw_agent(
+                prompt="Fix this.",
+                cwd=str(tmp_path),
+                writeable=True,
+                on_wake_fail="skip",
+                reason_out=reason_out,
+            )
+
+            fixer, _transcript = result
+            assert isinstance(fixer, dict)
+            assert fixer.get("concluded") is False
+            assert reason_out == []

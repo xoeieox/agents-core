@@ -718,6 +718,7 @@ def call_gw_agent(
     tool_executors: dict[str, ToolExecutor] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     before_tool: Callable[[str, dict], dict] | None = None,
+    reason_out: list[str] | None = None,
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Run a multi-step read-only tool-loop on GravityWell.
 
@@ -770,6 +771,14 @@ def call_gw_agent(
                      loop, interrupted result). Raising is fail-closed: the tool is skipped
                      with {"error": "gate_failure: <detail>"} fed back, loop continues. When
                      None (default), never called.
+        reason_out: Optional list. When provided, on a `writeable=False` (readonly/json_mode)
+                    call that collapses to an empty result, one of the following category
+                    strings is appended: "gw_unreachable", "gw_not_serving", "request_failed",
+                    "no_choices", "grounding_failed", "budget_exhausted", "max_steps_exhausted",
+                    "interrupted". Left untouched on a genuinely successful (non-empty) result.
+                    Stays empty/unpopulated for `writeable=True` calls regardless of cause. Pure
+                    side channel - does not change the return type. When None (default), never
+                    touched.
 
     Returns:
         - str or None (or (str|None, list) when return_transcript=True).
@@ -846,6 +855,8 @@ def call_gw_agent(
                 if on_wake_fail == "skip":
                     if writeable:
                         return (_build_fixer_result(cwd, transcript, concluded=False), transcript)
+                    if reason_out is not None:
+                        reason_out.append("gw_unreachable")
                     return (None, transcript) if return_transcript else None
                 elif on_wake_fail == "error":
                     raise
@@ -862,6 +873,8 @@ def call_gw_agent(
                 if on_wake_fail == "skip":
                     if writeable:
                         return (_build_fixer_result(cwd, transcript, concluded=False), transcript)
+                    if reason_out is not None:
+                        reason_out.append("gw_not_serving")
                     return (None, transcript) if return_transcript else None
                 elif on_wake_fail == "error":
                     raise Exception(f"GW not serving: {res.get('status')}")
@@ -914,12 +927,14 @@ def call_gw_agent(
                         writeable, cwd, concluded=False,
                         budget_forced=True,
                         budget_forced_suffix=_budget_suffix,
+                        reason_out=reason_out,
                     )
                 return _finalize_writeable_or_readonly(
                     messages, "", return_transcript, transcript,
                     writeable, cwd, concluded=False,
                     budget_forced=True,
                     budget_forced_suffix=_budget_suffix,
+                    reason_out=reason_out,
                 )
 
             if log:
@@ -965,7 +980,8 @@ def call_gw_agent(
                     log(f"[gw_agent] GW request failed: {e}")
                 # Return best-effort content accumulated so far
                 return _finalize_writeable_or_readonly(
-                    messages, "", return_transcript, transcript, writeable, cwd, concluded=False
+                    messages, "", return_transcript, transcript, writeable, cwd, concluded=False,
+                    reason_out=reason_out, reason="request_failed",
                 )
 
             # Extract response.
@@ -973,7 +989,8 @@ def call_gw_agent(
                 if log:
                     log(f"[gw_agent] GW returned no choices")
                 return _finalize_writeable_or_readonly(
-                    messages, "", return_transcript, transcript, writeable, cwd, concluded=False
+                    messages, "", return_transcript, transcript, writeable, cwd, concluded=False,
+                    reason_out=reason_out, reason="no_choices",
                 )
 
             choice = data["choices"][0]
@@ -1028,11 +1045,13 @@ def call_gw_agent(
                             return _finalize_writeable_or_readonly(
                                 messages, forced_content, return_transcript, transcript,
                                 writeable, cwd, concluded=True,
+                                reason_out=reason_out,
                             )
                         # Forced conclusion failed; fall back to exhaustion marker.
                         return _finalize_writeable_or_readonly(
                             messages, content, return_transcript, transcript,
                             writeable, cwd, concluded=False, max_steps_reached=True,
+                            reason_out=reason_out,
                         )
 
                     # Pre-tool cancel check (fail-safe: raising halts the loop)
@@ -1191,6 +1210,7 @@ def call_gw_agent(
                         return _finalize_writeable_or_readonly(
                             messages, "", return_transcript, transcript, writeable, cwd,
                             concluded=False,
+                            reason_out=reason_out, reason="grounding_failed",
                         )
 
                 # §1b: Validate JSON on voluntary stop for json_mode runs.
@@ -1204,6 +1224,7 @@ def call_gw_agent(
                         return _finalize_writeable_or_readonly(
                             messages, _stripped, return_transcript, transcript, writeable, cwd,
                             concluded=True,
+                            reason_out=reason_out,
                         )
                     except (json.JSONDecodeError, ValueError):
                         # Not valid JSON — re-emit under grammar constraint.
@@ -1221,11 +1242,13 @@ def call_gw_agent(
                         return _finalize_writeable_or_readonly(
                             messages, _re_emitted if _re_emitted else content,
                             return_transcript, transcript, writeable, cwd, concluded=True,
+                            reason_out=reason_out, reason="no_choices",
                         )
 
                 # Non-json_mode or writeable: byte-identical to previous behavior.
                 return _finalize_writeable_or_readonly(
-                    messages, content, return_transcript, transcript, writeable, cwd, concluded=True
+                    messages, content, return_transcript, transcript, writeable, cwd, concluded=True,
+                    reason_out=reason_out,
                 )
 
         # Interrupted: cancel_check or before_tool stop halted the loop.
@@ -1236,6 +1259,7 @@ def call_gw_agent(
                 messages, "", return_transcript, transcript, writeable, cwd, concluded=False,
                 interrupted=True, interrupt_reason=_interrupt_reason,
                 interrupted_step=_interrupted_step,
+                reason_out=reason_out,
             )
 
         # Exhausted max_steps without conclusion; try forced conclusion.
@@ -1250,12 +1274,14 @@ def call_gw_agent(
         forced_content = _force_conclusion(messages, backend_url, timeout, json_mode, log, _is_swarm)
         if forced_content:
             return _finalize_writeable_or_readonly(
-                messages, forced_content, return_transcript, transcript, writeable, cwd, concluded=False
+                messages, forced_content, return_transcript, transcript, writeable, cwd, concluded=False,
+                reason_out=reason_out,
             )
         # Forced conclusion failed; fall back to exhaustion marker.
         return _finalize_writeable_or_readonly(
             messages, last_content, return_transcript, transcript,
             writeable, cwd, concluded=False, max_steps_reached=True,
+            reason_out=reason_out,
         )
 
     finally:
@@ -1476,8 +1502,14 @@ def _finalize_writeable_or_readonly(
     interrupted: bool = False,
     interrupt_reason: str = "",
     interrupted_step: int = 0,
+    reason_out: list[str] | None = None,
+    reason: str | None = None,
 ) -> str | None | tuple:
-    """Route to FixerResult or plain result based on writeable flag."""
+    """Route to FixerResult or plain result based on writeable flag.
+
+    reason_out/reason are only consulted on the readonly (writeable=False) leg - a
+    writeable=True call always returns a FixerResult here and never touches reason_out.
+    """
     if writeable:
         fixer = _build_fixer_result(
             cwd, transcript,
@@ -1492,6 +1524,7 @@ def _finalize_writeable_or_readonly(
     return _finalize_result(
         messages, content, return_transcript, transcript, max_steps_reached, budget_forced_suffix,
         interrupted=interrupted, interrupt_reason=interrupt_reason, interrupted_step=interrupted_step,
+        reason_out=reason_out, reason=reason,
     )
 
 
@@ -1505,8 +1538,17 @@ def _finalize_result(
     interrupted: bool = False,
     interrupt_reason: str = "",
     interrupted_step: int = 0,
+    reason_out: list[str] | None = None,
+    reason: str | None = None,
 ) -> str | None | tuple[str | None, list[dict]]:
-    """Finalize the return value with optional max_steps or budget-forced marker."""
+    """Finalize the return value with optional max_steps or budget-forced marker.
+
+    reason_out (when not None) receives one category string if the underlying `content`
+    passed in was empty - gated on that pre-marker content, not on the marker-synthesized
+    `text` computed below, since interrupted/max_steps_reached/budget_forced_suffix all
+    synthesize non-empty marker text even when the underlying result was empty.
+    """
+    content_was_empty = not content
     text = content or ""
     if interrupted:
         marker = f"[gw_agent: interrupted at step {interrupted_step} - reason: {interrupt_reason}]"
@@ -1530,6 +1572,16 @@ def _finalize_result(
             text = text + f"\n\n{budget_forced_suffix}"
     elif budget_forced_suffix:
         text = budget_forced_suffix
+
+    if reason_out is not None and content_was_empty:
+        if interrupted:
+            reason_out.append("interrupted")
+        elif max_steps_reached:
+            reason_out.append("max_steps_exhausted")
+        elif budget_forced_suffix:
+            reason_out.append("budget_exhausted")
+        elif reason:
+            reason_out.append(reason)
 
     if return_transcript:
         return (text if text else None, transcript)
