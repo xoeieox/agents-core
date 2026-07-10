@@ -400,6 +400,35 @@ def test_ac1_unset_mode_no_enqueue(monkeypatch):
     mock_es.assert_not_called()
 
 
+def test_direct_dispatch_acquire_carries_work_id_principal(monkeypatch):
+    """Direct dispatch (off mode) with no explicit principal must still pass an
+    attributable principal=<work_id> to acquire(), not omit it (which would get
+    ghost-stamped server-side)."""
+    monkeypatch.setenv("GW_ADMISSION_MODE", "off")
+    dc, mock_client = _gw_dc(status="serving")
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="ok"):
+        result = call_operator("gravitywell", prompt="test")
+    assert result == "ok"
+    _, acquire_kwargs = mock_client.acquire.call_args
+    assert acquire_kwargs.get("principal") is not None
+    work_id_arg = mock_client.acquire.call_args[0][1]
+    assert acquire_kwargs["principal"] == work_id_arg
+
+
+def test_direct_dispatch_acquire_carries_explicit_principal(monkeypatch):
+    """Direct dispatch (off mode) with an explicit principal must pass that
+    principal through unchanged, not override it with work_id."""
+    monkeypatch.setenv("GW_ADMISSION_MODE", "off")
+    dc, mock_client = _gw_dc(status="serving")
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="ok"):
+        result = call_operator("gravitywell", prompt="test", principal="explicit-caller")
+    assert result == "ok"
+    _, acquire_kwargs = mock_client.acquire.call_args
+    assert acquire_kwargs.get("principal") == "explicit-caller"
+
+
 # ---------------------------------------------------------------------------
 # AC2: enforce — producer enqueues, serves, acks
 # ---------------------------------------------------------------------------

@@ -1154,7 +1154,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         try:
             res = client.acquire(
                 "gravitywell", work_id, ttl_sec=timeout + 60, reason="call_operator",
-                timeout=_gw_acquire_timeout()
+                timeout=_gw_acquire_timeout(), principal=effective_principal
             )
             if DoormanClient.is_deferred(res):
                 if _provenance_out is not None:
