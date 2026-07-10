@@ -18,10 +18,12 @@ Live ClaudeQueue calls are NOT exercised here (mocked throughout).
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import sys
 from datetime import date
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
@@ -322,3 +324,155 @@ def test_front_matter_schema_version_and_caller_present():
         f"caller must be second key; got: {content_lines[1]!r}"
     )
     assert "narrative-emit" in content_lines[1]
+
+
+# ---------------------------------------------------------------------------
+# Atomic spec write / submit / rename (agents-core-narrative-emit-atomic-submit-v0)
+# ---------------------------------------------------------------------------
+
+def _fake_queue_cls(submit_fn):
+    """Build a ClaudeQueue stand-in whose submit() behavior is injected."""
+    class _FakeQueue:
+        def __init__(self, _queue_dir):
+            pass
+
+        def submit(self, task_dict, task_id=None):
+            return submit_fn(task_dict, task_id)
+
+    return _FakeQueue
+
+
+def _short_circuit_poll(monkeypatch):
+    """Make the post-submit poll loop time out on its first check instead of
+    waiting out the real 360s deadline. The deadline calc consumes the first
+    time.monotonic() call; the while-condition check consumes the second."""
+    from agents_core.narrative import engine
+    calls = iter([0, 10**9])
+    monkeypatch.setattr(engine.time, "monotonic", lambda: next(calls))
+
+
+def test_submit_failure_cleans_up_and_reraises(tmp_path, monkeypatch):
+    from agents_core.narrative import engine
+    from agents_core.narrative.engine import emit_draft
+
+    queue_dir = tmp_path / "queue"
+    monkeypatch.setattr(
+        engine, "ClaudeQueue",
+        _fake_queue_cls(lambda task_dict, task_id: (_ for _ in ()).throw(RuntimeError("submit boom"))),
+    )
+
+    with patch("agents_core.narrative.engine._read_vault", side_effect=_vault_read), \
+         patch("agents_core.narrative.engine._load_chub", return_value=_CANNED_CHUB):
+        with pytest.raises(RuntimeError, match="submit boom"):
+            emit_draft("grants", "Some ask.", _queue_dir=queue_dir)
+
+    pending_dir = queue_dir / "pending"
+    assert list(pending_dir.iterdir()) == [], (
+        "no final json and no stray .tmp file should remain after submit() failure"
+    )
+
+
+def test_rename_failure_after_submit_success_cleans_up_and_reraises(tmp_path, monkeypatch):
+    from agents_core.narrative import engine
+    from agents_core.narrative.engine import emit_draft
+
+    queue_dir = tmp_path / "queue"
+    # submit() returns the local task_id it was passed (a normal, non-deduped
+    # submission), but the subsequent os.replace() rename itself raises.
+    monkeypatch.setattr(
+        engine, "ClaudeQueue",
+        _fake_queue_cls(lambda task_dict, task_id: task_id),
+    )
+    monkeypatch.setattr(engine.os, "replace", MagicMock(side_effect=OSError("replace boom")))
+
+    with patch("agents_core.narrative.engine._read_vault", side_effect=_vault_read), \
+         patch("agents_core.narrative.engine._load_chub", return_value=_CANNED_CHUB):
+        with pytest.raises(OSError, match="replace boom"):
+            emit_draft("grants", "Some ask.", _queue_dir=queue_dir)
+
+    pending_dir = queue_dir / "pending"
+    assert list(pending_dir.iterdir()) == [], (
+        "temp file must be cleaned up even when submit() succeeded but the rename failed"
+    )
+
+
+def test_dedup_submit_mismatch_does_not_rename_temp_to_final(tmp_path, monkeypatch):
+    """submit() returning a different (shared) task_id must not create an
+    orphaned final json - the write/submit/rename block must not rename."""
+    from agents_core.narrative import engine
+    from agents_core.narrative.engine import emit_draft
+
+    queue_dir = tmp_path / "queue"
+    monkeypatch.setattr(
+        engine, "ClaudeQueue",
+        _fake_queue_cls(lambda task_dict, task_id: "claude_shared_other_task"),
+    )
+    _short_circuit_poll(monkeypatch)
+
+    with patch("agents_core.narrative.engine._read_vault", side_effect=_vault_read), \
+         patch("agents_core.narrative.engine._load_chub", return_value=_CANNED_CHUB):
+        # Not fixed by this spec: the unmodified poll loop still polls this
+        # caller's own dispatch_cwd, which a dedup join never writes to, so
+        # it still hits the existing 360s (here: short-circuited) TimeoutError.
+        with pytest.raises(TimeoutError):
+            emit_draft("grants", "Some ask.", _queue_dir=queue_dir)
+
+    pending_dir = queue_dir / "pending"
+    assert list(pending_dir.iterdir()) == [], (
+        "a dedup-mismatched submit() return must not leave an orphaned final json"
+    )
+
+
+def test_successful_submit_writes_final_json_matching_spec(tmp_path, monkeypatch):
+    from agents_core.narrative import engine
+    from agents_core.narrative.engine import emit_draft
+
+    queue_dir = tmp_path / "queue"
+    captured = {}
+
+    def _submit_fn(task_dict, task_id):
+        captured["task_id"] = task_id
+        captured["task_dict"] = task_dict
+        return task_id
+
+    monkeypatch.setattr(engine, "ClaudeQueue", _fake_queue_cls(_submit_fn))
+    _short_circuit_poll(monkeypatch)
+
+    with patch("agents_core.narrative.engine._read_vault", side_effect=_vault_read), \
+         patch("agents_core.narrative.engine._load_chub", return_value=_CANNED_CHUB):
+        with pytest.raises(TimeoutError):
+            emit_draft("grants", "Some ask.", _queue_dir=queue_dir)
+
+    pending_dir = queue_dir / "pending"
+    final_jsons = list(pending_dir.glob("*.json"))
+    assert len(final_jsons) == 1
+    assert final_jsons[0].name == f"{captured['task_id']}.json"
+    spec = json.loads(final_jsons[0].read_text())
+    assert spec["task_id"] == captured["task_id"]
+    assert spec["task_type"] == "subprocess"
+    assert spec["model"] == "opus"
+    assert captured["task_dict"]["payload"]["spec_path"] == str(final_jsons[0])
+
+
+def test_submit_failure_logs_full_traceback(tmp_path, monkeypatch, caplog):
+    from agents_core.narrative import engine
+    from agents_core.narrative.engine import emit_draft
+
+    queue_dir = tmp_path / "queue"
+    monkeypatch.setattr(
+        engine, "ClaudeQueue",
+        _fake_queue_cls(lambda task_dict, task_id: (_ for _ in ()).throw(RuntimeError("boom-for-log"))),
+    )
+
+    with patch("agents_core.narrative.engine._read_vault", side_effect=_vault_read), \
+         patch("agents_core.narrative.engine._load_chub", return_value=_CANNED_CHUB):
+        with caplog.at_level(logging.ERROR, logger="agents_core.narrative.engine"):
+            with pytest.raises(RuntimeError, match="boom-for-log"):
+                emit_draft("grants", "Some ask.", _queue_dir=queue_dir)
+
+    assert len(caplog.records) >= 1, "submit() failure must be logged"
+    record = caplog.records[-1]
+    assert record.exc_info is not None, (
+        "log.exception must attach exc_info (full traceback), not just the "
+        "exception's string form"
+    )

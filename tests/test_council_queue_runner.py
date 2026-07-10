@@ -539,6 +539,113 @@ def test_startup_sweep_skips_already_terminal_run(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# startup_sweep: narrative-emit orphan-spec recovery
+# (agents-core-narrative-emit-atomic-submit-v0)
+# ---------------------------------------------------------------------------
+
+def _make_fake_queue_for_pending_sweep(tmp_path):
+    """Fake ClaudeQueue with all five queue subdirs plus pending_dir set."""
+    fake_queue = MagicMock()
+    fake_queue.active_dir = tmp_path / "active"
+    fake_queue.active_dir.mkdir(parents=True, exist_ok=True)
+    fake_queue.queue_dir = tmp_path / "queue"
+    for sub in ("pending", "active", "completed", "failed", "cancelled"):
+        (fake_queue.queue_dir / sub).mkdir(parents=True, exist_ok=True)
+    fake_queue.pending_dir = fake_queue.queue_dir / "pending"
+    return fake_queue
+
+
+def test_startup_sweep_reaps_orphaned_json_to_dead_letter(tmp_path, monkeypatch):
+    import agents_core.claude_queue_runner as runner_mod
+    monkeypatch.setattr(runner_mod, "_COUNCIL_DIR", tmp_path / "council")  # does not exist
+    monkeypatch.setattr(runner_mod, "WORKTREE_ROOT", tmp_path / "worktrees")
+
+    fake_queue = _make_fake_queue_for_pending_sweep(tmp_path)
+    orphan = fake_queue.pending_dir / "narrative_20260709_000000_0000_grants.json"
+    orphan.write_text('{"task_id": "narrative_20260709_000000_0000_grants"}')
+
+    with patch("subprocess.run"):
+        runner_mod.startup_sweep(fake_queue)
+
+    assert not orphan.exists(), "orphaned json must be moved out of pending/"
+    dead_letter = fake_queue.queue_dir / "dead-letter" / orphan.name
+    assert dead_letter.exists(), "orphaned json must land in dead-letter/"
+
+
+@pytest.mark.parametrize("yaml_subdir", ["pending", "active", "completed", "failed", "cancelled"])
+def test_startup_sweep_leaves_json_with_matching_yaml_alone(tmp_path, monkeypatch, yaml_subdir):
+    import agents_core.claude_queue_runner as runner_mod
+    monkeypatch.setattr(runner_mod, "_COUNCIL_DIR", tmp_path / "council")
+    monkeypatch.setattr(runner_mod, "WORKTREE_ROOT", tmp_path / "worktrees")
+
+    fake_queue = _make_fake_queue_for_pending_sweep(tmp_path)
+    task_id = "narrative_20260709_000000_0001_grants"
+    spec_json = fake_queue.pending_dir / f"{task_id}.json"
+    spec_json.write_text(f'{{"task_id": "{task_id}"}}')
+    (fake_queue.queue_dir / yaml_subdir / f"{task_id}.yaml").write_text("id: " + task_id)
+
+    with patch("subprocess.run"):
+        runner_mod.startup_sweep(fake_queue)
+
+    assert spec_json.exists(), f"json with a matching yaml in {yaml_subdir}/ must NOT be reaped"
+    assert not (fake_queue.queue_dir / "dead-letter").exists()
+
+
+def test_startup_sweep_no_nameerror_when_council_dir_missing(tmp_path, monkeypatch):
+    """Regression: queued_ids must be function-scoped, not just inside
+    `if _COUNCIL_DIR.exists():` - else this NameErrors when the dir is absent,
+    aborting startup_sweep entirely."""
+    import agents_core.claude_queue_runner as runner_mod
+    missing_council_dir = tmp_path / "no-such-council-dir"
+    assert not missing_council_dir.exists()
+    monkeypatch.setattr(runner_mod, "_COUNCIL_DIR", missing_council_dir)
+    monkeypatch.setattr(runner_mod, "WORKTREE_ROOT", tmp_path / "worktrees")
+
+    fake_queue = _make_fake_queue_for_pending_sweep(tmp_path)
+    task_id = "narrative_20260709_000000_0002_grants"
+    orphan = fake_queue.pending_dir / f"{task_id}.json"
+    orphan.write_text(f'{{"task_id": "{task_id}"}}')
+
+    with patch("subprocess.run"):
+        runner_mod.startup_sweep(fake_queue)  # must not raise NameError
+
+    assert not orphan.exists()
+    assert (fake_queue.queue_dir / "dead-letter" / orphan.name).exists()
+
+
+def test_startup_sweep_ignores_dotfile_and_tmp_suffixed_files(tmp_path, monkeypatch):
+    import agents_core.claude_queue_runner as runner_mod
+    monkeypatch.setattr(runner_mod, "_COUNCIL_DIR", tmp_path / "council")
+    monkeypatch.setattr(runner_mod, "WORKTREE_ROOT", tmp_path / "worktrees")
+
+    fake_queue = _make_fake_queue_for_pending_sweep(tmp_path)
+    hidden_tmp = fake_queue.pending_dir / ".narrative_20260709_000000_0003_grants.json.tmp"
+    hidden_tmp.write_text('{"task_id": "in-progress-write"}')
+
+    with patch("subprocess.run"):
+        runner_mod.startup_sweep(fake_queue)
+
+    assert hidden_tmp.exists(), "an in-flight atomic-write temp file must never be reaped"
+    assert not (fake_queue.queue_dir / "dead-letter").exists()
+
+
+def test_startup_sweep_continues_when_dead_letter_move_raises(tmp_path, monkeypatch):
+    import agents_core.claude_queue_runner as runner_mod
+    monkeypatch.setattr(runner_mod, "_COUNCIL_DIR", tmp_path / "council")
+    monkeypatch.setattr(runner_mod, "WORKTREE_ROOT", tmp_path / "worktrees")
+
+    fake_queue = _make_fake_queue_for_pending_sweep(tmp_path)
+    orphan = fake_queue.pending_dir / "narrative_20260709_000000_0004_grants.json"
+    orphan.write_text('{"task_id": "narrative_20260709_000000_0004_grants"}')
+
+    with patch("subprocess.run"), \
+         patch("agents_core.claude_queue_runner.shutil.move", side_effect=OSError("move boom")):
+        runner_mod.startup_sweep(fake_queue)  # must not raise/abort the sweep
+
+    assert orphan.exists(), "file must remain in pending/ since the move itself failed"
+
+
+# ---------------------------------------------------------------------------
 # Semaphore ordering and concurrency cap
 # ---------------------------------------------------------------------------
 

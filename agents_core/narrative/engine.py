@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -24,6 +26,8 @@ if _CHUB_SCRIPTS not in sys.path:
 
 from agents_core.claude_queue import CLAUDE_QUEUE_DIR, ClaudeQueue
 from agents_core.narrative.audiences import AUDIENCE_REGISTRY, AudienceProfile
+
+log = logging.getLogger(__name__)
 
 _VAULT_ROOT = Path("/srv/git/inertia-vault-working")
 
@@ -249,24 +253,38 @@ def emit_draft(
         "capture_meta": False,
     }
     spec_path = pending_dir / f"{task_id}.json"
-    spec_path.write_text(json.dumps(spec, ensure_ascii=False))
+    tmp_path = pending_dir / f".{task_id}.json.tmp"
+    tmp_path.write_text(json.dumps(spec, ensure_ascii=False))
 
     dispatched_at = datetime.now(timezone.utc).isoformat()
 
     q = ClaudeQueue(queue_dir)
-    q.submit(
-        {
-            "task_type": "subprocess",
-            "priority": 50,
-            "timeout_seconds": 360,
-            "submitted_by": "narrative-emit",
-            "model": "opus",
-            "description": f"narrative:{audience_slug}",
-            "notify": False,
-            "payload": {"spec_path": str(spec_path)},
-        },
-        task_id=task_id,
-    )
+    try:
+        submitted_id = q.submit(
+            {
+                "task_type": "subprocess",
+                "priority": 50,
+                "timeout_seconds": 360,
+                "submitted_by": "narrative-emit",
+                "model": "opus",
+                "description": f"narrative:{audience_slug}",
+                "notify": False,
+                "payload": {"spec_path": str(spec_path)},
+            },
+            task_id=task_id,
+        )
+        # submit() returning cleanly is not enough: an intention-registry dedup
+        # join returns a different, pre-existing shared task_id instead of
+        # queuing task_id. Only rename into the final visible name when this
+        # submission was the one actually queued - otherwise the .yaml that
+        # would ever reference this final path never gets written.
+        if submitted_id == task_id:
+            os.replace(tmp_path, spec_path)
+    except Exception:
+        log.exception(f"emit_draft: submit/rename failed for task_id={task_id}")
+        raise
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
     # 6. Poll for output.md (≤360s hard deadline, 2s interval)
     output_file = dispatch_cwd / "output.md"
