@@ -296,21 +296,24 @@ def startup_sweep(queue: ClaudeQueue) -> None:
             ["git", "-C", str(clone), "worktree", "prune"],
             check=False, capture_output=True, timeout=30)
 
+    # Hoisted out of the council-orphan block below so both it and the
+    # narrative-emit orphan-spec pass can rely on queued_ids regardless of
+    # whether _COUNCIL_DIR exists on this host.
+    import yaml as _yaml
+    queued_ids: set[str] = set()
+    for subdir_name in ("pending", "active", "completed", "failed"):
+        subdir = queue.queue_dir / subdir_name
+        if subdir.exists():
+            for f in subdir.glob("*.yaml"):
+                queued_ids.add(f.stem)
+    cancelled_dir = queue.queue_dir / "cancelled"
+    if cancelled_dir.exists():
+        for f in cancelled_dir.glob("*.yaml"):
+            queued_ids.add(f.stem)
+
     # Council orphan recovery: mark deliberating runs that have no
     # corresponding queue task and are older than _COUNCIL_ORPHAN_AGE_SECS.
-    import yaml as _yaml
     if _COUNCIL_DIR.exists():
-        queued_ids: set[str] = set()
-        for subdir_name in ("pending", "active", "completed", "failed"):
-            subdir = queue.queue_dir / subdir_name
-            if subdir.exists():
-                for f in subdir.glob("*.yaml"):
-                    queued_ids.add(f.stem)
-        cancelled_dir = queue.queue_dir / "cancelled"
-        if cancelled_dir.exists():
-            for f in cancelled_dir.glob("*.yaml"):
-                queued_ids.add(f.stem)
-
         sweep_now = datetime.now()  # naive — matches council YAML created_at
         for run_yaml in _COUNCIL_DIR.glob("*.yaml"):
             try:
@@ -345,6 +348,24 @@ def startup_sweep(queue: ClaudeQueue) -> None:
                 )
             except Exception as exc:
                 log.warning(f"council orphan recovery: could not write {run_yaml}: {exc}")
+
+    # narrative-emit orphan-spec recovery: a pending/*.json spec with no
+    # matching .yaml anywhere means its submit() (or the atomic rename after
+    # it) never completed - dead-letter it rather than leaving it stuck.
+    for spec_json in sorted(queue.pending_dir.glob("*.json")):
+        name = spec_json.name
+        if name.startswith(".") or name.endswith(".tmp"):
+            continue
+        task_id = spec_json.stem
+        if task_id in queued_ids:
+            continue
+        try:
+            dead_letter_dir = queue.queue_dir / "dead-letter"
+            dead_letter_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(spec_json), str(dead_letter_dir / spec_json.name))
+            log.warning(f"orphaned spec {task_id} has no matching queue entry, moved to dead-letter")
+        except Exception as exc:
+            log.warning(f"failed to reap orphaned spec {task_id}: {exc}")
 
     # Layer 2: reap lapis-fixer-*.scope units left behind by a prior crash.
     _reap_orphan_scopes(queue)
