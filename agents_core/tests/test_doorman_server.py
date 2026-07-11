@@ -60,6 +60,33 @@ def _make_state(gw_url: str = GW_URL_DEFAULT) -> _NodeState:
     return _NodeState(gw_url)
 
 
+class _StopRefreshLoop(Exception):
+    """Sentinel raised from a mocked time.sleep to end _start_refresh_thread's
+    while-True loop after exactly one tick. Without this, the background
+    thread outlives the `with patch(...)` block and keeps looping — once the
+    patches are torn down it calls the REAL subprocess.run/requests.get."""
+
+
+def _run_refresh_thread_one_tick(nodes: dict, timeout: float = 1.0) -> threading.Thread:
+    """Start _start_refresh_thread and join it, asserting it actually exited.
+
+    Callers must include `patch("time.sleep", side_effect=_StopRefreshLoop)`
+    in their patch stack so the loop raises (and the thread dies) right after
+    completing its first tick.
+    """
+    from agents_core.doorman_server import _start_refresh_thread
+
+    prev_hook = threading.excepthook
+    threading.excepthook = lambda args: None
+    try:
+        t = _start_refresh_thread(nodes)
+        t.join(timeout=timeout)
+    finally:
+        threading.excepthook = prev_hook
+    assert not t.is_alive(), "refresh thread leaked past test teardown"
+    return t
+
+
 @pytest.fixture(autouse=True)
 def _default_serve_mode_big(monkeypatch):
     """Pin DOORMAN_DEFAULT_SERVE_MODE=big for this whole legacy suite.
@@ -2602,8 +2629,6 @@ class TestProbeBlindnessFallback:
     """
 
     def test_indeterminate_within_blindness_window_does_not_stop(self):
-        from agents_core.doorman_server import _start_refresh_thread
-
         state = _NodeState(GW_URL_DEFAULT)
         # Past grace but well within grace + blindness.
         state.idle_since = time.time() - 650
@@ -2616,7 +2641,7 @@ class TestProbeBlindnessFallback:
             return MagicMock(returncode=0, stderr="")
 
         with patch("subprocess.run", side_effect=fake_run), \
-             patch("time.sleep"), \
+             patch("time.sleep", side_effect=_StopRefreshLoop), \
              patch.object(state, "_is_serving", return_value=True), \
              patch.object(state, "_is_creative_serving", return_value=False), \
              patch.object(state, "_probe_slot_activity", return_value=None), \
@@ -2625,15 +2650,12 @@ class TestProbeBlindnessFallback:
              patch("agents_core.doorman_server.GW_STOP_GRACE_SEC", 600), \
              patch("agents_core.doorman_server.DOORMAN_PROBE_BLINDNESS_SEC", 900), \
              patch("agents_core.doorman_server._write_idle_log"):
-            t = _start_refresh_thread(nodes)
-            t.join(timeout=1.0)
+            _run_refresh_thread_one_tick(nodes)
 
         assert stop_calls == []
         assert state.service_stopped is False
 
     def test_indeterminate_past_blindness_window_falls_back_to_stop(self):
-        from agents_core.doorman_server import _start_refresh_thread
-
         state = _NodeState(GW_URL_DEFAULT)
         # Past grace AND past grace + blindness.
         state.idle_since = time.time() - 1600
@@ -2646,7 +2668,7 @@ class TestProbeBlindnessFallback:
             return MagicMock(returncode=0, stderr="")
 
         with patch("subprocess.run", side_effect=fake_run), \
-             patch("time.sleep"), \
+             patch("time.sleep", side_effect=_StopRefreshLoop), \
              patch.object(state, "_is_serving", return_value=True), \
              patch.object(state, "_is_creative_serving", return_value=False), \
              patch.object(state, "_probe_slot_activity", return_value=None), \
@@ -2655,8 +2677,7 @@ class TestProbeBlindnessFallback:
              patch("agents_core.doorman_server.GW_STOP_GRACE_SEC", 600), \
              patch("agents_core.doorman_server.DOORMAN_PROBE_BLINDNESS_SEC", 900), \
              patch("agents_core.doorman_server._write_idle_log"):
-            t = _start_refresh_thread(nodes)
-            t.join(timeout=1.0)
+            _run_refresh_thread_one_tick(nodes)
 
         assert len(stop_calls) >= 1
         assert state.service_stopped is True

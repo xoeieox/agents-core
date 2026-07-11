@@ -166,10 +166,15 @@ DOORMAN_PROBE_LLAMA_ACTIVITY = os.environ.get(
 ).lower() not in ("0", "false")
 
 # Prometheus gauge names read from vLLM's /metrics (plaintext exposition format, not
-# JSON) to detect activity on a dual-mode slot. Live-confirmed against this GW's vLLM
-# 0.22.1 install (vllm/v1/metrics/loggers.py, gw-doorman-vllm-activity-probe-v0) —
+# JSON) to detect activity on a dual-mode slot (gw-doorman-vllm-activity-probe-v0).
+# NOT live-curl-confirmed: GW was in big mode (not dual) throughout implementation
+# and at last check, so :8081/:8082 /metrics could not be curled against a running
+# vLLM instance (DoD item 0 remains open). These names are instead confirmed by
+# reading vLLM 0.22.1's source (vllm/v1/metrics/loggers.py) —
 # labelnames = ["model_name", "engine"], e.g.
 # `vllm:num_requests_running{model_name="gravitywell-27b",engine="0"} 0.0`.
+# Re-verify against a live dual-mode /metrics response before treating DoD item 0
+# as satisfied.
 _VLLM_ACTIVITY_METRICS = ("vllm:num_requests_running", "vllm:num_requests_waiting")
 
 # Must match OPERATOR_DEFAULTS['gravitywell'] in agents_core.llm (verified: llm.py:58).
@@ -379,13 +384,28 @@ class _NodeState:
                 if not line or line.startswith("#"):
                     continue
                 for metric in _VLLM_ACTIVITY_METRICS:
-                    if line.startswith(metric + "{") or line.startswith(metric + " "):
-                        try:
-                            total += float(line.rsplit(" ", 1)[-1])
-                        except ValueError:
+                    if line.startswith(metric + "{"):
+                        # Labels present: value (and optional timestamp) start
+                        # right after the closing brace, not at the last space —
+                        # a naive rsplit(" ", 1) would silently take a trailing
+                        # Prometheus timestamp field as the value if one is ever
+                        # emitted.
+                        brace_end = line.find("}")
+                        if brace_end == -1:
                             continue
-                        else:
-                            found = True
+                        value_str = line[brace_end + 1:].strip().split()
+                    elif line.startswith(metric + " "):
+                        value_str = line[len(metric):].strip().split()
+                    else:
+                        continue
+                    if not value_str:
+                        continue
+                    try:
+                        total += float(value_str[0])
+                    except ValueError:
+                        continue
+                    else:
+                        found = True
             if not found:
                 return None
             return total > 0
