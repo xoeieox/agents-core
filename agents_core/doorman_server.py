@@ -45,10 +45,23 @@ Environment variables:
                                   fast path (HOLE 1), controller-lease-aware serving_mode
                                   (HOLE 2), and the three-state /v1/models big-model probe.
                                   Default false (lands dark). Set "true" or "1" to activate.
-  DOORMAN_PROBE_LLAMA_ACTIVITY — probe llama-server's own /slots for unmediated-caller
-                                 activity before dwell-stopping on zero leases
-                                 (default true; set "false"/"0" to disable and restore
-                                 pre-fix lease-only behavior as a rollback lever)
+  DOORMAN_PROBE_LLAMA_ACTIVITY — probe for unmediated-caller activity before
+                                 dwell-stopping on zero leases (default true; set
+                                 "false"/"0" to disable and restore pre-fix
+                                 lease-only behavior as a rollback lever). Probes
+                                 BOTH llama.cpp's /slots (big mode) and vLLM's
+                                 /metrics on both dual-mode slots (gw-doorman-
+                                 vllm-activity-probe-v0), concurrently, per tick.
+                                 Tri-state per probe (True/False/None); an
+                                 indeterminate tick pauses the grace-period clock
+                                 rather than either resetting or advancing it,
+                                 bounded by DOORMAN_PROBE_BLINDNESS_SEC.
+  DOORMAN_PROBE_BLINDNESS_SEC — extra seconds of benefit-of-the-doubt past
+                                 GW_STOP_GRACE_SEC before an indeterminate probe
+                                 (both /slots and /metrics unreachable) falls back
+                                 to confirmed-idle behavior, so a permanently
+                                 broken probe can't pin GW awake forever
+                                 (default 900)
 
 Safety properties (gravitywell-doorman-clean-stop-v0):
   - Doorman crash → GW stays POWERED, not suspended. The host-side guard
@@ -75,6 +88,7 @@ import os
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import requests
@@ -97,6 +111,12 @@ GW_HOLD_REFRESH_SEC = int(os.environ.get("GW_HOLD_REFRESH_SEC", "45"))
 # Machine-economics boundary: amortizes the ~25s cold-load against burst gaps.
 # Calibrate from /var/log/doorman-idle.jsonl observations — never auto-tuned.
 GW_STOP_GRACE_SEC = int(os.environ.get("GW_STOP_GRACE_SEC", "600"))
+
+# Extra benefit-of-the-doubt window past GW_STOP_GRACE_SEC before an indeterminate
+# activity probe (gw-doorman-vllm-activity-probe-v0) falls back to confirmed-idle
+# behavior — bounds the pause so a permanently broken /slots + /metrics probe can't
+# pin GW awake forever (the opposite failure mode from the one this spec fixes).
+DOORMAN_PROBE_BLINDNESS_SEC = int(os.environ.get("DOORMAN_PROBE_BLINDNESS_SEC", "900"))
 
 # Cold-wake serving target (gw-doorman-wake-to-default-mode-v0). "dual" is the default —
 # GW's boot-default resting posture is now dual (Slot 1 27B :8081 + Slot 2 Devstral :8082,
@@ -133,13 +153,24 @@ DOORMAN_MODE_AWARE_ADMISSION = os.environ.get(
     "DOORMAN_MODE_AWARE_ADMISSION", ""
 ).lower() in ("1", "true", "yes")
 
-# Probe llama-server's own /slots for unmediated-caller activity (doorman-probe-llama-activity-v0)
-# so dwell-stop doesn't fire out from under a direct (non-lease) caller like an interactive
-# OpenCode session hitting :8081. Default ON — this is a net-safety fix for a real incident,
-# not a speculative feature. Set "false"/"0" as a rollback lever.
+# Probe for unmediated-caller activity (doorman-probe-llama-activity-v0, extended by
+# gw-doorman-vllm-activity-probe-v0) so dwell-stop doesn't fire out from under a direct
+# (non-lease) caller like an interactive OpenCode session hitting a dual-mode vLLM slot
+# directly. Probes BOTH llama.cpp's /slots (big mode) and vLLM's /metrics on both dual
+# slots, concurrently, each tick — /slots alone silently no-ops against vLLM (vLLM has
+# no /slots endpoint), which was the root cause of dual-mode sessions getting evicted.
+# Default ON — this is a net-safety fix for a real incident, not a speculative feature.
+# Set "false"/"0" as a rollback lever.
 DOORMAN_PROBE_LLAMA_ACTIVITY = os.environ.get(
     "DOORMAN_PROBE_LLAMA_ACTIVITY", "true"
 ).lower() not in ("0", "false")
+
+# Prometheus gauge names read from vLLM's /metrics (plaintext exposition format, not
+# JSON) to detect activity on a dual-mode slot. Live-confirmed against this GW's vLLM
+# 0.22.1 install (vllm/v1/metrics/loggers.py, gw-doorman-vllm-activity-probe-v0) —
+# labelnames = ["model_name", "engine"], e.g.
+# `vllm:num_requests_running{model_name="gravitywell-27b",engine="0"} 0.0`.
+_VLLM_ACTIVITY_METRICS = ("vllm:num_requests_running", "vllm:num_requests_waiting")
 
 # Must match OPERATOR_DEFAULTS['gravitywell'] in agents_core.llm (verified: llm.py:58).
 GW_BIG_MODEL_ID = "gravitywell-122b"
@@ -227,6 +258,11 @@ class _NodeState:
         # llama-server /slots activity probe (doorman-probe-llama-activity-v0)
         self._last_probed_task_by_slot: dict[int, int] = {}
         self._idle_since_source: str | None = None  # 'lease' | 'probe' | None
+        # Tri-state dual-slot activity probe (gw-doorman-vllm-activity-probe-v0):
+        # True when the most recent _probe_slot_activity() tick was indeterminate
+        # (at least one probe ambiguous, none confirmed activity) — read by the
+        # refresh loop to pause the grace-period clock instead of advancing it.
+        self._probe_indeterminate: bool = False
 
     # ------------------------------------------------------------------
     # Health poll (lock-free — read-only HTTP, safe to call outside lock)
@@ -278,8 +314,8 @@ class _NodeState:
             log.debug(f"[{self.node_name}] big-model probe inconclusive: {exc}")
             return None, "inconclusive"
 
-    def _probe_llama_activity(self) -> bool:
-        """Probe llama-server's own /slots for unmediated-caller activity.
+    def _probe_llama_slots_activity(self) -> bool:
+        """Probe A: llama.cpp's own /slots for unmediated-caller activity (big mode).
 
         Detects activity from callers that never acquired a doorman lease (e.g. an
         interactive session hitting :8081 directly) so the dwell-stop clock doesn't
@@ -287,9 +323,11 @@ class _NodeState:
         is_processing is True, or when id_task changed since the last probe (a
         generation completed between ticks).
 
-        Best-effort: any error (timeout, connection refused, non-200, malformed
-        JSON, empty list) returns False — inconclusive for this tick, never raises,
-        never treated as forced-idle.
+        Best-effort, unchanged since doorman-probe-llama-activity-v0: any error
+        (timeout, connection refused, non-200, malformed JSON, empty list) returns
+        False — never raises, never returns None (that's Probe B's contract, not
+        this one — vLLM's dual slots don't implement /slots at all, so absence
+        here is expected in dual mode, not an error).
 
         Must be called OUTSIDE self.lock (blocking HTTP, ~2.5s timeout).
         """
@@ -316,6 +354,71 @@ class _NodeState:
             log.debug(f"[{self.node_name}] llama activity probe inconclusive: {exc}")
             return False
 
+    def _probe_vllm_metrics_activity(self, url: str) -> bool | None:
+        """Probe B: GET {url}/metrics (vLLM's Prometheus plaintext exposition format,
+        NOT JSON) and scan for the dual-slot activity gauges.
+
+        Returns:
+          True  — a gauge was found and parsed with a nonzero value (confirmed activity)
+          False — all target gauges were found and parsed, all zero (confirmed idle)
+          None  — the call failed (timeout/connection-refused/non-200) or the body
+                  didn't contain either target gauge (malformed, or this port isn't
+                  serving vLLM at all — e.g. big mode, or the other slot is down) —
+                  indeterminate, never treated as confirmed-idle by the caller.
+
+        Never raises. Must be called OUTSIDE self.lock (blocking HTTP, ~2.5s timeout).
+        """
+        try:
+            resp = requests.get(f"{url}/metrics", timeout=2.5)
+            if resp.status_code != 200:
+                return None
+            total = 0.0
+            found = False
+            for line in resp.text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                for metric in _VLLM_ACTIVITY_METRICS:
+                    if line.startswith(metric + "{") or line.startswith(metric + " "):
+                        try:
+                            total += float(line.rsplit(" ", 1)[-1])
+                        except ValueError:
+                            continue
+                        else:
+                            found = True
+            if not found:
+                return None
+            return total > 0
+        except Exception as exc:
+            log.debug(f"[{self.node_name}] vllm metrics probe ({url}) inconclusive: {exc}")
+            return None
+
+    def _probe_slot_activity(self) -> bool | None:
+        """Tri-state unmediated-caller activity probe across both signal sources
+        (gw-doorman-vllm-activity-probe-v0) — Probe A (llama.cpp /slots, big mode)
+        and Probe B (vLLM /metrics, both dual slots), dispatched concurrently so
+        total probe-tick latency stays ~2.5s rather than growing additively with
+        each new endpoint.
+
+        Combines: True if any source confirms activity (a real True always wins,
+        regardless of other sources' uncertainty); False only if every source
+        confirms no activity; None (indeterminate) otherwise — e.g. a transient
+        /metrics blip that must not be conflated with confirmed idleness.
+
+        Must be called OUTSIDE self.lock (blocking HTTP via a thread pool).
+        """
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            fut_a = pool.submit(self._probe_llama_slots_activity)
+            fut_b1 = pool.submit(self._probe_vllm_metrics_activity, self.gw_url)
+            fut_b2 = pool.submit(self._probe_vllm_metrics_activity, self._slot2_url())
+            results = [fut_a.result(), fut_b1.result(), fut_b2.result()]
+
+        if any(r is True for r in results):
+            return True
+        if all(r is False for r in results):
+            return False
+        return None
+
     def _refresh_serving_cache(self) -> None:
         """Refresh the serving cache by probing _is_serving outside the lock.
 
@@ -330,8 +433,9 @@ class _NodeState:
         When DOORMAN_MODE_AWARE_ADMISSION is True, also probes /v1/models for
         the three-state serving_is_big predicate (outside the lock, AC11).
 
-        When DOORMAN_PROBE_LLAMA_ACTIVITY is True, also probes /slots for
-        unmediated-caller activity (outside the lock) — see _probe_llama_activity.
+        When DOORMAN_PROBE_LLAMA_ACTIVITY is True, also probes both llama.cpp's
+        /slots and vLLM's /metrics (both dual slots) for unmediated-caller activity
+        (outside the lock) — see _probe_slot_activity.
         """
         serving = self._is_serving(timeout=2.0)
         creative_serving = self._is_creative_serving()
@@ -341,10 +445,12 @@ class _NodeState:
         if DOORMAN_MODE_AWARE_ADMISSION:
             _, big_probe_state = self._probe_big_model()
 
-        # Optional llama-activity probe — outside the lock (blocking HTTP)
-        probe_activity = False
+        # Optional dual-slot activity probe — outside the lock (blocking HTTP).
+        # Tri-state: True (confirmed activity), False (confirmed idle), None
+        # (indeterminate — at least one probe source was ambiguous this tick).
+        probe_activity: bool | None = None
         if DOORMAN_PROBE_LLAMA_ACTIVITY:
-            probe_activity = self._probe_llama_activity()
+            probe_activity = self._probe_slot_activity()
 
         with self.lock:
             self._cached_serving = serving
@@ -366,12 +472,16 @@ class _NodeState:
                         f"(serving_is_big={self._serving_is_big}); probe_inconclusive"
                     )
 
-            # Probe-driven idle keepalive (doorman-probe-llama-activity-v0): an unmediated
-            # caller (e.g. OpenCode hitting :8081 directly) never acquires a lease, so
-            # detected llama-server activity re-arms the dwell-stop clock the same way an
-            # arriving lease resets idle_since in acquire_lease(). No-op while leases exist
-            # — lease-driven bookkeeping already covers that case.
-            if DOORMAN_PROBE_LLAMA_ACTIVITY and probe_activity and not self.leases:
+            # Probe-driven idle keepalive (doorman-probe-llama-activity-v0, extended by
+            # gw-doorman-vllm-activity-probe-v0): an unmediated caller (e.g. OpenCode
+            # hitting a dual-mode vLLM slot directly) never acquires a lease, so
+            # detected activity on either signal source re-arms the dwell-stop clock the
+            # same way an arriving lease resets idle_since in acquire_lease(). No-op
+            # while leases exist — lease-driven bookkeeping already covers that case.
+            self._probe_indeterminate = (
+                DOORMAN_PROBE_LLAMA_ACTIVITY and probe_activity is None
+            )
+            if DOORMAN_PROBE_LLAMA_ACTIVITY and probe_activity is True and not self.leases:
                 was_idle_unset = self.idle_since is None
                 self.idle_since = time.time()
                 self._idle_since_source = "probe"
@@ -883,6 +993,19 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                             and not state.service_stopped
                         ):
                             idle_elapsed = time.time() - state.idle_since
+                            blindness_deadline = (
+                                GW_STOP_GRACE_SEC + DOORMAN_PROBE_BLINDNESS_SEC
+                            )
+                            if state._probe_indeterminate and idle_elapsed < blindness_deadline:
+                                # Probe genuinely ambiguous this tick (gw-doorman-vllm-
+                                # activity-probe-v0) — pause the grace clock rather than
+                                # advance it, same as if leases were held. Bounded below.
+                                continue
+                            if state._probe_indeterminate:
+                                log.warning(
+                                    f"[{node_name}] probe blind for {idle_elapsed:.0f}s — "
+                                    f"proceeding on stale grace period"
+                                )
                             if idle_elapsed >= GW_STOP_GRACE_SEC:
                                 log.warning(
                                     f"[{node_name}] idle {idle_elapsed:.0f}s >= grace "
