@@ -1,0 +1,108 @@
+{
+  "_meta": {
+    "description": "Geist fixed-answer stage fixture for corpus_reader.read_batch_corpus over the RoomRAG podcast corpus.",
+    "authored": "2026-07-13",
+    "categories": ["answerable", "absent-trap", "difficult-present"],
+    "grounding": "Each answerable/difficult-present item was confirmed to retrieve live against RoomRAG :8201 (POST /search) on 2026-07-13; absent-trap items reference shows confirmed absent from the corpus's 11 observed folders (80k-hours, accelerating-ai-ethics, ai-daily-brief, dwarkesh, fli-podcast, hard-fork, in-machines-we-trust, latent-space, mlst, most-interesting-thing-ai, no-priors)."
+  },
+  "questions": [
+    {
+      "question": "According to the Dwarkesh Podcast episode with Jensen Huang on selling chips to China, is NVIDIA's market share in China growing or decreasing?",
+      "target_show": "dwarkesh",
+      "expected_answer_substrings": ["growing, not decreasing", "growing not decreasing", "share is growing"],
+      "answer_present": true,
+      "category": "answerable"
+    },
+    {
+      "question": "What was Cerebras's IPO valuation, according to the No Priors episode with founder and CEO Andrew Feldman?",
+      "target_show": "no-priors",
+      "expected_answer_substrings": ["$63 billion", "63 billion"],
+      "answer_present": true,
+      "category": "answerable"
+    },
+    {
+      "question": "Which two podcasts joined together for the crossover special episode featuring Satya Nadella recorded at Microsoft Build?",
+      "target_show": "latent-space",
+      "expected_answer_substrings": ["No Priors x Latent Space", "No Priors and Latent Space", "No Priors", "Latent Space"],
+      "answer_present": true,
+      "category": "answerable"
+    },
+    {
+      "question": "In the MLST episode \"The AI Models Smart Enough to Know They're Cheating,\" what organization are guests Beth Barnes and David Rein affiliated with?",
+      "target_show": "mlst",
+      "expected_answer_substrings": ["METR"],
+      "answer_present": true,
+      "category": "answerable"
+    },
+    {
+      "question": "In the 80,000 Hours episode with Yoshua Bengio, what principle does he say we should apply when we don't know the probability of a catastrophic AI outcome?",
+      "target_show": "80k-hours",
+      "expected_answer_substrings": ["precautionary principle"],
+      "answer_present": true,
+      "category": "answerable"
+    },
+    {
+      "question": "According to Reiner Pope's Dwarkesh episode on chip design from the bottom up, what does TSMC provide chip designers that specifies the primitives of logic available on a process node?",
+      "target_show": "dwarkesh",
+      "expected_answer_substrings": ["PDK", "Process Design Kit"],
+      "answer_present": true,
+      "category": "answerable"
+    },
+    {
+      "question": "According to the AI Daily Brief episode on the new OpenAI-Microsoft agreement (\"AI Lab Power Rankings\"), what equity stake percentage does Microsoft retain in OpenAI?",
+      "target_show": "ai-daily-brief",
+      "expected_answer_substrings": ["27%", "27 percent"],
+      "answer_present": true,
+      "category": "answerable"
+    },
+    {
+      "question": "According to the In Machines We Trust episode \"Grok's Training: Musk's Profound Disclosure,\" what did Anthropic just launch in public beta?",
+      "target_show": "in-machines-we-trust",
+      "expected_answer_substrings": ["security in public beta", "cloud security", "Claude security"],
+      "answer_present": true,
+      "category": "answerable"
+    },
+    {
+      "question": "According to a Lex Fridman Podcast episode in this corpus, what does the guest say is their favorite programming language?",
+      "target_show": "lex-fridman",
+      "expected_answer_substrings": [],
+      "answer_present": false,
+      "category": "absent-trap"
+    },
+    {
+      "question": "According to a Joe Rogan Experience episode in this corpus, what does the guest say about UFO disclosure?",
+      "target_show": "joe-rogan-experience",
+      "expected_answer_substrings": [],
+      "answer_present": false,
+      "category": "absent-trap"
+    },
+    {
+      "question": "According to an episode of the Acquired podcast in this corpus, what multiple did Nvidia's stock trade at during its 2026 acquisition of Arm?",
+      "target_show": "acquired",
+      "expected_answer_substrings": [],
+      "answer_present": false,
+      "category": "absent-trap"
+    },
+    {
+      "question": "In the MLST episode featuring METR's Beth Barnes and David Rein, what effect do \"this is really important, please solve it the right way\" remediation prompts have on a model's tendency to reward-hack?",
+      "target_show": "mlst",
+      "expected_answer_substrings": ["more likely", "increase", "make it more likely"],
+      "answer_present": true,
+      "category": "difficult-present"
+    },
+    {
+      "question": "In the 80,000 Hours episode, what does Yoshua Bengio say was the main reason he used to dismiss AI loss-of-control risk as \"ridiculous\" back in 2019?",
+      "target_show": "80k-hours",
+      "expected_answer_substrings": ["hiding behind", "so far into the future", "far into the future"],
+      "answer_present": true,
+      "category": "difficult-present"
+    },
+    {
+      "question": "In the No Priors episode with Jensen Huang, what does he say about the true motivations of AI executives who publicly warn governments about catastrophic AI risk?",
+      "target_show": "no-priors",
+      "expected_answer_substrings": ["advocating for themselves", "not completely", "best interest of society"],
+      "answer_present": true,
+      "category": "difficult-present"
+    }
+  ]
+}
