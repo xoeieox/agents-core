@@ -9,6 +9,7 @@ Backends:
 All conductor/agent scripts should import from here.
 """
 
+import inspect
 import json
 import logging
 import os
@@ -754,6 +755,24 @@ def _apply_wake_fail(
     return None
 
 
+def _forward_supported_kwargs(func, kwargs: dict) -> dict:
+    """Signature-normalize kwargs at the dispatcher boundary before forwarding to `func`.
+
+    call_operator() accepts a superset of kwargs across operator classes (on_wake_fail,
+    think, _provenance_out, ...); not every backend function accepts all of them. Filtering
+    here, once, at the dispatcher means a backend simply not accepting some kwarg can never
+    surface as a TypeError again — the backend's own signature stays the source of truth,
+    with no per-backend kwarg-swallowing shim to keep in sync.
+
+    A func whose signature includes **kwargs (e.g. a test spy/mock wrapping the real
+    backend) declares it accepts anything, so nothing is filtered in that case.
+    """
+    params = inspect.signature(func).parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
 def call_operator(operator_class: str, prompt: str, model: str = None,
                   _provenance_out: list | None = None,
                   principal: str | None = None,
@@ -816,7 +835,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                 "not a per-call parameter. Either pass model=None to use the "
                 "default, or do the model swap out-of-band first."
             )
-        return _call_qwen_backend(prompt=prompt, **kwargs)
+        return _call_qwen_backend(prompt=prompt, **_forward_supported_kwargs(_call_qwen_backend, kwargs))
 
     if operator_class == "quest":
         if model is not None and model != OPERATOR_DEFAULTS["quest"]:
