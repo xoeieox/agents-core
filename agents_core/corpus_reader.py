@@ -26,15 +26,11 @@ from agents_core.retrieval import retrieve, Hit
 _log = logging.getLogger(__name__)
 
 ROOM_RAG_URL = os.environ.get("ROOM_RAG_URL", "http://203.0.113.10:8201")
-_PODCAST_PREFIX = "library/podcasts/"
+_DOC_TYPE_PODCAST = "podcast-transcript"
+_MIN_CANDIDATE_POOL = 30
+_DEFAULT_RAG_TIMEOUT_SEC = 10.0
 HEALTH_TIMEOUT_SEC = 2.0
 DEEP_READ_MAX_CONTEXT_CHARS = 4000
-
-
-def _podcast_prefix(show_filter: str | None) -> str:
-    if not show_filter:
-        return _PODCAST_PREFIX
-    return f"{_PODCAST_PREFIX}{show_filter}/"
 
 
 def _hit_label(h: Hit) -> str:
@@ -117,28 +113,33 @@ def _retrieve_corpus(
     show_filter: str | None,
     retrieve_k: int,
     min_score: float,
+    rag_timeout_sec: float,
 ) -> list[Hit]:
-    """Merge + dedupe Hits across queries, scoped to the podcast corpus.
+    """Merge + dedupe Hits across queries, scoped server-side to the podcast corpus.
 
-    filters={"path_prefix": ...} is passed through per the documented retrieve() contract,
-    but a client-side prefix check is also applied since the live RoomRAG :8201 /search
-    endpoint (confirmed via its /openapi.json SearchRequest schema, 2026-07-13) has no
-    path_prefix field and silently ignores it — without the local filter, non-podcast
-    corpus content would leak into the merged hit set.
+    Server-side scoping is filters={"doc_type": "podcast-transcript"} — the live RoomRAG
+    :8201 /search endpoint honors doc_type (confirmed 2026-07-13); path_prefix has no
+    field on that schema and is a silent no-op. A generous candidate pool (>= 30, the
+    empirically-validated floor) is requested so per-show client-side filtering below has
+    enough to work with; the floor overrides a smaller caller-supplied retrieve_k.
+
+    Per-show scoping is client-side on the folder metadata field (folder == bare show
+    slug) since RoomRAG's folder filter 500s live. A Hit missing the folder key is treated
+    as a NON-match and dropped — never a silent pass-through.
     """
-    prefix = _podcast_prefix(show_filter)
+    effective_k = max(retrieve_k, _MIN_CANDIDATE_POOL)
     merged: dict[str, Hit] = {}
     for query in queries:
         hits = retrieve(
             query,
             scope=["room-rag"],
-            filters={"path_prefix": prefix},
-            top_k=retrieve_k,
+            filters={"doc_type": _DOC_TYPE_PODCAST},
+            top_k=effective_k,
             min_score=min_score,
+            timeout=rag_timeout_sec,
         )
         for h in hits:
-            file_path = str((h.metadata or {}).get("file_path", ""))
-            if not file_path.startswith(prefix):
+            if show_filter and (h.metadata or {}).get("folder") != show_filter:
                 continue
             if h.id not in merged:
                 merged[h.id] = h
@@ -322,12 +323,16 @@ def read_batch_corpus(
 ) -> dict:
     """Run the corpus read funnel for each request.
 
-    Each request: {intent, context?, sub_intents?, prior_diagnosis?}
+    Each request: {intent, show?, context?, sub_intents?, prior_diagnosis?}
+    A per-request `show` scopes that request's retrieval to a single show (client-side,
+    folder-metadata match); when a request omits `show`, the batch-level `show_filter`
+    is used as the default.
     Returns: {drafts: [{intent, findings, citations, outcome, provenance}]}
     """
     retrieve_k = int((budget or {}).get("retrieve_k", 8))
     deep_read_k = int((budget or {}).get("deep_read_k", 5))
     min_score = float((budget or {}).get("min_score", 0.0))
+    rag_timeout_sec = float((budget or {}).get("rag_timeout_sec", _DEFAULT_RAG_TIMEOUT_SEC))
     wall_clock_sec = int((budget or {}).get("wall_clock_sec", 300))
     deadline = time.monotonic() + wall_clock_sec
 
@@ -339,6 +344,7 @@ def read_batch_corpus(
             continue
 
         intent = req["intent"]
+        show = req.get("show", show_filter)
         context = req.get("context")
         sub_intents = req.get("sub_intents")
         prior_diagnosis = req.get("prior_diagnosis")
@@ -354,7 +360,7 @@ def read_batch_corpus(
             rewrote = False
 
         # Stage 2: retrieve
-        hits = _retrieve_corpus(queries, show_filter, retrieve_k, min_score)
+        hits = _retrieve_corpus(queries, show, retrieve_k, min_score, rag_timeout_sec)
 
         notes: list[str] = []
         probe_alive = True
