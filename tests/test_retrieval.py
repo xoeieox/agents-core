@@ -155,6 +155,75 @@ def test_filters_tags_flow_to_mem_ignored_by_chub(caplog):
 
 
 # ---------------------------------------------------------------------------
+# *-rag payload adapter: real pagination field (n_results, not limit) + doc_type forwarding
+# ---------------------------------------------------------------------------
+
+def test_search_rag_sends_n_results_not_limit():
+    """RoomRAG's SearchRequest schema field is n_results; the old 'limit' key was a no-op."""
+    import json as _json
+    from unittest.mock import MagicMock
+
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["payload"] = json
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"results": []}
+        return resp
+
+    with patch("httpx.post", side_effect=fake_post):
+        retrieve("q", scope=["room-rag"], top_k=25)
+
+    assert "limit" not in captured["payload"]
+    assert captured["payload"]["n_results"] == 25
+
+
+def test_search_rag_forwards_doc_type_and_not_warned_as_unknown(caplog):
+    import logging
+    from unittest.mock import MagicMock
+
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["payload"] = json
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"results": [{"file_path": "a", "score": 1.0, "doc_type": "podcast-transcript"}]}
+        return resp
+
+    with patch("httpx.post", side_effect=fake_post):
+        with caplog.at_level(logging.DEBUG, logger="agents_core.retrieval"):
+            result = retrieve(
+                "q", scope=["room-rag"], filters={"doc_type": "podcast-transcript"}, top_k=10
+            )
+
+    assert captured["payload"]["doc_type"] == "podcast-transcript"
+    assert result and result[0].source == "room-rag"
+    assert not any("doc_type" in r.message for r in caplog.records if "ignoring unrecognised" in r.message)
+
+
+def test_search_rag_canary_warns_when_doc_type_appears_ignored(caplog):
+    """If the response contains a doc_type other than the one requested, warn loudly."""
+    import logging
+    from unittest.mock import MagicMock
+
+    def fake_post(url, json=None, timeout=None):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {
+            "results": [{"file_path": "a", "score": 1.0, "doc_type": "vault-note"}]
+        }
+        return resp
+
+    with patch("httpx.post", side_effect=fake_post):
+        with caplog.at_level(logging.WARNING, logger="agents_core.retrieval"):
+            retrieve("q", scope=["room-rag"], filters={"doc_type": "podcast-transcript"})
+
+    assert any("IGNORING doc_type" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
 # HTTP backend fail-soft: timeout → [] for that backend; others still contribute
 # ---------------------------------------------------------------------------
 

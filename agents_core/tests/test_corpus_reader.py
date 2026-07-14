@@ -109,15 +109,17 @@ class TestNoWebCredibilityPrior:
 
 
 # ---------------------------------------------------------------------------
-# Stage 2 scoping: show_filter restricts to one show
+# Stage 2 scoping: server-side doc_type + client-side folder filter
 # ---------------------------------------------------------------------------
 
 class TestShowFilterScoping:
-    def test_show_filter_passed_as_path_prefix(self):
+    def test_doc_type_always_applied_server_side(self):
         captured = {}
 
-        def fake_retrieve(query, scope, filters, top_k, min_score):
+        def fake_retrieve(query, scope, filters, top_k, min_score, timeout=None):
             captured["filters"] = filters
+            captured["top_k"] = top_k
+            captured["timeout"] = timeout
             return [_hit(1, show="creative-codex")]
 
         fake_read_op = _fake_read_op_factory()
@@ -129,7 +131,44 @@ class TestShowFilterScoping:
                 [{"intent": "x"}], read_operator="quest", show_filter="creative-codex"
             )
 
-        assert captured["filters"] == {"path_prefix": "library/podcasts/creative-codex/"}
+        assert captured["filters"] == {"doc_type": "podcast-transcript"}
+
+    def test_effective_fetch_floor_is_at_least_30(self):
+        """A small caller-supplied retrieve_k must not shrink the candidate pool below 30."""
+        captured = {}
+
+        def fake_retrieve(query, scope, filters, top_k, min_score, timeout=None):
+            captured["top_k"] = top_k
+            return []
+
+        fake_read_op = _fake_read_op_factory()
+
+        with patch("agents_core.corpus_reader._call_read_operator", side_effect=fake_read_op), \
+             patch("agents_core.corpus_reader.retrieve", side_effect=fake_retrieve), \
+             patch("agents_core.corpus_reader._room_rag_alive", return_value=True):
+            from agents_core.corpus_reader import read_batch_corpus
+            read_batch_corpus(
+                [{"intent": "x"}], read_operator="quest", budget={"retrieve_k": 8}
+            )
+
+        assert captured["top_k"] >= 30
+
+    def test_generous_timeout_passed_to_retrieve(self):
+        captured = {}
+
+        def fake_retrieve(query, scope, filters, top_k, min_score, timeout=None):
+            captured["timeout"] = timeout
+            return []
+
+        fake_read_op = _fake_read_op_factory()
+
+        with patch("agents_core.corpus_reader._call_read_operator", side_effect=fake_read_op), \
+             patch("agents_core.corpus_reader.retrieve", side_effect=fake_retrieve), \
+             patch("agents_core.corpus_reader._room_rag_alive", return_value=True):
+            from agents_core.corpus_reader import read_batch_corpus
+            read_batch_corpus([{"intent": "x"}], read_operator="quest")
+
+        assert captured["timeout"] >= 8
 
     def test_client_side_filter_drops_other_shows(self):
         """Even if retrieve() returns a hit outside the requested show, it must not surface."""
@@ -148,6 +187,50 @@ class TestShowFilterScoping:
         draft = result["drafts"][0]
         assert draft["provenance"]["hits_count"] == 1
         assert all(c["show"] != "dwarkesh" for c in draft["citations"])
+
+    def test_hit_missing_folder_key_is_dropped_not_passed_through(self):
+        """A Hit with no folder metadata must never survive a show scope — defensive default."""
+        no_folder_hit = Hit(
+            id="room-rag:library/podcasts/mystery/ep9.md",
+            score=0.9,
+            source="room-rag",
+            content="[01:00] some content",
+            metadata={"title": "Mystery Episode"},  # no "folder" key
+        )
+        fake_read_op = _fake_read_op_factory()
+
+        with patch("agents_core.corpus_reader._call_read_operator", side_effect=fake_read_op), \
+             patch("agents_core.corpus_reader.retrieve", return_value=[no_folder_hit]), \
+             patch("agents_core.corpus_reader._room_rag_alive", return_value=True):
+            from agents_core.corpus_reader import read_batch_corpus
+            result = read_batch_corpus(
+                [{"intent": "x"}], read_operator="quest", show_filter="dwarkesh"
+            )
+
+        assert result["drafts"][0]["provenance"]["hits_count"] == 0
+
+    def test_per_request_show_overrides_batch_show_filter(self):
+        captured_folders = []
+
+        def fake_retrieve(query, scope, filters, top_k, min_score, timeout=None):
+            return [_hit(1, show="no-priors"), _hit(2, show="dwarkesh")]
+
+        fake_read_op = _fake_read_op_factory(citations=[
+            {"chunk_index": 1, "excerpt": "quote a"},
+        ])
+
+        with patch("agents_core.corpus_reader._call_read_operator", side_effect=fake_read_op), \
+             patch("agents_core.corpus_reader.retrieve", side_effect=fake_retrieve):
+            from agents_core.corpus_reader import read_batch_corpus
+            result = read_batch_corpus(
+                [{"intent": "x", "show": "no-priors"}],
+                read_operator="quest",
+                show_filter="dwarkesh",
+            )
+
+        draft = result["drafts"][0]
+        assert draft["provenance"]["hits_count"] == 1
+        assert all(c["show"] == "no-priors" for c in draft["citations"])
 
 
 # ---------------------------------------------------------------------------

@@ -7,9 +7,9 @@ Scope tokens and backend endpoints
 ===================================
   mem        — agents_core.mem.MemoryStore.search (SQLite FTS5, local DB)
   chub       — ``chub search <query> --json`` CLI (BM25-ish; honors filter key: ``type``)
-  vault-rag  — POST http://<RAG_HOST>:8200/search (cosine sim; honors filter key: ``path_prefix``)
-  room-rag   — POST http://<RAG_HOST>:8201/search (cosine sim; honors filter key: ``path_prefix``)
-  code-rag   — POST http://<RAG_HOST>:8100/search (cosine sim; honors filter key: ``path_prefix``)
+  vault-rag  — POST http://<RAG_HOST>:8200/search (cosine sim; honors filter key: ``doc_type``)
+  room-rag   — POST http://<RAG_HOST>:8201/search (cosine sim; honors filter key: ``doc_type``)
+  code-rag   — POST http://<RAG_HOST>:8100/search (cosine sim; honors filter key: ``doc_type``)
 
 Default RAG_HOST is 203.0.113.10. Override via env:
   RAG_HOST        — shared host for all three RAG backends
@@ -26,10 +26,20 @@ rest. Recognised keys per backend:
 
   mem      → ``tags``        (list[str]) — AND-intersected against stored tag CSV
   chub     → ``type``        (str)       — filters results by ``_type`` (e.g. "doc", "skill")
-  *-rag    → ``path_prefix`` (str)       — passed as ``path_prefix`` in the POST body
+  *-rag    → ``doc_type``    (str)       — passed via a per-backend payload adapter (see
+                                            _RAG_PAYLOAD_ADAPTER); ``path_prefix`` is also
+                                            still forwarded but is a confirmed no-op on the
+                                            live room-rag server (kept only for backends that
+                                            may honor it — do not rely on it for room-rag).
 
 Unrecognised filter keys are silently dropped per backend but logged at DEBUG level
 so callers can catch typos.
+
+Pagination — ``top_k`` is forwarded to *-rag backends as their real pagination field via
+the same per-backend adapter (room-rag confirmed live: ``n_results``, not ``limit``). If a
+backend appears to have silently ignored ``doc_type`` or under-filled a request despite more
+results being available, ``_search_rag`` logs a loud WARNING (fail-open canary) rather than
+degrading invisibly — see ``_search_rag``.
 
 Score normalisation
 ===================
@@ -144,7 +154,7 @@ def retrieve(
             elif src == "chub":
                 return _search_chub(query, filters)
             else:
-                return _search_rag(src, query, filters, timeout=timeout)
+                return _search_rag(src, query, filters, top_k=top_k, timeout=timeout)
         except Exception as exc:
             log.warning("retrieval: %s raised unexpectedly: %s", src, exc)
             return []
@@ -286,13 +296,38 @@ def _search_chub(query: str, filters: dict) -> list[Hit]:
 # Backend: *-rag (vault-rag / room-rag / code-rag)
 # ---------------------------------------------------------------------------
 
-def _search_rag(source: str, query: str, filters: dict, timeout: float | None = None) -> list[Hit]:
-    _warn_unknown_keys(source, filters, {"path_prefix"})
+# Backend-agnostic payload adapter: maps retrieve()'s logical keys (top_k, doc_type) to
+# each *-rag backend's actual SearchRequest field name. Isolates backend-specific field
+# naming so a fix for one backend cannot silently regress another.
+#
+# room-rag confirmed live via its /openapi.json SearchRequest schema (2026-07-13): the
+# pagination field is ``n_results`` (default 8), NOT ``limit`` — the old hardcoded
+# ``{"limit": 50}`` payload was silently ignored, capping every query at 8 global
+# candidates regardless of caller top_k. ``doc_type`` is honored as-is.
+# vault-rag/code-rag are assumed to share the same SearchRequest schema (same FastAPI
+# template) pending independent live confirmation — the fail-open canary below surfaces
+# a loud warning if that assumption is ever wrong for either.
+_RAG_PAYLOAD_ADAPTER: dict[str, dict[str, str]] = {
+    "room-rag":  {"top_k": "n_results", "doc_type": "doc_type"},
+    "vault-rag": {"top_k": "n_results", "doc_type": "doc_type"},
+    "code-rag":  {"top_k": "n_results", "doc_type": "doc_type"},
+}
+_DEFAULT_RAG_ADAPTER = {"top_k": "n_results", "doc_type": "doc_type"}
 
+
+def _search_rag(
+    source: str, query: str, filters: dict, top_k: int = 10, timeout: float | None = None
+) -> list[Hit]:
+    _warn_unknown_keys(source, filters, {"path_prefix", "doc_type"})
+
+    adapter = _RAG_PAYLOAD_ADAPTER.get(source, _DEFAULT_RAG_ADAPTER)
     base_url = _RAG_BASE_URLS[source]
-    payload: dict = {"query": query, "limit": 50}
+    payload: dict = {"query": query, adapter["top_k"]: top_k}
     if "path_prefix" in filters:
         payload["path_prefix"] = filters["path_prefix"]
+    requested_doc_type = filters.get("doc_type")
+    if requested_doc_type:
+        payload[adapter["doc_type"]] = requested_doc_type
 
     effective_timeout = timeout if timeout is not None else RAG_HTTP_TIMEOUT
     timeout = httpx.Timeout(effective_timeout, connect=min(0.5, effective_timeout))
@@ -305,6 +340,27 @@ def _search_rag(source: str, query: str, filters: dict, timeout: float | None = 
         return []
 
     results: list[dict] = data.get("results", [])
+
+    # Fail-open canary: never crash on this, but if a requested scoping/pagination field
+    # was silently ignored by the backend, log loudly instead of degrading invisibly —
+    # this is exactly the bug class (limit/path_prefix silently dropped) this fix addresses.
+    if requested_doc_type:
+        seen_doc_types = {r.get("doc_type") for r in results if r.get("doc_type")}
+        if seen_doc_types - {requested_doc_type}:
+            log.warning(
+                "retrieval: %s may be IGNORING doc_type=%r — response contains other "
+                "doc_type(s) %s; verify the backend's SearchRequest schema still honors "
+                "this field",
+                source, requested_doc_type, sorted(seen_doc_types),
+            )
+    total_results = data.get("total_results")
+    if total_results is not None and len(results) < min(top_k, total_results):
+        log.warning(
+            "retrieval: %s returned %d result(s) but requested top_k=%d with %d available "
+            "(total_results) — the pagination field %r may have been silently ignored",
+            source, len(results), top_k, total_results, adapter["top_k"],
+        )
+
     if not results:
         return []
 
