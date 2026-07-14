@@ -8,6 +8,7 @@ from agents_core.llm import (
     OPERATOR_DEFAULTS,
     OperatorUnreachableError,
     CreativeOperatorUnavailable,
+    _forward_supported_kwargs,
 )
 
 
@@ -39,6 +40,49 @@ def test_call_operator_qwen_non_default_model_raises():
     assert "infrastructure operation" in str(exc_info.value)
     assert "qwen-other-7b" in str(exc_info.value)
     assert OPERATOR_DEFAULTS["qwen"] in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# qwen: on_wake_fail (and other kwargs _call_qwen_backend doesn't accept) must be
+# filtered at the dispatcher, not raise TypeError (agents-core-geist-disposition-harness-v0,
+# Blocker A2: corpus_reader.read_operator="qwen" was broken by exactly this).
+# ---------------------------------------------------------------------------
+
+def test_call_operator_qwen_on_wake_fail_no_longer_raises_typeerror():
+    """on_wake_fail is a call_operator-level kwarg that _call_qwen_backend never accepted;
+    the dispatcher must drop it before forwarding, not let it raise TypeError.
+
+    autospec=True so the mock's introspected signature is _call_qwen_backend's real one
+    (a plain non-autospec Mock advertises a generic (*args, **kwargs) signature, which
+    would make _forward_supported_kwargs treat it as accepting everything)."""
+    with patch("agents_core.llm._call_qwen_backend", autospec=True, return_value="ok") as mock_qwen:
+        result = call_operator("qwen", prompt="hi", on_wake_fail="skip")
+        assert result == "ok"
+        # on_wake_fail must not reach the backend call.
+        mock_qwen.assert_called_once_with(prompt="hi")
+
+
+def test_call_operator_qwen_on_wake_fail_reaches_real_backend_signature():
+    """Without any patching of _call_qwen_backend itself, the dispatcher-filtered call must
+    not raise — proves the fix is at call_operator, not a backend-side kwarg swallow."""
+    with patch("agents_core.llm.requests.post") as mock_post:
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_post.return_value.json.return_value = {
+            "choices": [{"message": {"content": "ok"}}]
+        }
+        # system="" avoids the chub_broker default-bundle import path (unrelated to this fix).
+        result = call_operator("qwen", prompt="hi", system="s", on_wake_fail="skip", timeout=5)
+    assert result == "ok"
+
+
+def test_forward_supported_kwargs_drops_unsupported_and_keeps_supported():
+    def backend(prompt, system=None, timeout=600):
+        return prompt
+
+    forwarded = _forward_supported_kwargs(
+        backend, {"system": "sys", "on_wake_fail": "skip", "think": False}
+    )
+    assert forwarded == {"system": "sys"}
 
 
 # ---------------------------------------------------------------------------
