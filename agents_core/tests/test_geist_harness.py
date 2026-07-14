@@ -56,6 +56,17 @@ def test_extract_final_answer_handles_unterminated_think():
     assert extract_final_answer(raw) == ""
 
 
+def test_extract_final_answer_ignores_answer_tag_nested_inside_think():
+    # A literal <answer> tag the model restates inside its own reasoning must never win over
+    # (or be mistaken for) the real answer — <think> spans are stripped before the <answer>
+    # search runs, not after.
+    raw = (
+        "<think>I will format my reply like <answer>WRONG</answer> as an example"
+        "</think><answer>METR</answer>"
+    )
+    assert extract_final_answer(raw) == "METR"
+
+
 def test_extract_final_answer_plain_response_passthrough():
     # A3B with enable_thinking=False: no <think>/<answer> at all.
     assert extract_final_answer("METR") == "METR"

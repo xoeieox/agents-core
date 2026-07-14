@@ -47,20 +47,21 @@ def extract_final_answer(raw: str) -> str:
     """Return only the post-reasoning final answer; the think trace is never scored.
 
     QUEST emits <think>...</think><answer>...</answer> even with enable_thinking=False; A3B
-    honors enable_thinking=False and emits a clean answer with no think block at all. An
-    explicit <answer> block wins when present; otherwise <think>...</think> spans are
-    stripped (including an unterminated trailing <think> with no closing tag) and whatever
-    remains is the answer.
+    honors enable_thinking=False and emits a clean answer with no think block at all.
+    <think>...</think> spans are stripped first (including an unterminated trailing <think>
+    with no closing tag) so that a literal <answer> tag a model restates inside its reasoning
+    can never be mistaken for the real answer block; an explicit <answer> block in what
+    remains wins, otherwise whatever remains is the answer.
     """
     if not raw:
         return ""
-    m = _ANSWER_RE.search(raw)
-    if m:
-        return m.group(1).strip()
     stripped = _THINK_RE.sub("", raw)
     open_idx = stripped.lower().find("<think>")
     if open_idx != -1:
         stripped = stripped[:open_idx]
+    m = _ANSWER_RE.search(stripped)
+    if m:
+        return m.group(1).strip()
     return stripped.strip()
 
 
