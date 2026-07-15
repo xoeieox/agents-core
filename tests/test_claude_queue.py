@@ -172,6 +172,29 @@ def test_fail_moves_task_to_failed(queue):
     assert task["error"] == "boom"
 
 
+def test_fail_on_missing_active_file_reconciles_state(queue):
+    state = queue._read_state()
+    state["in_flight"] = ["ghost-id"]
+    queue._write_state(state)
+
+    queue.fail("ghost-id", error="hand-killed and rm'd out of band")
+
+    import json
+    persisted = json.loads(queue.state_path.read_text())
+    assert "ghost-id" not in persisted["in_flight"]
+
+
+def test_fail_on_missing_active_file_does_not_write_failed_or_history(queue):
+    state = queue._read_state()
+    state["in_flight"] = ["ghost-id"]
+    queue._write_state(state)
+
+    queue.fail("ghost-id", error="hand-killed and rm'd out of band")
+
+    assert list(queue.failed_dir.glob("*.yaml")) == []
+    assert not queue.history_path.exists() or queue.history_path.read_text() == ""
+
+
 def test_complete_computes_duration_seconds(queue):
     task_id = queue.submit(_basic_task())
     queue.claim()
