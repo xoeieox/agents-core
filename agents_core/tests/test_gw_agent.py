@@ -1518,3 +1518,145 @@ class TestReasonOut:
             assert isinstance(fixer, dict)
             assert fixer.get("concluded") is False
             assert reason_out == []
+
+    def test_served_model_out_captures_echoed_model(self):
+        """served_model_out captures the top-level "model" field of the completion response."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+            mock_post.return_value.json.return_value = {
+                "model": "gravitywell-27b",
+                "choices": [
+                    {
+                        "message": {"content": "All good.", "tool_calls": []},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+
+            out = []
+            result = call_gw_agent(
+                prompt="Review this.",
+                served_model_out=out,
+            )
+
+            assert result == "All good."
+            assert out == ["gravitywell-27b"]
+
+    def test_served_model_out_forced_conclusion_appends_last_and_wins(self):
+        """A mid-run mode flip: the main tool-loop step observes one model, and the
+        forced-conclusion turn (max_steps exhausted) observes a different one. Both are
+        appended (append log, not overwritten), and the consumer-side last-observed-wins
+        read (`served_model_out[-1]`) picks up the forced-conclusion turn's model since it
+        appends last."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+
+            # GW always returns tool_calls (never concludes) while echoing gravitywell-27b.
+            infinite_response = {
+                "model": "gravitywell-27b",
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Investigating...",
+                            "tool_calls": [
+                                {
+                                    "id": "call_x",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": json.dumps({"path": "file.txt"}),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+
+            # Forced conclusion turn is answered by a different model (mode flip mid-run).
+            verdict_response = {
+                "model": "gravitywell-devstral",
+                "choices": [
+                    {
+                        "message": {"content": '{"verdict": "good"}', "tool_calls": []},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 150},
+            }
+
+            mock_post.side_effect = [
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: infinite_response),
+                MagicMock(json=lambda: verdict_response),
+            ]
+
+            out = []
+            result = call_gw_agent(
+                prompt="Infinite loop test.",
+                max_steps=3,
+                served_model_out=out,
+            )
+
+            assert '{"verdict": "good"}' in result
+            assert out == ["gravitywell-27b", "gravitywell-27b", "gravitywell-27b", "gravitywell-devstral"]
+            assert out[-1] == "gravitywell-devstral"
+
+    def test_served_model_out_omitted_backward_compatible(self):
+        """Omitting served_model_out (existing callers, default None) is byte-identical to
+        today: no crash, no new required field, no change to the return value."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+            mock_post.return_value.json.return_value = {
+                "model": "gravitywell-27b",
+                "choices": [
+                    {
+                        "message": {"content": "All good.", "tool_calls": []},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+
+            result = call_gw_agent(prompt="Review this.")
+
+            assert result == "All good."
+
+    def test_served_model_out_missing_model_key_stays_empty(self):
+        """A response body that never echoes a "model" key leaves served_model_out == [],
+        not [None] and not a crash."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+            mock_post.return_value.json.return_value = {
+                "choices": [
+                    {
+                        "message": {"content": "All good.", "tool_calls": []},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 100},
+            }
+
+            out = []
+            result = call_gw_agent(
+                prompt="Review this.",
+                served_model_out=out,
+            )
+
+            assert result == "All good."
+            assert out == []

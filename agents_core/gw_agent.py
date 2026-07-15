@@ -719,6 +719,7 @@ def call_gw_agent(
     cancel_check: Callable[[], bool] | None = None,
     before_tool: Callable[[str, dict], dict] | None = None,
     reason_out: list[str] | None = None,
+    served_model_out: list | None = None,
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Run a multi-step read-only tool-loop on GravityWell.
 
@@ -779,6 +780,15 @@ def call_gw_agent(
                     Stays empty/unpopulated for `writeable=True` calls regardless of cause. Pure
                     side channel - does not change the return type. When None (default), never
                     touched.
+        served_model_out: Optional list. When provided, the top-level "model" field echoed by
+                           each completion response (main tool-loop steps and forced-conclusion
+                           turns) is appended to it as observed - never overwritten/reset mid-run,
+                           so a run with N model-echoing steps produces N entries. A caller
+                           wanting the run's final/deciding served model reads
+                           `served_model_out[-1]` after this function returns (a forced-conclusion
+                           turn appends last, so it naturally wins). Silent (no append) when a
+                           response never echoes a "model" field. Pure side channel - does not
+                           change the return type. When None (default), never touched.
 
     Returns:
         - str or None (or (str|None, list) when return_transcript=True).
@@ -920,6 +930,7 @@ def call_gw_agent(
                 _forced_content = _force_conclusion(
                     messages, backend_url, timeout, json_mode, log, _is_swarm,
                     call_timeout=_fc_timeout, partial=True,
+                    served_model_out=served_model_out,
                 )
                 if _forced_content:
                     return _finalize_writeable_or_readonly(
@@ -975,6 +986,8 @@ def call_gw_agent(
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                if served_model_out is not None and "model" in data and data["model"] is not None:
+                    served_model_out.append(data["model"])
             except Exception as e:
                 if log:
                     log(f"[gw_agent] GW request failed: {e}")
@@ -1039,7 +1052,8 @@ def call_gw_agent(
                         if log:
                             log(f"[gw_agent] breaking due to repeated call (4x): {tool_name}")
                         forced_content = _force_conclusion(
-                            messages, backend_url, timeout, json_mode, log, _is_swarm
+                            messages, backend_url, timeout, json_mode, log, _is_swarm,
+                            served_model_out=served_model_out,
                         )
                         if forced_content:
                             return _finalize_writeable_or_readonly(
@@ -1233,6 +1247,7 @@ def call_gw_agent(
                         _re_emitted = _force_conclusion(
                             messages, backend_url, timeout, json_mode, log, _is_swarm,
                             verdict_schema=verdict_schema,
+                            served_model_out=served_model_out,
                             reason=(
                                 "You stopped without emitting a valid JSON verdict. "
                                 "Based only on what you have already gathered, produce "
@@ -1274,7 +1289,10 @@ def call_gw_agent(
             if msg.get("role") == "assistant" and msg.get("content"):
                 last_content = msg.get("content", "")
                 break
-        forced_content = _force_conclusion(messages, backend_url, timeout, json_mode, log, _is_swarm)
+        forced_content = _force_conclusion(
+            messages, backend_url, timeout, json_mode, log, _is_swarm,
+            served_model_out=served_model_out,
+        )
         if forced_content:
             return _finalize_writeable_or_readonly(
                 messages, forced_content, return_transcript, transcript, writeable, cwd, concluded=False,
@@ -1372,6 +1390,7 @@ def _force_conclusion(
     partial: bool = False,
     verdict_schema: dict | None = None,
     reason: str | None = None,
+    served_model_out: list | None = None,
 ) -> str:
     """Emit a forced conclusion when the agent exhausts its tool budget.
 
@@ -1391,6 +1410,10 @@ def _force_conclusion(
         reason: Truthful framing for the re-emission prompt. When provided, replaces the
                 default "reached your investigation budget" opening so a voluntary-stop
                 re-emission does not lie about why the model is being asked to conclude.
+        served_model_out: Optional list, passed through from the caller's own
+                           `served_model_out` (same append-only contract). When provided, the
+                           top-level "model" field echoed by this forced-conclusion response is
+                           appended to it if present.
 
     Validates that the response is not a leaked tool-call (content-integrity check).
     Does NOT raise exceptions or add to transcript.
@@ -1465,6 +1488,8 @@ def _force_conclusion(
         )
         resp.raise_for_status()
         data = resp.json()
+        if served_model_out is not None and "model" in data and data["model"] is not None:
+            served_model_out.append(data["model"])
     except Exception as e:
         if log:
             log(f"[gw_agent] forced conclusion POST failed: {e}")
