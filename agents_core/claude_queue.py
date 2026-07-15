@@ -492,6 +492,16 @@ class ClaudeQueue:
         active_path = self.active_dir / f"{task_id}.yaml"
         task = self._read_task(active_path)
         if not task:
+            # Active file already gone (hand-killed + rm'd, or never existed) —
+            # state.json's in_flight may still list this id from before it was
+            # removed. Reconcile against the live glob so the ghost doesn't wedge
+            # forever (gotcha/claude-queue-orphan-task-clean-recovery-2026-06-22's
+            # "second kill not reaped" case). Nothing else to do: no task data to
+            # write to failed/, no history event, no intention to compost.
+            state = self._read_state()
+            self._refresh_state(state)
+            state["last_activity"] = _now_iso()
+            self._write_state(state)
             return
 
         now = _now_iso()

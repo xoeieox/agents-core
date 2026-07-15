@@ -8,6 +8,7 @@ import asyncio
 import logging
 import sys
 import types
+from unittest.mock import patch
 
 import pytest
 
@@ -606,3 +607,31 @@ async def test_daemon_claim_loop_reraises_generator_exit(monkeypatch, caplog):
         await daemon.run()
 
     assert notify_calls == []
+
+
+# ---------------------------------------------------------------------------
+# startup_sweep — in_flight reconciliation against a ghost state.json entry
+# ---------------------------------------------------------------------------
+
+def test_startup_sweep_clears_ghost_in_flight_entry(tmp_path, monkeypatch):
+    """state.json.in_flight may list an id with no backing active/*.yaml
+    file at all (hand-killed + rm'd out of band). The stale-active-task loop
+    only ever sees files that still exist, so it can't catch this — the
+    unconditional _refresh_state/_write_state reconciliation at the end of
+    startup_sweep must clear it regardless."""
+    from agents_core.claude_queue import ClaudeQueue
+
+    monkeypatch.setattr(runner_mod, "WORKTREE_ROOT", tmp_path / "worktrees")
+    monkeypatch.setattr(runner_mod, "_COUNCIL_DIR", tmp_path / "council")
+
+    queue = ClaudeQueue(queue_dir=tmp_path / "claude-queue")
+    state = queue._read_state()
+    state["in_flight"] = ["ghost-id"]
+    queue._write_state(state)
+
+    with patch("subprocess.run"):
+        runner_mod.startup_sweep(queue)
+
+    import json
+    persisted = json.loads(queue.state_path.read_text())
+    assert "ghost-id" not in persisted["in_flight"]

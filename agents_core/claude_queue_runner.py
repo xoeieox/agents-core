@@ -278,6 +278,16 @@ def startup_sweep(queue: ClaudeQueue) -> None:
             log.warning(f"stale active task {task['id']} — moving to failed")
             queue.fail(task["id"], error="runner_crash_recovery")
 
+    # Unconditional in_flight reconciliation: state.json.in_flight may list
+    # ids with no backing active/*.yaml file at all (hand-killed + rm'd out
+    # of band, before this sweep or fail() ever ran) — the loop above only
+    # ever sees files that still exist, so it cannot catch this case. Force
+    # a fresh rebuild from the live glob every startup, independent of
+    # whether anything above was found stale.
+    state = queue._read_state()
+    queue._refresh_state(state)
+    queue._write_state(state)
+
     if WORKTREE_ROOT.exists():
         active_ids = {p.stem for p in queue.active_dir.glob("*.yaml")}
         for wt in WORKTREE_ROOT.iterdir():
