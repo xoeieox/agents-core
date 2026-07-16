@@ -130,7 +130,7 @@ class GrepExecutor(ToolExecutor):
 class GitExecutor(ToolExecutor):
     """Execute git(args) with read-only allowlist."""
 
-    ALLOWLIST = {"log", "show", "diff", "status", "blame", "ls-files", "rev-list", "cat-file", "describe", "shortlog"}
+    ALLOWLIST = {"log", "show", "diff", "status", "blame", "ls-files", "rev-list", "cat-file", "describe", "shortlog", "fetch"}
 
     def __init__(self, cwd: str | None = None):
         self.cwd = Path(cwd or "/srv/agents").resolve()
@@ -720,6 +720,7 @@ def call_gw_agent(
     before_tool: Callable[[str, dict], dict] | None = None,
     reason_out: list[str] | None = None,
     served_model_out: list | None = None,
+    model: str | None = None,
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Run a multi-step read-only tool-loop on GravityWell.
 
@@ -789,6 +790,10 @@ def call_gw_agent(
                            turn appends last, so it naturally wins). Silent (no append) when a
                            response never echoes a "model" field. Pure side channel - does not
                            change the return type. When None (default), never touched.
+        model: Optional model name to request from the backend. Included as the "model"
+               field in both POST payloads (main loop + forced-conclusion) when provided.
+               When None (default), the field is omitted entirely — backward compatible
+               with single-model vLLM endpoints that serve whatever is loaded.
 
     Returns:
         - str or None (or (str|None, list) when return_transcript=True).
@@ -931,6 +936,7 @@ def call_gw_agent(
                     messages, backend_url, timeout, json_mode, log, _is_swarm,
                     call_timeout=_fc_timeout, partial=True,
                     served_model_out=served_model_out,
+                    model=model,
                 )
                 if _forced_content:
                     return _finalize_writeable_or_readonly(
@@ -976,6 +982,7 @@ def call_gw_agent(
                 resp = requests.post(
                     f"{backend_url}/v1/chat/completions",
                     json={
+                        **({} if model is None else {"model": model}),
                         "messages": messages,
                         "tools": list(tools.values()),
                         "tool_choice": "auto",
@@ -1054,6 +1061,7 @@ def call_gw_agent(
                         forced_content = _force_conclusion(
                             messages, backend_url, timeout, json_mode, log, _is_swarm,
                             served_model_out=served_model_out,
+                            model=model,
                         )
                         if forced_content:
                             return _finalize_writeable_or_readonly(
@@ -1248,6 +1256,7 @@ def call_gw_agent(
                             messages, backend_url, timeout, json_mode, log, _is_swarm,
                             verdict_schema=verdict_schema,
                             served_model_out=served_model_out,
+                            model=model,
                             reason=(
                                 "You stopped without emitting a valid JSON verdict. "
                                 "Based only on what you have already gathered, produce "
@@ -1292,6 +1301,7 @@ def call_gw_agent(
         forced_content = _force_conclusion(
             messages, backend_url, timeout, json_mode, log, _is_swarm,
             served_model_out=served_model_out,
+            model=model,
         )
         if forced_content:
             return _finalize_writeable_or_readonly(
@@ -1391,6 +1401,7 @@ def _force_conclusion(
     verdict_schema: dict | None = None,
     reason: str | None = None,
     served_model_out: list | None = None,
+    model: str | None = None,
 ) -> str:
     """Emit a forced conclusion when the agent exhausts its tool budget.
 
@@ -1414,6 +1425,9 @@ def _force_conclusion(
                            `served_model_out` (same append-only contract). When provided, the
                            top-level "model" field echoed by this forced-conclusion response is
                            appended to it if present.
+        model: Optional model name, passed through from the caller's own `model` param.
+               Included as the "model" field in the POST payload when provided; omitted
+               when None (default), matching the main loop's behavior.
 
     Validates that the response is not a leaked tool-call (content-integrity check).
     Does NOT raise exceptions or add to transcript.
@@ -1479,6 +1493,7 @@ def _force_conclusion(
         resp = requests.post(
             f"{backend_url}/v1/chat/completions",
             json={
+                **({} if model is None else {"model": model}),
                 "messages": messages,
                 "temperature": 0.3,
                 **({} if is_swarm else {"chat_template_kwargs": {"enable_thinking": False}}),

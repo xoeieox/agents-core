@@ -296,7 +296,7 @@ class Shaper:
         # dispatch record via ClaudeQueue.get_recent_failed/completed.
         # force_gpu does not apply to local-fixer (there is no GPU path to fall back to).
         route_to_claude = (
-            agent.engine == "local-fixer"
+            agent.engine.startswith("local-")
             or (agent.model in {"sonnet", "haiku", "opus"} and not force_gpu)
         )
 
