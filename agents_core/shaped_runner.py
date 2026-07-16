@@ -338,6 +338,34 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                 print(f"WARN: local-fixer: worktree teardown failed: {exc}", file=sys.stderr)
 
 
+def _run_local_reviewer(spec: dict, base_cwd: str | None) -> str:
+    """Read-only reviewer runner for local GW agent.
+
+    Calls call_gw_agent(writeable=False, json_mode=True) and returns
+    the text result. No worktree, no git, no PR creation.
+    """
+    from agents_core.gw_agent import call_gw_agent
+
+    task_id = spec.get("task_id") or spec.get("slot_id") or "lr-unknown"
+    cwd = base_cwd or "/srv/agents"
+    model = spec.get("model")
+
+    result = call_gw_agent(
+        prompt=spec["prompt"],
+        system=spec.get("system", ""),
+        cwd=cwd,
+        writeable=False,
+        json_mode=True,
+        timeout=int(spec.get("timeout_s", 900)),
+        think=False,
+        on_wake_fail="skip",
+        work_id=task_id,
+        max_steps=int(spec.get("max_steps", 24)),
+        model=model,
+    )
+    return result or ""
+
+
 def main():
     if len(sys.argv) != 2:
         print("ERROR: usage: python3 -m agents_core.shaped_runner <spec.json>", file=sys.stderr)
@@ -374,6 +402,14 @@ def main():
         except OSError:
             pass
         print(pr_url)
+        return
+    elif engine == "local-reviewer":
+        result = _run_local_reviewer(spec, base_cwd)
+        try:
+            spec_path.unlink()
+        except OSError:
+            pass
+        print(result)
         return
 
     # Per-task git worktree isolation for shaped agents (2026-04-23). When
