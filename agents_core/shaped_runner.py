@@ -228,8 +228,9 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
 
         salvaged = False
         if not concluded:
-            if max_steps_hit and final_diff.strip() and _tests_passed(last_test_outcome):
-                # Step ceiling hit but diff is clean and tests pass — salvage as PR.
+            if (max_steps_hit or no_progress_hit) and final_diff.strip() and _tests_passed(last_test_outcome):
+                # Budget ceiling OR no-progress abort, but the diff is clean and
+                # tests pass — salvage the verified work as a PR rather than discard.
                 salvaged = True
             elif no_progress_hit:
                 print(
@@ -301,14 +302,32 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             test_summary = "no test outcome recorded"
 
         step_count = len(fixer_result.get("steps") or [])
+        salvage_kind = "no_progress" if no_progress_hit else "max_steps_reached"
         salvage_note = (
-            "**harness-salvaged: max_steps_reached** - loop hit the step ceiling but diff and tests were clean.\n\n"
+            f"**harness-salvaged: {salvage_kind}** - "
+            "loop aborted before an explicit conclusion but the diff and tests were clean.\n\n"
             if salvaged else ""
         )
+        # Machine-readable marker so the lapis-pm daemon can refuse to auto-merge a
+        # no_progress salvage (a model-admitted stall requires human sign-off). A
+        # max_steps salvage carries no such marker and follows normal authority rules.
+        signoff_marker = (
+            "**Requires human sign-off** (model-admitted stall — not auto-merge-eligible).\n\n"
+            "<!-- lapis-no-progress-salvage: true -->\n"
+            if (salvaged and no_progress_hit) else ""
+        )
+
+        if salvaged:
+            print(
+                f"INFO: local-fixer: harness-salvaged green diff on {salvage_kind} "
+                f"abort (target={target_id}, task={task_id})",
+                file=sys.stderr,
+            )
 
         pr_body = (
             f"Implemented by the local 122B fixer harness, not paid Claude.\n\n"
             f"{salvage_note}"
+            f"{signoff_marker}"
             f"## Diff summary\n\n```diff\n{diffstat}\n```\n\n"
             f"## Test outcome\n\n{test_summary}\n\n"
             f"## Steps\n\n{step_count} tool-call step(s) executed.\n\n"
