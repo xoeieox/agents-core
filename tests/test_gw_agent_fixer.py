@@ -20,11 +20,16 @@ from agents_core.gw_agent import (
     ApplyEditExecutor,
     DEFAULT_FIXER_TOOLS,
     DEFAULT_READONLY_TOOLS,
+    GitExecutor,
     RunTestsExecutor,
     WriteFileExecutor,
     _build_fixer_result,
+    _build_tool_block,
     _get_tool_executors,
+    _normalize_for_novelty,
+    _novelty_hash,
     _parse_pytest_outcome,
+    _resolve_int_env,
     call_gw_agent,
 )
 
@@ -713,13 +718,42 @@ class TestNoProgressGuard:
             )
         return fixer, transcript
 
-    def test_no_progress_triggers_after_k_consecutive_idle_steps(self, tmp_path):
-        """AC2b: K consecutive read-only steps → no_progress=True, no PR."""
-        # 3 read_file calls with no edits → should abort at step 3 (k=3)
+    def test_distinct_file_reads_do_not_trigger_no_progress(self, tmp_path):
+        """Novelty-aware guard: reading K distinct new files is genuine exploration,
+        not a stagnant loop — it must NOT trip the no-progress guard."""
         responses = [
             MagicMock(status_code=200, json=MagicMock(return_value=self._make_read_response("f1.py", "c1"))),
             MagicMock(status_code=200, json=MagicMock(return_value=self._make_read_response("f2.py", "c2"))),
             MagicMock(status_code=200, json=MagicMock(return_value=self._make_read_response("f3.py", "c3"))),
+            MagicMock(status_code=200, json=MagicMock(return_value=_make_stop_response("Done."))),
+        ]
+        for r in responses:
+            r.raise_for_status = MagicMock()
+
+        fixer, transcript = self._run_with_responses(tmp_path, responses[:], no_progress_steps=3)
+
+        assert fixer["no_progress"] is False
+        assert fixer["concluded"] is True
+        # 3 tool-call steps; the concluding "stop" step has no tool call so adds no entry.
+        assert len(transcript) == 3
+
+    def test_repeated_read_of_same_path_triggers_no_progress(self, tmp_path):
+        """Novelty-aware guard: re-reading the SAME path (no new context) is a stagnant
+        loop and must still trip the guard after K consecutive non-novel steps.
+
+        Varies start_line per call so the pre-existing exact-duplicate-call breaker
+        (3x/4x identical call_sig) doesn't preempt the no-progress guard under test —
+        novelty is keyed on path only, so these are still non-novel repeats.
+        """
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(
+                return_value=_make_tool_call_response("read_file", {"path": "f1.py"}, "c1"))),
+            MagicMock(status_code=200, json=MagicMock(
+                return_value=_make_tool_call_response("read_file", {"path": "f1.py", "start_line": 1}, "c2"))),
+            MagicMock(status_code=200, json=MagicMock(
+                return_value=_make_tool_call_response("read_file", {"path": "f1.py", "start_line": 2}, "c3"))),
+            MagicMock(status_code=200, json=MagicMock(
+                return_value=_make_tool_call_response("read_file", {"path": "f1.py", "start_line": 3}, "c4"))),
             # Should never reach here
             MagicMock(status_code=200, json=MagicMock(return_value=_make_stop_response("Done."))),
         ]
@@ -730,8 +764,8 @@ class TestNoProgressGuard:
 
         assert fixer["no_progress"] is True
         assert fixer["concluded"] is False
-        # Only 3 steps should have run (not 4)
-        assert len(transcript) == 3
+        # Only 4 steps should have run (not 5): 1 novel read + 3 non-novel repeats
+        assert len(transcript) == 4
 
     def test_progress_resets_counter(self, tmp_path):
         """AC2b: progress resets the counter — edit after 2 idle steps prevents abort."""
@@ -825,3 +859,363 @@ class TestNoProgressGuard:
         assert "no_progress" in fixer
         assert fixer["max_steps_reached"] is False
         assert fixer["no_progress"] is False
+
+
+# ---------------------------------------------------------------------------
+# local-fixer-harness-truth-and-nudge-v0
+# AC1: auto-generated tool block (writeable runs)
+# ---------------------------------------------------------------------------
+
+class TestToolSurfaceTruthBlock:
+    def _run_and_capture(self, cwd, extra_kwargs=None):
+        step1 = _make_stop_response("Done.")
+        responses = [MagicMock(status_code=200, json=MagicMock(return_value=step1))]
+        responses[0].raise_for_status = MagicMock()
+        captured = []
+
+        def fake_post(url, json=None, timeout=None):
+            captured.append(json)
+            return responses.pop(0)
+
+        with patch("agents_core.gw_agent.requests.post", side_effect=fake_post), \
+             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+            mock_client = MagicMock()
+            mock_client.acquire.return_value = {"status": "serving"}
+            MockDoorman.return_value = mock_client
+
+            call_gw_agent(
+                prompt="Fix.",
+                cwd=str(cwd),
+                acquire_lease=True,
+                backend_url=None,
+                **(extra_kwargs or {}),
+            )
+        return captured
+
+    def test_writeable_run_injects_tool_block_after_preamble(self, tmp_path):
+        repo = _tmp_git_repo(tmp_path)
+        captured = self._run_and_capture(
+            repo,
+            {
+                "system": "You run as a claude -p subprocess with full Bash access.",
+                "writeable": True,
+            },
+        )
+        system_msg = next(m for m in captured[0]["messages"] if m["role"] == "system")
+        content = system_msg["content"]
+
+        assert content.index("claude -p subprocess") < content.index("## Your actual tools")
+        assert "FALSE CONTEXT" in content
+        assert "apply_edit(path, old_string, new_string)" in content
+        assert "write_file(path, content)" in content
+        assert "run_tests(target=" in content
+        assert "pytest path" in content
+
+    def test_readonly_run_has_no_tool_block(self, tmp_path):
+        captured = self._run_and_capture(tmp_path, {"writeable": False})
+        system_msg = next(m for m in captured[0]["messages"] if m["role"] == "system")
+        assert "## Your actual tools" not in system_msg["content"]
+
+    def test_tool_block_reflects_live_tools_dict(self, tmp_path):
+        """Adding a fake tool makes it appear; removing one makes it absent."""
+        repo = _tmp_git_repo(tmp_path)
+        custom_tools = dict(DEFAULT_FIXER_TOOLS)
+        custom_tools["fake_tool"] = {
+            "type": "function",
+            "function": {
+                "name": "fake_tool",
+                "description": "A made-up tool for this test.",
+                "parameters": {"type": "object", "properties": {"x": {"type": "string"}}},
+            },
+        }
+        del custom_tools["list_open_prs"]
+
+        captured = self._run_and_capture(
+            repo, {"writeable": True, "tools": custom_tools}
+        )
+        system_msg = next(m for m in captured[0]["messages"] if m["role"] == "system")
+        assert "fake_tool(x)" in system_msg["content"]
+        assert "list_open_prs" not in system_msg["content"]
+
+    def test_build_tool_block_no_hardcoded_names(self):
+        block = _build_tool_block({"totally_made_up": {
+            "type": "function",
+            "function": {"name": "totally_made_up", "description": "d", "parameters": {}},
+        }})
+        bullet_lines = [l for l in block.splitlines() if l.startswith("- ")]
+        assert any(l.startswith("- totally_made_up(") for l in bullet_lines)
+        for known in DEFAULT_FIXER_TOOLS:
+            assert not any(l.startswith(f"- {known}(") for l in bullet_lines)
+
+
+# ---------------------------------------------------------------------------
+# AC3/AC4: single factual-directive nudge + no_progress_steps env override
+# ---------------------------------------------------------------------------
+
+class TestNudgeMessage:
+    def test_nudge_fires_exactly_once_before_abort(self, tmp_path):
+        repo = _tmp_git_repo(tmp_path)
+        (repo / "src.py").write_text("x = 1\n")
+        subprocess.run(["git", "add", "."], check=True, capture_output=True, cwd=str(repo))
+        subprocess.run(["git", "commit", "-m", "add src"], check=True, capture_output=True, cwd=str(repo))
+
+        # Vary start_line per call so the pre-existing exact-duplicate-call breaker
+        # (3x/4x identical call_sig) doesn't preempt this guard; novelty is keyed on
+        # path only, so these remain non-novel repeats after the first.
+        make_read = lambda cid, i: _make_tool_call_response("read_file", {"path": "src.py", "start_line": i}, cid)
+        # no_progress_steps=4 -> nudge_threshold=2; consecutive climbs 0(novel),1,2(nudge),3,4(abort)
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=make_read(f"c{i}", i)))
+            for i in range(5)
+        ]
+        captured = []
+
+        def fake_post(url, json=None, timeout=None):
+            captured.append(json)
+            r = responses.pop(0)
+            r.raise_for_status = MagicMock()
+            return r
+
+        with patch("agents_core.gw_agent.requests.post", side_effect=fake_post), \
+             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+            mock_client = MagicMock()
+            mock_client.acquire.return_value = {"status": "serving"}
+            MockDoorman.return_value = mock_client
+
+            fixer, transcript = call_gw_agent(
+                prompt="Fix.",
+                cwd=str(repo),
+                writeable=True,
+                acquire_lease=True,
+                backend_url=None,
+                no_progress_steps=4,
+            )
+
+        assert fixer["no_progress"] is True
+        last_messages = captured[-1]["messages"]
+        nudge_count = sum(
+            1 for m in last_messages
+            if "enough context to act" in (m.get("content") or "")
+        )
+        assert nudge_count == 1
+
+
+class TestResolveIntEnv:
+    def test_returns_default_when_unset(self, monkeypatch):
+        monkeypatch.delenv("GW_AGENT_NO_PROGRESS_STEPS", raising=False)
+        assert _resolve_int_env("GW_AGENT_NO_PROGRESS_STEPS", 12, None) == 12
+
+    def test_returns_env_value_when_valid(self, monkeypatch):
+        monkeypatch.setenv("GW_AGENT_NO_PROGRESS_STEPS", "20")
+        assert _resolve_int_env("GW_AGENT_NO_PROGRESS_STEPS", 12, None) == 20
+
+    def test_falls_back_and_logs_once_on_invalid_value(self, monkeypatch):
+        monkeypatch.setenv("GW_AGENT_NO_PROGRESS_STEPS", "not-a-number")
+        logged = []
+        result = _resolve_int_env("GW_AGENT_NO_PROGRESS_STEPS", 12, logged.append)
+        assert result == 12
+        assert len(logged) == 1
+        assert "not-a-number" in logged[0]
+
+
+class TestEffectiveDefaultRaisedToTwelve:
+    def test_default_no_progress_steps_is_twelve_not_eight(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("GW_AGENT_NO_PROGRESS_STEPS", raising=False)
+        repo = _tmp_git_repo(tmp_path)
+        # Vary start_line to dodge the pre-existing exact-duplicate-call breaker;
+        # novelty is keyed on path only, so these stay non-novel repeats after call 0.
+        make_read = lambda cid, i: _make_tool_call_response("read_file", {"path": "f.py", "start_line": i}, cid)
+        # 1 novel read + 11 non-novel repeats = consecutive_no_progress caps at 11 (< 12);
+        # under the old default (8) this would have aborted at the 9th call.
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=make_read(f"c{i}", i)))
+            for i in range(12)
+        ]
+        responses.append(
+            MagicMock(status_code=200, json=MagicMock(return_value=_make_stop_response("Done.")))
+        )
+        for r in responses:
+            r.raise_for_status = MagicMock()
+
+        with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
+             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+            mock_client = MagicMock()
+            mock_client.acquire.return_value = {"status": "serving"}
+            MockDoorman.return_value = mock_client
+
+            fixer, transcript = call_gw_agent(
+                prompt="Fix.",
+                cwd=str(repo),
+                writeable=True,
+                acquire_lease=True,
+                backend_url=None,
+                max_steps=20,
+            )
+
+        assert fixer["no_progress"] is False
+        assert fixer["concluded"] is True
+
+    def test_env_override_no_progress_steps(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GW_AGENT_NO_PROGRESS_STEPS", "2")
+        repo = _tmp_git_repo(tmp_path)
+        make_read = lambda cid, i: _make_tool_call_response("read_file", {"path": "f.py", "start_line": i}, cid)
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=make_read(f"c{i}", i)))
+            for i in range(3)
+        ]
+        for r in responses:
+            r.raise_for_status = MagicMock()
+
+        with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
+             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+            mock_client = MagicMock()
+            mock_client.acquire.return_value = {"status": "serving"}
+            MockDoorman.return_value = mock_client
+
+            fixer, transcript = call_gw_agent(
+                prompt="Fix.",
+                cwd=str(repo),
+                writeable=True,
+                acquire_lease=True,
+                backend_url=None,
+            )
+
+        assert fixer["no_progress"] is True
+        assert len(transcript) == 3
+
+
+class TestExploreCeiling:
+    def test_explore_ceiling_aborts_despite_all_novel_reads(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GW_AGENT_MAX_EXPLORE_STEPS", "3")
+        repo = _tmp_git_repo(tmp_path)
+        make_read = lambda cid, p: _make_tool_call_response("read_file", {"path": p}, cid)
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=make_read("c1", "f1.py"))),
+            MagicMock(status_code=200, json=MagicMock(return_value=make_read("c2", "f2.py"))),
+            MagicMock(status_code=200, json=MagicMock(return_value=make_read("c3", "f3.py"))),
+            MagicMock(status_code=200, json=MagicMock(return_value=make_read("c4", "f4.py"))),
+        ]
+        for r in responses:
+            r.raise_for_status = MagicMock()
+
+        with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
+             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+            mock_client = MagicMock()
+            mock_client.acquire.return_value = {"status": "serving"}
+            MockDoorman.return_value = mock_client
+
+            fixer, transcript = call_gw_agent(
+                prompt="Fix.",
+                cwd=str(repo),
+                writeable=True,
+                acquire_lease=True,
+                backend_url=None,
+                no_progress_steps=50,
+            )
+
+        assert fixer["no_progress"] is True
+        assert len(transcript) == 3
+
+
+# ---------------------------------------------------------------------------
+# AC5/AC6: actionable tool errors
+# ---------------------------------------------------------------------------
+
+class TestRunTestsGuidanceError:
+    def test_shell_shaped_target_bare_token_returns_guidance(self, tmp_path):
+        ex = RunTestsExecutor(str(tmp_path))
+        result = ex.execute({"target": "pwd"})
+        assert isinstance(result, dict) and "error" in result
+        assert "pytest path" in result["error"]
+        assert "no shell" in result["error"].lower()
+
+    def test_shell_shaped_target_with_args_returns_guidance(self, tmp_path):
+        ex = RunTestsExecutor(str(tmp_path))
+        result = ex.execute({"target": "ls -la"})
+        assert isinstance(result, dict) and "error" in result
+        assert "pytest path" in result["error"]
+
+    def test_valid_pytest_path_still_executes(self, tmp_path):
+        (tmp_path / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+        ex = RunTestsExecutor(str(tmp_path))
+        result = ex.execute({"target": "test_ok.py"})
+        assert isinstance(result, dict)
+        assert result["passed"] == 1
+        assert "error" not in result
+
+
+class TestGitExecutorGuidanceError:
+    def test_blocked_subcommand_names_allowed_alternative(self, tmp_path):
+        ex = GitExecutor(str(tmp_path))
+        result = ex.execute({"args": "push origin main"})
+        assert isinstance(result, dict) and "error" in result
+        assert "origin/main" in result["error"]
+        assert "apply_edit" in result["error"]
+
+    def test_readonly_subcommands_still_succeed(self, tmp_path):
+        _tmp_git_repo(tmp_path)
+        ex = GitExecutor(str(tmp_path))
+        for sub in ["log --oneline -1", "status", "diff", "show HEAD"]:
+            result = ex.execute({"args": sub})
+            assert not (isinstance(result, dict) and "error" in result), f"{sub} unexpectedly blocked: {result}"
+
+
+# ---------------------------------------------------------------------------
+# AC7 (regression): full grace + threshold budget with zero edits still aborts
+# ---------------------------------------------------------------------------
+
+class TestRegressionFullAbort:
+    def test_zero_edits_full_budget_aborts_no_progress(self, tmp_path):
+        repo = _tmp_git_repo(tmp_path)
+        make_read = lambda cid, i: _make_tool_call_response("read_file", {"path": "f.py", "start_line": i}, cid)
+        no_progress_steps = 5
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=make_read(f"c{i}", i)))
+            for i in range(no_progress_steps + 1)
+        ]
+        for r in responses:
+            r.raise_for_status = MagicMock()
+
+        with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
+             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+            mock_client = MagicMock()
+            mock_client.acquire.return_value = {"status": "serving"}
+            MockDoorman.return_value = mock_client
+
+            fixer, transcript = call_gw_agent(
+                prompt="Fix.",
+                cwd=str(repo),
+                writeable=True,
+                acquire_lease=True,
+                backend_url=None,
+                no_progress_steps=no_progress_steps,
+            )
+
+        assert fixer["no_progress"] is True
+        assert fixer["final_diff"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Novelty normalization unit tests
+# ---------------------------------------------------------------------------
+
+class TestNoveltyNormalization:
+    def test_json_reordered_keys_normalize_to_same_string(self):
+        a = _normalize_for_novelty('{"b": 1, "a": 2}')
+        b = _normalize_for_novelty('{"a": 2, "b": 1}')
+        assert a == b
+
+    def test_whitespace_only_diff_normalizes_to_same_string(self):
+        a = _normalize_for_novelty("  hello world  ")
+        b = _normalize_for_novelty("hello world")
+        assert a == b
+
+    def test_novelty_hash_stable_for_same_normalized_input(self):
+        h1 = _novelty_hash("grep", {"pattern": "foo"}, '{"a": 1, "b": 2}')
+        h2 = _novelty_hash("grep", {"pattern": "foo"}, '{"b": 2, "a": 1}')
+        assert h1 == h2
+
+    def test_novelty_hash_differs_for_different_results(self):
+        h1 = _novelty_hash("grep", {"pattern": "foo"}, "result A")
+        h2 = _novelty_hash("grep", {"pattern": "foo"}, "result B")
+        assert h1 != h2

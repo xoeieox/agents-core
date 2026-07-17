@@ -14,6 +14,7 @@ doorman is imported from agents_core.doorman_client.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -151,7 +152,12 @@ class GitExecutor(ToolExecutor):
                 return {"error": "no git subcommand provided"}
 
             if tokens[0] not in self.ALLOWLIST:
-                return {"error": f"git subcommand {tokens[0]!r} not allowed (read-only allowlist)"}
+                return {
+                    "error": (
+                        f"git {tokens[0]!r} not allowed (read-only); origin/main is already "
+                        "your base — use read_file/grep to inspect, apply_edit/write_file to change"
+                    )
+                }
 
             cmd = ["git", "-C", str(self.cwd)] + tokens
             result = subprocess.run(
@@ -383,6 +389,7 @@ class RunTestsExecutor(ToolExecutor):
     """Execute run_tests(target?, k_expr?): run pytest in cwd."""
 
     _SHELL_METACHARS = set(";|&$()`\n\r")
+    _SHELL_TOKENS = {"pwd", "ls", "cd", "echo", "git", "cat", "grep", "find"}
 
     def __init__(self, cwd: str | None = None, run_timeout: int = 180):
         self.cwd = Path(cwd or "/srv/agents").resolve()
@@ -396,6 +403,17 @@ class RunTestsExecutor(ToolExecutor):
             for val in [target, k_expr]:
                 if val and any(c in val for c in self._SHELL_METACHARS):
                     return {"error": "shell metacharacters not allowed in test args"}
+
+            if target:
+                _first_token = target.strip().split(" ", 1)[0] if target.strip() else ""
+                if any(ch.isspace() for ch in target) or _first_token in self._SHELL_TOKENS:
+                    return {
+                        "error": (
+                            "run_tests(target=...) takes a pytest path or node id, e.g. "
+                            "'tests/test_foo.py' or ''; there is no shell — use read_file/grep "
+                            "to inspect"
+                        )
+                    }
 
             cmd = [sys.executable, "-m", "pytest"]
             if target:
@@ -692,6 +710,106 @@ def _get_tool_executors(cwd: str | None = None, writeable: bool = False) -> dict
 
 
 # ---------------------------------------------------------------------------
+# Tool-surface truth block (writeable runs) + novelty-aware progress tracking
+# ---------------------------------------------------------------------------
+
+
+def _render_tool_line(name: str, tool_spec: dict) -> str:
+    """One-line usage description for a single tool, driven by its live spec.
+
+    apply_edit/write_file/run_tests get exact hand-authored signatures (required so a
+    small model can't miscall them); every other tool gets a generic signature derived
+    from its own parameter schema, so an unfamiliar/renamed tool still renders correctly.
+    """
+    if name == "apply_edit":
+        return (
+            "- apply_edit(path, old_string, new_string) — replace an exact, unique "
+            "old_string with new_string in a file under cwd. This is how you edit code."
+        )
+    if name == "write_file":
+        return (
+            "- write_file(path, content) — create or overwrite a file under cwd with "
+            "content. This is how you create a new file."
+        )
+    if name == "run_tests":
+        return (
+            "- run_tests(target=\"\", k_expr=\"\") — run pytest. target is a pytest path "
+            "or node-id (e.g. 'tests/test_foo.py' or 'tests/test_foo.py::test_bar'), or "
+            "\"\" for the whole suite. There is no shell — target is NOT a shell command."
+        )
+    func = (tool_spec or {}).get("function", {}) or {}
+    description = func.get("description", "")
+    props = ((func.get("parameters") or {}).get("properties") or {})
+    sig = f"{name}({', '.join(props.keys())})" if props else f"{name}()"
+    return f"- {sig} — {description}" if description else f"- {sig}"
+
+
+def _build_tool_block(tools: dict[str, dict]) -> str:
+    """Auto-generate the '## Your actual tools' block from the live tools dict.
+
+    Never hardcodes a tool-name list — iterates `tools` so this can't drift from what's
+    actually wired up (the harness generates its own truth instead of trusting prose
+    that describes a different agent's toolset).
+    """
+    lines = [
+        "## Your actual tools",
+        "",
+        "These are the ONLY tools available to you in this run. Call them exactly as named below:",
+        "",
+    ]
+    for name, spec in tools.items():
+        lines.append(_render_tool_line(name, spec))
+    lines.append("")
+    lines.append(
+        "Any earlier statement that you have Bash, Read, Write, Edit, Grep, or mem-CLI shell "
+        "access is FALSE CONTEXT inherited from a different agent — ignore it entirely. Your "
+        "ONLY tools are the ones listed above. To change code you MUST call `apply_edit` or "
+        "`write_file`; describing a change in your response does nothing."
+    )
+    return "\n".join(lines)
+
+
+def _normalize_for_novelty(result_str: str) -> str:
+    """Normalize a tool result string before hashing it for novelty tracking.
+
+    Strips whitespace and, for JSON payloads, re-serializes with sorted keys so
+    trivially-reordered or re-whitespaced output isn't counted as fresh progress.
+    """
+    stripped = result_str.strip()
+    try:
+        parsed = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return stripped
+    return json.dumps(parsed, sort_keys=True)
+
+
+def _novelty_hash(tool_name: str, tool_args: dict, result_str: str) -> str:
+    """Hash a (call-args -> normalized-result) pair for grep/mem novelty tracking."""
+    payload = json.dumps(
+        {"tool": tool_name, "args": tool_args, "result": _normalize_for_novelty(result_str)},
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _resolve_int_env(env_name: str, default: int, log: Callable[[str], None] | None) -> int:
+    """Read an int override from the environment; fall back (and log once) on bad input."""
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        _msg = f"[gw_agent] invalid {env_name}={raw!r}; falling back to default {default}"
+        if log:
+            log(_msg)
+        else:
+            logger.warning(_msg)
+        return default
+
+
+# ---------------------------------------------------------------------------
 # Main Agent Loop
 # ---------------------------------------------------------------------------
 
@@ -712,7 +830,7 @@ def call_gw_agent(
     backend_url: str | None = None,
     acquire_lease: bool = True,
     writeable: bool = False,
-    no_progress_steps: int = 8,
+    no_progress_steps: int | None = None,
     principal: str | None = None,
     verdict_schema: dict | None = None,
     tool_executors: dict[str, ToolExecutor] | None = None,
@@ -828,10 +946,28 @@ def call_gw_agent(
     if backend_url is None:
         backend_url = GW_URL
 
+    # Effective local-fixer no-progress default raised 8 -> 12 (see novelty-aware guard
+    # below); GW_AGENT_NO_PROGRESS_STEPS overrides, GW_AGENT_MAX_EXPLORE_STEPS bounds
+    # total exploration regardless of novelty grace.
+    if no_progress_steps is None:
+        no_progress_steps = _resolve_int_env("GW_AGENT_NO_PROGRESS_STEPS", 12, log)
+    _max_explore_steps = _resolve_int_env("GW_AGENT_MAX_EXPLORE_STEPS", 20, log)
+
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
+
+    if writeable:
+        # Authoritative tool-surface truth, generated from the live `tools` dict and
+        # appended AFTER any composed preamble so it wins on ordering (final/highest
+        # priority system content).
+        _tool_block = _build_tool_block(tools)
+        _sys_idx = next((i for i, m in enumerate(messages) if m.get("role") == "system"), None)
+        if _sys_idx is not None:
+            messages[_sys_idx]["content"] = messages[_sys_idx]["content"] + "\n\n" + _tool_block
+        else:
+            messages.insert(0, {"role": "system", "content": _tool_block})
 
     transcript: list[dict] = []
     if tool_executors is None:
@@ -841,6 +977,13 @@ def call_gw_agent(
     # No-progress guard state (writeable mode): track consecutive steps with no semantic progress.
     consecutive_no_progress = 0
     last_test_counts: tuple | None = None
+    # Novelty-aware progress state (writeable mode): seen read_file paths and normalized
+    # grep/mem result hashes, plus a hard ceiling on total non-edit steps and a
+    # fired-once nudge flag.
+    _seen_read_paths: set[str] = set()
+    _seen_result_hashes: set[str] = set()
+    _explore_steps = 0
+    _nudge_fired = False
     # Grounding guard state (json_mode review runs): track verified (error-free) tool calls.
     grounding_count = 0  # tool calls with error is None
     grounding_nudged = False  # True after the first 0-tool-call stop nudge
@@ -1158,40 +1301,79 @@ def call_gw_agent(
                     )
 
                     # Semantic-progress tracking for no-progress guard (writeable only).
+                    # Novelty accounting: a repeated non-novel action (re-reading an
+                    # already-read path, an unchanged grep/mem/test) does NOT reset the
+                    # guard — it counts toward exhaustion via _explore_steps instead.
                     if writeable and no_progress_steps > 0:
                         if tool_name in ("apply_edit", "write_file"):
                             if not (isinstance(tool_result, dict) and "error" in tool_result):
                                 step_made_progress = True
-                        elif tool_name == "run_tests":
-                            if isinstance(tool_result, dict) and "error" not in tool_result:
-                                tc = (
-                                    int(tool_result.get("passed") or 0),
-                                    int(tool_result.get("failed") or 0),
-                                    int(tool_result.get("errors") or 0),
-                                )
-                                if tc != last_test_counts:
+                        else:
+                            _explore_steps += 1
+                            if tool_name == "run_tests":
+                                if isinstance(tool_result, dict) and "error" not in tool_result:
+                                    tc = (
+                                        int(tool_result.get("passed") or 0),
+                                        int(tool_result.get("failed") or 0),
+                                        int(tool_result.get("errors") or 0),
+                                    )
+                                    if tc != last_test_counts:
+                                        step_made_progress = True
+                                        last_test_counts = tc
+                            elif tool_name == "read_file":
+                                # Novelty keyed on path only — a path already read this run
+                                # is never novel again, even if its bytes changed (defeats
+                                # a live-timestamp-in-file state-flip loop).
+                                _path_key = tool_args.get("path")
+                                if _path_key is not None:
+                                    if _path_key not in _seen_read_paths:
+                                        step_made_progress = True
+                                    _seen_read_paths.add(_path_key)
+                            elif tool_name in ("grep", "mem"):
+                                _rhash = _novelty_hash(tool_name, tool_args, result_str)
+                                if _rhash not in _seen_result_hashes:
                                     step_made_progress = True
-                                    last_test_counts = tc
+                                _seen_result_hashes.add(_rhash)
 
                 if _interrupted:
                     break
 
-                # No-progress guard: abort if K consecutive steps made no semantic progress.
+                # No-progress guard: abort if K consecutive steps made no semantic progress,
+                # OR if total exploration steps exceed the hard ceiling (grace can never
+                # mask an infinite loop of "novel" reads).
                 if writeable and no_progress_steps > 0:
                     if step_made_progress:
                         consecutive_no_progress = 0
                     else:
                         consecutive_no_progress += 1
-                        if consecutive_no_progress >= no_progress_steps:
-                            if log:
-                                log(
-                                    f"[gw_agent] no-progress guard: {consecutive_no_progress} "
-                                    f"consecutive steps with no semantic progress - aborting"
-                                )
-                            return _finalize_writeable_or_readonly(
-                                messages, "", return_transcript, transcript, writeable, cwd,
-                                concluded=False, no_progress=True,
+
+                    _nudge_threshold = max(no_progress_steps - 2, 1)
+                    _explore_nudge_threshold = max(_max_explore_steps - 2, 1)
+                    if not _nudge_fired and (
+                        consecutive_no_progress >= _nudge_threshold
+                        or _explore_steps >= _explore_nudge_threshold
+                    ):
+                        _nudge_fired = True
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "You now have enough context to act. Make your first "
+                                "`apply_edit`/`write_file` now — continued reading without "
+                                "an edit will end this run without a result."
+                            ),
+                        })
+
+                    if consecutive_no_progress >= no_progress_steps or _explore_steps >= _max_explore_steps:
+                        if log:
+                            log(
+                                f"[gw_agent] no-progress guard: {consecutive_no_progress} "
+                                f"consecutive steps with no semantic progress "
+                                f"({_explore_steps} total exploration steps) - aborting"
                             )
+                        return _finalize_writeable_or_readonly(
+                            messages, "", return_transcript, transcript, writeable, cwd,
+                            concluded=False, no_progress=True,
+                        )
 
                 # Context-growth guard: truncate oldest tool-result messages if needed.
                 if ctx_tokens > GW_AGENT_CTX_CAP:
