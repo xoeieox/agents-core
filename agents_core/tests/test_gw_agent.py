@@ -1660,3 +1660,24 @@ class TestReasonOut:
 
             assert result == "All good."
             assert out == []
+
+
+class TestFirstStepBudgetGuard:
+    """Regression: gw-agent-first-step-budget-guard-v0 — step 0 must run a real
+    step, not force-conclude on the seeded reserve at a modest timeout."""
+
+    def test_first_step_executes_before_budget_force(self):
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+            mock_post.return_value.json.return_value = {
+                "choices": [{"message": {"content": "Real answer.", "tool_calls": []},
+                             "finish_reason": "stop"}],
+                "usage": {"total_tokens": 100},
+            }
+            result = call_gw_agent(prompt="Review this.", system="", timeout=10)
+            assert mock_post.call_count >= 1
+            assert result == "Real answer."
+            assert "budget-forced" not in result
