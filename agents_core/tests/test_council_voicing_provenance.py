@@ -188,6 +188,34 @@ def test_apply_voicing_provenance_gravitywell_degraded():
     assert run["turns"][1]["effective_voicing"] == "sonnet"
 
 
+def test_apply_voicing_provenance_stream_culled_is_degraded():
+    """AC6 (spec-review-gw-generation-guards-v0): a gravitywell turn that culled-and-
+    salvaged must NOT be reported as clean, even though gravitywell itself answered
+    (no fallback operator involved) - a truncated deliberation is never honest as
+    voicing_degraded=False."""
+    from agents_core.council.cli import _apply_voicing_provenance
+    from agents_core.council.gravitywell_adapter import GravityWellAdapter
+
+    adapter = GravityWellAdapter()
+    adapter.voicing_events = [
+        {"effective_operator": "gravitywell", "reason": "success"},
+        {"effective_operator": "gravitywell", "reason": "stream_culled"},
+    ]
+
+    run = {
+        "voicing": "gravitywell",
+        "turns": [{"step": 1}, {"step": 2}],
+    }
+
+    _apply_voicing_provenance(run, adapter)
+
+    assert run["voicing_degraded"] is True
+    assert run["voicing_degraded_reason"] == "stream_culled"
+    # gravitywell did answer (just degraded) - not "unknown".
+    assert run["effective_voicing"] == "gravitywell"
+    assert run["turns"][1]["effective_voicing"] == "gravitywell"
+
+
 def test_apply_voicing_provenance_doorman_unreachable_reason():
     """_apply_voicing_provenance() records doorman_unreachable as reason."""
     from agents_core.council.cli import _apply_voicing_provenance

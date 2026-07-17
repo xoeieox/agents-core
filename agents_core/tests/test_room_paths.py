@@ -62,6 +62,7 @@ GOLDEN: dict[str, str] = {
     "notify_audit.silenced": "/srv/lapis/notify-audit/silenced.jsonl",
     "council": "/srv/lapis/council",
     "council.logs": "/srv/lapis/council/logs",
+    "council.gw_cull": "/srv/lapis/council/gw-cull",
     "council.cache_cohesion": "/srv/lapis/council/cache/cohesion",
     "council.speakers": "/srv/lapis/council/speakers",
     "facets": "/srv/lapis/facets",

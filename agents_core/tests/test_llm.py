@@ -510,6 +510,225 @@ def test_gravitywell_http_error_is_retryable():
 
 
 # ---------------------------------------------------------------------------
+# GW Generation Guards (spec-review-gw-generation-guards-v0)
+# ---------------------------------------------------------------------------
+
+def _make_gw_sse_response(content: str, model: str = "gravitywell-122b"):
+    """Fake streaming requests.Response: one content delta then a clean [DONE]."""
+    import json as _json
+    lines = [
+        _json.dumps(
+            {"model": model, "choices": [{"delta": {"content": content}}]}
+        ).encode(),
+        b"[DONE]",
+    ]
+    lines = [b"data: " + lines[0], b"data: " + lines[1]]
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.iter_lines = MagicMock(return_value=iter(lines))
+    resp.close = MagicMock()
+    return resp
+
+
+def test_gravitywell_streaming_payload_includes_max_tokens_default(monkeypatch):
+    """AC1: streaming payload carries max_tokens, defaulting to GW_MAX_TOKENS_DEFAULT."""
+    from agents_core.llm import _call_gravitywell_backend
+
+    monkeypatch.delenv("GW_MAX_TOKENS", raising=False)
+    resp = _make_gw_sse_response("hello")
+
+    with patch("agents_core.llm.requests.post", return_value=resp) as mock_post, \
+         patch("agents_core.llm._gw_probe_served_model", return_value=None):
+        result = _call_gravitywell_backend(prompt="hi")
+
+    assert result == "hello"
+    payload = mock_post.call_args[1]["json"]
+    assert payload["max_tokens"] == 4096
+
+
+def test_gravitywell_streaming_payload_max_tokens_env_override(monkeypatch):
+    """AC1: GW_MAX_TOKENS env var overrides the default."""
+    from agents_core.llm import _call_gravitywell_backend
+
+    monkeypatch.setenv("GW_MAX_TOKENS", "777")
+    resp = _make_gw_sse_response("hello")
+
+    with patch("agents_core.llm.requests.post", return_value=resp) as mock_post, \
+         patch("agents_core.llm._gw_probe_served_model", return_value=None):
+        _call_gravitywell_backend(prompt="hi")
+
+    payload = mock_post.call_args[1]["json"]
+    assert payload["max_tokens"] == 777
+
+
+def test_gravitywell_streaming_payload_max_tokens_caller_param_wins(monkeypatch):
+    """AC1: an explicit max_tokens= caller param wins over the env default."""
+    from agents_core.llm import _call_gravitywell_backend
+
+    monkeypatch.setenv("GW_MAX_TOKENS", "777")
+    resp = _make_gw_sse_response("hello")
+
+    with patch("agents_core.llm.requests.post", return_value=resp) as mock_post, \
+         patch("agents_core.llm._gw_probe_served_model", return_value=None):
+        _call_gravitywell_backend(prompt="hi", max_tokens=42)
+
+    payload = mock_post.call_args[1]["json"]
+    assert payload["max_tokens"] == 42
+
+
+def test_post_chat_completion_includes_max_tokens_default(monkeypatch):
+    """AC1: the non-streaming sibling (_post_chat_completion) also carries max_tokens."""
+    from agents_core.llm import _post_chat_completion
+
+    monkeypatch.delenv("GW_MAX_TOKENS", raising=False)
+    resp = _make_llama_response("hi there")
+
+    with patch("agents_core.llm.requests.post", return_value=resp) as mock_post:
+        _post_chat_completion(
+            base_url="http://x:1", model="m",
+            messages=[{"role": "user", "content": "p"}],
+        )
+
+    payload = mock_post.call_args[1]["json"]
+    assert payload["max_tokens"] == 4096
+
+
+def test_gravitywell_llamacpp_backend_includes_repeat_penalty(monkeypatch):
+    """AC2: the llama.cpp payload branch carries a repeat_penalty (env-overridable)."""
+    from agents_core.llm import _call_gravitywell_backend
+
+    monkeypatch.setenv("GW_BACKEND", "llamacpp")
+    monkeypatch.delenv("GW_REPEAT_PENALTY", raising=False)
+    resp = _make_gw_sse_response("hello")
+
+    with patch("agents_core.llm.requests.post", return_value=resp) as mock_post, \
+         patch("agents_core.llm._gw_probe_served_model", return_value=None):
+        _call_gravitywell_backend(prompt="hi")
+
+    payload = mock_post.call_args[1]["json"]
+    assert payload["repeat_penalty"] == 1.1
+
+
+def test_gravitywell_repeat_penalty_env_override(monkeypatch):
+    """AC2: GW_REPEAT_PENALTY env var overrides the default on the llamacpp branch."""
+    from agents_core.llm import _call_gravitywell_backend
+
+    monkeypatch.setenv("GW_BACKEND", "llamacpp")
+    monkeypatch.setenv("GW_REPEAT_PENALTY", "1.3")
+    resp = _make_gw_sse_response("hello")
+
+    with patch("agents_core.llm.requests.post", return_value=resp) as mock_post, \
+         patch("agents_core.llm._gw_probe_served_model", return_value=None):
+        _call_gravitywell_backend(prompt="hi")
+
+    payload = mock_post.call_args[1]["json"]
+    assert payload["repeat_penalty"] == 1.3
+
+
+def test_gravitywell_vllm_backend_omits_repeat_penalty(monkeypatch):
+    """AC2: the vLLM branch never gets a repeat_penalty (llamacpp-only guard)."""
+    from agents_core.llm import _call_gravitywell_backend
+
+    monkeypatch.setenv("GW_BACKEND", "vllm")
+    resp = _make_gw_sse_response("hello", model="gravitywell-27b")
+
+    with patch("agents_core.llm.requests.post", return_value=resp) as mock_post, \
+         patch("agents_core.llm._gw_probe_served_model", return_value=None):
+        _call_gravitywell_backend(prompt="hi")
+
+    payload = mock_post.call_args[1]["json"]
+    assert "repeat_penalty" not in payload
+    assert "cache_prompt" not in payload
+
+
+def test_gravitywell_hard_ceiling_cull_salvages_partial(monkeypatch, tmp_path):
+    """AC3: on hard_ceiling_exceeded with buffered content, the accumulated partial is
+    returned (with a degraded marker) instead of None."""
+    from agents_core.llm import _call_gravitywell_backend
+
+    monkeypatch.setenv("ROOM_ROOT", str(tmp_path))
+    cull = ("hard_ceiling_exceeded", 300.2, 0.0)
+
+    with patch("agents_core.llm._gw_stream_attempt",
+               return_value=("partial voice content", cull, "gravitywell-122b")), \
+         patch("agents_core.llm._gw_probe_served_model", return_value=None):
+        result = _call_gravitywell_backend(prompt="runaway turn")
+
+    assert result is not None
+    assert result.startswith("partial voice content")
+    assert "gw-degraded" in result
+    assert "hard_ceiling_exceeded" in result
+
+
+def test_gravitywell_hard_ceiling_cull_persists_partial_artifact(monkeypatch, tmp_path):
+    """AC4: a culled stream's partial is written to a run artifact path."""
+    from agents_core.llm import _call_gravitywell_backend
+
+    monkeypatch.setenv("ROOM_ROOT", str(tmp_path))
+    cull = ("hard_ceiling_exceeded", 300.2, 0.0)
+
+    with patch("agents_core.llm._gw_stream_attempt",
+               return_value=("the runaway partial", cull, "gravitywell-122b")), \
+         patch("agents_core.llm._gw_probe_served_model", return_value=None):
+        _call_gravitywell_backend(prompt="runaway turn")
+
+    cull_dir = tmp_path / "council" / "gw-cull"
+    files = list(cull_dir.glob("*.txt"))
+    assert len(files) == 1
+    assert "the runaway partial" in files[0].read_text()
+
+
+def test_gravitywell_no_token_cull_still_returns_none(monkeypatch):
+    """AC3 (negative): a cull with no accumulated text (nothing ever arrived) stays None."""
+    from agents_core.llm import _call_gravitywell_backend
+
+    cull = ("first_token_grace_exceeded", 600.0, 600.0)
+
+    with patch("agents_core.llm._gw_stream_attempt", return_value=(None, cull, None)), \
+         patch("agents_core.llm._gw_probe_served_model", return_value=None):
+        result = _call_gravitywell_backend(prompt="dead stream")
+
+    assert result is None
+
+
+def test_gravitywell_healthy_stream_unaffected_by_guards(monkeypatch):
+    """AC7 (regression): a healthy (uncalled) turn returns full text, no degraded marker."""
+    from agents_core.llm import _call_gravitywell_backend
+
+    with patch("agents_core.llm._gw_stream_attempt",
+               return_value=("clean full response", None, "gravitywell-122b")), \
+         patch("agents_core.llm._gw_probe_served_model", return_value=None):
+        result = _call_gravitywell_backend(prompt="normal turn")
+
+    assert result == "clean full response"
+    assert "gw-degraded" not in result
+
+
+def test_call_operator_gravitywell_records_stream_culled_provenance():
+    """AC6: call_operator('gravitywell') records 'stream_culled' (not 'success') provenance
+    when the backend returns a degraded/salvaged partial."""
+    from agents_core import llm as llm_mod
+    from agents_core.doorman_client import DoormanClient
+
+    degraded = "partial content" + llm_mod._gw_degraded_marker("hard_ceiling_exceeded", 300.2, 0.0)
+    provenance = []
+
+    with patch.object(DoormanClient, "acquire", return_value={"status": "serving"}), \
+         patch.object(DoormanClient, "release"), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value=degraded):
+
+        result = llm_mod.call_operator(
+            "gravitywell", prompt="test",
+            on_wake_fail="sonnet",
+            _provenance_out=provenance,
+        )
+
+    assert result == degraded
+    assert ("stream_culled", "gravitywell") in provenance
+    assert ("success", "gravitywell") not in provenance
+
+
+# ---------------------------------------------------------------------------
 # Swarm Tests: call_swarm, swarm_serving, swarm_model
 # ---------------------------------------------------------------------------
 

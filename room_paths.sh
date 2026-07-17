@@ -51,6 +51,7 @@ export ROOM_NOTIFY_AUDIT_SILENCED="${ROOM_ROOT:-/room}/notify-audit/silenced.jso
 export ROOM_NOTIFY_AUDIT_CAPTURED="${ROOM_ROOT:-/room}/notify-audit/captured.jsonl"
 export ROOM_COUNCIL="${ROOM_ROOT:-/room}/council"
 export ROOM_COUNCIL_LOGS="${ROOM_ROOT:-/room}/council/logs"
+export ROOM_COUNCIL_GW_CULL="${ROOM_ROOT:-/room}/council/gw-cull"
 export ROOM_COUNCIL_CACHE_COHESION="${ROOM_ROOT:-/room}/council/cache/cohesion"
 export ROOM_COUNCIL_SPEAKERS="${ROOM_ROOT:-/room}/council/speakers"
 export ROOM_FACETS="${ROOM_ROOT:-/room}/facets"
