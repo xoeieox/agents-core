@@ -1061,12 +1061,25 @@ def call_gw_agent(
 
             # Pre-step budget check: stop exploring if too close to the deadline to
             # fit another step AND still have time for a forced-conclusion call.
+            #
+            # First-step guarantee: at step_num == 0 no real step has run yet, so
+            # _avg_step_s is only a seed (18s). The seeded 2*_avg_step_s reserve term
+            # can spuriously exceed a modest timeout (e.g. 36s > a 10s timeout),
+            # force-concluding at step 0 with ZERO real work — a conclusion from the
+            # prompt alone. So at step 0 we use only the real proportional reserve
+            # (0.20*timeout) and ignore the unvalidated seed term; steps >= 1 use the
+            # full reserve once _avg_step_s reflects measured latency. A genuine
+            # deadline breach at step 0 (little/no wall-clock left) still force-
+            # concludes below, salvaging a partial via the 20s-floored conclusion call.
             _conclusion_reserve_s = max(2.0 * _avg_step_s, 0.20 * timeout)
-            if _deadline - _now <= _conclusion_reserve_s:
+            _effective_reserve_s = (
+                0.20 * timeout if step_num == 0 else _conclusion_reserve_s
+            )
+            if _deadline - _now <= _effective_reserve_s:
                 if log:
                     log(
                         f"[gw_agent] budget deadline approaching at step {step_num + 1}: "
-                        f"{_deadline - _now:.1f}s remaining, reserve={_conclusion_reserve_s:.1f}s — "
+                        f"{_deadline - _now:.1f}s remaining, reserve={_effective_reserve_s:.1f}s — "
                         "forcing conclusion"
                     )
                 _elapsed = _now - _loop_start
