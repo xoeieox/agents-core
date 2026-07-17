@@ -1144,14 +1144,19 @@ def _apply_voicing_provenance(run: dict, adapter) -> None:
             operators = [e.get("effective_operator") for e in adapter.voicing_events]
             reasons = [e.get("reason") for e in adapter.voicing_events]
 
-            # Determine effective_voicing: if all are gravitywell, it's gravitywell; else fallback
-            if all(op == "gravitywell" for op in operators):
+            # Determine effective_voicing: only clean if every operator is gravitywell
+            # AND every turn's reason is "success" - a culled-but-salvaged turn still
+            # answers via gravitywell but must not be reported as clean (AC6,
+            # spec-review-gw-generation-guards-v0: a truncated deliberation is never
+            # honest as "voicing_degraded": False).
+            if all(op == "gravitywell" for op in operators) and all(r == "success" for r in reasons):
                 run["effective_voicing"] = "gravitywell"
                 run["voicing_degraded"] = False
             else:
-                # Mixed or all fallback - pick the first non-gravitywell operator
+                # Mixed, all fallback, or a gravitywell turn that culled - pick the first
+                # non-gravitywell operator, or "gravitywell" itself if it answered (degraded).
                 non_gw = [op for op in operators if op != "gravitywell"]
-                run["effective_voicing"] = non_gw[0] if non_gw else "unknown"
+                run["effective_voicing"] = non_gw[0] if non_gw else "gravitywell"
                 run["voicing_degraded"] = True
                 # Collect unique failure reasons (excluding "success" which indicates clean calls)
                 failure_reasons = []
@@ -1165,6 +1170,8 @@ def _apply_voicing_provenance(run: dict, adapter) -> None:
                     run["voicing_degraded_reason"] = "serving_http_error"
                 elif "gw_not_serving" in failure_reasons:
                     run["voicing_degraded_reason"] = "gw_not_serving"
+                elif "stream_culled" in failure_reasons:
+                    run["voicing_degraded_reason"] = "stream_culled"
                 else:
                     run["voicing_degraded_reason"] = failure_reasons[0] if failure_reasons else "unknown"
 

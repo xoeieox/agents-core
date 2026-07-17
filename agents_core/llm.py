@@ -36,6 +36,60 @@ QUEST_URL = os.environ.get("QUEST_URL", "http://203.0.113.11:8080")
 SWARM_URL = os.environ.get("SWARM_URL", GW_URL)
 SWARM_MAX_CONCURRENT = int(os.environ.get("SWARM_MAX_CONCURRENT", "4"))
 
+# Generation guards (spec-review-gw-generation-guards-v0): an unbounded GW call
+# can degenerate and run to the 300s gw-liveness hard ceiling before being culled.
+# max_tokens bounds a single turn's length; repeat_penalty (llama.cpp only) breaks
+# repetition loops before they start.
+GW_MAX_TOKENS_DEFAULT = 4096
+GW_REPEAT_PENALTY_DEFAULT = 1.1
+
+# Marker appended to a salvaged culled-partial so callers/tests can detect
+# degradation without changing the str|None return contract.
+GW_DEGRADED_MARKER = "[gw-degraded:"
+
+
+def _gw_max_tokens_default() -> int:
+    """Read at call time (not module load) so tests can monkeypatch.setenv."""
+    return int(os.environ.get("GW_MAX_TOKENS", str(GW_MAX_TOKENS_DEFAULT)))
+
+
+def _gw_repeat_penalty_default() -> float:
+    """Read at call time (not module load) so tests can monkeypatch.setenv."""
+    return float(os.environ.get("GW_REPEAT_PENALTY", str(GW_REPEAT_PENALTY_DEFAULT)))
+
+
+def _gw_degraded_marker(reason: str, elapsed: float, idle: float) -> str:
+    return f"\n\n{GW_DEGRADED_MARKER} reason={reason} elapsed={elapsed:.1f}s idle={idle:.1f}s]"
+
+
+def _is_gw_result_degraded(text) -> bool:
+    """True if `text` is a GW result carrying the culled-partial marker (AC3/AC6)."""
+    return isinstance(text, str) and GW_DEGRADED_MARKER in text
+
+
+def _persist_gw_cull_partial(
+    text: str, model: str, url: str, cull_reason: str, cull_elapsed: float, cull_idle: float,
+) -> None:
+    """Best-effort persistence of a culled GW stream's partial text (AC4).
+
+    Today the evidence of a runaway generation is destroyed on cull. Writes the
+    partial to a run artifact path so future runaways are inspectable. Never
+    raises — an artifact-write failure must not affect the caller's result.
+    """
+    try:
+        from agents_core.room_paths import room_path
+        out_dir = room_path("council.gw_cull", write=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(PACIFIC).strftime("%Y%m%d-%H%M%S")
+        out_path = out_dir / f"gw-cull-{ts}-{uuid.uuid4().hex[:8]}.txt"
+        out_path.write_text(
+            f"model={model} url={url} reason={cull_reason} "
+            f"elapsed={cull_elapsed:.1f}s idle={cull_idle:.1f}s\n\n{text}"
+        )
+    except Exception as e:
+        _log.warning("[gw-liveness] failed to persist culled partial: %s", e)
+
+
 # GW admission provenance vocabulary — all known tuples appended to _provenance_out.
 #
 #   admission_off_master_passthrough — enforce mode on a non-master node; request passed through.
@@ -383,6 +437,7 @@ def _post_chat_completion(
     cache_prompt: bool | None = None,
     chat_template_kwargs: dict | None = None,
     _no_thinking: bool = False,
+    max_tokens: int | None = None,
 ) -> str | None:
     """Shared POST core for OpenAI-compatible chat/completions endpoints.
 
@@ -395,12 +450,16 @@ def _post_chat_completion(
     matching _call_gravitywell_backend's pattern. _no_thinking=True structurally omits
     chat_template_kwargs entirely, for models that do not support the thinking knob.
 
+    max_tokens bounds generation length (env-overridable default via GW_MAX_TOKENS,
+    per spec-review-gw-generation-guards-v0) — pass an explicit value to override.
+
     Used by _call_gravitywell_backend, call_swarm, and other chat-completion callers.
     """
     payload = {
         "model": model,
         "messages": messages,
         "temperature": temperature,
+        "max_tokens": max_tokens if max_tokens is not None else _gw_max_tokens_default(),
     }
     if cache_prompt is not None:
         payload["cache_prompt"] = cache_prompt
@@ -550,6 +609,12 @@ def _gw_stream_attempt(base_url, model, payload, idle_gap, first_token_gap, hard
         return (text if text.strip() else None, None, _state["served_model"])
 
     if _state["cull"]:
+        # Only hard_ceiling_exceeded is salvageable (AC3/B) - idle_gap_exceeded gets one
+        # stall retry at the _call_gravitywell_backend layer and first_token_grace_exceeded
+        # means no token ever arrived, so both keep their existing text=None contract.
+        if _state["cull"][0] == "hard_ceiling_exceeded":
+            text = "".join(content_parts) or "".join(reasoning_parts)
+            return (text if text.strip() else None, _state["cull"], _state["served_model"])
         return (None, _state["cull"], _state["served_model"])
 
     # Stream ended without [DONE] and no cull - return what we have
@@ -569,6 +634,7 @@ def _call_gravitywell_backend(
     _model: str = None,
     _no_thinking: bool = False,
     _served_model_out: list | None = None,
+    max_tokens: int | None = None,
 ) -> str | None:
     """Send a completion request to a GravityWell endpoint via streaming SSE.
 
@@ -598,12 +664,20 @@ def _call_gravitywell_backend(
     _served_model_out: optional list to append the response-echoed "model" field to (1c
     true-mirror provenance) — the model the server actually reported serving, not merely
     the request's model field.
+    max_tokens: bounds generation length (env-overridable default via GW_MAX_TOKENS,
+    default 4096 — spec-review-gw-generation-guards-v0). Always present in the payload;
+    pass an explicit value to override the default for this call.
 
     Dual-timer liveness model:
     - Phase 1 (pre-first-token): cull after GW_FIRST_TOKEN_GAP_SECS (default 600).
     - Phase 2 (post-first-token): cull after GW_IDLE_GAP_SECS (default 45) of chunk silence.
     - Hard ceiling: GW_LIVENESS_HARD_CEILING_SECS (default 1800) total.
     - Stall retry: if idle_gap_exceeded, retry once within the same ceiling budget.
+    - On hard_ceiling_exceeded, the accumulated partial is salvaged and returned with a
+      GW_DEGRADED_MARKER suffix (and persisted to a run artifact) instead of dropping the
+      voice entirely — a degenerate turn completes-with-partial rather than empty
+      (spec-review-gw-generation-guards-v0, AC3/AC4). Other cull reasons (no token ever
+      arrived) still return None.
 
     Connection-level retry: 3 attempts, 2s/4s backoff on network errors.
     Persistent errors raise OperatorUnreachableError; parse errors return None.
@@ -640,9 +714,11 @@ def _call_gravitywell_backend(
         "model": model,
         "messages": messages,
         "temperature": temperature,
+        "max_tokens": max_tokens if max_tokens is not None else _gw_max_tokens_default(),
     }
     if backend == "llamacpp":
         payload["cache_prompt"] = True
+        payload["repeat_penalty"] = _gw_repeat_penalty_default()
     payload["stream"] = True
     if not _no_thinking:
         payload["chat_template_kwargs"] = {"enable_thinking": think}
@@ -689,6 +765,11 @@ def _call_gravitywell_backend(
             "[gw-liveness] stream culled reason=%s elapsed=%.1fs idle=%.1fs",
             cull_reason, cull_elapsed, cull_idle,
         )
+        if cull_reason == "hard_ceiling_exceeded" and text:
+            # Salvage: a runaway turn completes-with-partial instead of empty (AC3).
+            _persist_gw_cull_partial(text, model, url, cull_reason, cull_elapsed, cull_idle)
+            return text + _gw_degraded_marker(cull_reason, cull_elapsed, cull_idle)
+        # No tokens ever arrived (or a non-hard-ceiling cull) - nothing to salvage.
         return None
 
     # Per-call response-echo assertion (1d.2) — runs on every call, never cached, so a
@@ -892,7 +973,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
             )
         gw_kwargs = {
             k: kwargs[k] for k in (
-                "system", "timeout", "json_mode", "temperature", "log"
+                "system", "timeout", "json_mode", "temperature", "log", "max_tokens"
             ) if k in kwargs
         }
         think = kwargs.get("think", False)
@@ -1137,7 +1218,11 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                                         _loop_ticket_settled = True
                                     raise
                                 if _provenance_out is not None:
-                                    _provenance_out.append(("success", "gravitywell"))
+                                    _provenance_out.append(
+                                        ("stream_culled", "gravitywell")
+                                        if _is_gw_result_degraded(result)
+                                        else ("success", "gravitywell")
+                                    )
                                 elevator.ack(
                                     ticket,
                                     provenance={
@@ -1188,7 +1273,11 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
             try:
                 result = _call_gravitywell_backend(prompt=prompt, think=think, **gw_kwargs)
                 if _provenance_out is not None:
-                    _provenance_out.append(("success", "gravitywell"))
+                    _provenance_out.append(
+                        ("stream_culled", "gravitywell")
+                        if _is_gw_result_degraded(result)
+                        else ("success", "gravitywell")
+                    )
                 return result
             finally:
                 client.release("gravitywell", work_id)

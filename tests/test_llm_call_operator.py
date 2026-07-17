@@ -1239,6 +1239,7 @@ def test_default_unset_auto_detects_vllm_when_dual_serving(monkeypatch):
         "model": "gravitywell-27b",
         "messages": [{"role": "user", "content": "hi"}],
         "temperature": 0.7,
+        "max_tokens": 4096,
         "stream": True,
         "chat_template_kwargs": {"enable_thinking": False},
     }

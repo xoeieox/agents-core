@@ -250,6 +250,11 @@ subpath = "council/logs"
 class = "C"
 access = "write"
 
+[keys."council.gw_cull"]
+subpath = "council/gw-cull"
+class = "C"
+access = "write"
+
 [keys."council.cache_cohesion"]
 subpath = "council/cache/cohesion"
 class = "C"
