@@ -10,6 +10,11 @@ AC5: Provenance body is factual — attribution, diffstat, test outcome, traceab
      transcript artifact link present.
 AC6: Git failures (branch/commit/push non-zero) → return "", no PR, worktree torn down.
 AC7: Full module green; no live-network dependency.
+
+Additional coverage for local-fixer-salvage-no-progress-green-v0 (AC1-AC7 of that spec):
+covers salvaging a green (non-empty diff, passing tests) no_progress abort the same
+way a green max_steps_reached abort is salvaged, the no_progress-specific PR sign-off
+marker, and the salvage frequency INFO log line.
 """
 from __future__ import annotations
 
@@ -777,3 +782,323 @@ def test_warn_message_doorman_unreachable(tmp_path, capsys):
 
     err = capsys.readouterr().err
     assert "DoormanUnreachable" in err or "doorman" in err.lower()
+
+
+# ---------------------------------------------------------------------------
+# local-fixer-salvage-no-progress-green-v0: AC1-AC7
+# ---------------------------------------------------------------------------
+
+def _no_progress_fixer_result(
+    diff: str = "diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n@@ -1 +1 @@\n-old\n+new\n",
+    passed: int = 5,
+    failed: int = 0,
+    errors: int = 0,
+) -> dict:
+    return {
+        "final_diff": diff,
+        "concluded": False,
+        "max_steps_reached": False,
+        "no_progress": True,
+        "last_test_outcome": {"passed": passed, "failed": failed, "errors": errors},
+        "steps": [],
+    }
+
+
+def test_salvage_no_progress_with_passing_tests_opens_pr(tmp_path):
+    """AC1: no_progress + non-empty diff + passing tests → PR opened, salvage note names no_progress."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    captured_body: list[str] = []
+
+    def fake_create_pr(**kwargs):
+        captured_body.append(kwargs.get("body", ""))
+        return {"html_url": "http://203.0.113.10:3000/Erah/agents-core/pulls/100"}
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_no_progress_fixer_result(), [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", side_effect=fake_create_pr),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        url = sr._run_local_fixer(spec, str(tmp_path))
+
+    assert url == "http://203.0.113.10:3000/Erah/agents-core/pulls/100"
+    assert captured_body, "create_pr was not called"
+    assert "harness-salvaged: no_progress" in captured_body[0], "salvage note must name no_progress"
+
+
+def test_no_pr_no_progress_empty_diff(tmp_path):
+    """AC2: no_progress + empty diff → no-op, no PR."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    result = _no_progress_fixer_result(diff="")
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(result, [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr") as mock_pr,
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        url = sr._run_local_fixer(spec, str(tmp_path))
+
+    assert url == ""
+    mock_pr.assert_not_called()
+
+
+def test_no_pr_no_progress_failing_tests(tmp_path):
+    """AC3: no_progress + non-empty diff but failing tests → no-op, no PR."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    result = _no_progress_fixer_result(passed=3, failed=2, errors=0)
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(result, [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr") as mock_pr,
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        url = sr._run_local_fixer(spec, str(tmp_path))
+
+    assert url == ""
+    mock_pr.assert_not_called()
+
+
+def test_no_pr_no_progress_zero_passing_tests(tmp_path):
+    """AC3: no_progress + non-empty diff but zero-passing tests → no-op, no PR."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    result = _no_progress_fixer_result(passed=0, failed=0, errors=0)
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(result, [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr") as mock_pr,
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        url = sr._run_local_fixer(spec, str(tmp_path))
+
+    assert url == ""
+    mock_pr.assert_not_called()
+
+
+def test_max_steps_salvage_unchanged_green_and_bad(tmp_path):
+    """AC4: max_steps_reached salvage behavior is unchanged (green salvages, empty/failing don't)."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_max_steps_fixer_result(), [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", return_value={"html_url": "http://x/p/1"}),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        url = sr._run_local_fixer(spec, str(tmp_path))
+    assert url == "http://x/p/1"
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_max_steps_fixer_result(diff=""), [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr") as mock_pr,
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        url = sr._run_local_fixer(spec, str(tmp_path))
+    assert url == ""
+    mock_pr.assert_not_called()
+
+
+def test_max_steps_salvage_note_still_names_max_steps_reached(tmp_path):
+    """AC4: max_steps salvage note still names max_steps_reached, not no_progress."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    captured_body: list[str] = []
+
+    def fake_create_pr(**kwargs):
+        captured_body.append(kwargs.get("body", ""))
+        return {"html_url": "http://x/p/2"}
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_max_steps_fixer_result(), [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", side_effect=fake_create_pr),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        sr._run_local_fixer(spec, str(tmp_path))
+
+    assert captured_body
+    assert "harness-salvaged: max_steps_reached" in captured_body[0]
+    assert "harness-salvaged: no_progress" not in captured_body[0]
+
+
+def test_no_progress_salvage_pr_body_has_signoff_marker(tmp_path):
+    """AC6: a no_progress salvage PR body carries the machine marker and human sign-off line."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    captured_body: list[str] = []
+
+    def fake_create_pr(**kwargs):
+        captured_body.append(kwargs.get("body", ""))
+        return {"html_url": "http://x/p/3"}
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_no_progress_fixer_result(), [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", side_effect=fake_create_pr),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        sr._run_local_fixer(spec, str(tmp_path))
+
+    assert captured_body
+    body = captured_body[0]
+    assert "<!-- lapis-no-progress-salvage: true -->" in body
+    assert "Requires human sign-off" in body
+
+
+def test_max_steps_salvage_pr_body_has_no_signoff_marker(tmp_path):
+    """AC6: a max_steps_reached salvage PR body contains neither the marker nor the sign-off line."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    captured_body: list[str] = []
+
+    def fake_create_pr(**kwargs):
+        captured_body.append(kwargs.get("body", ""))
+        return {"html_url": "http://x/p/4"}
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_max_steps_fixer_result(), [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", side_effect=fake_create_pr),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        sr._run_local_fixer(spec, str(tmp_path))
+
+    assert captured_body
+    body = captured_body[0]
+    assert "<!-- lapis-no-progress-salvage: true -->" not in body
+    assert "Requires human sign-off" not in body
+
+
+def test_salvage_frequency_log_no_progress(tmp_path, capsys):
+    """AC7: a no_progress salvage emits one INFO harness-salvaged log line naming the kind/target/task."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_no_progress_fixer_result(), [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", return_value={"html_url": "http://x/p/5"}),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        sr._run_local_fixer(spec, str(tmp_path))
+
+    err = capsys.readouterr().err
+    assert "INFO: local-fixer: harness-salvaged green diff on no_progress abort" in err
+    assert "target=my-target-v0" in err
+    assert "task=abc123" in err
+
+
+def test_salvage_frequency_log_max_steps(tmp_path, capsys):
+    """AC7: a max_steps_reached salvage emits one INFO harness-salvaged log line naming the kind."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_max_steps_fixer_result(), [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", return_value={"html_url": "http://x/p/6"}),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        sr._run_local_fixer(spec, str(tmp_path))
+
+    err = capsys.readouterr().err
+    assert "INFO: local-fixer: harness-salvaged green diff on max_steps_reached abort" in err
+    assert "target=my-target-v0" in err
+    assert "task=abc123" in err
+
+
+def test_no_salvage_log_when_no_pr(tmp_path, capsys):
+    """AC7 (negative): no INFO harness-salvaged line when the run isn't salvaged."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_no_progress_fixer_result(diff=""), [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr") as mock_pr,
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        sr._run_local_fixer(spec, str(tmp_path))
+
+    err = capsys.readouterr().err
+    assert "harness-salvaged" not in err
+    mock_pr.assert_not_called()
