@@ -2943,3 +2943,307 @@ class TestEnsureServingDualMode:
             result = state.ensure_serving()
 
         assert result is CREATIVE_OCCUPIED
+
+
+# ---------------------------------------------------------------------------
+# doorman-acquire-lease-lock-release-during-wake-v0: self.lock must not be
+# held across a cold-wake poll — only self.wake_lock serializes wakes.
+# ---------------------------------------------------------------------------
+
+class TestWakeLockDecoupledFromStateLock:
+    """Regression guard: a cold-wake ensure_serving() must not hold self.lock,
+    so /status, /v0/drain-count, /v0/mode-owner, and /lease/release for the
+    same node stay responsive while a wake is in flight. Concurrent wake
+    attempts must still serialize to one subprocess pair via self.wake_lock
+    (today's guarantee, unchanged)."""
+
+    def test_status_snapshot_not_blocked_by_inflight_wake(self):
+        """status_snapshot() (takes self.lock) must return promptly while
+        another thread's acquire_lease() is stuck inside a simulated wake."""
+        state = _make_state()
+        wake_started = threading.Event()
+        release_wake = threading.Event()
+
+        def blocking_ensure_serving(role=None):
+            wake_started.set()
+            assert release_wake.wait(timeout=5), "release never signaled"
+            return True
+
+        with patch.object(state, "ensure_serving", side_effect=blocking_ensure_serving), \
+             patch.object(state, "_place_hold"):
+            t = threading.Thread(target=state.acquire_lease, args=("work-1", 120, "test"))
+            t.start()
+            assert wake_started.wait(timeout=2), "wake never started"
+
+            start = time.time()
+            snap = state.status_snapshot()
+            elapsed = time.time() - start
+
+            release_wake.set()
+            t.join(timeout=5)
+
+        assert not t.is_alive()
+        assert elapsed < 1.0, f"status_snapshot() blocked {elapsed:.2f}s during in-flight wake"
+        assert isinstance(snap, dict)
+
+    def test_http_status_endpoint_not_blocked_by_inflight_acquire(self):
+        """GET /status must return promptly while POST /lease/acquire is
+        mid-wake for the same node — proves the route no longer wraps
+        acquire_lease() in self.lock either."""
+        wake_started = threading.Event()
+        release_wake = threading.Event()
+
+        def blocking_ensure_serving(self, role=None):
+            wake_started.set()
+            assert release_wake.wait(timeout=5), "release never signaled"
+            return True
+
+        with patch("agents_core.doorman_server._start_refresh_thread"):
+            app = create_app(gw_url=GW_URL_DEFAULT)
+        c = TestClient(app, raise_server_exceptions=True)
+
+        with patch.object(_NodeState, "ensure_serving", blocking_ensure_serving), \
+             patch.object(_NodeState, "_place_hold"):
+            t = threading.Thread(
+                target=c.post,
+                args=("/lease/acquire",),
+                kwargs={"json": {
+                    "node": "gravitywell", "work_id": "w1", "ttl_sec": 120, "reason": "t",
+                }},
+            )
+            t.start()
+            assert wake_started.wait(timeout=2), "wake never started"
+
+            start = time.time()
+            r = c.get("/status")
+            elapsed = time.time() - start
+
+            release_wake.set()
+            t.join(timeout=5)
+
+        assert not t.is_alive()
+        assert r.status_code == 200
+        assert elapsed < 1.0, f"/status blocked {elapsed:.2f}s during in-flight /lease/acquire"
+
+    def test_http_drain_count_endpoint_not_blocked_by_inflight_acquire(self):
+        wake_started = threading.Event()
+        release_wake = threading.Event()
+
+        def blocking_ensure_serving(self, role=None):
+            wake_started.set()
+            assert release_wake.wait(timeout=5), "release never signaled"
+            return True
+
+        with patch("agents_core.doorman_server._start_refresh_thread"):
+            app = create_app(gw_url=GW_URL_DEFAULT)
+        c = TestClient(app, raise_server_exceptions=True)
+
+        with patch.object(_NodeState, "ensure_serving", blocking_ensure_serving), \
+             patch.object(_NodeState, "_place_hold"):
+            t = threading.Thread(
+                target=c.post,
+                args=("/lease/acquire",),
+                kwargs={"json": {
+                    "node": "gravitywell", "work_id": "w1", "ttl_sec": 120, "reason": "t",
+                }},
+            )
+            t.start()
+            assert wake_started.wait(timeout=2), "wake never started"
+
+            start = time.time()
+            r = c.get("/v0/drain-count?node=gravitywell")
+            elapsed = time.time() - start
+
+            release_wake.set()
+            t.join(timeout=5)
+
+        assert not t.is_alive()
+        assert r.status_code == 200
+        assert elapsed < 1.0, f"/v0/drain-count blocked {elapsed:.2f}s during in-flight wake"
+
+    def test_http_lease_release_not_blocked_by_inflight_acquire(self):
+        wake_started = threading.Event()
+        release_wake = threading.Event()
+
+        def blocking_ensure_serving(self, role=None):
+            wake_started.set()
+            assert release_wake.wait(timeout=5), "release never signaled"
+            return True
+
+        with patch("agents_core.doorman_server._start_refresh_thread"):
+            app = create_app(gw_url=GW_URL_DEFAULT)
+        c = TestClient(app, raise_server_exceptions=True)
+
+        with patch.object(_NodeState, "ensure_serving", blocking_ensure_serving), \
+             patch.object(_NodeState, "_place_hold"), \
+             patch.object(_NodeState, "_release_hold"):
+            t = threading.Thread(
+                target=c.post,
+                args=("/lease/acquire",),
+                kwargs={"json": {
+                    "node": "gravitywell", "work_id": "w1", "ttl_sec": 120, "reason": "t",
+                }},
+            )
+            t.start()
+            assert wake_started.wait(timeout=2), "wake never started"
+
+            start = time.time()
+            r = c.post("/lease/release", json={"node": "gravitywell", "work_id": "some-other-work"})
+            elapsed = time.time() - start
+
+            release_wake.set()
+            t.join(timeout=5)
+
+        assert not t.is_alive()
+        assert r.status_code == 200
+        assert elapsed < 1.0, f"/lease/release blocked {elapsed:.2f}s during in-flight wake"
+
+    def test_http_mode_owner_not_blocked_by_inflight_acquire(self):
+        wake_started = threading.Event()
+        release_wake = threading.Event()
+
+        def blocking_ensure_serving(self, role=None):
+            wake_started.set()
+            assert release_wake.wait(timeout=5), "release never signaled"
+            return True
+
+        with patch("agents_core.doorman_server._start_refresh_thread"):
+            app = create_app(gw_url=GW_URL_DEFAULT)
+        c = TestClient(app, raise_server_exceptions=True)
+
+        with patch.object(_NodeState, "ensure_serving", blocking_ensure_serving), \
+             patch.object(_NodeState, "_place_hold"):
+            t = threading.Thread(
+                target=c.post,
+                args=("/lease/acquire",),
+                kwargs={"json": {
+                    "node": "gravitywell", "work_id": "w1", "ttl_sec": 120, "reason": "t",
+                }},
+            )
+            t.start()
+            assert wake_started.wait(timeout=2), "wake never started"
+
+            start = time.time()
+            r = c.get("/v0/mode-owner?node=gravitywell")
+            elapsed = time.time() - start
+
+            release_wake.set()
+            t.join(timeout=5)
+
+        assert not t.is_alive()
+        assert r.status_code == 200
+        assert elapsed < 1.0, f"/v0/mode-owner blocked {elapsed:.2f}s during in-flight wake"
+
+    def test_concurrent_ensure_serving_calls_serialize_to_one_wake(self):
+        """Two concurrent ensure_serving() calls for the same cold node must
+        result in exactly one wake-gravitywell + one gw-serve big subprocess
+        invocation, and the two must never run concurrently (wake_lock, not
+        self.lock, is what's serializing them now)."""
+        state = _make_state()
+        serving_state = {"is_up": False}
+        wake_calls = []
+        serve_calls = []
+        concurrency = {"active": 0, "max_active": 0}
+        tracker_lock = threading.Lock()
+
+        def fake_is_serving(_timeout=3.0):
+            return serving_state["is_up"]
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = str(cmd)
+            is_wake_or_serve = "wake-gravitywell" in cmd_str or (
+                "gw-serve" in cmd_str and "big" in cmd_str
+            )
+            if is_wake_or_serve:
+                with tracker_lock:
+                    concurrency["active"] += 1
+                    concurrency["max_active"] = max(concurrency["max_active"], concurrency["active"])
+                # threading.Event.wait, not time.sleep — this test patches time.sleep
+                # below, which would otherwise silently no-op this widening delay.
+                threading.Event().wait(0.05)
+                with tracker_lock:
+                    concurrency["active"] -= 1
+            if "wake-gravitywell" in cmd_str:
+                wake_calls.append(cmd)
+                return MagicMock(returncode=0, stderr="")
+            if "gw-serve" in cmd_str and "big" in cmd_str:
+                serve_calls.append(cmd)
+                serving_state["is_up"] = True
+                return MagicMock(returncode=0, stderr="")
+            return MagicMock(returncode=0, stderr="")
+
+        with patch.object(state, "_is_serving", side_effect=fake_is_serving), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch.object(state, "_place_hold"), \
+             patch("time.sleep"):
+            t1 = threading.Thread(target=state.ensure_serving)
+            t2 = threading.Thread(target=state.ensure_serving)
+            t1.start()
+            t2.start()
+            t1.join(timeout=5)
+            t2.join(timeout=5)
+
+        assert not t1.is_alive() and not t2.is_alive()
+        assert len(wake_calls) == 1
+        assert len(serve_calls) == 1
+        assert concurrency["max_active"] == 1
+
+    def test_no_torn_state_visible_to_concurrent_reader_during_wake_success(self):
+        """A reader sampling fields mid-wake (under self.lock) must never see
+        last_wake_at set without _cached_serving/service_stopped/last_error
+        also matching the post-success combination — self.lock still makes
+        each write site atomic even though it's no longer held for the whole
+        wake."""
+        state = _make_state()
+        observations = []
+        stop_reading = threading.Event()
+
+        def reader():
+            while not stop_reading.is_set():
+                with state.lock:
+                    observations.append((
+                        state.last_wake_at, state._cached_serving,
+                        state.service_stopped, state.last_error,
+                    ))
+
+        poll_count = {"n": 0}
+
+        def fake_is_serving(_timeout=3.0):
+            poll_count["n"] += 1
+            return poll_count["n"] > 1  # False on fast-path check, True on the poll
+
+        with patch.object(state, "_is_serving", side_effect=fake_is_serving), \
+             patch("subprocess.run") as mock_sub, \
+             patch.object(state, "_place_hold"), \
+             patch("time.sleep"):
+            mock_sub.return_value = MagicMock(returncode=0, stderr="")
+            reader_thread = threading.Thread(target=reader)
+            reader_thread.start()
+            result = state.ensure_serving()
+            stop_reading.set()
+            reader_thread.join(timeout=5)
+
+        assert result is True
+        for last_wake_at, cached_serving, service_stopped, last_error in observations:
+            if last_wake_at is not None:
+                assert cached_serving is True
+                assert service_stopped is False
+                assert last_error is None
+
+    def test_fast_path_probe_runs_outside_self_lock(self):
+        """The already-warm fast path's _is_serving() call must not run while
+        self.lock is held (same convention as the other probe methods)."""
+        state = _make_state()
+        lock_was_free_during_probe = {"val": None}
+
+        def probe(_timeout=3.0):
+            lock_was_free_during_probe["val"] = state.lock.acquire(blocking=False)
+            if lock_was_free_during_probe["val"]:
+                state.lock.release()
+            return True
+
+        with patch.object(state, "_is_serving", side_effect=probe):
+            result = state.ensure_serving()
+
+        assert result is True
+        assert lock_was_free_during_probe["val"] is True
