@@ -985,6 +985,68 @@ class _NodeState:
                 "idle_since_source": self._idle_since_source,
             }
 
+    # ------------------------------------------------------------------
+    # Manual force-stop (doorman-force-stop-endpoint-v0): bypasses
+    # GW_STOP_GRACE_SEC entirely. Mirrors the refresh thread's grace-period
+    # stop logic (idempotency guards, state updates) so behavior stays
+    # consistent whichever path issues the stop. Must be called under
+    # self.lock — caller (the /v0/force-stop route) holds it.
+    # ------------------------------------------------------------------
+
+    def _force_stop(self) -> dict:
+        if self.service_stopped:
+            return {"status": "already_stopped", "node": self.node_name}
+
+        log.info(f"[{self.node_name}] force-stop: issuing gw-serve stop (bypassing grace period)")
+        try:
+            stop_proc = subprocess.run(
+                ["ssh", "gravitywell", "gw-serve stop"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if stop_proc.returncode == 0:
+                self.service_stopped = True
+                self.idle_since = None
+                self._idle_since_source = None
+                self._cached_serving = False
+                self._serving_checked_at = time.time()
+                log.info(f"[{self.node_name}] force-stop: gw-serve stop succeeded")
+                _write_idle_log(self.node_name, "force_stopped", 0)
+                return {"status": "stopped", "node": self.node_name, "exit_code": 0}
+            else:
+                # rc != 0: idempotency guard — check if already down
+                if not self._is_serving():
+                    self.service_stopped = True
+                    self.idle_since = None
+                    self._idle_since_source = None
+                    self._cached_serving = False
+                    self._serving_checked_at = time.time()
+                    log.warning(
+                        f"[{self.node_name}] force-stop: gw-serve stop "
+                        f"rc={stop_proc.returncode} but service already down — "
+                        f"treating as success"
+                    )
+                    _write_idle_log(self.node_name, "force_stopped", 0)
+                    return {
+                        "status": "already_stopped", "node": self.node_name,
+                        "exit_code": stop_proc.returncode,
+                    }
+                else:
+                    err = (
+                        f"gw-serve stop failed rc={stop_proc.returncode}: "
+                        f"{stop_proc.stderr[:200]}"
+                    )
+                    log.error(f"[{self.node_name}] {err}")
+                    self.last_error = err
+                    return {
+                        "status": "error", "node": self.node_name, "error": err,
+                        "exit_code": stop_proc.returncode,
+                    }
+        except Exception as exc:
+            err = f"force-stop exception: {exc}"
+            log.error(f"[{self.node_name}] {err}")
+            self.last_error = err
+            return {"status": "error", "node": self.node_name, "error": err}
+
 
 # ---------------------------------------------------------------------------
 # Background refresh thread
@@ -1303,6 +1365,33 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         if require_drain_clear:
             resp["drain_cleared"] = True  # signals to client that drain check was honored (AC5a)
         return resp
+
+    # ------------------------------------------------------------------
+    # POST /v0/force-stop — manual GW model unload, bypasses GW_STOP_GRACE_SEC
+    # ------------------------------------------------------------------
+
+    @app.post("/v0/force-stop")
+    def force_stop(body: dict[str, Any]):
+        node = body.get("node", "gravitywell")
+
+        if node != "gravitywell":
+            return JSONResponse(
+                status_code=400,
+                content=_error("bad_node", f"node {node!r} not supported"),
+            )
+        if node not in nodes:
+            return JSONResponse(
+                status_code=404,
+                content=_error("not_found", f"node {node!r} not found"),
+            )
+
+        state = nodes[node]
+        with state.lock:
+            result = state._force_stop()
+
+        if result["status"] == "error":
+            return JSONResponse(result, status_code=500)
+        return result
 
     # ------------------------------------------------------------------
     # POST /lease/release
