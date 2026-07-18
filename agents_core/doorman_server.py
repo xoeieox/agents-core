@@ -273,16 +273,23 @@ def _write_idle_log(
 # ---------------------------------------------------------------------------
 
 class _NodeState:
-    """All mutable state for one node, guarded by a single threading.Lock.
+    """All mutable state for one node, guarded by self.lock plus a dedicated
+    self.wake_lock for the cold-wake path (doorman-acquire-lease-lock-release-during-wake-v0).
 
-    The lock serializes:
+    self.lock serializes:
     - every lease-registry mutation (acquire, release, GC)
-    - ensure_serving calls (prevents parallel wake-gravitywell subprocesses)
+    - short reads/writes of cached-serving / error / service-lifecycle fields
     - background refresh-thread reads and SSH hold re-issues
+
+    self.wake_lock serializes ensure_serving() calls (prevents parallel
+    wake-gravitywell subprocesses) without holding self.lock across the
+    minutes-long wake + poll loop, so /status, /lease/release, etc. stay
+    responsive for this node while a wake is in flight.
     """
 
     def __init__(self, gw_url: str, node_name: str = "gravitywell"):
         self.lock = threading.Lock()
+        self.wake_lock = threading.Lock()
         self.gw_url = gw_url
         self.node_name = node_name
         # keyed by work_id → {acquired_at: float, ttl_sec: int, reason: str, role: str}
@@ -727,15 +734,20 @@ class _NodeState:
         return None, None
 
     # ------------------------------------------------------------------
-    # ensure_serving — must be called under lock
+    # ensure_serving — serializes wakes via self.wake_lock, not self.lock
     # ------------------------------------------------------------------
 
     def ensure_serving(self, role: str | None = None) -> bool | object:
         """Wake GW if needed, start the serving unit, and wait until it serves.
 
         Returns True on success, DEFERRED if controller owns the mode, False on failure.
-        Called under self.lock — serializes concurrent wake attempts so only one
-        wake-gravitywell subprocess runs at a time.
+        Acquires self.wake_lock internally for the duration of the wake-gravitywell /
+        gw-serve subprocess + poll loop — this serializes concurrent wake attempts so
+        only one wake-gravitywell subprocess runs at a time, without requiring the
+        caller to hold self.lock (which would otherwise freeze every other endpoint
+        for this node for the whole wake). self.lock is taken only briefly, internally,
+        around each shared-state read/write (controller-lease checks, last_error,
+        _cached_serving, service_stopped, last_wake_at).
 
         Args:
           role: optional role of the caller (e.g., "mode-controller" for flip-controller).
@@ -758,64 +770,74 @@ class _NodeState:
              backgrounded launch; the ~488s Devstral cold-init happens off the subprocess),
              then poll both slots until GW_DUAL_WAKE_DEADLINE_SEC.
         """
-        # Block co-load if creative 70B holds the GPU lane
-        if self._is_creative_serving():
-            return CREATIVE_OCCUPIED
+        with self.wake_lock:
+            # Block co-load if creative 70B holds the GPU lane
+            if self._is_creative_serving():
+                return CREATIVE_OCCUPIED
 
-        # HOLE 1 fix (AC2): mode-aware deference before _is_serving() fast path.
-        # Worker acquires return DEFERRED immediately when the controller owns the mode,
-        # even when _is_serving() would return True (avoids wrong-model leases on a live swarm).
-        # Mode-controller's own acquire (role='mode-controller') skips this and always proceeds.
-        if DOORMAN_MODE_AWARE_ADMISSION and DOORMAN_DEFER_TO_CONTROLLER:
-            if role != "mode-controller" and self._controller_lease_active():
-                log.info(
-                    f"[{self.node_name}] mode-aware: controller owns mode — "
-                    f"deferring before is_serving check (role={role!r})"
+            # HOLE 1 fix (AC2): mode-aware deference before _is_serving() fast path.
+            # Worker acquires return DEFERRED immediately when the controller owns the mode,
+            # even when _is_serving() would return True (avoids wrong-model leases on a live swarm).
+            # Mode-controller's own acquire (role='mode-controller') skips this and always proceeds.
+            if DOORMAN_MODE_AWARE_ADMISSION and DOORMAN_DEFER_TO_CONTROLLER:
+                with self.lock:
+                    controller_owns = self._controller_lease_active()
+                if role != "mode-controller" and controller_owns:
+                    log.info(
+                        f"[{self.node_name}] mode-aware: controller owns mode — "
+                        f"deferring before is_serving check (role={role!r})"
+                    )
+                    return DEFERRED
+
+            # Fast path: already awake and serving
+            if self._is_serving():
+                with self.lock:
+                    self.last_error = None
+                    self.service_stopped = False
+                return True
+
+            log.info(f"[{self.node_name}] GW not serving — running wake-gravitywell")
+            try:
+                proc = subprocess.run(
+                    ["wake-gravitywell", "doorman-acquire"],
+                    capture_output=True, text=True, timeout=60,
                 )
-                return DEFERRED
-
-        # Fast path: already awake and serving
-        if self._is_serving():
-            self.last_error = None
-            self.service_stopped = False
-            return True
-
-        log.info(f"[{self.node_name}] GW not serving — running wake-gravitywell")
-        try:
-            proc = subprocess.run(
-                ["wake-gravitywell", "doorman-acquire"],
-                capture_output=True, text=True, timeout=60,
-            )
-            if proc.returncode != 0:
-                err = f"wake-gravitywell failed rc={proc.returncode}: {proc.stderr[:300]}"
+                if proc.returncode != 0:
+                    err = f"wake-gravitywell failed rc={proc.returncode}: {proc.stderr[:300]}"
+                    log.error(f"[{self.node_name}] {err}")
+                    with self.lock:
+                        self.last_error = err
+                    return False
+            except Exception as e:
+                err = f"wake-gravitywell subprocess error: {e}"
                 log.error(f"[{self.node_name}] {err}")
-                self.last_error = err
+                with self.lock:
+                    self.last_error = err
                 return False
-        except Exception as e:
-            err = f"wake-gravitywell subprocess error: {e}"
-            log.error(f"[{self.node_name}] {err}")
-            self.last_error = err
-            return False
 
-        # Deference guard: if controller owns the mode, don't issue gw-serve big
-        if DOORMAN_DEFER_TO_CONTROLLER:
-            if role == "mode-controller" or self._controller_lease_active():
-                log.info(
-                    f"[{self.node_name}] GW not serving but controller owns mode — "
-                    f"deferring (no gw-serve big)"
-                )
-                return DEFERRED
+            # Deference guard: if controller owns the mode, don't issue gw-serve big
+            if DOORMAN_DEFER_TO_CONTROLLER:
+                with self.lock:
+                    controller_owns = self._controller_lease_active()
+                if role == "mode-controller" or controller_owns:
+                    log.info(
+                        f"[{self.node_name}] GW not serving but controller owns mode — "
+                        f"deferring (no gw-serve big)"
+                    )
+                    return DEFERRED
 
-        # Issue the configured cold-wake serving target (gw-doorman-wake-to-default-mode-v0).
-        # DOORMAN_DEFAULT_SERVE_MODE=big is byte-identical to the pre-dual-default behavior.
-        if DOORMAN_DEFAULT_SERVE_MODE == "big":
-            return self._wake_big()
-        return self._wake_dual()
+            # Issue the configured cold-wake serving target (gw-doorman-wake-to-default-mode-v0).
+            # DOORMAN_DEFAULT_SERVE_MODE=big is byte-identical to the pre-dual-default behavior.
+            if DOORMAN_DEFAULT_SERVE_MODE == "big":
+                return self._wake_big()
+            return self._wake_dual()
 
     def _wake_big(self) -> bool:
         """Synchronous gw-serve big wake — unchanged timings (~60s subprocess,
         poll until GW_WAKE_DEADLINE_SEC). Must be called from ensure_serving()
-        under self.lock, after wake-gravitywell + deference checks.
+        while holding self.wake_lock, after wake-gravitywell + deference checks.
+        Shared node state is written under a brief self.lock acquisition at
+        each write site, not for the duration of the subprocess/poll loop.
         """
         # Ensure the serving unit is up (idempotent — fast no-op if already active)
         log.info(f"[{self.node_name}] running gw-serve big to ensure llama-server.service is up")
@@ -829,12 +851,14 @@ class _NodeState:
                     f"gw-serve big failed rc={proc.returncode}: {proc.stderr[:300]}"
                 )
                 log.error(f"[{self.node_name}] {err}")
-                self.last_error = err
+                with self.lock:
+                    self.last_error = err
                 return False
         except Exception as e:
             err = f"gw-serve big subprocess error: {e}"
             log.error(f"[{self.node_name}] {err}")
-            self.last_error = err
+            with self.lock:
+                self.last_error = err
             return False
 
         # Poll /health until serving or deadline (covers ~25s cold-load)
@@ -844,18 +868,20 @@ class _NodeState:
             if self._is_serving():
                 elapsed = GW_WAKE_DEADLINE_SEC - (deadline - time.time())
                 log.info(f"[{self.node_name}] GW serving after ~{elapsed:.0f}s")
-                self.last_wake_at = time.time()
-                self.last_error = None
-                self.service_stopped = False
-                self._cached_serving = True
-                self._serving_checked_at = time.time()
+                with self.lock:
+                    self.last_wake_at = time.time()
+                    self.last_error = None
+                    self.service_stopped = False
+                    self._cached_serving = True
+                    self._serving_checked_at = time.time()
                 self._place_hold()
                 return True
             time.sleep(poll_interval)
 
         err = f"GW did not serve within {GW_WAKE_DEADLINE_SEC}s after wake"
         log.error(f"[{self.node_name}] {err}")
-        self.last_error = err
+        with self.lock:
+            self.last_error = err
         return False
 
     def _wake_dual(self) -> bool:
@@ -872,7 +898,9 @@ class _NodeState:
         host side — this method does not duplicate that logic, it only detects (a) a
         failed *launch* (caught immediately, distinct from a merely slow init) and
         (b) deadline exhaustion (transient — caller retries/degrades). Must be called
-        from ensure_serving() under self.lock, after wake-gravitywell + deference checks.
+        from ensure_serving() while holding self.wake_lock, after wake-gravitywell +
+        deference checks. Shared node state is written under a brief self.lock
+        acquisition at each write site, not for the duration of the poll loop.
         """
         log.info(f"[{self.node_name}] issuing async-initiated gw-serve dual")
         try:
@@ -884,13 +912,15 @@ class _NodeState:
             if proc.returncode != 0:
                 err = f"gw-serve dual initiation failed rc={proc.returncode}: {proc.stderr[:300]}"
                 log.error(f"[{self.node_name}] {err}")
-                self.last_error = err
+                with self.lock:
+                    self.last_error = err
                 self._cleanup_failed_dual_initiation()
                 return False
         except Exception as e:
             err = f"gw-serve dual initiation subprocess error: {e}"
             log.error(f"[{self.node_name}] {err}")
-            self.last_error = err
+            with self.lock:
+                self.last_error = err
             self._cleanup_failed_dual_initiation()
             return False
 
@@ -905,11 +935,12 @@ class _NodeState:
             if slot1_streak >= 2 and slot2_streak >= 2:
                 elapsed = GW_DUAL_WAKE_DEADLINE_SEC - (deadline - time.time())
                 log.info(f"[{self.node_name}] dual serving (both slots) after ~{elapsed:.0f}s")
-                self.last_wake_at = time.time()
-                self.last_error = None
-                self.service_stopped = False
-                self._cached_serving = True
-                self._serving_checked_at = time.time()
+                with self.lock:
+                    self.last_wake_at = time.time()
+                    self.last_error = None
+                    self.service_stopped = False
+                    self._cached_serving = True
+                    self._serving_checked_at = time.time()
                 self._place_hold()
                 return True
             time.sleep(poll_interval)
@@ -924,7 +955,8 @@ class _NodeState:
             f"(slot1_ready={slot1_streak >= 2}, slot2_ready={slot2_streak >= 2})"
         )
         log.error(f"[{self.node_name}] {err}")
-        self.last_error = err
+        with self.lock:
+            self.last_error = err
         return False
 
     def _is_slot2_serving(self, timeout: float = 3.0) -> bool:
@@ -1058,15 +1090,24 @@ class _NodeState:
                       by the endpoint before this method). Caller (the endpoint) is
                       responsible for the defer-check; this method only stamps the
                       lease with its class.
+
+        self.lock is held only for the short bookkeeping at the start (idle-tracking
+        reset) and end (lease registration + _place_hold()) — NOT across ensure_serving(),
+        which can block for minutes on a cold wake. ensure_serving() serializes concurrent
+        wakes internally via its own wake_lock, so other node state (reads via /status,
+        /v0/drain-count, /lease/release, etc.) stays responsive while a wake is in flight.
         """
         # Clear idle tracking: an arriving lease means the node is no longer idle
-        was_idle = self.idle_since is not None
-        self.idle_since = None
-        self._idle_since_source = None
+        with self.lock:
+            was_idle = self.idle_since is not None
+            self.idle_since = None
+            self._idle_since_source = None
+            lease_count_for_log = len(self.leases)
         if was_idle:
-            _write_idle_log(self.node_name, "resumed", len(self.leases))
+            _write_idle_log(self.node_name, "resumed", lease_count_for_log)
 
-        # ensure_serving serializes concurrent wakes under the same lock
+        # ensure_serving serializes concurrent wakes internally via its own wake_lock —
+        # this call intentionally runs without self.lock held.
         ok = self.ensure_serving(role=role)
         if ok is CREATIVE_OCCUPIED:
             return CREATIVE_OCCUPIED
@@ -1075,13 +1116,14 @@ class _NodeState:
             # even though ensure_serving returns DEFERRED (no gw-serve big was issued).
             # Foreign acquires during controller ownership don't register a lease.
             if role == "mode-controller":
-                self.leases[work_id] = {
-                    "acquired_at": time.time(),
-                    "ttl_sec": ttl_sec,
-                    "reason": reason,
-                    "role": role,
-                }
-                self._place_hold()
+                with self.lock:
+                    self.leases[work_id] = {
+                        "acquired_at": time.time(),
+                        "ttl_sec": ttl_sec,
+                        "reason": reason,
+                        "role": role,
+                    }
+                    self._place_hold()
                 return DEFERRED  # still return DEFERRED so endpoint knows not to issue gw-serve big
             else:
                 # Foreign caller during controller ownership — return deferred, no lease
@@ -1093,40 +1135,42 @@ class _NodeState:
         # the new lease in one critical section — check-and-register atomic; closes the
         # drain-gate TOCTOU where separate drain_count + acquire calls let multiple
         # distinct-principal workers all observe drain=0 before any registers.
-        if require_drain_clear and role == "worker":
-            effective_principal = principal if principal is not None else GHOST_PRINCIPAL
-            for _wid, _info in self.leases.items():
-                if _info.get("role") != "worker":
-                    continue
-                # Coordination leases hold no inference — not a drain-gate contender (AC2).
-                # /v0/drain-count still counts them for flip-protection (unchanged, AC4).
-                if _info.get("lease_kind", "inference") == "coordination":
-                    continue
-                _p = _info.get("principal", GHOST_PRINCIPAL)
-                if _p == GHOST_PRINCIPAL:
-                    # Ghost leases always count as contending; never silently excluded (AC7).
-                    log.critical(
-                        "[doorman] drain_count ghost_lease_counted work_id=%s - "
-                        "role=worker lease has no principal; add principal= to "
-                        "acquire() call to prevent drain-gate freeze",
-                        _wid,
-                    )
-                    return CONTENDED
-                if _p != effective_principal:
-                    return CONTENDED
+        with self.lock:
+            if require_drain_clear and role == "worker":
+                effective_principal = principal if principal is not None else GHOST_PRINCIPAL
+                for _wid, _info in self.leases.items():
+                    if _info.get("role") != "worker":
+                        continue
+                    # Coordination leases hold no inference — not a drain-gate contender (AC2).
+                    # /v0/drain-count still counts them for flip-protection (unchanged, AC4).
+                    if _info.get("lease_kind", "inference") == "coordination":
+                        continue
+                    _p = _info.get("principal", GHOST_PRINCIPAL)
+                    if _p == GHOST_PRINCIPAL:
+                        # Ghost leases always count as contending; never silently excluded (AC7).
+                        log.critical(
+                            "[doorman] drain_count ghost_lease_counted work_id=%s - "
+                            "role=worker lease has no principal; add principal= to "
+                            "acquire() call to prevent drain-gate freeze",
+                            _wid,
+                        )
+                        return CONTENDED
+                    if _p != effective_principal:
+                        return CONTENDED
 
-        lease_entry: dict = {
-            "acquired_at": time.time(),
-            "ttl_sec": ttl_sec,
-            "reason": reason,
-            "role": role,
-            "lease_kind": lease_kind,
-            "class": lease_class,
-        }
-        if role == "worker":
-            lease_entry["principal"] = principal if principal is not None else GHOST_PRINCIPAL
-        self.leases[work_id] = lease_entry
-        self._place_hold()
+        with self.lock:
+            lease_entry: dict = {
+                "acquired_at": time.time(),
+                "ttl_sec": ttl_sec,
+                "reason": reason,
+                "role": role,
+                "lease_kind": lease_kind,
+                "class": lease_class,
+            }
+            if role == "worker":
+                lease_entry["principal"] = principal if principal is not None else GHOST_PRINCIPAL
+            self.leases[work_id] = lease_entry
+            self._place_hold()
         return True
 
     def release_lease(self, work_id: str) -> None:
@@ -1586,12 +1630,15 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         if pending_resp is not None:
             return pending_resp
 
-        with state.lock:
-            ok = state.acquire_lease(
-                work_id, ttl_sec, reason, role=role, principal=principal,
-                require_drain_clear=require_drain_clear, lease_kind=lease_kind,
-                lease_class=lease_class,
-            )
+        # acquire_lease() manages its own locking internally (narrow self.lock
+        # sections around bookkeeping, self.wake_lock around ensure_serving) —
+        # it must NOT be wrapped in self.lock here, or a cold wake would once
+        # again freeze every other endpoint for this node.
+        ok = state.acquire_lease(
+            work_id, ttl_sec, reason, role=role, principal=principal,
+            require_drain_clear=require_drain_clear, lease_kind=lease_kind,
+            lease_class=lease_class,
+        )
 
         if ok is CREATIVE_OCCUPIED:
             return JSONResponse(
