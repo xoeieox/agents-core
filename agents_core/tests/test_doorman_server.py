@@ -3373,9 +3373,16 @@ class TestBackgroundSweepIntegration:
         state = _NodeState(GW_URL_DEFAULT)
         state.wait_list["fixer-1"] = {"enqueued_at": time.time() - 5, "reason": "t", "role": "worker"}
         nodes = {"gravitywell": state}
+        run_calls = []
 
-        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
+        def fake_run(cmd, **kwargs):
+            run_calls.append(cmd)
+            return MagicMock(returncode=0, stderr="")
+
+        with patch("subprocess.run", side_effect=fake_run), \
              patch("time.sleep", side_effect=_StopRefreshLoop), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
              patch("agents_core.doorman_server.DOORMAN_RELEASE_JITTER_MAX_SEC", 0.0), \
              patch("agents_core.doorman_server.DOORMAN_PROBE_LLAMA_ACTIVITY", False), \
              patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0), \
@@ -3383,3 +3390,7 @@ class TestBackgroundSweepIntegration:
             _run_refresh_thread_one_tick(nodes)
 
         assert "fixer-1" not in state.wait_list
+        # A fresh idle_since (just constructed, well under GW_STOP_GRACE_SEC) means
+        # this tick's wait-list sweep must not touch gw-serve at all — no wake/stop
+        # subprocess call should fire from a pure sweep-and-release tick.
+        assert run_calls == []
