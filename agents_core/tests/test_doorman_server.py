@@ -3247,3 +3247,451 @@ class TestWakeLockDecoupledFromStateLock:
 
         assert result is True
         assert lock_was_free_during_probe["val"] is True
+# Foreground-priority gate (gw-router-phase1-foreground-gate)
+# ---------------------------------------------------------------------------
+
+class TestLeaseClass:
+    """Lease `class` field: missing → deferrable, invalid → 400 (AC6)."""
+
+    def test_acquire_lease_defaults_class_to_deferrable(self):
+        state = _make_state()
+        with patch.object(state, "ensure_serving", return_value=True), \
+             patch.object(state, "_place_hold"):
+            ok = state.acquire_lease("w1", ttl_sec=120, reason="t")
+        assert ok is True
+        assert state.leases["w1"]["class"] == "deferrable"
+
+    def test_acquire_lease_stores_explicit_class(self):
+        state = _make_state()
+        with patch.object(state, "ensure_serving", return_value=True), \
+             patch.object(state, "_place_hold"):
+            state.acquire_lease("w1", ttl_sec=120, reason="t", lease_class="protected")
+        assert state.leases["w1"]["class"] == "protected"
+
+    def test_endpoint_missing_class_defaults_deferrable(self):
+        with patch("agents_core.doorman_server._start_refresh_thread"), \
+             patch("agents_core.doorman_server._NodeState.acquire_lease", return_value=True) as mock_acq:
+            app = create_app(gw_url=GW_URL_DEFAULT)
+            c = TestClient(app)
+            r = c.post("/lease/acquire", json={
+                "node": "gravitywell", "work_id": "w1", "ttl_sec": 120, "reason": "test",
+            })
+        assert r.status_code == 200
+        assert r.json()["status"] == "serving"
+        assert mock_acq.call_args.kwargs["lease_class"] == "deferrable"
+
+    def test_endpoint_invalid_class_returns_400(self):
+        c = _client_no_auth()
+        r = c.post("/lease/acquire", json={
+            "node": "gravitywell", "work_id": "w1", "ttl_sec": 120, "reason": "test",
+            "class": "urgent",
+        })
+        assert r.status_code == 400
+
+    def test_endpoint_protected_class_accepted(self):
+        with patch("agents_core.doorman_server._start_refresh_thread"), \
+             patch("agents_core.doorman_server._NodeState.acquire_lease", return_value=True) as mock_acq:
+            app = create_app(gw_url=GW_URL_DEFAULT)
+            c = TestClient(app)
+            r = c.post("/lease/acquire", json={
+                "node": "gravitywell", "work_id": "w1", "ttl_sec": 120, "reason": "test",
+                "class": "protected",
+            })
+        assert r.status_code == 200
+        assert r.json()["status"] == "serving"
+        assert r.json()["class"] == "protected"
+        assert mock_acq.call_args.kwargs["lease_class"] == "protected"
+
+
+class TestProtectedGate:
+    """Protected/deferrable gating primitives (AC1, AC2)."""
+
+    def test_protected_lease_active_true(self):
+        state = _make_state()
+        state.leases["pm-session"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "interactive",
+            "role": "worker", "class": "protected",
+        }
+        assert state._protected_lease_active() is True
+
+    def test_protected_lease_active_false_for_deferrable(self):
+        state = _make_state()
+        state.leases["fixer-1"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "fixer",
+            "role": "worker", "class": "deferrable",
+        }
+        assert state._protected_lease_active() is False
+
+    def test_protected_lease_active_false_missing_class(self):
+        """A pre-gate lease with no `class` field must default to deferrable —
+        never counted as protected (AC6, missing → deferrable)."""
+        state = _make_state()
+        state.leases["legacy"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "legacy",
+            "role": "worker",
+        }
+        assert state._protected_lease_active() is False
+
+    def test_protected_lease_active_false_when_expired(self):
+        state = _make_state()
+        state.leases["pm-session"] = {
+            "acquired_at": time.time() - 1000, "ttl_sec": 1, "reason": "interactive",
+            "role": "worker", "class": "protected",
+        }
+        assert state._protected_lease_active() is False
+
+    def test_protected_acquire_never_gated(self):
+        """AC2: a protected dispatch is never deferred by a deferrable one —
+        acquire_or_defer is a no-op for lease_class == 'protected'."""
+        state = _make_state()
+        state.leases["other-protected"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "spec-review",
+            "role": "worker", "class": "protected",
+        }
+        pending, release_info = state.acquire_or_defer("w2", "test", "worker", "protected")
+        assert pending is None
+        assert release_info is None
+        assert "w2" not in state.wait_list
+
+    def test_deferrable_acquire_enqueued_while_protected_active(self):
+        """AC1: a deferrable dispatch is enqueued while a protected lease is active."""
+        state = _make_state()
+        state.leases["pm-session"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "interactive",
+            "role": "worker", "class": "protected",
+        }
+        pending, release_info = state.acquire_or_defer("fixer-1", "fixer work", "worker", "deferrable")
+        assert pending is not None
+        assert pending["status"] == "pending_defer"
+        assert pending["work_id"] == "fixer-1"
+        assert release_info is None
+        assert "fixer-1" in state.wait_list
+
+    def test_deferrable_acquire_proceeds_when_no_protected(self):
+        state = _make_state()
+        pending, release_info = state.acquire_or_defer("fixer-1", "fixer work", "worker", "deferrable")
+        assert pending is None
+        assert release_info is None
+        assert "fixer-1" not in state.wait_list
+
+    def test_deferrable_acquire_endpoint_returns_pending_defer(self):
+        """End-to-end: a deferrable acquire against a live protected lease gets
+        pending_defer from the endpoint, and no lease is registered."""
+        with patch("agents_core.doorman_server._start_refresh_thread"):
+            app = create_app(gw_url=GW_URL_DEFAULT)
+        c = TestClient(app)
+
+        with patch("agents_core.doorman_server._NodeState._is_serving", return_value=True):
+            r = c.post("/lease/acquire", json={
+                "node": "gravitywell", "work_id": "pm-session", "ttl_sec": 300,
+                "reason": "interactive", "class": "protected",
+            })
+            assert r.status_code == 200
+            assert r.json()["status"] == "serving"
+
+            r2 = c.post("/lease/acquire", json={
+                "node": "gravitywell", "work_id": "fixer-1", "ttl_sec": 120,
+                "reason": "fixer work", "class": "deferrable",
+            })
+        assert r2.status_code == 200
+        assert r2.json()["status"] == "pending_defer"
+        assert r2.json()["work_id"] == "fixer-1"
+
+    def test_hermes_class_deferrable_yields_to_spec_review_protected(self):
+        """AC5: a Hermes-class (deferrable) lease yields while a spec-review
+        (protected) lease is held."""
+        state = _make_state()
+        state.leases["spec-review-run-1"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "spec-review gate",
+            "role": "worker", "class": "protected",
+        }
+        pending, _ = state.acquire_or_defer("hermes-session-1", "hermes chat", "worker", "deferrable")
+        assert pending is not None
+        assert pending["status"] == "pending_defer"
+
+
+class TestWaitListRelease:
+    """Wait-list release: protected-cleared, non-resetting max-hold-timeout,
+    jitter, structured events (AC1, AC3, AC7)."""
+
+    def test_release_when_protected_clears(self):
+        state = _make_state()
+        state.leases["pm-session"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "interactive",
+            "role": "worker", "class": "protected",
+        }
+        state.acquire_or_defer("fixer-1", "fixer work", "worker", "deferrable")
+        assert "fixer-1" in state.wait_list
+
+        # protected clears
+        del state.leases["pm-session"]
+
+        with patch("agents_core.doorman_server.DOORMAN_RELEASE_JITTER_MAX_SEC", 0.0):
+            released = state._sweep_wait_list()
+
+        assert len(released) == 1
+        assert released[0]["job_id"] == "fixer-1"
+        assert released[0]["reason"] == "protected-cleared"
+        assert "fixer-1" not in state.wait_list
+
+    def test_max_hold_timeout_releases_regardless_of_protected(self):
+        """AC3: max-hold timeout releases a waiting job even while protected
+        is STILL active — never held past enqueue + timeout."""
+        state = _make_state()
+        state.leases["pm-session"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "interactive",
+            "role": "worker", "class": "protected",
+        }
+        # Enqueue with an enqueued_at far enough in the past to exceed max-hold.
+        state.wait_list["fixer-1"] = {"enqueued_at": time.time() - 1000, "reason": "t", "role": "worker"}
+
+        with patch("agents_core.doorman_server.DOORMAN_MAX_HOLD_TIMEOUT_SEC", 900), \
+             patch("agents_core.doorman_server.DOORMAN_RELEASE_JITTER_MAX_SEC", 0.0):
+            released = state._sweep_wait_list()
+
+        assert len(released) == 1
+        assert released[0]["reason"] == "max-hold-timeout"
+        assert "fixer-1" not in state.wait_list
+        # protected lease itself is untouched — Phase 1a is defer-only, no kill (AC9)
+        assert "pm-session" in state.leases
+
+    def test_anchor_not_reset_by_new_protected_lease(self):
+        """AC3 starvation guard: a NEW protected lease arriving after enqueue
+        must not push the release past the ORIGINAL enqueue + max-hold."""
+        state = _make_state()
+        original_enqueue = time.time() - 890  # 10s shy of a 900s timeout
+        state.wait_list["fixer-1"] = {"enqueued_at": original_enqueue, "reason": "t", "role": "worker"}
+        state.leases["pm-session-old"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "old",
+            "role": "worker", "class": "protected",
+        }
+
+        with patch("agents_core.doorman_server.DOORMAN_MAX_HOLD_TIMEOUT_SEC", 900), \
+             patch("agents_core.doorman_server.DOORMAN_RELEASE_JITTER_MAX_SEC", 0.0):
+            # Not yet timed out (890s < 900s) and protected is active — still gated.
+            released_before = state._sweep_wait_list()
+            assert released_before == []
+            assert "fixer-1" in state.wait_list
+
+            # A brand-new protected lease arrives (recursive-loop scenario) —
+            # must NOT reset fixer-1's enqueued_at.
+            state.leases["pm-session-new"] = {
+                "acquired_at": time.time(), "ttl_sec": 300, "reason": "new",
+                "role": "worker", "class": "protected",
+            }
+            assert state.wait_list["fixer-1"]["enqueued_at"] == original_enqueue
+
+            # Advance past the ORIGINAL anchor's timeout without touching the
+            # entry directly — simulate time passing.
+            state.wait_list["fixer-1"]["enqueued_at"] = time.time() - 901
+            released_after = state._sweep_wait_list()
+
+        assert len(released_after) == 1
+        assert released_after[0]["reason"] == "max-hold-timeout"
+
+    def test_retry_with_same_work_id_preserves_original_enqueued_at(self):
+        """The wait-list anchors enqueued_at to the FIRST enqueue for a given
+        work_id — a retried acquire call must not reset it."""
+        state = _make_state()
+        state.leases["pm-session"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "interactive",
+            "role": "worker", "class": "protected",
+        }
+        pending1, _ = state.acquire_or_defer("fixer-1", "t", "worker", "deferrable")
+        first_enqueued_at = pending1["enqueued_at"]
+
+        pending2, _ = state.acquire_or_defer("fixer-1", "t", "worker", "deferrable")
+        assert pending2["enqueued_at"] == first_enqueued_at
+
+    def test_release_emits_structured_event(self):
+        """AC7: every release emits a structured event with job_id/reason/waited_seconds."""
+        state = _make_state()
+        state.wait_list["fixer-1"] = {"enqueued_at": time.time() - 5, "reason": "t", "role": "worker"}
+
+        log_calls = []
+        with patch("agents_core.doorman_server._write_idle_log", side_effect=lambda *a, **kw: log_calls.append((a, kw))), \
+             patch("agents_core.doorman_server.DOORMAN_RELEASE_JITTER_MAX_SEC", 0.0):
+            released = state._sweep_wait_list()
+
+        assert len(released) == 1
+        assert len(log_calls) == 1
+        args, kwargs = log_calls[0]
+        assert kwargs["job_id"] == "fixer-1"
+        assert kwargs["reason"] == "protected-cleared"
+        assert "waited_seconds" in kwargs
+
+    def test_release_never_gated_on_acknowledgment(self):
+        """Release fires from the background sweep even with no caller polling —
+        no acknowledgment/ack step is required."""
+        state = _make_state()
+        state.wait_list["fixer-1"] = {"enqueued_at": time.time() - 5, "reason": "t", "role": "worker"}
+        with patch("agents_core.doorman_server.DOORMAN_RELEASE_JITTER_MAX_SEC", 0.0):
+            released = state._sweep_wait_list()
+        assert len(released) == 1
+        assert "fixer-1" not in state.wait_list
+
+    def test_batch_release_jitter_staggers(self):
+        """Backoff jitter: a batch of simultaneously-releasable jobs must not
+        all finalize in the same instant when jitter is nonzero."""
+        state = _make_state()
+        now = time.time()
+        for i in range(5):
+            state.wait_list[f"job-{i}"] = {"enqueued_at": now - 5, "reason": "t", "role": "worker"}
+
+        with patch("agents_core.doorman_server.DOORMAN_RELEASE_JITTER_MAX_SEC", 2.0), \
+             patch("agents_core.doorman_server.random.uniform", side_effect=[0.1, 0.5, 1.0, 1.5, 2.0]):
+            first_sweep = state._sweep_wait_list()
+
+        # None finalize on the same tick they're scheduled (jitter defers them).
+        assert first_sweep == []
+        assert len(state.wait_list) == 5
+        assert {e["_release_at"] for e in state.wait_list.values()} != {now}
+
+    def test_pending_release_soon_warning_emitted_once(self):
+        """Optional pre-release warning fires once at T-minus the warn window,
+        strictly informational."""
+        state = _make_state()
+        state.leases["pm-session"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "interactive",
+            "role": "worker", "class": "protected",
+        }
+        # 30s remaining before a 900s max-hold, with a 120s warn window.
+        state.wait_list["fixer-1"] = {"enqueued_at": time.time() - 870, "reason": "t", "role": "worker"}
+
+        with patch("agents_core.doorman_server.DOORMAN_MAX_HOLD_TIMEOUT_SEC", 900), \
+             patch("agents_core.doorman_server.DOORMAN_PENDING_RELEASE_WARN_SEC", 120), \
+             patch("agents_core.doorman_server.log.info") as mock_log:
+            state._sweep_wait_list()
+            state._sweep_wait_list()
+
+        warn_calls = [c for c in mock_log.call_args_list if "pending-release-soon" in str(c)]
+        assert len(warn_calls) == 1
+
+
+class TestBrake:
+    """Emergency defer-only brake: REST contract, bounded TTL, subordinate to
+    per-job timeout, no kill of existing leases (AC4, AC8, AC9)."""
+
+    def test_brake_hold_endpoint(self):
+        c = _client_no_auth()
+        r = c.post("/v0/brake", json={"reason": "urgent human task", "ttl_s": 60})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["braked"] is True
+        assert "expires_at" in body
+
+    def test_brake_hold_default_ttl(self):
+        c = _client_no_auth()
+        r = c.post("/v0/brake", json={"reason": "urgent"})
+        assert r.status_code == 200
+        assert r.json()["braked"] is True
+
+    def test_brake_release_endpoint(self):
+        c = _client_no_auth()
+        c.post("/v0/brake", json={"reason": "urgent", "ttl_s": 60})
+        r = c.post("/v0/brake/release", json={})
+        assert r.status_code == 200
+        assert r.json()["braked"] is False
+
+    def test_brake_defers_new_deferrable_dispatch(self):
+        """AC4: doorman brake --hold defers new deferrable dispatch."""
+        state = _make_state()
+        state.brake_reason = "urgent"
+        state.brake_expires_at = time.time() + 900
+
+        pending, _ = state.acquire_or_defer("fixer-1", "t", "worker", "deferrable")
+        assert pending is not None
+        assert pending["status"] == "pending_defer"
+
+    def test_brake_release_restores_dispatch(self):
+        """AC4: --release restores normal deferrable dispatch."""
+        state = _make_state()
+        state.brake_reason = "urgent"
+        state.brake_expires_at = time.time() + 900
+        state.brake_reason = None
+        state.brake_expires_at = None
+
+        pending, _ = state.acquire_or_defer("fixer-1", "t", "worker", "deferrable")
+        assert pending is None
+
+    def test_brake_auto_expires_at_ttl(self):
+        """AC4: brake auto-expires at TTL — no indefinite freeze."""
+        state = _make_state()
+        state.brake_reason = "urgent"
+        state.brake_expires_at = time.time() - 1  # already expired
+
+        assert state._brake_active() is False
+        assert state.brake_reason is None
+        assert state.brake_expires_at is None
+
+    def test_waiting_job_releases_at_own_timeout_under_brake(self):
+        """AC4: a waiting job still releases at its own enqueue + max_hold_timeout
+        even under an active brake."""
+        state = _make_state()
+        state.brake_reason = "urgent"
+        state.brake_expires_at = time.time() + 900
+        state.wait_list["fixer-1"] = {"enqueued_at": time.time() - 1000, "reason": "t", "role": "worker"}
+
+        with patch("agents_core.doorman_server.DOORMAN_MAX_HOLD_TIMEOUT_SEC", 900), \
+             patch("agents_core.doorman_server.DOORMAN_RELEASE_JITTER_MAX_SEC", 0.0):
+            released = state._sweep_wait_list()
+
+        assert len(released) == 1
+        assert released[0]["reason"] == "max-hold-timeout"
+        # brake is untouched — Phase 1a is defer-only, no kill of existing state
+        assert state._brake_active() is True
+
+    def test_brake_does_not_clear_existing_leases(self):
+        """AC9 / brake contract: brake never clears/kills existing leases."""
+        state = _make_state()
+        state.leases["fixer-1"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "t",
+            "role": "worker", "class": "deferrable",
+        }
+        state.brake_reason = "urgent"
+        state.brake_expires_at = time.time() + 900
+        assert "fixer-1" in state.leases
+
+    def test_brake_unknown_node_400(self):
+        c = _client_no_auth()
+        r = c.post("/v0/brake", json={"node": "starhouse", "reason": "t"})
+        assert r.status_code == 400
+
+    def test_status_snapshot_reports_brake(self):
+        state = _make_state()
+        state.brake_reason = "urgent human task"
+        state.brake_expires_at = time.time() + 900
+        snapshot = state.status_snapshot()
+        assert snapshot["brake_active"] is True
+        assert snapshot["brake_reason"] == "urgent human task"
+
+
+class TestBackgroundSweepIntegration:
+    """The background refresh thread must advance the wait-list every tick,
+    releasing without any caller polling (AC1, AC7)."""
+
+    def test_refresh_loop_sweeps_wait_list_and_releases(self):
+        state = _NodeState(GW_URL_DEFAULT)
+        state.wait_list["fixer-1"] = {"enqueued_at": time.time() - 5, "reason": "t", "role": "worker"}
+        nodes = {"gravitywell": state}
+        run_calls = []
+
+        def fake_run(cmd, **kwargs):
+            run_calls.append(cmd)
+            return MagicMock(returncode=0, stderr="")
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("time.sleep", side_effect=_StopRefreshLoop), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("agents_core.doorman_server.DOORMAN_RELEASE_JITTER_MAX_SEC", 0.0), \
+             patch("agents_core.doorman_server.DOORMAN_PROBE_LLAMA_ACTIVITY", False), \
+             patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            _run_refresh_thread_one_tick(nodes)
+
+        assert "fixer-1" not in state.wait_list
+        # A fresh idle_since (just constructed, well under GW_STOP_GRACE_SEC) means
+        # this tick's wait-list sweep must not touch gw-serve at all — no wake/stop
+        # subprocess call should fire from a pure sweep-and-release tick.
+        assert run_calls == []

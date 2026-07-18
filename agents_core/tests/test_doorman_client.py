@@ -500,3 +500,131 @@ def test_drain_count_defaults_to_gravitywell():
     c = _client_with([(200, {"node": "gravitywell", "drain_count": 0})])
     result = c.drain_count()  # no node arg
     assert result == 0
+
+
+# ---------------------------------------------------------------------------
+# Foreground-priority gate (gw-router-phase1-foreground-gate)
+# ---------------------------------------------------------------------------
+
+def test_acquire_with_lease_class_forwards_class_field():
+    """acquire() must forward lease_class as the `class` body field."""
+    captured = {}
+
+    class _CaptureTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"status": "serving"})
+
+    c = DoormanClient(base_url="http://doorman.test")
+    c._client = httpx.Client(base_url="http://doorman.test", transport=_CaptureTransport())
+    result = c.acquire("gravitywell", "w1", ttl_sec=120, reason="test", lease_class="protected")
+    assert result["status"] == "serving"
+    assert captured["body"]["class"] == "protected"
+
+
+def test_acquire_without_lease_class_omits_class_field():
+    """acquire() must omit `class` from the body when lease_class is not provided
+    (missing → server defaults to deferrable, per doorman-server contract)."""
+    captured = {}
+
+    class _CaptureTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"status": "serving"})
+
+    c = DoormanClient(base_url="http://doorman.test")
+    c._client = httpx.Client(base_url="http://doorman.test", transport=_CaptureTransport())
+    c.acquire("gravitywell", "w1", ttl_sec=120, reason="test")
+    assert "class" not in captured["body"]
+
+
+def test_acquire_pending_defer_status():
+    """acquire() must surface a pending_defer status verbatim."""
+    resp_body = {
+        "status": "pending_defer",
+        "work_id": "fixer-1",
+        "class": "deferrable",
+        "enqueued_at": 1000.0,
+        "waited_seconds": 0.0,
+    }
+    c = _client_with([(200, resp_body)])
+    result = c.acquire("gravitywell", "fixer-1", ttl_sec=120, reason="fixer work", lease_class="deferrable")
+    assert result["status"] == "pending_defer"
+
+
+def test_is_pending_defer_true_for_pending_defer_response():
+    resp = {"status": "pending_defer", "work_id": "fixer-1"}
+    assert DoormanClient.is_pending_defer(resp) is True
+
+
+def test_is_pending_defer_false_for_serving_response():
+    resp = {"status": "serving", "node": "gravitywell"}
+    assert DoormanClient.is_pending_defer(resp) is False
+
+
+def test_brake_hold_posts_reason_and_ttl():
+    captured = {}
+
+    class _CaptureTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            captured["path"] = request.url.path
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"braked": True, "expires_at": 12345.0})
+
+    c = DoormanClient(base_url="http://doorman.test")
+    c._client = httpx.Client(base_url="http://doorman.test", transport=_CaptureTransport())
+    result = c.brake("urgent human task", ttl_s=60)
+    assert result["braked"] is True
+    assert captured["path"] == "/v0/brake"
+    assert captured["body"]["reason"] == "urgent human task"
+    assert captured["body"]["ttl_s"] == 60
+
+
+def test_brake_hold_omits_ttl_s_when_not_provided():
+    captured = {}
+
+    class _CaptureTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"braked": True, "expires_at": 12345.0})
+
+    c = DoormanClient(base_url="http://doorman.test")
+    c._client = httpx.Client(base_url="http://doorman.test", transport=_CaptureTransport())
+    c.brake("urgent")
+    assert "ttl_s" not in captured["body"]
+
+
+def test_brake_release_posts_to_release_endpoint():
+    captured = {}
+
+    class _CaptureTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            captured["path"] = request.url.path
+            return httpx.Response(200, json={"braked": False})
+
+    c = DoormanClient(base_url="http://doorman.test")
+    c._client = httpx.Client(base_url="http://doorman.test", transport=_CaptureTransport())
+    result = c.brake_release()
+    assert result["braked"] is False
+    assert captured["path"] == "/v0/brake/release"
+
+
+def test_defer_wait_timeout_default():
+    """_defer_wait_timeout() must derive from DOORMAN_MAX_HOLD_TIMEOUT_SEC + margin."""
+    from agents_core.doorman_client import _defer_wait_timeout
+
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("DOORMAN_MAX_HOLD_TIMEOUT_SEC", None)
+        os.environ.pop("GW_ACQUIRE_MARGIN_SEC", None)
+        assert _defer_wait_timeout() == 930.0  # 900 + 30
+
+
+def test_defer_wait_timeout_custom():
+    from agents_core.doorman_client import _defer_wait_timeout
+
+    with mock.patch.dict(
+        os.environ,
+        {"DOORMAN_MAX_HOLD_TIMEOUT_SEC": "300", "GW_ACQUIRE_MARGIN_SEC": "10"},
+        clear=False,
+    ):
+        assert _defer_wait_timeout() == 310.0
