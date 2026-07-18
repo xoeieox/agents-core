@@ -62,6 +62,20 @@ Environment variables:
                                  to confirmed-idle behavior, so a permanently
                                  broken probe can't pin GW awake forever
                                  (default 900)
+  DOORMAN_MAX_HOLD_TIMEOUT_SEC — foreground-priority gate (gw-router-phase1-foreground-
+                                 gate): max seconds a `deferrable`-class lease acquire
+                                 waits on the pending-defer wait-list while a `protected`
+                                 lease (or the brake) is active, anchored to the job's own
+                                 enqueue timestamp and never reset by newly-arriving
+                                 `protected` leases (default 900 = 15min)
+  DOORMAN_RELEASE_JITTER_MAX_SEC — max random backoff (seconds) applied before finalizing
+                                 a wait-list release, so a batch of simultaneously-releasable
+                                 jobs doesn't thundering-herd the freed slot (default 2.0)
+  DOORMAN_PENDING_RELEASE_WARN_SEC — T-minus window (seconds) before a max-hold-timeout
+                                 release at which an informational `pending-release-soon`
+                                 log event fires once per waiting job (default 120)
+  DOORMAN_BRAKE_TTL_SEC       — default TTL (seconds) for the emergency brake set via
+                                 POST /v0/brake when the caller omits ttl_s (default 900)
 
 Safety properties (gravitywell-doorman-clean-stop-v0):
   - Doorman crash → GW stays POWERED, not suspended. The host-side guard
@@ -85,6 +99,7 @@ import datetime
 import json
 import logging
 import os
+import random
 import subprocess
 import threading
 import time
@@ -183,6 +198,33 @@ GW_BIG_MODEL_ID = "gravitywell-122b"
 HOLD_NAME = "doorman"
 DOORMAN_IDLE_LOG = os.environ.get("DOORMAN_IDLE_LOG", "/var/log/doorman-idle.jsonl")
 
+# ---------------------------------------------------------------------------
+# Foreground-priority gate (gw-router-phase1-foreground-gate)
+# ---------------------------------------------------------------------------
+
+# Binary lease classification (Mirror Council, converged 2026-07-17): a third
+# tier for measured gates was rejected as needless complexity. Missing `class`
+# on /lease/acquire defaults to "deferrable" (safe — never accidentally
+# preempts); an invalid value is rejected 400 by the endpoint.
+LEASE_CLASSES = ("protected", "deferrable")
+DEFAULT_LEASE_CLASS = "deferrable"
+
+# The "iron rod": absolute, non-resettable max-hold for a deferrable job
+# waiting on the pending-defer wait-list, anchored to its own enqueue
+# timestamp — never extended by newly-arriving protected leases.
+DOORMAN_MAX_HOLD_TIMEOUT_SEC = int(os.environ.get("DOORMAN_MAX_HOLD_TIMEOUT_SEC", "900"))
+
+# Anti-thundering-herd backoff applied before finalizing a wait-list release.
+DOORMAN_RELEASE_JITTER_MAX_SEC = float(os.environ.get("DOORMAN_RELEASE_JITTER_MAX_SEC", "2.0"))
+
+# T-minus window before a max-hold-timeout release at which one informational
+# pending-release-soon log event fires (strictly informational, never blocking).
+DOORMAN_PENDING_RELEASE_WARN_SEC = int(os.environ.get("DOORMAN_PENDING_RELEASE_WARN_SEC", "120"))
+
+# Default TTL for the emergency brake (POST /v0/brake) when ttl_s is omitted —
+# bounded so the brake can never freeze deferrable dispatch indefinitely.
+DOORMAN_BRAKE_TTL_SEC = int(os.environ.get("DOORMAN_BRAKE_TTL_SEC", "900"))
+
 # Sentinel for deferred acquire (controller owns the mode)
 DEFERRED = object()
 
@@ -268,6 +310,16 @@ class _NodeState:
         # (at least one probe ambiguous, none confirmed activity) — read by the
         # refresh loop to pause the grace-period clock instead of advancing it.
         self._probe_indeterminate: bool = False
+        # Foreground-priority gate (gw-router-phase1-foreground-gate): in-memory
+        # pending-defer wait-list, keyed by work_id → {enqueued_at, reason, role,
+        # _warned, _release_at, _release_reason}. Ephemeral slot-arbitration state
+        # tied to the doorman's own lease lifecycle — deliberately not a table in
+        # agents_core.elevator's SQLite work-queue (see spec).
+        self.wait_list: dict[str, dict] = {}
+        # Emergency brake: a global defer-only flag (not a work_id lease) with a
+        # bounded TTL so it auto-expires — never an indefinite freeze.
+        self.brake_reason: str | None = None
+        self.brake_expires_at: float | None = None
 
     # ------------------------------------------------------------------
     # Health poll (lock-free — read-only HTTP, safe to call outside lock)
@@ -520,6 +572,159 @@ class _NodeState:
                 and now <= lease_info["acquired_at"] + lease_info["ttl_sec"]):
                 return True
         return False
+
+    # ------------------------------------------------------------------
+    # Foreground-priority gate (gw-router-phase1-foreground-gate)
+    # ------------------------------------------------------------------
+
+    def _protected_lease_active(self) -> bool:
+        """True iff a non-expired lease with class=='protected' currently exists.
+
+        Must be called under self.lock. A missing class defaults to
+        "deferrable" (agents_core.doorman_server.DEFAULT_LEASE_CLASS), so
+        pre-gate leases (no `class` field) never count as protected.
+        """
+        now = time.time()
+        for info in self.leases.values():
+            if (info.get("class", DEFAULT_LEASE_CLASS) == "protected"
+                    and now <= info["acquired_at"] + info["ttl_sec"]):
+                return True
+        return False
+
+    def _brake_active(self) -> bool:
+        """Check + auto-expire the global emergency brake. Must be called
+        under self.lock. Bounded TTL means a forgotten brake never freezes
+        deferrable dispatch indefinitely."""
+        if self.brake_expires_at is None:
+            return False
+        if time.time() >= self.brake_expires_at:
+            self.brake_expires_at = None
+            self.brake_reason = None
+            return False
+        return True
+
+    def _emit_release_event(self, job_id: str, reason: str, waited_seconds: float) -> None:
+        """Structured release event — always emitted, never silent (Council:
+        "release signaling stands firm"). Log-level/informational by design
+        (anti-thundering-herd, anti-notification-storm for M2M/background
+        consumers); more prominent surfacing for an affected interactive
+        consumer is a follow-on wrapper concern, not this mechanism's job.
+        Release is never gated on an acknowledgment. Must be called under
+        self.lock (in-process log/file I/O only, no blocking network calls).
+        """
+        log.info(
+            f"[{self.node_name}] defer_release job_id={job_id} reason={reason} "
+            f"waited_seconds={waited_seconds:.1f}"
+        )
+        _write_idle_log(
+            self.node_name, "defer_release", len(self.leases),
+            job_id=job_id, reason=reason, waited_seconds=round(waited_seconds, 2),
+        )
+
+    def _sweep_wait_list(self) -> list[dict]:
+        """Advance the pending-defer wait-list: detect newly-releasable entries,
+        finalize jittered releases, and emit release events. Must be called
+        under self.lock — this is the "dispatch-layer check" the starvation
+        guard is anchored to (gw-router-phase1-foreground-gate spec): the
+        max-hold-timeout is computed from each entry's own `enqueued_at` and
+        is never reset by a newly-arrived `protected` lease, even across a
+        recursive protected-lease chain.
+
+        Returns the list of entries released this call (each a dict with
+        job_id/reason/waited_seconds), for callers that want to react
+        immediately (e.g. the acquire endpoint completing a wait for its own
+        work_id). The background refresh thread calls this too, purely for
+        its event-emission side effect, on every tick — release is never
+        gated on anyone polling for it.
+        """
+        now = time.time()
+        gated = self._protected_lease_active() or self._brake_active()
+        released: list[dict] = []
+        for wid, entry in list(self.wait_list.items()):
+            elapsed = now - entry["enqueued_at"]
+            timed_out = elapsed >= DOORMAN_MAX_HOLD_TIMEOUT_SEC
+            releasable = timed_out or not gated
+
+            if not releasable:
+                # Re-gated before a scheduled protected-cleared release finalized:
+                # cancel it. The max-hold-timeout anchor is untouched by this —
+                # once timed_out flips True it can never flip back, so a
+                # timeout-triggered release is never revocable (the iron rod).
+                if entry.get("_release_reason") == "protected-cleared":
+                    entry.pop("_release_at", None)
+                    entry.pop("_release_reason", None)
+                remaining = DOORMAN_MAX_HOLD_TIMEOUT_SEC - elapsed
+                if remaining <= DOORMAN_PENDING_RELEASE_WARN_SEC and not entry.get("_warned"):
+                    entry["_warned"] = True
+                    log.info(
+                        f"[{self.node_name}] pending-release-soon job_id={wid} "
+                        f"in ~{remaining:.0f}s (max-hold-timeout)"
+                    )
+                continue
+
+            reason = "max-hold-timeout" if timed_out else "protected-cleared"
+            if "_release_at" not in entry or entry.get("_release_reason") != reason:
+                entry["_release_at"] = now + random.uniform(0, DOORMAN_RELEASE_JITTER_MAX_SEC)
+                entry["_release_reason"] = reason
+            if now >= entry["_release_at"]:
+                del self.wait_list[wid]
+                waited = now - entry["enqueued_at"]
+                self._emit_release_event(wid, entry["_release_reason"], waited)
+                released.append({"job_id": wid, "reason": entry["_release_reason"], "waited_seconds": waited})
+        return released
+
+    def acquire_or_defer(self, work_id: str, reason: str, role: str, lease_class: str) -> tuple[dict | None, dict | None]:
+        """The dispatch-layer defer-check for a `deferrable`-class acquire.
+
+        Must be called under self.lock. `protected`-class acquires are never
+        gated (AC2) — this is a no-op for them, always (None, None).
+
+        For `deferrable`, first advances the wait-list (_sweep_wait_list) so a
+        release that becomes due exactly at this call is picked up immediately
+        rather than waiting for the next background tick — this call site IS
+        one of the "dispatch-layer check" points the starvation guard is
+        anchored to. Then:
+          - if work_id is (still) on the wait-list → return a pending_defer
+            response dict (job must keep waiting), (dict, None).
+          - if work_id was just released by the sweep above → (None, release_info)
+            so the caller can attach waited_seconds/release_reason to the
+            eventual "serving" response.
+          - if neither active-protected/brake gating applies (fresh request,
+            never enqueued) → (None, None), proceed immediately.
+          - otherwise (freshly gated) → enqueue with enqueued_at=now (the
+            anchor) and return a pending_defer response, (dict, None).
+        """
+        if lease_class != "deferrable":
+            return None, None
+
+        released = self._sweep_wait_list()
+        release_info = next((r for r in released if r["job_id"] == work_id), None)
+
+        if work_id in self.wait_list:
+            entry = self.wait_list[work_id]
+            return {
+                "status": "pending_defer",
+                "work_id": work_id,
+                "class": lease_class,
+                "enqueued_at": entry["enqueued_at"],
+                "waited_seconds": time.time() - entry["enqueued_at"],
+            }, None
+
+        if release_info is not None:
+            return None, release_info
+
+        if self._protected_lease_active() or self._brake_active():
+            enqueued_at = time.time()
+            self.wait_list[work_id] = {"enqueued_at": enqueued_at, "reason": reason, "role": role}
+            return {
+                "status": "pending_defer",
+                "work_id": work_id,
+                "class": lease_class,
+                "enqueued_at": enqueued_at,
+                "waited_seconds": 0.0,
+            }, None
+
+        return None, None
 
     # ------------------------------------------------------------------
     # ensure_serving — must be called under lock
@@ -823,7 +1028,7 @@ class _NodeState:
             _write_idle_log(self.node_name, "idle_start", 0)
         return expired
 
-    def acquire_lease(self, work_id: str, ttl_sec: int, reason: str, role: str = "worker", principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference") -> bool | object:
+    def acquire_lease(self, work_id: str, ttl_sec: int, reason: str, role: str = "worker", principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference", lease_class: str = DEFAULT_LEASE_CLASS) -> bool | object:
         """Try to ensure GW is serving, then register the lease.
 
         Returns True on success, DEFERRED if a foreign caller acquires during controller
@@ -847,6 +1052,12 @@ class _NodeState:
                       "coordination" — the lease holds no inference (span/keepawake); excluded
                       from drain-gate contention count but still counted by /v0/drain-count
                       for flip-protection. Omitting is byte-identical to "inference".
+          lease_class: foreground-priority gate class (gw-router-phase1-foreground-gate):
+                      "protected" (never deferred) or "deferrable" (default — yields
+                      to an active protected lease/brake via acquire_or_defer, called
+                      by the endpoint before this method). Caller (the endpoint) is
+                      responsible for the defer-check; this method only stamps the
+                      lease with its class.
         """
         # Clear idle tracking: an arriving lease means the node is no longer idle
         was_idle = self.idle_since is not None
@@ -910,6 +1121,7 @@ class _NodeState:
             "reason": reason,
             "role": role,
             "lease_kind": lease_kind,
+            "class": lease_class,
         }
         if role == "worker":
             lease_entry["principal"] = principal if principal is not None else GHOST_PRINCIPAL
@@ -934,6 +1146,7 @@ class _NodeState:
     def status_snapshot(self) -> dict:
         with self.lock:
             self._gc_stale()
+            self._sweep_wait_list()
             serving = self._cached_serving
             # Check if controller owns the mode
             controller_owns = self._controller_lease_active()
@@ -983,6 +1196,15 @@ class _NodeState:
                 "creative_serving": self._cached_creative_serving,
                 "probe_activity_enabled": DOORMAN_PROBE_LLAMA_ACTIVITY,
                 "idle_since_source": self._idle_since_source,
+                "protected_active": self._protected_lease_active(),
+                "brake_active": self._brake_active(),
+                "brake_reason": self.brake_reason,
+                "brake_expires_at": self.brake_expires_at,
+                "wait_list": [
+                    {"job_id": wid, "enqueued_at": entry["enqueued_at"],
+                     "waited_seconds": time.time() - entry["enqueued_at"]}
+                    for wid, entry in self.wait_list.items()
+                ],
             }
 
 
@@ -1006,6 +1228,12 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                 state._refresh_serving_cache()
                 with state.lock:
                     state._gc_stale()
+                    # Foreground-priority gate (gw-router-phase1-foreground-gate):
+                    # advance the pending-defer wait-list every tick so a release
+                    # (protected-cleared or max-hold-timeout) and its structured
+                    # event fire even if no caller happens to be polling — release
+                    # is never gated on an acknowledgment.
+                    state._sweep_wait_list()
                     if not state.leases:
                         # No active leases: check if deferred service stop is due
                         if (
@@ -1262,6 +1490,7 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         principal = body.get("principal") or None  # empty string → None → ghost
         require_drain_clear = bool(body.get("require_drain_clear", False))
         lease_kind = body.get("lease_kind", "inference")
+        lease_class = body.get("class", DEFAULT_LEASE_CLASS)  # missing → deferrable (safe)
 
         if node not in nodes:
             return JSONResponse(
@@ -1273,12 +1502,33 @@ def create_app(gw_url: str | None = None) -> FastAPI:
                 status_code=400,
                 content=_error("bad_request", "work_id is required"),
             )
+        if lease_class not in LEASE_CLASSES:
+            return JSONResponse(
+                status_code=400,
+                content=_error(
+                    "bad_request",
+                    f"invalid class {lease_class!r}; must be one of {LEASE_CLASSES}",
+                ),
+            )
 
         state = nodes[node]
+
+        # Dispatch-layer defer-check (gw-router-phase1-foreground-gate): a
+        # `deferrable` acquire yields while a `protected` lease or the brake is
+        # active. `protected` acquires always return (None, None) here (AC2 —
+        # never deferred). release_info is populated only when this call's own
+        # wait-list entry finalized its release this call.
+        with state.lock:
+            state._gc_stale()
+            pending_resp, release_info = state.acquire_or_defer(work_id, reason, role, lease_class)
+        if pending_resp is not None:
+            return pending_resp
+
         with state.lock:
             ok = state.acquire_lease(
                 work_id, ttl_sec, reason, role=role, principal=principal,
                 require_drain_clear=require_drain_clear, lease_kind=lease_kind,
+                lease_class=lease_class,
             )
 
         if ok is CREATIVE_OCCUPIED:
@@ -1299,9 +1549,12 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         if not ok:
             return {"status": "wake_failed", "detail": state.last_error or "wake failed"}
 
-        resp: dict = {"status": "serving", "node": node, "work_id": work_id}
+        resp: dict = {"status": "serving", "node": node, "work_id": work_id, "class": lease_class}
         if require_drain_clear:
             resp["drain_cleared"] = True  # signals to client that drain check was honored (AC5a)
+        if release_info is not None:
+            resp["waited_seconds"] = release_info["waited_seconds"]
+            resp["release_reason"] = release_info["reason"]
         return resp
 
     # ------------------------------------------------------------------
@@ -1324,6 +1577,54 @@ def create_app(gw_url: str | None = None) -> FastAPI:
             state.release_lease(work_id)
 
         return {"ok": True}
+
+    # ------------------------------------------------------------------
+    # POST /v0/brake, /v0/brake/release — emergency defer-only brake
+    # (gw-router-phase1-foreground-gate). Global flag, not a work_id lease;
+    # bounded TTL so it always auto-expires. Defers new `deferrable` dispatch
+    # via the same wait-list; does NOT clear/kill existing leases. Subordinate
+    # to per-job max-hold-timeout — a job already waiting still releases at
+    # its own enqueue + max_hold even while the brake is held.
+    # ------------------------------------------------------------------
+
+    @app.post("/v0/brake")
+    def brake_hold(body: dict[str, Any]):
+        node = body.get("node", "gravitywell")
+        reason = body.get("reason", "")
+        ttl_s = int(body.get("ttl_s", DOORMAN_BRAKE_TTL_SEC))
+
+        if node not in nodes:
+            return JSONResponse(
+                status_code=400,
+                content=_error("bad_node", f"unknown node {node!r}"),
+            )
+
+        state = nodes[node]
+        with state.lock:
+            state.brake_reason = reason
+            state.brake_expires_at = time.time() + ttl_s
+            expires_at = state.brake_expires_at
+
+        log.warning(f"[{node}] brake held reason={reason!r} ttl_s={ttl_s}")
+        return {"braked": True, "expires_at": expires_at}
+
+    @app.post("/v0/brake/release")
+    def brake_release(body: dict[str, Any]):
+        node = body.get("node", "gravitywell")
+
+        if node not in nodes:
+            return JSONResponse(
+                status_code=400,
+                content=_error("bad_node", f"unknown node {node!r}"),
+            )
+
+        state = nodes[node]
+        with state.lock:
+            state.brake_reason = None
+            state.brake_expires_at = None
+
+        log.warning(f"[{node}] brake released")
+        return {"braked": False}
 
     return app
 
