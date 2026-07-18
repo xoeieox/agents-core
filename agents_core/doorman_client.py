@@ -16,9 +16,14 @@ Reads configuration from environment:
   GW_DUAL_WAKE_DEADLINE_SEC — GravityWell dual-mode wake deadline in seconds, used by
                            doorman-server (default 720). Only consulted here when
                            DOORMAN_DEFAULT_SERVE_MODE is "dual".
-  GW_ACQUIRE_MARGIN_SEC  — margin for acquire timeout above wake deadline (default 30)
+  GW_ACQUIRE_MARGIN_SEC  — margin for acquire timeout above wake deadline (default 30);
+                           also the margin used by _defer_wait_timeout()
   GW_ACQUIRE_TIMEOUT_SEC — (optional) override acquire timeout; if set below the
                            effective wake deadline, a warning is emitted
+  DOORMAN_MAX_HOLD_TIMEOUT_SEC — must match doorman-server's setting (default 900).
+                           Read by _defer_wait_timeout() to size a retry-loop budget
+                           for a `deferrable` acquire waiting on the foreground-priority
+                           gate's pending-defer wait-list (gw-router-phase1-foreground-gate).
 
 Raises DoormanUnreachable when the HTTP layer itself fails (connection error,
 timeout). The operator treats DoormanUnreachable exactly like status:"wake_failed":
@@ -28,6 +33,14 @@ Acquire statuses:
   "serving" — GW is serving; lease registered and keepawake hold placed
   "deferred" — GW is serving a controller-owned non-big mode; caller cannot use big
   "wake_failed" — GW failed to wake or serve; big endpoint unavailable for non-controller reason
+  "pending_defer" — foreground-priority gate (gw-router-phase1-foreground-gate): a
+                     `deferrable`-class acquire is queued on the doorman's pending-defer
+                     wait-list because a `protected` lease (or the brake) is active; no
+                     lease was registered. Retry the acquire call (same work_id — the
+                     wait-list anchors enqueued_at to the first call) to check for release;
+                     see DEFER_WAIT_TIMEOUT_SEC / _defer_wait_timeout() for how long a
+                     retry loop may need to keep polling before max-hold-timeout releases
+                     it unconditionally.
 """
 
 from __future__ import annotations
@@ -89,6 +102,26 @@ def _gw_acquire_timeout() -> float:
     return float(derived_timeout)
 
 
+def _defer_wait_timeout() -> float:
+    """Derive a request timeout long enough to cover one defer-gated acquire poll.
+
+    Foreground-priority gate (gw-router-phase1-foreground-gate): a `deferrable`
+    acquire against a `protected` lease (or the brake) does not block server-side —
+    it returns "pending_defer" immediately (see DoormanClient.acquire docstring) — so
+    the DEFAULT client timeout is fine for a single call. This helper exists for
+    callers that want to size a retry-loop budget against the server's own
+    non-resettable max-hold-timeout (DOORMAN_MAX_HOLD_TIMEOUT_SEC, default 900s):
+    a `deferrable` job is guaranteed to be releasable within this many seconds of
+    its first enqueue, regardless of how many new `protected` leases arrive meanwhile.
+
+    Reads the same DOORMAN_MAX_HOLD_TIMEOUT_SEC env var doorman_server.py reads,
+    plus GW_ACQUIRE_MARGIN_SEC (shared margin convention with _gw_acquire_timeout()).
+    """
+    max_hold_sec = int(os.environ.get("DOORMAN_MAX_HOLD_TIMEOUT_SEC", "900"))
+    margin_sec = int(os.environ.get("GW_ACQUIRE_MARGIN_SEC", "30"))
+    return float(max_hold_sec + margin_sec)
+
+
 class DoormanUnreachable(Exception):
     """HTTP transport failure reaching the doorman service."""
 
@@ -139,7 +172,7 @@ class DoormanClient:
         except httpx.TimeoutException as e:
             raise DoormanUnreachable(f"doorman timeout at {self._base_url}: {e}") from e
 
-    def acquire(self, node: str, work_id: str, ttl_sec: int, reason: str, role: str = "worker", timeout: float | None = None, principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference") -> dict:
+    def acquire(self, node: str, work_id: str, ttl_sec: int, reason: str, role: str = "worker", timeout: float | None = None, principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference", lease_class: str | None = None) -> dict:
         """Acquire a lease for node.
 
         Args:
@@ -163,10 +196,18 @@ class DoormanClient:
                       excluded from the drain-gate contention count (they hold no GPU
                       inference) but still counted by /v0/drain-count for flip-protection.
                       Omitting is byte-identical to "inference".
+          lease_class: foreground-priority gate class (gw-router-phase1-foreground-gate):
+                      "protected" (never deferred — interactive PM session, measured
+                      gates) or "deferrable" (yields to an active protected lease/brake;
+                      fixers, code-review, subagents, Hermes). Omitting sends no `class`
+                      field — the server defaults missing class to "deferrable" (safe).
+                      Invalid values are rejected 400 by the server.
 
         Returns dict with status field (or contended/creative_occupied sentinel):
           "serving" — GW is serving; lease registered and keepawake hold placed
           "deferred" — GW is serving a controller-owned non-big mode; no lease registered
+          "pending_defer" — a `deferrable` acquire is queued behind an active `protected`
+                            lease/brake; no lease registered — retry to check for release
           "wake_failed" — GW failed to wake
           {"ok": False, "contended": True} — drain gate active; another group holds a lease
           {"ok": False, "creative_occupied": True} — Llama-3.3-70B holds the GPU; check is_creative_occupied()
@@ -184,6 +225,8 @@ class DoormanClient:
             body["require_drain_clear"] = True
         if lease_kind != "inference":
             body["lease_kind"] = lease_kind
+        if lease_class is not None:
+            body["class"] = lease_class
         return self._post("/lease/acquire", body, timeout=timeout)
 
     def release(self, node: str, work_id: str) -> None:
@@ -240,6 +283,26 @@ class DoormanClient:
         except DoormanUnreachable:
             return None
 
+    def brake(self, reason: str, ttl_s: int | None = None, node: str = "gravitywell") -> dict:
+        """Hold the emergency defer-only brake (gw-router-phase1-foreground-gate).
+
+        Defers new `deferrable` dispatch (same wait-list as an active `protected`
+        lease) without clearing or killing any existing lease. Bounded TTL — the
+        brake always auto-expires server-side (default DOORMAN_BRAKE_TTL_SEC=900s
+        if ttl_s is omitted); a job already waiting still releases at its own
+        enqueue + max-hold-timeout even while the brake is held.
+
+        Returns {"braked": True, "expires_at": <epoch>}.
+        """
+        body: dict = {"reason": reason, "node": node}
+        if ttl_s is not None:
+            body["ttl_s"] = ttl_s
+        return self._post("/v0/brake", body)
+
+    def brake_release(self, node: str = "gravitywell") -> dict:
+        """Release the emergency brake early. Returns {"braked": False}."""
+        return self._post("/v0/brake/release", {"node": node})
+
     @staticmethod
     def is_deferred(resp: dict) -> bool:
         """Convenience predicate: is this acquire response a deferred outcome?
@@ -247,6 +310,15 @@ class DoormanClient:
         Returns True iff resp["status"] == "deferred", False otherwise.
         """
         return resp.get("status") == "deferred"
+
+    @staticmethod
+    def is_pending_defer(resp: dict) -> bool:
+        """Convenience predicate: is this acquire response queued on the
+        foreground-priority gate's pending-defer wait-list?
+
+        Returns True iff resp["status"] == "pending_defer", False otherwise.
+        """
+        return resp.get("status") == "pending_defer"
 
     @staticmethod
     def is_creative_occupied(resp: dict) -> bool:
