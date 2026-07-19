@@ -1,0 +1,16 @@
+[Unit]
+Description=Docker Tailscale Bind Healer — recreate containers left broken by the tailscaled boot race (dry-run until --apply is added post-verification, see spec)
+After=network-online.target tailscaled.service docker.service
+Wants=network-online.target tailscaled.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=user
+WorkingDirectory=/srv/agents
+ExecStart=/usr/bin/python3 /srv/agents/scripts/docker_tailscale_bind_healer.py
+Environment=PYTHONPATH=/srv/agents:/home/user/.local/lib/python3.12/site-packages
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target
