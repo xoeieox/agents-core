@@ -65,6 +65,19 @@ def _slugify(text: str, max_len: int = 32) -> str:
     return (s or "task")[:max_len]
 
 
+def _bool_val(raw) -> bool:
+    """Proper boolean parser for registry YAML fields.
+
+    Mirrors the `_bool_val` idiom in lapis_pm/node_identity.py (not imported —
+    agents-core must not depend on lapis_pm). `bool(...)` is unsafe here because
+    `bool("false")` is `True` in Python; a quoted YAML "false" must resolve to
+    `False`.
+    """
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _record_dispatch_slot(
     *,
     slot_id: str,
@@ -110,6 +123,8 @@ class ShapedAgent:
     notify: bool = False
     notify_policy: str = "always"
     engine: str = "claude"
+    backend_url: str | None = None
+    acquire_lease: bool = True
 
 
 @dataclass
@@ -151,6 +166,24 @@ class Shaper:
         self._shared_preamble = raw.get("shared_preamble") or ""
         registry: dict[str, ShapedAgent] = {}
         for name, body in (raw.get("agents") or {}).items():
+            backend_url = body.get("backend_url")
+            if isinstance(backend_url, str):
+                backend_url = backend_url.strip() or None
+            acquire_lease = _bool_val(body.get("acquire_lease", True))
+
+            # Phantom-swarm guardrail: acquire_lease=false with no backend_url would
+            # hit the default GravityWell endpoint without acquiring a lease to wake
+            # it. _is_swarm in gw_agent.call_gw_agent requires backend_url is not
+            # None, so this combo isn't even flagged as the swarm/no-lease path — it
+            # is only legal when backend_url is an explicit non-None endpoint.
+            if not acquire_lease and backend_url is None:
+                raise RuntimeError(
+                    f"Shaper registry malformed: agent {name!r} sets "
+                    "acquire_lease: false but no backend_url — this would skip the "
+                    "doorman lease while still posting to the default GravityWell "
+                    "endpoint. acquire_lease: false requires an explicit backend_url."
+                )
+
             registry[name] = ShapedAgent(
                 name=name,
                 chub_bundles=list(body.get("chub_bundles") or []),
@@ -161,6 +194,8 @@ class Shaper:
                 notify=bool(body.get("notify", False)),
                 notify_policy=str(body.get("notify_policy", "always")),
                 engine=str(body.get("engine", "claude")),
+                backend_url=backend_url,
+                acquire_lease=acquire_lease,
             )
         self._registry = registry
 
@@ -238,6 +273,8 @@ class Shaper:
             "repo": vars_.get("repo", ""),
             "engine": agent.engine,
             "model": agent.model,
+            "backend_url": agent.backend_url,
+            "acquire_lease": agent.acquire_lease,
             "timeout_s": agent.timeout_s,
             "system": system,
             "prompt": user_prompt,
