@@ -66,7 +66,9 @@ from agents_core.room_paths import room_path
 COUNCIL_DIR = room_path("council")
 CARDS_ROOT = cards_root() / "characters"
 # reviewer: the seeded fail-loud pool (see agents_core.cards.load_deck_cards),
-# roster-eligible via build_roster(pools=[..., REVIEWER_POOL]) or `--pools`.
+# roster-eligible via build_roster(pools=[..., REVIEWER_POOL]) or the `submit`
+# subcommand's `--pools reviewer,...` flag (parsed + validated by
+# _resolve_requested_pools, below cmd_submit).
 # Not in DEFAULT_POOLS: general decision-deliberation submissions keep
 # today's behavior unchanged — a node without a seeded reviewer deck yet
 # must not have every council submission start failing.
@@ -1441,6 +1443,37 @@ def _role_assignments(
     return [{"id": sid, "role": f"scene_slot_{i}"} for i, sid in enumerate(selected)]
 
 
+def _resolve_requested_pools(pools_arg: str) -> list[str]:
+    """Parse+validate a `--pools` CLI value into a build_roster()-ready list.
+
+    Strips whitespace around each comma-separated name and drops empty
+    segments. Raises ValueError (legible, naming the problem) if the result
+    is empty, or if any requested name does not resolve to an existing pool
+    directory — cards_root()/characters/<pool> for native pools, or
+    cards_root()/decks/reviewer for `reviewer`. An explicit --pools request
+    is user intent; a typo'd pool name must fail loud here rather than
+    silently degrade to an empty/partial roster (build_roster's own
+    skip-empty behavior is reserved for the unset-flag DEFAULT_POOLS path).
+    """
+    pools = [p.strip() for p in pools_arg.split(",") if p.strip()]
+    if not pools:
+        raise ValueError(f"--pools resolved to an empty pool list: {pools_arg!r}")
+
+    unknown = [
+        pool for pool in pools
+        if not (
+            (DECKS_ROOT / REVIEWER_POOL) if pool == REVIEWER_POOL else (CARDS_ROOT / pool)
+        ).is_dir()
+    ]
+    if unknown:
+        raise ValueError(
+            f"--pools named unknown pool(s): {', '.join(unknown)} "
+            f"(expected a subdirectory of {CARDS_ROOT}, or the seeded "
+            f"{REVIEWER_POOL!r} pool at {DECKS_ROOT / REVIEWER_POOL})"
+        )
+    return pools
+
+
 def cmd_submit(args: argparse.Namespace) -> int:
     mode = args.mode
     narrator = bool(args.narrator or args.narrator_voice)
@@ -1475,7 +1508,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
         print(f"[council] no mem hits for terms {context['terms']}", flush=True)
 
     print("[council] building roster...", flush=True)
-    roster = build_roster()
+    pools_arg = getattr(args, "pools", None)
+    if pools_arg:
+        roster = build_roster(pools=_resolve_requested_pools(pools_arg))
+    else:
+        roster = build_roster()
     print(f"[council] roster size: {len(roster)}", flush=True)
 
     recent_pair_ids = recent_pair_entities()
@@ -1682,6 +1719,12 @@ def build_parser() -> argparse.ArgumentParser:
         "Paid-model voicing was removed to prevent the per-turn subprocess firehose.",
     )
     sp.add_argument("--with", dest="with_entity", default=None)
+    sp.add_argument(
+        "--pools", default=None,
+        help="Comma-separated pool names to draw the roster from, e.g. "
+        "'reviewer,personal'. Default: unset -> DEFAULT_POOLS "
+        f"({', '.join(DEFAULT_POOLS)}).",
+    )
     sp.add_argument("--narrator", action="store_true")
     sp.add_argument("--narrator-voice", dest="narrator_voice", default=None)
     sp.add_argument(

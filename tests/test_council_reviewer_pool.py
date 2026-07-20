@@ -82,6 +82,33 @@ def test_build_roster_reviewer_and_legacy_pool_together(tmp_path, monkeypatch):
     assert roster[0]["pool"] == "reviewer"
 
 
+def test_resolve_requested_pools_selects_non_default_pool_set(tmp_path, monkeypatch):
+    root, council_cli = _wire_cards_root(tmp_path, monkeypatch)
+    personal_dir = root / "characters" / "personal"
+    personal_dir.mkdir(parents=True)
+    (personal_dir / "ada-lovelace.yaml").write_text(
+        "character_id: ada-lovelace\ncharacter_name: Ada Lovelace\ncultural_context: test\n"
+    )
+    pools = council_cli._resolve_requested_pools("reviewer, personal")
+    assert pools == ["reviewer", "personal"]
+    roster = council_cli.build_roster(pools=pools)
+    assert {r["pool"] for r in roster} == {"reviewer", "personal"}
+
+
+def test_resolve_requested_pools_unknown_pool_names_it(tmp_path, monkeypatch):
+    _root, council_cli = _wire_cards_root(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="bogus"):
+        council_cli._resolve_requested_pools("bogus")
+
+
+def test_resolve_requested_pools_empty_after_split_raises(tmp_path, monkeypatch):
+    _root, council_cli = _wire_cards_root(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="empty"):
+        council_cli._resolve_requested_pools("")
+    with pytest.raises(ValueError, match="empty"):
+        council_cli._resolve_requested_pools("  , ,")
+
+
 def test_find_card_path_resolves_reviewer_card(tmp_path, monkeypatch):
     root, council_cli = _wire_cards_root(tmp_path, monkeypatch)
     path = council_cli.find_card_path("technical-integrity")
