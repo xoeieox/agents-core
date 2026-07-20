@@ -3,17 +3,20 @@
 Relocated from /srv/agents/scripts/council.py.
 
 The AI_ROOT sys.path injection below is a packaging shim: archetypes.engine is
-not pip-installed; it lives at /srv/git/archetypal-intelligence-working.
-Proper fix (pip-install editable or merge) is v0.next.
+not pip-installed; it lives under the node's archetypal cards root (see
+agents_core.cards.cards_root — node-portable, env ARCHETYPAL_CARDS_PATH ->
+default BRIX path). Proper fix (pip-install editable or merge) is v0.next.
 
 archetypes.engine.character_entity is imported function-locally inside
 run_deliberation; this injection ensures it is resolvable at that point.
 """
 import sys
-from pathlib import Path
+
+from agents_core.cards import cards_root
 
 # Archetypes-engine packaging shim — load-bearing for every council run.
-AI_ROOT = Path("/srv/git/archetypal-intelligence-working")
+# cards_root() resolves to <AI_ROOT>/cards, so its parent is AI_ROOT.
+AI_ROOT = cards_root().parent
 if str(AI_ROOT) not in sys.path:
     sys.path.insert(0, str(AI_ROOT))
 
@@ -21,6 +24,7 @@ from agents_core.council.cli import (  # noqa: E402, F401
     COUNCIL_DIR,
     LOG_DIR,
     CARDS_ROOT,
+    DECKS_ROOT,
     DEFAULT_POOLS,
     DEFAULT_TURNS,
     DEFAULT_VOICING,
