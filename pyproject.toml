@@ -39,6 +39,7 @@ exclude = ["tests*"]
 
 [tool.setuptools.package-data]
 "agents_core.room_paths" = ["*.toml"]
+"agents_core" = ["data/*.yaml"]
 
 [tool.setuptools]
 include-package-data = true

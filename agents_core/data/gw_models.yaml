@@ -1,0 +1,19 @@
+# Canonical GW model-name registry (gw-serving-state-resolver-v0).
+#
+# Stable alias facts ONLY — never live serving/mode state. One row per model;
+# lookup by any alias (canonical_id / display_label / operator_alias / mode_alias)
+# must return the same row. Loaded once at import by agents_core.llm; a malformed
+# or absent file raises GwRegistryError (loud deploy-time failure).
+#
+# canonical_id    — the served /v1/models id (authoritative key)
+# mode_alias      — the flip-controller mode this model implies
+# operator_alias  — the OPERATOR_DEFAULTS class this model belongs to
+# display_label   — the flip-controller model_label (decorative-but-registered)
+# weights_hint    — substring of the gguf/weights path, for humans
+
+models:
+  - canonical_id: gravitywell-122b
+    mode_alias: big
+    operator_alias: gravitywell
+    display_label: qwen3.5-122b-a10b
+    weights_hint: "Qwen3.5-122B-A10B"

@@ -19,11 +19,14 @@ import threading
 import time
 import uuid
 import warnings
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests
+import yaml
 from requests.exceptions import Timeout, ConnectionError, HTTPError, ChunkedEncodingError
 
 TAILSCALE_IP = "203.0.113.12"
@@ -35,6 +38,10 @@ GW_CREATIVE_URL = os.environ.get("GW_CREATIVE_URL", "http://203.0.113.11:8093")
 QUEST_URL = os.environ.get("QUEST_URL", "http://203.0.113.11:8080")
 SWARM_URL = os.environ.get("SWARM_URL", GW_URL)
 SWARM_MAX_CONCURRENT = int(os.environ.get("SWARM_MAX_CONCURRENT", "4"))
+
+# flip-controller — sole mode/units/in-flight-flip oracle (gw-serving-state-resolver-v0).
+FLIP_CONTROLLER_URL = os.environ.get("FLIP_CONTROLLER_URL", "http://203.0.113.10:8408")
+GW_MODEL_REGISTRY_PATH = Path(__file__).parent / "data" / "gw_models.yaml"
 
 # Generation guards (spec-review-gw-generation-guards-v0): an unbounded GW call
 # can degenerate and run to the 300s gw-liveness hard ceiling before being culled.
@@ -1552,6 +1559,237 @@ def call_claude_cli(
 
 
 # ---------------------------------------------------------------------------
+# Canonical GW serving-state + model-name resolver (gw-serving-state-resolver-v0)
+# ---------------------------------------------------------------------------
+#
+# Contract: mode/units/in-flight-flip are owned solely by the flip-controller
+# (:8408/v0/status); served model id(s) solely by the endpoint's /v1/models;
+# name reconciliation solely by the static alias registry below (gw_models.yaml).
+# No consumer re-derives these — everyone calls gw_serving_state().
+#
+# Silent-oracle epistemology ("both, never conflated", enforced architecturally):
+# when the flip-controller is unreachable, `mode` is None and `authority_gap` is
+# True — the resolver never writes an inferred value into `mode`. `mode_inferred`
+# is a distinct, read-only field a caller must opt into by name;
+# require_authoritative_mode() raises rather than let a caller silently act on it.
+
+
+class GwRegistryError(Exception):
+    """Raised when agents_core/data/gw_models.yaml is malformed or absent.
+
+    A loud, load-time failure — never a blank-map silent start (C2)."""
+
+
+class AuthorityGapError(Exception):
+    """Raised by require_authoritative_mode() when the flip-controller mode
+    oracle is unreachable (state.mode is None) — the caller may not proceed
+    on state.mode_inferred as a substitute."""
+
+
+@dataclass(frozen=True)
+class ModelEntry:
+    canonical_id: str
+    mode_alias: str
+    operator_alias: str
+    display_label: str
+    weights_hint: str
+
+
+_GW_MODEL_ENTRY_FIELDS = ("canonical_id", "mode_alias", "operator_alias", "display_label", "weights_hint")
+
+
+def _load_gw_model_registry(path: Path = GW_MODEL_REGISTRY_PATH) -> list[ModelEntry]:
+    """Parse gw_models.yaml into ModelEntry rows. Raises GwRegistryError loudly
+    on any malformed or absent file — never a blank-map silent start."""
+    try:
+        with open(path) as f:
+            raw = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as exc:
+        raise GwRegistryError(f"gw_models.yaml unreadable at {path}: {exc}") from exc
+
+    if not isinstance(raw, dict) or not isinstance(raw.get("models"), list):
+        raise GwRegistryError(f"gw_models.yaml at {path} missing top-level 'models' list")
+
+    entries = []
+    for row in raw["models"]:
+        if not isinstance(row, dict) or not all(k in row for k in _GW_MODEL_ENTRY_FIELDS):
+            raise GwRegistryError(f"gw_models.yaml at {path} has a malformed model entry: {row!r}")
+        entries.append(ModelEntry(**{k: row[k] for k in _GW_MODEL_ENTRY_FIELDS}))
+    return entries
+
+
+_GW_MODEL_REGISTRY = _load_gw_model_registry()
+
+
+def _gw_registry_lookup(alias: str | None) -> ModelEntry | None:
+    """Lookup a ModelEntry by ANY of its aliases (canonical_id, display_label,
+    operator_alias, mode_alias). Returns None if unrecognised (resolve-time
+    unknown_model, never a load-time error — the file is valid, the world moved)."""
+    if alias is None:
+        return None
+    for entry in _GW_MODEL_REGISTRY:
+        if alias in (entry.canonical_id, entry.display_label, entry.operator_alias, entry.mode_alias):
+            return entry
+    return None
+
+
+def gw_slot2_url(primary_url: str | None = None) -> str:
+    """Resolve the slot-2 GW URL (unified helper, Sonnet #3).
+
+    GW_SLOT2_URL env override wins; else primary_url (or GW_URL) host with
+    GW_SLOT2_PORT (default 8082)."""
+    override = os.environ.get("GW_SLOT2_URL")
+    if override:
+        return override
+    base = primary_url or GW_URL
+    parsed = urlparse(base)
+    port = os.environ.get("GW_SLOT2_PORT", "8082")
+    return f"{parsed.scheme}://{parsed.hostname}:{port}"
+
+
+def _gw_freshness(status: str, checked_at: int | None = None) -> dict:
+    return {"status": status, "checked_at": checked_at}
+
+
+@dataclass(frozen=True)
+class GwServingState:
+    endpoint: str
+    reachable: bool
+    serving: bool
+    served_id: str | None
+    served_ids: list
+    canonical: ModelEntry | None
+    unknown_model: bool
+    mode: str | None
+    mode_inferred: str | None
+    authority_gap: bool
+    units: dict
+    in_flight_flip: bool
+    distinct_second_model: bool
+    source_freshness: dict
+
+
+def require_authoritative_mode(state: GwServingState) -> str:
+    """Return state.mode, or raise AuthorityGapError when the flip-controller
+    oracle was silent (state.mode is None). State-transition / lease-acceptance
+    code calls this — it structurally cannot proceed on mode_inferred."""
+    if state.mode is None:
+        raise AuthorityGapError(
+            f"flip-controller mode oracle unreachable for {state.endpoint} "
+            f"(authority_gap=True) — refusing to substitute mode_inferred={state.mode_inferred!r}"
+        )
+    return state.mode
+
+
+def gw_serving_state(endpoint: str | None = None, timeout: float = 4.0, log=None) -> GwServingState:
+    """The single resolver for GW serving-state + model-name (C3).
+
+    Composes three independently-owned sources — the endpoint's /health and
+    /v1/models, and the flip-controller's :8408/v0/status — reconciled against
+    the static alias registry (gw_models.yaml). Degrades soft on any single-
+    source outage (never raises); source_freshness reports which source
+    answered. Never makes a live network call from a test — all HTTP here is
+    the live-verification path callers opt into by invoking this function."""
+    resolved_endpoint = endpoint or GW_URL
+
+    source_freshness = {
+        "flip_controller": _gw_freshness("unreachable"),
+        "models_endpoint": _gw_freshness("unreachable"),
+        "health": _gw_freshness("unreachable"),
+        "slot2": _gw_freshness("unreachable"),
+    }
+
+    reachable = False
+    try:
+        resp = requests.get(f"{resolved_endpoint}/health", timeout=timeout)
+        if resp.status_code == 200:
+            reachable = True
+            source_freshness["health"] = _gw_freshness("answered", int(time.time()))
+    except Exception:
+        pass
+
+    serving = False
+    served_ids: list = []
+    try:
+        resp = requests.get(f"{resolved_endpoint}/v1/models", timeout=timeout)
+        if resp.status_code == 200:
+            data = (resp.json() or {}).get("data") or []
+            served_ids = [d.get("id") for d in data if d.get("id")]
+            if served_ids:
+                serving = True
+                source_freshness["models_endpoint"] = _gw_freshness("answered", int(time.time()))
+    except Exception:
+        pass
+
+    served_id = served_ids[0] if served_ids else None
+    canonical = _gw_registry_lookup(served_id)
+    unknown_model = served_id is not None and canonical is None
+    if unknown_model and log:
+        log(f"[gw_serving_state] unknown_model: served_id={served_id!r} not in registry")
+
+    mode = None
+    units: dict = {}
+    in_flight_flip = False
+    authority_gap = True
+    try:
+        resp = requests.get(f"{FLIP_CONTROLLER_URL}/v0/status", timeout=timeout)
+        if resp.status_code == 200:
+            fc = resp.json() or {}
+            mode = fc.get("mode")
+            units = fc.get("units") or {}
+            in_flight_flip = bool(fc.get("in_flight_flip"))
+            authority_gap = False
+            source_freshness["flip_controller"] = _gw_freshness("answered", int(time.time()))
+    except Exception:
+        pass
+
+    mode_inferred = canonical.mode_alias if canonical else None
+
+    primary_key = canonical.canonical_id if canonical else served_id
+    distinct_second_model = False
+    if served_id is not None:
+        for other_id in served_ids[1:]:
+            other_canonical = _gw_registry_lookup(other_id)
+            other_key = other_canonical.canonical_id if other_canonical else other_id
+            if other_key != primary_key:
+                distinct_second_model = True
+                break
+
+        if not distinct_second_model:
+            slot2_url = gw_slot2_url(resolved_endpoint)
+            try:
+                resp = requests.get(f"{slot2_url}/v1/models", timeout=timeout)
+                if resp.status_code == 200:
+                    slot2_data = (resp.json() or {}).get("data") or []
+                    if slot2_data:
+                        source_freshness["slot2"] = _gw_freshness("answered", int(time.time()))
+                        slot2_id = slot2_data[0].get("id")
+                        slot2_canonical = _gw_registry_lookup(slot2_id)
+                        slot2_key = slot2_canonical.canonical_id if slot2_canonical else slot2_id
+                        if slot2_key != primary_key:
+                            distinct_second_model = True
+            except Exception:
+                pass
+
+    return GwServingState(
+        endpoint=resolved_endpoint,
+        reachable=reachable,
+        serving=serving,
+        served_id=served_id,
+        served_ids=served_ids,
+        canonical=canonical,
+        unknown_model=unknown_model,
+        mode=mode,
+        mode_inferred=mode_inferred,
+        authority_gap=authority_gap,
+        units=units,
+        in_flight_flip=in_flight_flip,
+        distinct_second_model=distinct_second_model,
+        source_freshness=source_freshness,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Lease-free swarm client
 # ---------------------------------------------------------------------------
 
@@ -1560,8 +1798,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 def swarm_serving(swarm_url: str = SWARM_URL, timeout: int = 4) -> bool:
     """Check if the swarm endpoint is ready to serve.
 
-    Probes {swarm_url}/v1/models (must be 200 + non-empty) AND
-    {swarm_url}/health (must be 200). Both must succeed for serving=True.
+    Delegates to gw_serving_state() (gw-serving-state-resolver-v0) — the one
+    definition of "serving" lives there. True iff {swarm_url}/v1/models is
+    200 + non-empty AND {swarm_url}/health is 200.
 
     Does NOT use the doorman (which returns False for a healthy vLLM).
     Does NOT check systemctl (a unit can be active while the model is still loading).
@@ -1571,38 +1810,22 @@ def swarm_serving(swarm_url: str = SWARM_URL, timeout: int = 4) -> bool:
 
     Returns False on any error (timeout, connection error, HTTP error, empty models).
     """
-    try:
-        models_resp = requests.get(f"{swarm_url}/v1/models", timeout=timeout)
-        models_resp.raise_for_status()
-        models_data = models_resp.json()
-        if not models_data.get("data") or len(models_data["data"]) == 0:
-            return False
-
-        health_resp = requests.get(f"{swarm_url}/health", timeout=timeout)
-        health_resp.raise_for_status()
-        return True
-    except Exception:
-        return False
+    state = gw_serving_state(endpoint=swarm_url, timeout=timeout)
+    return state.serving and state.reachable
 
 
 def swarm_model(swarm_url: str = SWARM_URL, timeout: int = 4) -> str | None:
     """Get the served model ID from the swarm endpoint.
 
-    Returns the model id (e.g., 'Qwen2.5-3B') from {swarm_url}/v1/models data[0].id.
+    Delegates to gw_serving_state() (gw-serving-state-resolver-v0). Returns
+    the model id (e.g., 'Qwen2.5-3B') from {swarm_url}/v1/models data[0].id.
     Returns None if the endpoint is not serving or the response is malformed.
 
     For observability and phase discrimination: a caller comparing swarm_model()
     against its expected swarm model asserts the model phase (vs big).
     """
-    try:
-        resp = requests.get(f"{swarm_url}/v1/models", timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("data") and len(data["data"]) > 0:
-            return data["data"][0].get("id")
-        return None
-    except Exception:
-        return None
+    state = gw_serving_state(endpoint=swarm_url, timeout=timeout)
+    return state.served_id
 
 
 def call_swarm(
