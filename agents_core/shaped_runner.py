@@ -200,6 +200,9 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             on_wake_fail="skip",
             work_id=task_id,
             max_steps=_max_steps,
+            backend_url=spec.get("backend_url"),
+            acquire_lease=spec.get("acquire_lease", True),
+            model=spec.get("model"),
         )
 
         # Persist transcript regardless of outcome
@@ -381,6 +384,8 @@ def _run_local_reviewer(spec: dict, base_cwd: str | None) -> str:
         work_id=task_id,
         max_steps=int(spec.get("max_steps", 24)),
         model=model,
+        backend_url=spec.get("backend_url"),
+        acquire_lease=spec.get("acquire_lease", True),
     )
     return result or ""
 
