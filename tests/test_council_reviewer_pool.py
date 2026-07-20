@@ -17,7 +17,7 @@ from agents_core.cards import CardsRootError
 
 SEED_CARD = (
     Path(__file__).resolve().parents[1]
-    / "agents_core" / "council" / "seed_decks" / "reviewer" / "technical-integrity.yaml"
+    / "agents_core" / "council" / "seed_decks" / "decks" / "reviewer" / "technical-integrity.yaml"
 )
 
 SEED_PRIMITIVES = {
@@ -34,7 +34,7 @@ def _make_portable_cards_root(tmp_path: Path, with_reviewer_card: bool = True) -
         family_dir.mkdir(parents=True)
         for prim_id in prim_ids:
             (family_dir / f"{prim_id}.yaml").write_text("id: " + prim_id + "\n")
-    reviewer_dir = root / "characters" / "reviewer"
+    reviewer_dir = root / "decks" / "reviewer"
     reviewer_dir.mkdir(parents=True)
     if with_reviewer_card:
         shutil.copy(SEED_CARD, reviewer_dir / SEED_CARD.name)
@@ -42,11 +42,12 @@ def _make_portable_cards_root(tmp_path: Path, with_reviewer_card: bool = True) -
 
 
 def _wire_cards_root(tmp_path, monkeypatch, with_reviewer_card=True):
-    """Point ARCHETYPAL_CARDS_PATH + council.cli.CARDS_ROOT at a matching portable root."""
+    """Point ARCHETYPAL_CARDS_PATH + council.cli.CARDS_ROOT/DECKS_ROOT at a matching portable root."""
     root = _make_portable_cards_root(tmp_path, with_reviewer_card=with_reviewer_card)
     monkeypatch.setenv("ARCHETYPAL_CARDS_PATH", str(root))
     from agents_core.council import cli as council_cli
     monkeypatch.setattr(council_cli, "CARDS_ROOT", root / "characters")
+    monkeypatch.setattr(council_cli, "DECKS_ROOT", root / "decks")
     return root, council_cli
 
 
@@ -84,7 +85,7 @@ def test_build_roster_reviewer_and_legacy_pool_together(tmp_path, monkeypatch):
 def test_find_card_path_resolves_reviewer_card(tmp_path, monkeypatch):
     root, council_cli = _wire_cards_root(tmp_path, monkeypatch)
     path = council_cli.find_card_path("technical-integrity")
-    assert path == (root / "characters" / "reviewer" / "technical-integrity.yaml").resolve()
+    assert path == (root / "decks" / "reviewer" / "technical-integrity.yaml").resolve()
 
 
 def test_build_entity_dispatches_reviewer_card_to_persona_card_entity(tmp_path, monkeypatch):
@@ -143,7 +144,7 @@ def test_persona_card_entity_load_raises_on_missing_file(tmp_path):
 
 
 def test_seed_card_matches_documented_spec_fields():
-    """The shipped seed asset (agents_core/council/seed_decks/reviewer/
+    """The shipped seed asset (agents_core/council/seed_decks/decks/reviewer/
     technical-integrity.yaml) matches the worked card in the spec verbatim
     on its structural fields."""
     data = yaml.safe_load(SEED_CARD.read_text())

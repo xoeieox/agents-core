@@ -24,6 +24,7 @@ from agents_core.council.cli import (  # noqa: E402, F401
     COUNCIL_DIR,
     LOG_DIR,
     CARDS_ROOT,
+    DECKS_ROOT,
     DEFAULT_POOLS,
     DEFAULT_TURNS,
     DEFAULT_VOICING,

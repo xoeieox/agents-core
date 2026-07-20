@@ -70,6 +70,11 @@ CARDS_ROOT = cards_root() / "characters"
 # Not in DEFAULT_POOLS: general decision-deliberation submissions keep
 # today's behavior unchanged — a node without a seeded reviewer deck yet
 # must not have every council submission start failing.
+# Lives under decks/, a cards_root() sibling of characters/, not under
+# characters/ itself — the reviewer card schema is foreign to
+# archetypal-intelligence's CharacterComposition and would fail its own
+# CardRegistry validation (characters/**/*.yaml glob) if colocated there.
+DECKS_ROOT = cards_root() / "decks"
 REVIEWER_POOL = "reviewer"
 DEFAULT_POOLS = ["personal", "historical", "fiction"]
 DEFAULT_TURNS = 8
@@ -182,8 +187,8 @@ def build_roster(pools: list[str] = DEFAULT_POOLS) -> list[dict]:
     """
     roster: list[dict] = []
     for pool in pools:
-        pool_dir = CARDS_ROOT / pool
         if pool == REVIEWER_POOL:
+            pool_dir = DECKS_ROOT / pool
             for card in load_deck_cards(pool_dir):
                 data = card["data"]
                 slug = data["slug"]
@@ -199,6 +204,7 @@ def build_roster(pools: list[str] = DEFAULT_POOLS) -> list[dict]:
                     }
                 )
             continue
+        pool_dir = CARDS_ROOT / pool
         if not pool_dir.is_dir():
             continue
         for card_path in sorted(pool_dir.glob("*.yaml")):
@@ -222,10 +228,16 @@ def build_roster(pools: list[str] = DEFAULT_POOLS) -> list[dict]:
 
 
 def find_card_path(character_id: str) -> Path | None:
-    for pool_dir in CARDS_ROOT.iterdir():
-        if not pool_dir.is_dir():
-            continue
-        candidate = pool_dir / f"{character_id}.yaml"
+    if CARDS_ROOT.is_dir():
+        for pool_dir in CARDS_ROOT.iterdir():
+            if not pool_dir.is_dir():
+                continue
+            candidate = pool_dir / f"{character_id}.yaml"
+            if candidate.exists():
+                return candidate
+    reviewer_dir = DECKS_ROOT / REVIEWER_POOL
+    if reviewer_dir.is_dir():
+        candidate = reviewer_dir / f"{character_id}.yaml"
         if candidate.exists():
             return candidate
     return None
