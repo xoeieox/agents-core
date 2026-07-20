@@ -59,13 +59,18 @@ from pathlib import Path
 import yaml
 
 from agents_core.llm import call_operator  # noqa: E402
+from agents_core.cards import cards_root, load_deck_cards
 from agents_core.council.gravitywell_adapter import GravityWellAdapter
 from agents_core.room_paths import room_path
 
 COUNCIL_DIR = room_path("council")
-CARDS_ROOT = Path(
-    "/srv/git/archetypal-intelligence-working/cards/characters"
-)
+CARDS_ROOT = cards_root() / "characters"
+# reviewer: the seeded fail-loud pool (see agents_core.cards.load_deck_cards),
+# roster-eligible via build_roster(pools=[..., REVIEWER_POOL]) or `--pools`.
+# Not in DEFAULT_POOLS: general decision-deliberation submissions keep
+# today's behavior unchanged — a node without a seeded reviewer deck yet
+# must not have every council submission start failing.
+REVIEWER_POOL = "reviewer"
 DEFAULT_POOLS = ["personal", "historical", "fiction"]
 DEFAULT_TURNS = 8
 DEFAULT_VOICING = "gravitywell"
@@ -169,10 +174,31 @@ def new_run_id() -> str:
 
 
 def build_roster(pools: list[str] = DEFAULT_POOLS) -> list[dict]:
-    """Return lightweight summaries for every card in the selection pool."""
+    """Return lightweight summaries for every card in the selection pool.
+
+    The `reviewer` pool is fail-loud (agents_core.cards.load_deck_cards): an
+    empty or invalid deck raises CardsRootError naming exactly what is
+    missing, rather than silently skipping like the legacy pools below.
+    """
     roster: list[dict] = []
     for pool in pools:
         pool_dir = CARDS_ROOT / pool
+        if pool == REVIEWER_POOL:
+            for card in load_deck_cards(pool_dir):
+                data = card["data"]
+                slug = data["slug"]
+                exemplars = data.get("voice_exemplars") or []
+                cue = (exemplars[0] if exemplars else "").strip()
+                roster.append(
+                    {
+                        "character_id": slug,
+                        "character_name": slug.replace("-", " ").title(),
+                        "pool": pool,
+                        "cultural_context": cue[:240],
+                        "path": str(card["path"]),
+                    }
+                )
+            continue
         if not pool_dir.is_dir():
             continue
         for card_path in sorted(pool_dir.glob("*.yaml")):
@@ -1247,6 +1273,9 @@ def _build_entity(sel: dict, adapter, CharacterEntity, NarratorEntity):
     card_path = find_card_path(sel["id"])
     if card_path is None:
         raise RuntimeError(f"No card for entity id: {sel['id']!r}")
+    if card_path.parent.name == REVIEWER_POOL:
+        from agents_core.council.persona_card_entity import PersonaCardEntity
+        return PersonaCardEntity.load(card_path, adapter)
     return CharacterEntity.load(card_path, adapter)
 
 
