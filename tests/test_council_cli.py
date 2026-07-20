@@ -23,6 +23,7 @@ def _make_submit_args(**kwargs):
         "turns": 8,
         "voicing": "sonnet",
         "with_entity": None,
+        "pools": None,
         "narrator": False,
         "narrator_voice": None,
         "no_queue": False,
@@ -286,6 +287,86 @@ def test_build_parser_defaults_no_queue_false_notify_false():
     args = p.parse_args(["submit", "some decision"])
     assert args.no_queue is False
     assert args.notify is False
+
+
+def test_build_parser_pools_flag_defaults_none():
+    from agents_core.council.cli import build_parser
+    p = build_parser()
+    args = p.parse_args(["submit", "some decision"])
+    assert args.pools is None
+
+
+def test_build_parser_pools_flag_parses_value():
+    from agents_core.council.cli import build_parser
+    p = build_parser()
+    args = p.parse_args(["submit", "some decision", "--pools", "reviewer,personal"])
+    assert args.pools == "reviewer,personal"
+
+
+def test_cmd_submit_no_pools_calls_build_roster_with_no_args(tmp_path, monkeypatch):
+    """Absent --pools, build_roster must be called exactly as before (DEFAULT_POOLS)."""
+    from agents_core.council import cli as council_cli
+    import agents_core.claude_queue as cq_mod
+
+    monkeypatch.setattr(council_cli, "COUNCIL_DIR", tmp_path)
+    monkeypatch.setattr(council_cli, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(council_cli, "gather_mem_context", lambda d: {"terms": [], "hits": []})
+    monkeypatch.setattr(
+        council_cli, "select_entities",
+        lambda **kw: {"selected": ["a", "b"], "reasoning": "x"},
+    )
+    monkeypatch.setattr(cq_mod, "ClaudeQueue", lambda: type(
+        "_FakeQueue", (), {"submit": lambda self, task, task_id=None: task_id or "fake-id"}
+    )())
+
+    calls = []
+    def _tracking_build_roster(*a, **kw):
+        calls.append((a, kw))
+        return []
+    monkeypatch.setattr(council_cli, "build_roster", _tracking_build_roster)
+
+    rc = council_cli.cmd_submit(_make_submit_args())
+    assert rc == 0
+    assert calls == [((), {})]
+
+
+def test_cmd_submit_pools_flag_passes_resolved_pools_to_build_roster(tmp_path, monkeypatch):
+    from agents_core.council import cli as council_cli
+    import agents_core.claude_queue as cq_mod
+
+    monkeypatch.setattr(council_cli, "COUNCIL_DIR", tmp_path)
+    monkeypatch.setattr(council_cli, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(council_cli, "gather_mem_context", lambda d: {"terms": [], "hits": []})
+    monkeypatch.setattr(
+        council_cli, "select_entities",
+        lambda **kw: {"selected": ["a", "b"], "reasoning": "x"},
+    )
+    monkeypatch.setattr(cq_mod, "ClaudeQueue", lambda: type(
+        "_FakeQueue", (), {"submit": lambda self, task, task_id=None: task_id or "fake-id"}
+    )())
+    monkeypatch.setattr(council_cli, "_resolve_requested_pools", lambda arg: ["reviewer", "personal"])
+
+    calls = []
+    def _tracking_build_roster(*a, **kw):
+        calls.append((a, kw))
+        return []
+    monkeypatch.setattr(council_cli, "build_roster", _tracking_build_roster)
+
+    rc = council_cli.cmd_submit(_make_submit_args(pools="reviewer,personal"))
+    assert rc == 0
+    assert calls == [((), {"pools": ["reviewer", "personal"]})]
+
+
+def test_cmd_submit_bogus_pool_fails_loud(tmp_path, monkeypatch):
+    """--pools bogus must raise, naming the unknown pool, not run with a partial roster."""
+    from agents_core.council import cli as council_cli
+
+    monkeypatch.setattr(council_cli, "COUNCIL_DIR", tmp_path)
+    monkeypatch.setattr(council_cli, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(council_cli, "gather_mem_context", lambda d: {"terms": [], "hits": []})
+
+    with pytest.raises(ValueError, match="bogus"):
+        council_cli.cmd_submit(_make_submit_args(pools="bogus"))
 
 
 def test_cmd_list_empty(tmp_path, monkeypatch, capsys):
