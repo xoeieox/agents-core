@@ -22,6 +22,7 @@ Invoked as: python3 -m agents_core.shaped_runner <spec.json>
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -497,7 +498,11 @@ def _run_local_reviewer(spec: dict, base_cwd: str | None) -> str:
     """Read-only reviewer runner for local GW agent.
 
     Calls call_gw_agent(writeable=False, json_mode=True) and returns
-    the text result. No worktree, no git, no PR creation.
+    the text result. No git, no PR creation — but the caller (main())
+    routes worktree_required=True dispatches (always true for this engine)
+    through the same worktree-setup path as other engines, so base_cwd here
+    is already a worktree checked out to existing_branch (verified against
+    origin) or base_branch, not the raw shared clone.
     """
     from agents_core.gw_agent import call_gw_agent
 
@@ -560,29 +565,43 @@ def main():
             pass
         print(pr_url)
         return
-    elif engine == "local-reviewer":
-        result = _run_local_reviewer(spec, base_cwd)
-        try:
-            spec_path.unlink()
-        except OSError:
-            pass
-        print(result)
-        return
 
     # Per-task git worktree isolation for shaped agents (2026-04-23). When
     # the shaper routes to ClaudeQueue it sets worktree_required=True;
     # concurrent runners would otherwise interleave git checkout/commit/push
     # on the shared /srv/git/<repo>-working/ tree (see
     # /srv/lapis/planning/specs/agents-core-claude-queue.md).
+    #
+    # local-reviewer also sets worktree_required=True
+    # (agents-core-reviewer-worktree-branch-checkout-v0) so a reviewer/
+    # reviewer_fresh dispatch reviews the PR's actual head branch instead of
+    # whatever branch the shared clone happened to be sitting on.
     worktree_path = None
     try:
         if spec.get("worktree_required"):
             try:
                 from agents_core.worktree import setup_worktree
-                handle = setup_worktree(
-                    spec["task_id"], base_cwd,
-                    spec.get("base_branch", "main"),
-                )
+
+                worktree_ref = spec.get("base_branch", "main")
+                existing_branch = spec.get("existing_branch") or ""
+                if existing_branch:
+                    try:
+                        verify = subprocess.run(
+                            ["git", "-C", base_cwd, "ls-remote", "--exit-code", "origin", existing_branch],
+                            capture_output=True, text=True, timeout=30,
+                        )
+                        verified = verify.returncode == 0
+                    except subprocess.TimeoutExpired:
+                        verified = False
+                    if not verified:
+                        print(
+                            f"ERROR: worktree_setup: existing_branch {existing_branch} not found on origin",
+                            file=sys.stderr,
+                        )
+                        sys.exit(2)
+                    worktree_ref = existing_branch
+
+                handle = setup_worktree(spec["task_id"], base_cwd, worktree_ref)
                 worktree_path = handle.path
                 cwd = str(worktree_path)
                 # Propagate pip-isolation env into this process so the claude -p
@@ -596,7 +615,9 @@ def main():
         else:
             cwd = base_cwd
 
-        if capture_meta:
+        if engine == "local-reviewer":
+            result = _run_local_reviewer(spec, cwd)
+        elif capture_meta:
             result, envelope = call_claude_cli(
                 prompt=spec["prompt"],
                 system=spec.get("system", ""),

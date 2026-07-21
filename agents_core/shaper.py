@@ -346,8 +346,10 @@ class Shaper:
             spec["task_id"] = task_id
             spec["base_branch"] = "main"
             # existing_branch is only meaningful for fixer_retry (an already-open
-            # PR's head ref); other agent types don't need it in their spec.
-            if agent_type == "fixer_retry":
+            # PR's head ref) and reviewer/reviewer_fresh (the PR's head branch to
+            # review); other agent types (e.g. spec_reviewer, which has no PR)
+            # don't need it in their spec.
+            if agent_type in ("fixer_retry", "reviewer", "reviewer_fresh"):
                 spec["existing_branch"] = vars_.get("existing_branch", "")
             # local-fixer manages its own worktree inside _run_local_fixer;
             # setting worktree_required=True would cause the runner to set up a
