@@ -867,6 +867,54 @@ def _novelty_hash(tool_name: str, tool_args: dict, result_str: str) -> str:
     return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
 
 
+def _build_handler_context(
+    transcript: list[dict],
+    messages: list[dict],
+    handler_objective: str,
+    consecutive_no_progress: int,
+    step_num: int,
+    explore_steps: int,
+) -> dict:
+    """Build the bounded context dict passed to handler_hook at the no-progress threshold.
+
+    transcript_slice is the last 6 transcript entries, each stripped down to
+    {step, tool, args, error} - tool RESULT bodies are omitted entirely, and each
+    string arg value is truncated to 200 chars. Plus the most recent assistant
+    message content (truncated to ~1000 chars), which is what reveals drift
+    ("I'll wait for the background suite"). No full message history, no tool results.
+    """
+    _slice = []
+    for entry in transcript[-6:]:
+        _args = entry.get("arguments")
+        _trunc_args: dict = {}
+        if isinstance(_args, dict):
+            for k, v in _args.items():
+                _trunc_args[k] = v[:200] if isinstance(v, str) and len(v) > 200 else v
+        _slice.append({
+            "step": entry.get("step"),
+            "tool": entry.get("tool_name"),
+            "args": _trunc_args,
+            "error": entry.get("error"),
+        })
+
+    _last_assistant = None
+    for _m in reversed(messages):
+        if _m.get("role") == "assistant":
+            _last_assistant = _m.get("content") or ""
+            break
+    if _last_assistant and len(_last_assistant) > 1000:
+        _last_assistant = _last_assistant[:1000]
+
+    return {
+        "objective": handler_objective,
+        "transcript_slice": _slice,
+        "consecutive_no_progress": consecutive_no_progress,
+        "step_num": step_num,
+        "explore_steps": explore_steps,
+        "last_assistant_message": _last_assistant,
+    }
+
+
 def _resolve_int_env(env_name: str, default: int, log: Callable[[str], None] | None) -> int:
     """Read an int override from the environment; fall back (and log once) on bad input."""
     raw = os.environ.get(env_name)
@@ -913,6 +961,9 @@ def call_gw_agent(
     reason_out: list[str] | None = None,
     served_model_out: list | None = None,
     model: str | None = None,
+    handler_hook: Callable[[dict], dict] | None = None,
+    handler_objective: str = "",
+    handler_max_interventions: int = 2,
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Run a multi-step read-only tool-loop on GravityWell.
 
@@ -986,6 +1037,38 @@ def call_gw_agent(
                field in both POST payloads (main loop + forced-conclusion) when provided.
                When None (default), the field is omitted entirely — backward compatible
                with single-model vLLM endpoints that serve whatever is loaded.
+        handler_hook: Optional callable (dict) -> dict. When provided (writeable mode
+                      only), called at the no-progress nudge threshold - same trigger
+                      point that fires the static nudge - in place of the static string,
+                      as long as the intervention budget (handler_max_interventions) is
+                      not exhausted. Called with a bounded context dict (objective, a
+                      6-entry transcript slice, consecutive_no_progress, step_num,
+                      explore_steps, last_assistant_message); expected to return a
+                      verdict dict {"decision": "continue"|"redirect", "redirect": str
+                      or None, "note": str, "anomaly": str or None}. "redirect" (non-empty
+                      after strip) appends the redirect as a user message and resets the
+                      no-progress counter; "continue" resets the counter with no message
+                      appended (strategic pause); any other decision (including a stray
+                      "stop" - v0 is redirect-only, run-halting is not supported), a
+                      non-dict, or None falls through to the static nudge. The MODEL CALL
+                      lives in the caller, not here - gw_agent stays model-agnostic and
+                      never imports llm/call_claude_cli, exactly like cancel_check/
+                      before_tool. Fail-safe: wrapped in try/except - any exception
+                      (including a self-raised TimeoutError) logs a WARN and falls
+                      through to the static nudge; the hook is REQUIRED to be
+                      self-time-bounding (pass an explicit short timeout to its own model
+                      call) since gw_agent applies no timeout of its own around the call.
+                      When None (default), never called - behavior is byte-identical to
+                      before this param existed.
+        handler_objective: Objective string threaded into the handler_hook context dict's
+                           "objective" field. Ignored when handler_hook is None.
+        handler_max_interventions: Caps the total number of Handler-driven no-progress-
+                                   counter resets (redirect + continue-extend combined) in
+                                   one run (default 2). Once exhausted, every subsequent
+                                   threshold hit takes the fall-through (static nudge)
+                                   path and the existing hard-abort stands - the Handler
+                                   can never create an infinite supervision loop. Ignored
+                                   when handler_hook is None.
 
     Returns:
         - str or None (or (str|None, list) when return_transcript=True).
@@ -1058,6 +1141,9 @@ def call_gw_agent(
     _seen_result_hashes: set[str] = set()
     _explore_steps = 0
     _nudge_fired = False
+    # Handler supervision state (writeable mode, handler_hook only): bounded intervention
+    # budget for Handler-driven counter resets (redirect + continue-extend combined).
+    _handler_interventions_used = 0
     # Grounding guard state (json_mode review runs): track verified (error-free) tool calls.
     grounding_count = 0  # tool calls with error is None
     grounding_nudged = False  # True after the first 0-tool-call stop nudge
@@ -1436,19 +1522,52 @@ def call_gw_agent(
 
                     _nudge_threshold = max(no_progress_steps - 2, 1)
                     _explore_nudge_threshold = max(_max_explore_steps - 2, 1)
-                    if not _nudge_fired and (
+                    if (
                         consecutive_no_progress >= _nudge_threshold
                         or _explore_steps >= _explore_nudge_threshold
                     ):
-                        _nudge_fired = True
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                "You now have enough context to act. Make your first "
-                                "`apply_edit`/`write_file` now — continued reading without "
-                                "an edit will end this run without a result."
-                            ),
-                        })
+                        _handler_acted = False
+                        if handler_hook is not None and _handler_interventions_used < handler_max_interventions:
+                            try:
+                                _handler_ctx = _build_handler_context(
+                                    transcript, messages, handler_objective,
+                                    consecutive_no_progress, step_num + 1, _explore_steps,
+                                )
+                                _verdict = handler_hook(_handler_ctx)
+                            except Exception as _hh_exc:
+                                logger.warning(f"[gw_agent] handler_hook raised: {_hh_exc}")
+                                _verdict = None
+
+                            _decision = _verdict.get("decision") if isinstance(_verdict, dict) else None
+                            if _decision == "redirect":
+                                _redirect_raw = _verdict.get("redirect")
+                                _redirect_text = _redirect_raw.strip() if isinstance(_redirect_raw, str) else ""
+                                if _redirect_text:
+                                    messages.append({"role": "user", "content": _redirect_text})
+                                    consecutive_no_progress = 0
+                                    _handler_interventions_used += 1
+                                    _handler_acted = True
+                            elif _decision == "continue":
+                                # Strategic pause: Handler vouches the Operative is legitimately
+                                # still gathering context. Extend the budget, append nothing -
+                                # the Operative is judged on-track, don't pressure it.
+                                consecutive_no_progress = 0
+                                _handler_interventions_used += 1
+                                _handler_acted = True
+                            # else: malformed/absent/unrecognized decision (incl. a stray "stop" -
+                            # v0 is redirect-only, run-halting is deferred) or empty/null redirect
+                            # falls through to the static nudge below, uncounted against budget.
+
+                        if not _handler_acted and not _nudge_fired:
+                            _nudge_fired = True
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    "You now have enough context to act. Make your first "
+                                    "`apply_edit`/`write_file` now - continued reading without "
+                                    "an edit will end this run without a result."
+                                ),
+                            })
 
                     if consecutive_no_progress >= no_progress_steps or _explore_steps >= _max_explore_steps:
                         if log:
