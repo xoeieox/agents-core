@@ -178,7 +178,31 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         from agents_core.worktree import setup_worktree, teardown_worktree
         import agents_core.forgejo as _forgejo
 
-        handle = setup_worktree(task_id, effective_cwd, base_branch)
+        # fixer_retry dispatches target an already-open PR — the worktree must
+        # start from the PR's own branch, not base_branch (main), or the target
+        # file simply won't exist in the checkout. Verify the branch is really
+        # on origin first: the local-fixer GW sandbox has no git checkout tool,
+        # so if this is wrong there is no way for the model to self-correct.
+        existing_branch = spec.get("existing_branch") or ""
+        worktree_ref = base_branch
+        if spec.get("agent_type") == "fixer_retry" and existing_branch:
+            try:
+                verify = subprocess.run(
+                    ["git", "-C", effective_cwd, "ls-remote", "--exit-code", "origin", existing_branch],
+                    capture_output=True, text=True, timeout=30,
+                )
+                verified = verify.returncode == 0
+            except subprocess.TimeoutExpired:
+                verified = False
+            if not verified:
+                print(
+                    f"ERROR: worktree_setup: existing_branch {existing_branch} not found on origin",
+                    file=sys.stderr,
+                )
+                return ""
+            worktree_ref = existing_branch
+
+        handle = setup_worktree(task_id, effective_cwd, worktree_ref)
         worktree_path = handle.path
         cwd = str(worktree_path)
 

@@ -121,6 +121,13 @@ def shaper_mocks_with_local_fixer(tmp_path, monkeypatch):
             "engine": "local-fixer",
             "timeout_s": 60,
         },
+        "fixer_retry": {
+            "chub_bundles": [],
+            "system_template": "test for {repo}",
+            "model": "gravitywell-122b",
+            "engine": "local-fixer",
+            "timeout_s": 60,
+        },
         "qwen_agent": _agent_def("qwen3.6-35b-a3b"),
     })
     monkeypatch.setattr(shaper_mod, "SPEC_DIR", tmp_path / "shaped")
@@ -162,12 +169,16 @@ def test_local_fixer_spec_has_no_worktree_required_true(shaper_mocks_with_local_
 def test_local_fixer_spec_retains_required_fields(shaper_mocks_with_local_fixer, tmp_path):
     s, _, _ = shaper_mocks_with_local_fixer
     spec_dir = tmp_path / "shaped"
-    s.dispatch("fixer_local", "t-lf", "fix it", vars_={"repo": "agents-core"})
+    s.dispatch(
+        "fixer_retry", "t-lf", "fix it",
+        vars_={"repo": "agents-core", "existing_branch": "lapis/t-lf/forced"},
+    )
     spec = json.loads(list(spec_dir.glob("*.json"))[0].read_text())
     assert spec["engine"] == "local-fixer"
     assert spec["repo"] == "agents-core"
     assert "task_id" in spec
     assert spec["base_branch"] == "main"
+    assert spec["existing_branch"] == "lapis/t-lf/forced"
 
 
 def test_local_fixer_task_id_matches_claude_queue_id(shaper_mocks_with_local_fixer, tmp_path):
