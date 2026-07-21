@@ -425,6 +425,192 @@ def test_open_prs_executor_large_pr_list_no_output_cap_corruption(executor):
         assert "…(+5 more)" in pr["changed_files"][-1]
 
 
+def _mock_git_remote_result(returncode=0, stdout="", stderr=""):
+    """Build a fake CompletedProcess-like object for a mocked `git remote get-url origin`."""
+    m = MagicMock()
+    m.returncode = returncode
+    m.stdout = stdout
+    m.stderr = stderr
+    return m
+
+
+def test_open_prs_executor_cwd_owner_wins_over_model_supplied_repo(tmp_path):
+    """cwd-derived (owner, repo) must replace the model-supplied repo entirely.
+
+    Uses a deliberately wrong arguments["repo"] to prove the cwd-derived origin
+    remote wins, not just fills in a missing owner.
+    """
+    mock_prs = [
+        {
+            "number": 1,
+            "title": "Test",
+            "head": {"ref": "branch"},
+            "base": {"ref": "main"},
+            "body": "Test",
+            "updated_at": "2026-07-20T10:00:00Z",
+        },
+    ]
+
+    executor = OpenPrsExecutor(cwd=str(tmp_path))
+
+    def mock_run(cmd, **kwargs):
+        return _mock_git_remote_result(
+            returncode=0, stdout="git@forgejo:lapis/knowledge-mesh-seed.git\n"
+        )
+
+    with patch("agents_core.gw_agent.subprocess.run", side_effect=mock_run):
+        with patch("agents_core.forgejo.get_open_prs", return_value=mock_prs) as mock_get_prs:
+            result = executor.execute({"repo": "some-other-wrong-repo"})
+
+    mock_get_prs.assert_called_once()
+    call_args = mock_get_prs.call_args
+    assert call_args[0][0] == "knowledge-mesh-seed"
+    assert call_args[1].get("owner") == "lapis"
+    assert isinstance(result, str)
+    assert json.loads(result)[0]["number"] == 1
+
+
+def test_open_prs_executor_cwd_owner_Erah_majority_case(tmp_path):
+    """cwd resolving to an Erah-org URL still works (regression guard for the common case)."""
+    mock_prs = [
+        {
+            "number": 1,
+            "title": "Test",
+            "head": {"ref": "branch"},
+            "base": {"ref": "main"},
+            "body": "Test",
+            "updated_at": "2026-07-20T10:00:00Z",
+        },
+    ]
+
+    executor = OpenPrsExecutor(cwd=str(tmp_path))
+
+    def mock_run(cmd, **kwargs):
+        return _mock_git_remote_result(
+            returncode=0, stdout="git@forgejo:Erah/agents-core.git\n"
+        )
+
+    with patch("agents_core.gw_agent.subprocess.run", side_effect=mock_run):
+        with patch("agents_core.forgejo.get_open_prs", return_value=mock_prs) as mock_get_prs:
+            result = executor.execute({"repo": "agents-core"})
+
+    mock_get_prs.assert_called_once()
+    call_args = mock_get_prs.call_args
+    assert call_args[0][0] == "agents-core"
+    assert call_args[1].get("owner") == "Erah"
+    assert isinstance(result, str)
+
+
+def test_open_prs_executor_no_cwd_falls_back_and_warns(capsys):
+    """No cwd (or a cwd that isn't a git repo) falls back to today's behavior and warns."""
+    mock_prs = [
+        {
+            "number": 1,
+            "title": "Test",
+            "head": {"ref": "branch"},
+            "base": {"ref": "main"},
+            "body": "Test",
+            "updated_at": "2026-07-20T10:00:00Z",
+        },
+    ]
+
+    executor = OpenPrsExecutor()
+
+    with patch("agents_core.forgejo.get_open_prs", return_value=mock_prs) as mock_get_prs:
+        result = executor.execute({"repo": "agents-core"})
+
+    mock_get_prs.assert_called_once()
+    call_args = mock_get_prs.call_args
+    assert call_args[0][0] == "agents-core"
+    assert call_args[1].get("owner") is None
+    assert isinstance(result, str)
+
+    captured = capsys.readouterr()
+    assert "WARN: local-fixer: openprs owner-resolution failed" in captured.err
+
+
+def test_open_prs_executor_get_changed_files_threads_resolved_owner(tmp_path):
+    """_get_changed_files must use the same cwd-resolved owner, not None."""
+    mock_prs = [
+        {
+            "number": 1,
+            "title": "Test",
+            "head": {"ref": "branch"},
+            "base": {"ref": "main"},
+            "body": "Test",
+            "updated_at": "2026-07-20T10:00:00Z",
+        },
+    ]
+    mock_files = [{"filename": "foo.py"}]
+
+    executor = OpenPrsExecutor(cwd=str(tmp_path))
+
+    def mock_run(cmd, **kwargs):
+        return _mock_git_remote_result(
+            returncode=0, stdout="git@forgejo:lapis/knowledge-mesh-seed.git\n"
+        )
+
+    with patch("agents_core.gw_agent.subprocess.run", side_effect=mock_run):
+        with patch("agents_core.forgejo.get_open_prs", return_value=mock_prs):
+            with patch(
+                "agents_core.forgejo.get_pr_files", return_value=mock_files
+            ) as mock_get_files:
+                result = executor.execute({"repo": "wrong-repo", "with_files": True})
+
+    mock_get_files.assert_called_once()
+    call_args = mock_get_files.call_args
+    assert call_args[0][0] == "knowledge-mesh-seed"
+    assert call_args[1].get("owner") == "lapis"
+    prs = json.loads(result)
+    assert prs[0]["changed_files"] == ["foo.py"]
+
+
+def test_open_prs_executor_get_changed_files_diff_fallback_threads_resolved_owner(tmp_path):
+    """The diff-parsing fallback branch of _get_changed_files must also thread owner."""
+    mock_prs = [
+        {
+            "number": 1,
+            "title": "Test",
+            "head": {"ref": "branch"},
+            "base": {"ref": "main"},
+            "body": "Test",
+            "updated_at": "2026-07-20T10:00:00Z",
+        },
+    ]
+    mock_diff = """diff --git a/foo.py b/foo.py
+index abc..def 100644
+--- a/foo.py
++++ b/foo.py
+@@ -1 +1 @@
+-old
++new
+"""
+
+    executor = OpenPrsExecutor(cwd=str(tmp_path))
+
+    def mock_run(cmd, **kwargs):
+        return _mock_git_remote_result(
+            returncode=0, stdout="git@forgejo:lapis/knowledge-mesh-seed.git\n"
+        )
+
+    with patch("agents_core.gw_agent.subprocess.run", side_effect=mock_run):
+        with patch("agents_core.forgejo.get_open_prs", return_value=mock_prs):
+            with patch(
+                "agents_core.forgejo.get_pr_files", side_effect=Exception("no files endpoint")
+            ):
+                with patch(
+                    "agents_core.forgejo.get_pr_diff", return_value=mock_diff
+                ) as mock_get_diff:
+                    result = executor.execute({"repo": "wrong-repo", "with_files": True})
+
+    mock_get_diff.assert_called_once()
+    call_args = mock_get_diff.call_args
+    assert call_args[0][0] == "knowledge-mesh-seed"
+    assert call_args[1].get("owner") == "lapis"
+    prs = json.loads(result)
+    assert "foo.py" in prs[0]["changed_files"]
+
+
 def test_open_prs_executor_uses_default_owner_not_lapis_org(executor):
     """Guard against namespace regression: executor must use default owner (None).
 
