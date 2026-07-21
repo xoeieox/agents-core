@@ -29,6 +29,91 @@ from agents_core.llm import call_claude_cli
 from agents_core.room_paths import room_path
 
 
+# ---------------------------------------------------------------------------
+# Handler supervision (agents-core-handler-operative-live-supervision-v0)
+#
+# Live Handler supervision of the local-fixer Operative's step loop. Redirect-only
+# v0: the Handler can nudge the Operative back on track or vouch for a strategic
+# pause, but cannot halt a run (the "stop" verdict is deferred to a follow-on).
+# The Handler seat routes through call_claude_cli only (no direct Anthropic API).
+# ---------------------------------------------------------------------------
+
+HANDLER_SYSTEM = """\
+You are the HANDLER in a Handler+Operative pair. The Operative is a coding agent
+fixing code toward a fixed objective. It has now gone several steps with no code edit.
+You do NOT execute anything. You read what it just did and said, and you steer it with
+one short, imperative verdict.
+
+Objective:
+{objective}
+
+Default to the SAFE baseline. The system already has a fallback nudge and a hard stop
+that will handle an ordinary stall on their own. Only override that baseline when you can
+point to something SPECIFIC and concrete - if you are unsure, do NOT issue a command;
+omit "decision" (or set it to null) and let the baseline handle it. A confidently-wrong
+command is worse than staying quiet, because you see only a short slice of the run and a
+"wait" may be a valid dependency you cannot see.
+
+Decide ONE of:
+- "redirect": ONLY when you can name the SPECIFIC drift - a concrete off-objective action
+  (waiting on a named background process, editing a file outside the objective, re-reading
+  without progressing). Issue a sharp imperative instruction that returns it to the
+  objective (e.g. "Stop waiting on the background test run. The objective only needs <X>.
+  Make your edit to <file> now."). Cite the specific drift in "note". If you cannot name a
+  specific drift, do NOT redirect.
+- "continue": ONLY when you can cite the SPECIFIC objective-aligned work still in progress
+  (a concrete dependency the Operative is legitimately gathering before it can edit) - a
+  real strategic pause, not a hopeful guess. Cite that dependency in "note". Use sparingly.
+
+You cannot halt the run - your only levers are a redirect nudge or letting it continue.
+If something odd appears that you are NOT redirecting toward, record it in "anomaly"
+(capture-don't-chase) - do not chase it.
+
+Output ONLY this JSON, no prose, no markdown fences:
+{{"decision":"redirect|continue","redirect":"<imperative instruction, or null>",
+ "note":"<one line of provenance>","anomaly":"<oddity to capture, or null>"}}"""
+
+
+def _build_handler_prompt(ctx: dict) -> str:
+    """Render the Handler's per-invocation prompt from a gw_agent handler_hook context dict."""
+    return (
+        f"The Operative has made no edit for {ctx.get('consecutive_no_progress')} steps "
+        f"(step {ctx.get('step_num')}, {ctx.get('explore_steps')} total exploration steps "
+        "so far). Here is what it just did and said.\n\n"
+        f"Recent tool calls (most recent last):\n"
+        f"{json.dumps(ctx.get('transcript_slice') or [], ensure_ascii=False, default=str)}\n\n"
+        f"Its most recent stated plan/reasoning:\n"
+        f"{ctx.get('last_assistant_message') or '(none)'}"
+    )
+
+
+def _build_handler_hook(objective: str, model: str, hook_timeout_s: int):
+    """Build a handler_hook closure for call_gw_agent's Handler supervision (v0).
+
+    The seat call routes through call_claude_cli only, with an explicit timeout so the
+    hook is self-time-bounding (gw_agent applies no timeout of its own around the call).
+    Returns None (the gw_agent fall-through case: static nudge, no budget change) on any
+    unparseable/failed seat reply, so a broken Handler can never stop or extend a healthy
+    Operative.
+    """
+    from agents_core.calibration.handler_agent_harness import _extract_json
+
+    system = HANDLER_SYSTEM.replace("{objective}", objective)
+
+    def _hook(ctx: dict) -> dict | None:
+        reply = call_claude_cli(
+            prompt=_build_handler_prompt(ctx),
+            system=system,
+            model=model,
+            timeout=hook_timeout_s,
+        )
+        if not reply:
+            return None
+        return _extract_json(reply)
+
+    return _hook
+
+
 _FORGEJO_PR_RE = re.compile(r"http://\d+\.\d+\.\d+\.\d+:\d+/[\w\-]+/[\w\-]+/pulls?/\d+")
 _GIT_EVIDENCE_RE = re.compile(
     r"(git (?:checkout|push|commit|add|fetch|branch)\b|create_pr\(|html_url)",
@@ -178,6 +263,27 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         from agents_core.worktree import setup_worktree, teardown_worktree
         import agents_core.forgejo as _forgejo
 
+        # Handler supervision config (agents-core-handler-operative-live-supervision-v0).
+        # Off by default: an absent key, a malformed (non-dict) value, or enabled
+        # falsy/missing all resolve to handler_hook=None - byte-identical to today.
+        # Unknown extra keys are ignored (superset-tolerant).
+        _handler_hook = None
+        _handler_objective = ""
+        _handler_max_interventions = 2
+        _supervision_cfg = spec.get("handler_supervision")
+        if isinstance(_supervision_cfg, dict) and _supervision_cfg.get("enabled"):
+            _backend = _supervision_cfg.get("backend", "claude_cli")
+            if _backend != "claude_cli":
+                raise ValueError(
+                    f"handler_supervision backend {_backend!r} not supported in v0, "
+                    "use claude_cli"
+                )
+            _handler_model = _supervision_cfg.get("model", "haiku")
+            _hook_timeout_s = int(_supervision_cfg.get("hook_timeout_s", 60))
+            _handler_max_interventions = int(_supervision_cfg.get("max_interventions", 2))
+            _handler_objective = (spec.get("prompt") or "")[:1500]
+            _handler_hook = _build_handler_hook(_handler_objective, _handler_model, _hook_timeout_s)
+
         # fixer_retry dispatches target an already-open PR — the worktree must
         # start from the PR's own branch, not base_branch (main), or the target
         # file simply won't exist in the checkout. Verify the branch is really
@@ -227,6 +333,9 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             backend_url=spec.get("backend_url"),
             acquire_lease=spec.get("acquire_lease", True),
             model=spec.get("model"),
+            handler_hook=_handler_hook,
+            handler_objective=_handler_objective,
+            handler_max_interventions=_handler_max_interventions,
         )
 
         # Persist transcript regardless of outcome

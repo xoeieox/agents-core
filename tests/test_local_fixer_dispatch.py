@@ -1213,3 +1213,128 @@ def test_no_salvage_log_when_no_pr(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "harness-salvaged" not in err
     mock_pr.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# agents-core-handler-operative-live-supervision-v0: DoD 9-10
+# ---------------------------------------------------------------------------
+
+def test_handler_supervision_enabled_builds_hook_routed_through_claude_cli(tmp_path):
+    """DoD9: enabled supervision builds a handler_hook that routes the seat call
+    through call_claude_cli (model=haiku default, timeout=hook_timeout_s default 60),
+    parses a well-formed verdict, and returns None on an unparseable/None seat reply
+    (the gw_agent fall-through case) rather than fabricating a 'continue' verdict."""
+    spec = json.loads(_make_spec(
+        tmp_path, handler_supervision={"enabled": True}, prompt="Fix the thing.",
+    ).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    captured_kwargs: list[dict] = []
+
+    def fake_gw_agent(**kwargs):
+        captured_kwargs.append(kwargs)
+        return (_good_fixer_result(), [])
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw_agent),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", return_value={"html_url": "http://x/p/1"}),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        sr._run_local_fixer(spec, str(tmp_path))
+
+    assert captured_kwargs, "call_gw_agent not called"
+    handler_hook = captured_kwargs[0]["handler_hook"]
+    assert handler_hook is not None
+    assert captured_kwargs[0]["handler_objective"].startswith("Fix the thing.")
+    assert captured_kwargs[0]["handler_max_interventions"] == 2
+
+    ctx = {
+        "objective": "Fix the thing.",
+        "transcript_slice": [{"step": 1, "tool": "read_file", "args": {}, "error": None}],
+        "consecutive_no_progress": 3,
+        "step_num": 4,
+        "explore_steps": 4,
+        "last_assistant_message": "I'll wait for the background suite.",
+    }
+
+    with patch(
+        "agents_core.shaped_runner.call_claude_cli",
+        return_value=(
+            '{"decision":"redirect","redirect":"stop waiting, commit now",'
+            '"note":"n","anomaly":null}'
+        ),
+    ) as mock_cli:
+        verdict = handler_hook(ctx)
+
+    assert mock_cli.call_args.kwargs["model"] == "haiku"
+    assert mock_cli.call_args.kwargs["timeout"] == 60
+    assert verdict == {
+        "decision": "redirect", "redirect": "stop waiting, commit now",
+        "note": "n", "anomaly": None,
+    }
+
+    # Unparseable seat reply -> None (fall-through), never a fabricated 'continue'.
+    with patch("agents_core.shaped_runner.call_claude_cli", return_value="not json"):
+        assert handler_hook(ctx) is None
+
+    # Failed/empty seat call -> None (fall-through).
+    with patch("agents_core.shaped_runner.call_claude_cli", return_value=None):
+        assert handler_hook(ctx) is None
+
+
+@pytest.mark.parametrize("supervision_cfg", [None, {"enabled": False}])
+def test_handler_supervision_off_passes_none_hook_and_empty_objective(tmp_path, supervision_cfg):
+    """DoD10: absent handler_supervision key and enabled=False both resolve to
+    handler_hook=None, handler_objective='' - today's behavior, unchanged."""
+    overrides = {} if supervision_cfg is None else {"handler_supervision": supervision_cfg}
+    spec = json.loads(_make_spec(tmp_path, **overrides).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    captured_kwargs: list[dict] = []
+
+    def fake_gw_agent(**kwargs):
+        captured_kwargs.append(kwargs)
+        return (_good_fixer_result(), [])
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw_agent),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", return_value={"html_url": "http://x/p/1"}),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        sr._run_local_fixer(spec, str(tmp_path))
+
+    assert captured_kwargs, "call_gw_agent not called"
+    assert captured_kwargs[0]["handler_hook"] is None
+    assert captured_kwargs[0]["handler_objective"] == ""
+
+
+def test_handler_supervision_unsupported_backend_fails_loud(tmp_path, capsys):
+    """Config schema: backend != 'claude_cli' fails loud (no silent fallback), no PR."""
+    spec = json.loads(_make_spec(
+        tmp_path, handler_supervision={"enabled": True, "backend": "gw_http"},
+    ).read_text())
+
+    import agents_core.shaped_runner as sr
+
+    with patch("agents_core.gw_agent.call_gw_agent") as mock_gw:
+        result = sr._run_local_fixer(spec, str(tmp_path))
+
+    assert result == ""
+    mock_gw.assert_not_called()
+    err = capsys.readouterr().err
+    assert "gw_http" in err
+    assert "not supported in v0" in err

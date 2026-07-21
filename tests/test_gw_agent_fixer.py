@@ -1000,6 +1000,243 @@ class TestNudgeMessage:
         assert nudge_count == 1
 
 
+# ---------------------------------------------------------------------------
+# agents-core-handler-operative-live-supervision-v0: handler_hook at the
+# no-progress nudge threshold
+# ---------------------------------------------------------------------------
+
+class TestHandlerHookSupervision:
+    """Tests for the handler_hook callable param on call_gw_agent (writeable mode)."""
+
+    def _run_and_capture(self, tmp_path, responses, no_progress_steps=4, **extra_kwargs):
+        repo = _tmp_git_repo(tmp_path)
+        (repo / "src.py").write_text("x = 1\n")
+        subprocess.run(["git", "add", "."], check=True, capture_output=True, cwd=str(repo))
+        subprocess.run(["git", "commit", "-m", "add src"], check=True, capture_output=True, cwd=str(repo))
+
+        captured = []
+
+        def fake_post(url, json=None, timeout=None):
+            captured.append(json)
+            r = responses.pop(0)
+            r.raise_for_status = MagicMock()
+            return r
+
+        with patch("agents_core.gw_agent.requests.post", side_effect=fake_post), \
+             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+            mock_client = MagicMock()
+            mock_client.acquire.return_value = {"status": "serving"}
+            MockDoorman.return_value = mock_client
+
+            fixer, transcript = call_gw_agent(
+                prompt="Fix.",
+                cwd=str(repo),
+                writeable=True,
+                acquire_lease=True,
+                backend_url=None,
+                no_progress_steps=no_progress_steps,
+                **extra_kwargs,
+            )
+        return fixer, transcript, captured
+
+    @staticmethod
+    def _make_read(cid: str, i: int, path: str = "src.py") -> dict:
+        return _make_tool_call_response("read_file", {"path": path, "start_line": i}, cid)
+
+    @staticmethod
+    def _nudge_count(messages: list[dict]) -> int:
+        return sum(1 for m in messages if "enough context to act" in (m.get("content") or ""))
+
+    def test_handler_none_is_byte_identical_to_static_nudge(self, tmp_path):
+        """DoD1: handler_hook=None -> unchanged loop, static nudge fires once, then hard-abort."""
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read(f"c{i}", i)))
+            for i in range(5)
+        ]
+        fixer, transcript, captured = self._run_and_capture(
+            tmp_path, responses, no_progress_steps=4, handler_hook=None,
+        )
+        assert fixer["no_progress"] is True
+        assert self._nudge_count(captured[-1]["messages"]) == 1
+
+    def test_redirect_verdict_appends_redirect_not_static_nudge(self, tmp_path):
+        """DoD2: a valid redirect replaces the static nudge and resets the counter."""
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c0", 0))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c1", 1))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c2", 2))),
+            MagicMock(status_code=200, json=MagicMock(return_value=_make_stop_response("Done."))),
+        ]
+        handler_calls = []
+
+        def handler_hook(ctx):
+            handler_calls.append(ctx)
+            return {"decision": "redirect", "redirect": "return to objective X"}
+
+        fixer, transcript, captured = self._run_and_capture(
+            tmp_path, responses, no_progress_steps=4,
+            handler_hook=handler_hook, handler_objective="obj",
+        )
+
+        assert len(handler_calls) == 1
+        assert fixer["no_progress"] is False
+        assert fixer["concluded"] is True
+        last_messages = captured[-1]["messages"]
+        redirect_count = sum(1 for m in last_messages if m.get("content") == "return to objective X")
+        assert redirect_count == 1
+        assert self._nudge_count(last_messages) == 0
+
+    def test_continue_verdict_resets_counter_appends_nothing(self, tmp_path):
+        """DoD3: strategic-pause 'continue' resets the counter, appends no message."""
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c0", 0))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c1", 1))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c2", 2))),
+            MagicMock(status_code=200, json=MagicMock(return_value=_make_stop_response("Done."))),
+        ]
+        handler_calls = []
+
+        def handler_hook(ctx):
+            handler_calls.append(ctx)
+            return {"decision": "continue", "note": "gathering context"}
+
+        fixer, transcript, captured = self._run_and_capture(
+            tmp_path, responses, no_progress_steps=4, handler_hook=handler_hook,
+        )
+
+        assert len(handler_calls) == 1
+        assert fixer["no_progress"] is False
+        assert fixer["concluded"] is True
+        last_messages = captured[-1]["messages"]
+        assert self._nudge_count(last_messages) == 0
+        user_messages = [m for m in last_messages if m.get("role") == "user"]
+        assert len(user_messages) == 1  # only the original prompt - no redirect, no nudge
+
+    def test_empty_redirect_falls_through_and_does_not_consume_intervention(self, tmp_path):
+        """DoD4: whitespace-only redirect -> fall-through nudge, budget left untouched so a
+        subsequent real redirect is still allowed (proven here with max_interventions=1)."""
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c0", 0))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c1", 1))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c2", 2))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c3", 3))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c4", 4))),
+            MagicMock(status_code=200, json=MagicMock(return_value=_make_stop_response("Done."))),
+        ]
+        handler_calls = []
+
+        def handler_hook(ctx):
+            handler_calls.append(ctx)
+            if len(handler_calls) == 1:
+                return {"decision": "redirect", "redirect": "   "}
+            return {"decision": "redirect", "redirect": "second real redirect"}
+
+        fixer, transcript, captured = self._run_and_capture(
+            tmp_path, responses, no_progress_steps=5,
+            handler_hook=handler_hook, handler_max_interventions=1,
+        )
+
+        # A budget of 1 still permits a 2nd call - proves the empty redirect never
+        # consumed the (sole) intervention slot.
+        assert len(handler_calls) == 2
+        assert fixer["no_progress"] is False
+        assert fixer["concluded"] is True
+        last_messages = captured[-1]["messages"]
+        assert self._nudge_count(last_messages) == 1
+        assert sum(1 for m in last_messages if m.get("content") == "second real redirect") == 1
+
+    def test_stop_verdict_not_honored_falls_through(self, tmp_path):
+        """DoD5: a stray 'stop' verdict is NOT honored in v0 - falls through, run continues."""
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c0", 0))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c1", 1))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c2", 2))),
+            MagicMock(status_code=200, json=MagicMock(return_value=_make_stop_response("Done."))),
+        ]
+        handler_calls = []
+
+        def handler_hook(ctx):
+            handler_calls.append(ctx)
+            return {"decision": "stop", "note": "trying to halt"}
+
+        fixer, transcript, captured = self._run_and_capture(
+            tmp_path, responses, no_progress_steps=4, handler_hook=handler_hook,
+        )
+
+        assert len(handler_calls) == 1
+        assert fixer["concluded"] is True
+        assert fixer["no_progress"] is False
+        assert len(captured) == 4  # backend kept being called after the stray "stop"
+        assert self._nudge_count(captured[-1]["messages"]) == 1
+
+    def test_handler_hook_exception_is_fail_safe(self, tmp_path):
+        """DoD6: a raising handler_hook (incl. TimeoutError) never crashes the loop."""
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c0", 0))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c1", 1))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c2", 2))),
+            MagicMock(status_code=200, json=MagicMock(return_value=_make_stop_response("Done."))),
+        ]
+        handler_calls = []
+
+        def handler_hook(ctx):
+            handler_calls.append(ctx)
+            raise TimeoutError("handler seat timed out")
+
+        fixer, transcript, captured = self._run_and_capture(
+            tmp_path, responses, no_progress_steps=4, handler_hook=handler_hook,
+        )
+
+        assert len(handler_calls) == 1
+        assert fixer["concluded"] is True
+        assert self._nudge_count(captured[-1]["messages"]) == 1
+
+    @pytest.mark.parametrize("bad_verdict", [None, "not a dict", {}, {"decision": "banana"}])
+    def test_malformed_verdict_falls_through_not_continue(self, tmp_path, bad_verdict):
+        """DoD7: None/non-dict/unrecognized decision is NOT treated as 'continue'."""
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c0", 0))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c1", 1))),
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read("c2", 2))),
+            MagicMock(status_code=200, json=MagicMock(return_value=_make_stop_response("Done."))),
+        ]
+        handler_calls = []
+
+        def handler_hook(ctx):
+            handler_calls.append(ctx)
+            return bad_verdict
+
+        fixer, transcript, captured = self._run_and_capture(
+            tmp_path, responses, no_progress_steps=4, handler_hook=handler_hook,
+        )
+
+        assert len(handler_calls) == 1
+        assert fixer["concluded"] is True
+        assert self._nudge_count(captured[-1]["messages"]) == 1
+
+    def test_bounded_interventions_then_hard_abort(self, tmp_path):
+        """DoD8: handler_hook always redirecting is called at most handler_max_interventions
+        times; the budget-exhausted fall-through lets the existing hard-abort stand."""
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=self._make_read(f"c{i}", i)))
+            for i in range(6)
+        ]
+        handler_calls = []
+
+        def handler_hook(ctx):
+            handler_calls.append(ctx)
+            return {"decision": "redirect", "redirect": f"redirect #{len(handler_calls)}"}
+
+        fixer, transcript, captured = self._run_and_capture(
+            tmp_path, responses, no_progress_steps=3,
+            handler_hook=handler_hook, handler_max_interventions=2,
+        )
+
+        assert len(handler_calls) == 2
+        assert fixer["no_progress"] is True
+        assert fixer["concluded"] is False
+
+
 class TestResolveIntEnv:
     def test_returns_default_when_unset(self, monkeypatch):
         monkeypatch.delenv("GW_AGENT_NO_PROGRESS_STEPS", raising=False)
