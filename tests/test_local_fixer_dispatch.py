@@ -61,6 +61,7 @@ def shaper_mocks(tmp_path, monkeypatch):
     reg = _write_registry(tmp_path, {
         "fixer": _agent_def("sonnet"),
         "fixer_local": _agent_def("gravitywell-122b", engine="local-fixer"),
+        "fixer_retry": _agent_def("gravitywell-122b", engine="local-fixer"),
     })
     monkeypatch.setattr(shaper_mod, "SPEC_DIR", tmp_path / "shaped")
 
@@ -163,12 +164,18 @@ def test_claude_engine_spec_has_no_engine_override(shaper_mocks, tmp_path):
 def test_local_fixer_spec_has_task_id_and_base_branch(shaper_mocks, tmp_path):
     s, _, gpu_q = shaper_mocks
     spec_dir = tmp_path / "shaped"
-    s.dispatch("fixer_local", "my-target-v0", "fix it", vars_={"repo": "agents-core"})
+    s.dispatch(
+        "fixer_retry", "my-target-v0", "fix it",
+        vars_={"repo": "agents-core", "existing_branch": "lapis/my-target-v0/forced"},
+    )
     written = list(spec_dir.glob("*.json"))
     spec = json.loads(written[0].read_text())
     # local-fixer injects task_id so the runner can call setup_worktree
     assert "task_id" in spec
     assert spec["base_branch"] == "main"
+    # existing_branch is forwarded for fixer_retry so the runner can check out
+    # the PR's real branch instead of always defaulting to base_branch (main)
+    assert spec["existing_branch"] == "lapis/my-target-v0/forced"
 
 
 def test_existing_claude_spec_fields_unchanged(shaper_mocks, tmp_path):
@@ -311,6 +318,110 @@ def test_run_local_fixer_branch_name_uses_slug(tmp_path):
     # cmd = ["git", "-C", cwd, "checkout", "-b", branch]
     branch_cmds = [c for c in git_calls if len(c) > 3 and c[3] == "checkout"]
     assert any("lapis/my-target-v0/forced" in " ".join(c) for c in branch_cmds)
+
+
+# ---------------------------------------------------------------------------
+# fixer_retry branch selection (local-fixer-worktree-existing-branch-v0)
+# ---------------------------------------------------------------------------
+
+def test_run_local_fixer_retry_uses_existing_branch_when_confirmed(tmp_path):
+    spec = json.loads(_make_spec(
+        tmp_path, agent_type="fixer_retry", existing_branch="lapis/my-target-v0/forced",
+    ).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_good_fixer_result(), [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)) as mock_setup,
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", return_value={"html_url": "http://x/pulls/1"}),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        url = sr._run_local_fixer(spec, str(tmp_path))
+
+    assert url == "http://x/pulls/1"
+    mock_setup.assert_called_once()
+    # setup_worktree(task_id, effective_cwd, <ref>) — ref must be existing_branch, not base_branch
+    assert mock_setup.call_args.args[2] == "lapis/my-target-v0/forced"
+
+
+def test_run_local_fixer_retry_aborts_when_branch_not_on_origin(tmp_path, capsys):
+    spec = json.loads(_make_spec(
+        tmp_path, agent_type="fixer_retry", existing_branch="lapis/my-target-v0/forced",
+    ).read_text())
+
+    import agents_core.shaped_runner as sr
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent") as mock_gw,
+        patch("agents_core.worktree.setup_worktree") as mock_setup,
+        patch("agents_core.worktree.teardown_worktree") as mock_teardown,
+        patch("subprocess.run", return_value=MagicMock(returncode=1, stderr="branch not found")),
+    ):
+        url = sr._run_local_fixer(spec, str(tmp_path))
+
+    assert url == ""
+    mock_gw.assert_not_called()
+    mock_setup.assert_not_called()
+    mock_teardown.assert_not_called()
+    err = capsys.readouterr().err
+    assert "ERROR: worktree_setup: existing_branch lapis/my-target-v0/forced not found on origin" in err
+
+
+def test_run_local_fixer_retry_without_existing_branch_falls_back_to_base_branch(tmp_path):
+    """Old specs written before this fix have no existing_branch — must not abort."""
+    spec = json.loads(_make_spec(tmp_path, agent_type="fixer_retry").read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_good_fixer_result(), [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)) as mock_setup,
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", return_value={"html_url": "http://x/pulls/1"}),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        url = sr._run_local_fixer(spec, str(tmp_path))
+
+    assert url == "http://x/pulls/1"
+    mock_setup.assert_called_once()
+    assert mock_setup.call_args.args[2] == "main"
+
+
+def test_run_local_fixer_local_ignores_existing_branch(tmp_path):
+    """fixer_local (deprecated, no-existing-PR path) must not scope-creep into
+    the existing_branch check even if a stray existing_branch value is present."""
+    spec = json.loads(_make_spec(
+        tmp_path, agent_type="fixer_local", existing_branch="lapis/my-target-v0/forced",
+    ).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_good_fixer_result(), [])),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)) as mock_setup,
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", return_value={"html_url": "http://x/pulls/1"}),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        url = sr._run_local_fixer(spec, str(tmp_path))
+
+    assert url == "http://x/pulls/1"
+    mock_setup.assert_called_once()
+    assert mock_setup.call_args.args[2] == "main"
 
 
 # ---------------------------------------------------------------------------

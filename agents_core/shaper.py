@@ -345,6 +345,10 @@ class Shaper:
             task_id = queue._generate_id(slug=f"{agent.name}-{target_id}")
             spec["task_id"] = task_id
             spec["base_branch"] = "main"
+            # existing_branch is only meaningful for fixer_retry (an already-open
+            # PR's head ref); other agent types don't need it in their spec.
+            if agent_type == "fixer_retry":
+                spec["existing_branch"] = vars_.get("existing_branch", "")
             # local-fixer manages its own worktree inside _run_local_fixer;
             # setting worktree_required=True would cause the runner to set up a
             # competing worktree before the engine even starts.
