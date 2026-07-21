@@ -195,3 +195,73 @@ def test_other_gpu_models_still_route_to_gpu_queue(shaper_mocks_with_local_fixer
     s.dispatch("qwen_agent", "t-q", "do qwen", vars_={"repo": "agents-core"})
     assert gpu_q.submit.called, "non-local-fixer GPU model must still route to GPUQueue"
     assert not claude_q.submit.called
+
+
+# ---------------------------------------------------------------------------
+# reviewer / reviewer_fresh / spec_reviewer existing_branch threading
+# (agents-core-reviewer-worktree-branch-checkout-v0)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def shaper_mocks_with_local_reviewer(tmp_path, monkeypatch):
+    reg = _write_registry(tmp_path, {
+        "reviewer": {
+            "chub_bundles": [],
+            "system_template": "test for {repo}",
+            "model": "gravitywell-122b",
+            "engine": "local-reviewer",
+            "timeout_s": 60,
+        },
+        "reviewer_fresh": {
+            "chub_bundles": [],
+            "system_template": "test for {repo}",
+            "model": "gravitywell-122b",
+            "engine": "local-reviewer",
+            "timeout_s": 60,
+        },
+        "spec_reviewer": {
+            "chub_bundles": [],
+            "system_template": "test for {repo}",
+            "model": "gravitywell-122b",
+            "engine": "local-reviewer",
+            "timeout_s": 60,
+        },
+    })
+    monkeypatch.setattr(shaper_mod, "SPEC_DIR", tmp_path / "shaped")
+
+    claude_q = MagicMock()
+    claude_q._generate_id.return_value = "claude_task_id"
+    claude_q.submit.return_value = None
+    gpu_q = MagicMock()
+    gpu_q.submit.return_value = "gpu_task_id"
+
+    monkeypatch.setattr(shaper_mod, "ClaudeQueue", lambda: claude_q)
+    monkeypatch.setattr(shaper_mod, "GPUQueue", lambda: gpu_q)
+    monkeypatch.delenv("AGENTS_CORE_FORCE_GPU_QUEUE", raising=False)
+    monkeypatch.delenv("LAPIS_PM_FORCE_GPU_QUEUE", raising=False)
+
+    s = Shaper(reg)
+    monkeypatch.setattr(Shaper, "resolve_repo_cwd", staticmethod(lambda repo: "/tmp/fake-cwd"))
+    return s, claude_q, gpu_q
+
+
+@pytest.mark.parametrize("agent_name", ["reviewer", "reviewer_fresh"])
+def test_reviewer_types_thread_existing_branch(shaper_mocks_with_local_reviewer, tmp_path, agent_name):
+    s, _, _ = shaper_mocks_with_local_reviewer
+    spec_dir = tmp_path / "shaped"
+    s.dispatch(
+        agent_name, "t-rev", "review it",
+        vars_={"repo": "agents-core", "existing_branch": "lapis/t-rev/forced"},
+    )
+    spec = json.loads(list(spec_dir.glob("*.json"))[0].read_text())
+    assert spec["existing_branch"] == "lapis/t-rev/forced"
+
+
+def test_spec_reviewer_does_not_receive_existing_branch(shaper_mocks_with_local_reviewer, tmp_path):
+    """spec_reviewer has no PR to reference — Deliverable 1's threading must not
+    leak existing_branch onto it even though it shares the local-reviewer engine."""
+    s, _, _ = shaper_mocks_with_local_reviewer
+    spec_dir = tmp_path / "shaped"
+    s.dispatch("spec_reviewer", "t-spec", "review spec", vars_={"repo": "agents-core"})
+    spec = json.loads(list(spec_dir.glob("*.json"))[0].read_text())
+    assert not spec.get("existing_branch")

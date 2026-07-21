@@ -20,6 +20,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -134,3 +135,62 @@ def test_shaped_runner_module_invocation(tmp_path, stub_site):
     assert "Traceback" not in combined, (
         f"Traceback found in output:\n{combined}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: worktree_required=True, non-reviewer, no existing_branch
+# (agents-core-reviewer-worktree-branch-checkout-v0, DoD 8)
+#
+# The reviewer worktree-branch-checkout fix restructures main()'s
+# worktree-setup block to resolve existing_branch for ANY worktree_required
+# dispatch, not just local-reviewer. A plain "claude"-engine agent type
+# (e.g. "fixer") that never populates spec["existing_branch"] must still
+# resolve its worktree ref to base_branch and call call_claude_cli exactly
+# as before this change.
+# ---------------------------------------------------------------------------
+
+
+def test_claude_engine_worktree_required_without_existing_branch_unchanged(tmp_path):
+    shaped = tmp_path / "shaped"
+    shaped.mkdir()
+    spec = {
+        "model": "sonnet",
+        "engine": "claude",
+        "system": "",
+        "prompt": "do the fix",
+        "timeout_s": 30,
+        "capture_meta": False,
+        "task_id": "task-42",
+        "base_branch": "main",
+        "worktree_required": True,
+        "cwd": str(tmp_path / "shared-clone"),
+        "target_id": "t-1",
+        "repo": "agents-core",
+    }
+    spec_path = shaped / "t-1-fixer-abc.json"
+    spec_path.write_text(json.dumps(spec))
+
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    fake_handle = MagicMock()
+    fake_handle.path = worktree
+    fake_handle.env = {}
+
+    import agents_core.shaped_runner as sr
+
+    with (
+        patch.object(sys, "argv", ["sr", str(spec_path)]),
+        patch("agents_core.shaped_runner.call_claude_cli", return_value="ok") as mock_cli,
+        patch("agents_core.shaped_runner._run_local_reviewer") as mock_lr,
+        patch("agents_core.worktree.setup_worktree", return_value=fake_handle) as mock_setup,
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("subprocess.run") as mock_run,
+    ):
+        sr.main()
+
+    mock_setup.assert_called_once()
+    assert mock_setup.call_args.args[2] == "main", "ref must resolve to base_branch, unchanged"
+    # no existing_branch -> git ls-remote verification must be skipped
+    mock_run.assert_not_called()
+    mock_cli.assert_called_once()
+    mock_lr.assert_not_called()
