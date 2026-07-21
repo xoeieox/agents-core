@@ -220,12 +220,73 @@ class MemExecutor(ToolExecutor):
             return {"error": f"mem failed: {e}"}
 
 
+def _resolve_owner_repo_from_cwd(cwd: str | None) -> tuple[str | None, str | None]:
+    """Resolve (owner, repo) from a cwd's git `origin` remote.
+
+    Pure local git inspection - no network round-trip. A linked worktree shares
+    its parent's .git config (including origin), so this is authoritative ground
+    truth for the repo a given dispatch is actually running against, unlike a
+    bare model-supplied repo name which carries no owner/org information.
+
+    Returns (None, None) on any failure and prints a single WARN line to stderr
+    so a resolution failure is distinguishable from a resolution that succeeded
+    and happened to land on the Erah default.
+    """
+    if not cwd or not os.path.isdir(cwd):
+        print(
+            f"WARN: local-fixer: openprs owner-resolution failed for cwd={cwd} "
+            "(no such directory); falling back to model-supplied repo argument",
+            file=sys.stderr,
+        )
+        return None, None
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        print(
+            f"WARN: local-fixer: openprs owner-resolution failed for cwd={cwd} "
+            f"(git remote get-url failed: {exc}); falling back to model-supplied repo argument",
+            file=sys.stderr,
+        )
+        return None, None
+
+    if result.returncode != 0:
+        stderr_lower = (result.stderr or "").lower()
+        reason = "not a git repo" if "not a git repository" in stderr_lower else "git remote get-url failed"
+        print(
+            f"WARN: local-fixer: openprs owner-resolution failed for cwd={cwd} "
+            f"({reason}); falling back to model-supplied repo argument",
+            file=sys.stderr,
+        )
+        return None, None
+
+    url = result.stdout.strip()
+    if url.endswith(".git"):
+        url = url[: -len(".git")]
+
+    segments = [s for s in re.split(r"[/:]", url) if s]
+    if len(segments) < 2:
+        print(
+            f"WARN: local-fixer: openprs owner-resolution failed for cwd={cwd} "
+            f"(unparseable origin URL: {url}); falling back to model-supplied repo argument",
+            file=sys.stderr,
+        )
+        return None, None
+
+    owner, repo = segments[-2], segments[-1]
+    return owner, repo
+
+
 class OpenPrsExecutor(ToolExecutor):
     """Execute list_open_prs(repo, with_files?) to enumerate open PRs with optional file lists."""
 
     def __init__(self, cwd: str | None = None):
-        # PRs are remote resources, no cwd confinement; accept for API consistency
-        pass
+        self.cwd = cwd
 
     def execute(self, arguments: dict) -> str | dict:
         try:
@@ -238,9 +299,18 @@ class OpenPrsExecutor(ToolExecutor):
             # Import here to avoid circular dependency
             from agents_core import forgejo
 
+            # cwd-derived owner/repo (from the dispatch's own worktree origin remote) is
+            # authoritative when available; it replaces the model-supplied repo argument
+            # entirely rather than just filling in a missing owner.
+            cwd_owner, cwd_repo = _resolve_owner_repo_from_cwd(self.cwd)
+            if cwd_repo is not None:
+                owner, repo = cwd_owner, cwd_repo
+            else:
+                owner = None
+
             # Fetch open PRs
             try:
-                prs = forgejo.get_open_prs(repo, owner=None)
+                prs = forgejo.get_open_prs(repo, owner=owner)
             except Exception as e:
                 return {"error": f"failed to fetch open PRs: {e}"}
 
@@ -264,7 +334,7 @@ class OpenPrsExecutor(ToolExecutor):
 
                 # Optionally fetch changed files
                 if with_files:
-                    changed_files = self._get_changed_files(repo, pr.get("number"))
+                    changed_files = self._get_changed_files(repo, pr.get("number"), owner)
                     pr_record["changed_files"] = changed_files
 
                 result.append(pr_record)
@@ -274,7 +344,7 @@ class OpenPrsExecutor(ToolExecutor):
         except Exception as e:
             return {"error": f"list_open_prs failed: {e}"}
 
-    def _get_changed_files(self, repo: str, pr_number: int) -> list[str]:
+    def _get_changed_files(self, repo: str, pr_number: int, owner: str | None = None) -> list[str]:
         """Fetch changed files for a PR, with fallback to diff parsing.
 
         Prefers the PR files API endpoint if available, falls back to diff parsing.
@@ -286,7 +356,7 @@ class OpenPrsExecutor(ToolExecutor):
 
         # Try the PR files endpoint first
         try:
-            files_data = forgejo.get_pr_files(repo, pr_number)
+            files_data = forgejo.get_pr_files(repo, pr_number, owner=owner)
             if isinstance(files_data, list):
                 for f in files_data:
                     if f.get("filename"):
@@ -303,7 +373,7 @@ class OpenPrsExecutor(ToolExecutor):
 
         # Fall back to diff parsing
         try:
-            diff = forgejo.get_pr_diff(repo, pr_number)
+            diff = forgejo.get_pr_diff(repo, pr_number, owner=owner)
             changed_files = self._parse_diff_for_paths(diff)
             return changed_files[:50] if len(changed_files) <= 50 else changed_files[:50] + [f"…(+{len(changed_files) - 50} more)"]
         except Exception:
@@ -629,7 +699,11 @@ DEFAULT_READONLY_TOOLS: dict[str, dict[str, Any]] = {
                 "properties": {
                     "repo": {
                         "type": "string",
-                        "description": "Repository name (e.g., 'agents-core').",
+                        "description": (
+                            "Repository name (e.g., 'agents-core'). A bare name is fine - "
+                            "the correct org/owner is resolved automatically from the "
+                            "dispatch's working directory when possible."
+                        ),
                     },
                     "with_files": {
                         "type": "boolean",
