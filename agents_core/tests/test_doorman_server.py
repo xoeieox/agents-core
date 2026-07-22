@@ -3666,6 +3666,141 @@ class TestBrake:
         assert snapshot["brake_reason"] == "urgent human task"
 
 
+class TestForceStopLeaseGuard:
+    """gw-force-stop-lease-guard-v0: /v0/force-stop refuses to stop while a
+    non-excluded worker lease is active."""
+
+    def test_force_stop_zero_leases_stops(self):
+        """Existing regression path: no leases -> stops, service_stopped=True."""
+        state = _make_state()
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as mock_sub, \
+             patch("agents_core.doorman_server._write_idle_log"):
+            result = state._force_stop()
+
+        assert result["status"] == "stopped"
+        assert state.service_stopped is True
+        mock_sub.assert_called_once()
+
+    def test_force_stop_blocked_by_worker_lease(self):
+        """One worker lease, no exclude_principal -> blocked; gw-serve stop never called."""
+        state = _make_state()
+        state.leases["w1"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "t",
+            "role": "worker", "principal": "some-consumer",
+        }
+
+        with patch("subprocess.run") as mock_sub:
+            result = state._force_stop()
+
+        assert result["status"] == "blocked"
+        assert result["node"] == state.node_name
+        assert result["active_leases"] == [{"work_id": "w1", "principal": "some-consumer"}]
+        assert state.service_stopped is False
+        mock_sub.assert_not_called()
+
+    def test_force_stop_self_exclusion_proceeds(self):
+        """exclude_principal matching the only lease's principal -> proceeds and stops."""
+        state = _make_state()
+        state.leases["w1"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "t",
+            "role": "worker", "principal": "cockpit",
+        }
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as mock_sub, \
+             patch("agents_core.doorman_server._write_idle_log"):
+            result = state._force_stop(exclude_principal="cockpit")
+
+        assert result["status"] == "stopped"
+        assert state.service_stopped is True
+        mock_sub.assert_called_once()
+
+    def test_force_stop_self_exclusion_still_blocked_by_other_consumer(self):
+        """exclude_principal excludes its own lease but a second lease from another
+        consumer still blocks."""
+        state = _make_state()
+        state.leases["w1"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "t",
+            "role": "worker", "principal": "cockpit",
+        }
+        state.leases["w2"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "t",
+            "role": "worker", "principal": "other-consumer",
+        }
+
+        with patch("subprocess.run") as mock_sub:
+            result = state._force_stop(exclude_principal="cockpit")
+
+        assert result["status"] == "blocked"
+        assert {"work_id": "w2", "principal": "other-consumer"} in result["active_leases"]
+        assert len(result["active_leases"]) == 1
+        mock_sub.assert_not_called()
+
+    def test_force_stop_ghost_lease_always_blocks(self, caplog):
+        """A lease with no principal key (ghost) blocks regardless of exclude_principal,
+        and logs critical (mirrors drain_count's ghost-lease handling)."""
+        import logging
+
+        state = _make_state()
+        state.leases["w-ghost"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "t",
+            "role": "worker",
+        }
+
+        with patch("subprocess.run") as mock_sub, \
+             caplog.at_level(logging.CRITICAL, logger="doorman-server"):
+            result = state._force_stop(exclude_principal="cockpit")
+
+        assert result["status"] == "blocked"
+        assert result["active_leases"] == [{"work_id": "w-ghost", "principal": GHOST_PRINCIPAL}]
+        mock_sub.assert_not_called()
+        assert any("ghost_lease_counted" in rec.message for rec in caplog.records)
+        assert any("w-ghost" in rec.message for rec in caplog.records)
+
+    def test_force_stop_endpoint_blocked_response(self):
+        """POST /v0/force-stop with an active worker lease -> 200 status=blocked."""
+        c = _client_no_auth()
+        from agents_core.doorman_server import _NodeState as NS
+
+        with patch.object(NS, "ensure_serving", return_value=True), \
+             patch.object(NS, "_place_hold"):
+            c.post("/lease/acquire", json={
+                "node": "gravitywell", "work_id": "w1",
+                "ttl_sec": 300, "reason": "t", "role": "worker",
+                "principal": "some-consumer",
+            })
+
+        with patch("subprocess.run") as mock_sub:
+            r = c.post("/v0/force-stop", json={"node": "gravitywell"})
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "blocked"
+        assert body["active_leases"] == [{"work_id": "w1", "principal": "some-consumer"}]
+        mock_sub.assert_not_called()
+
+    def test_force_stop_endpoint_exclude_principal_passthrough(self):
+        """POST /v0/force-stop with exclude_principal matching the sole lease's
+        principal -> proceeds and stops."""
+        c = _client_no_auth()
+        from agents_core.doorman_server import _NodeState as NS
+
+        with patch.object(NS, "ensure_serving", return_value=True), \
+             patch.object(NS, "_place_hold"):
+            c.post("/lease/acquire", json={
+                "node": "gravitywell", "work_id": "w1",
+                "ttl_sec": 300, "reason": "t", "role": "worker",
+                "principal": "cockpit",
+            })
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            r = c.post("/v0/force-stop", json={"node": "gravitywell", "exclude_principal": "cockpit"})
+
+        assert r.status_code == 200
+        assert r.json()["status"] == "stopped"
+
+
 class TestBackgroundSweepIntegration:
     """The background refresh thread must advance the wait-list every tick,
     releasing without any caller polling (AC1, AC7)."""
