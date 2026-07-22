@@ -628,3 +628,49 @@ def test_defer_wait_timeout_custom():
         clear=False,
     ):
         assert _defer_wait_timeout() == 310.0
+
+
+# ---------------------------------------------------------------------------
+# force_stop (gw-force-stop-lease-guard-v0)
+# ---------------------------------------------------------------------------
+
+def test_force_stop_posts_node_and_exclude_principal():
+    captured = {}
+
+    class _CaptureTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            captured["path"] = request.url.path
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"status": "stopped", "node": "gravitywell", "exit_code": 0})
+
+    c = DoormanClient(base_url="http://doorman.test")
+    c._client = httpx.Client(base_url="http://doorman.test", transport=_CaptureTransport())
+    result = c.force_stop("gravitywell", exclude_principal="cockpit")
+    assert captured["path"] == "/v0/force-stop"
+    assert captured["body"] == {"node": "gravitywell", "exclude_principal": "cockpit"}
+    assert result["status"] == "stopped"
+
+
+def test_force_stop_omits_exclude_principal_when_not_provided():
+    captured = {}
+
+    class _CaptureTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"status": "stopped", "node": "gravitywell", "exit_code": 0})
+
+    c = DoormanClient(base_url="http://doorman.test")
+    c._client = httpx.Client(base_url="http://doorman.test", transport=_CaptureTransport())
+    c.force_stop()
+    assert captured["body"] == {"node": "gravitywell"}
+    assert "exclude_principal" not in captured["body"]
+
+
+def test_force_stop_returns_blocked_response():
+    c = _client_with([(200, {
+        "status": "blocked", "node": "gravitywell",
+        "active_leases": [{"work_id": "w1", "principal": "other-consumer"}],
+    })])
+    result = c.force_stop("gravitywell", exclude_principal="cockpit")
+    assert result["status"] == "blocked"
+    assert result["active_leases"] == [{"work_id": "w1", "principal": "other-consumer"}]

@@ -1257,11 +1257,57 @@ class _NodeState:
     # stop logic (idempotency guards, state updates) so behavior stays
     # consistent whichever path issues the stop. Must be called under
     # self.lock — caller (the /v0/force-stop route) holds it.
+    #
+    # Lease guard (gw-force-stop-lease-guard-v0): refuses to stop while any
+    # other worker lease is active, so one caller can't evict a model out
+    # from under another consumer's in-flight lease.
     # ------------------------------------------------------------------
 
-    def _force_stop(self) -> dict:
+    def _worker_lease_blockers(self, exclude_principal: str | None = None) -> list[dict]:
+        """Active role="worker" leases that should block a drain/force-stop decision.
+
+        Shared filter for drain_count_endpoint and _force_stop: ghost leases (no
+        principal) always count; a lease matching exclude_principal (the caller's
+        own admission group) is excluded. Caller must hold self.lock and have
+        already called self._gc_stale().
+        """
+        blockers = []
+        for wid, info in self.leases.items():
+            if info.get("role") != "worker":
+                continue
+            p = info.get("principal", GHOST_PRINCIPAL)
+            if p == GHOST_PRINCIPAL:
+                # Ghost leases are always counted; emit critical log when counted in a drain decision
+                if exclude_principal is not None:
+                    log.critical(
+                        "[doorman] drain_count ghost_lease_counted work_id=%s - "
+                        "role=worker lease has no principal; add principal= to "
+                        "acquire() call to prevent drain-gate freeze",
+                        wid,
+                    )
+                blockers.append({"work_id": wid, "principal": p})
+            elif exclude_principal is not None and p == exclude_principal:
+                continue  # same admission group — exclude from the check
+            else:
+                blockers.append({"work_id": wid, "principal": p})
+        return blockers
+
+    def _force_stop(self, exclude_principal: str | None = None) -> dict:
         if self.service_stopped:
             return {"status": "already_stopped", "node": self.node_name}
+
+        self._gc_stale()
+        blocking_leases = self._worker_lease_blockers(exclude_principal)
+        if blocking_leases:
+            log.info(
+                f"[{self.node_name}] force-stop: blocked by {len(blocking_leases)} "
+                f"active worker lease(s)"
+            )
+            return {
+                "status": "blocked",
+                "node": self.node_name,
+                "active_leases": blocking_leases,
+            }
 
         log.info(f"[{self.node_name}] force-stop: issuing gw-serve stop (bypassing grace period)")
         try:
@@ -1559,27 +1605,9 @@ def create_app(gw_url: str | None = None) -> FastAPI:
             )
 
         state = nodes[node]
-        count = 0
         with state.lock:
             state._gc_stale()
-            for wid, info in state.leases.items():
-                if info.get("role") != "worker":
-                    continue
-                p = info.get("principal", GHOST_PRINCIPAL)
-                if p == GHOST_PRINCIPAL:
-                    # Ghost leases are always counted; emit critical log when counted in a drain decision
-                    if exclude_principal is not None:
-                        log.critical(
-                            "[doorman] drain_count ghost_lease_counted work_id=%s - "
-                            "role=worker lease has no principal; add principal= to "
-                            "acquire() call to prevent drain-gate freeze",
-                            wid,
-                        )
-                    count += 1
-                elif exclude_principal is not None and p == exclude_principal:
-                    continue  # same admission group — exclude from drain count
-                else:
-                    count += 1
+            count = len(state._worker_lease_blockers(exclude_principal))
         return {"node": node, "drain_count": count}
 
     # ------------------------------------------------------------------
@@ -1673,6 +1701,7 @@ def create_app(gw_url: str | None = None) -> FastAPI:
     @app.post("/v0/force-stop")
     def force_stop(body: dict[str, Any]):
         node = body.get("node", "gravitywell")
+        exclude_principal = body.get("exclude_principal") or None
 
         if node != "gravitywell":
             return JSONResponse(
@@ -1687,7 +1716,7 @@ def create_app(gw_url: str | None = None) -> FastAPI:
 
         state = nodes[node]
         with state.lock:
-            result = state._force_stop()
+            result = state._force_stop(exclude_principal=exclude_principal)
 
         if result["status"] == "error":
             return JSONResponse(result, status_code=500)

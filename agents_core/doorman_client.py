@@ -264,6 +264,28 @@ class DoormanClient:
         except DoormanUnreachable:
             return None
 
+    def force_stop(
+        self, node: str = "gravitywell", exclude_principal: str | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        """Manually unload the GW model now, bypassing GW_STOP_GRACE_SEC.
+
+        Args:
+          exclude_principal: when set, a lease held by this principal does not
+                             block the stop (self-exclusion, same convention as
+                             drain_count()). Ghost leases (__GHOST_LEASE__) and
+                             any other worker's lease still block.
+
+        Returns dict with a status field:
+          "stopped" / "already_stopped" — model unloaded (or already was)
+          "blocked" — refused; includes active_leases: [{work_id, principal}, ...]
+          "error" — gw-serve stop failed; includes error/exit_code
+        """
+        body: dict = {"node": node}
+        if exclude_principal is not None:
+            body["exclude_principal"] = exclude_principal
+        return self._post("/v0/force-stop", body, timeout=timeout)
+
     def mode_owner(self, node: str = "gravitywell") -> dict | None:
         """Get the /v0/mode-owner deference-liveness probe.
 
