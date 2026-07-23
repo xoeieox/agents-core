@@ -460,6 +460,17 @@ def _post_chat_completion(
     max_tokens bounds generation length (env-overridable default via GW_MAX_TOKENS,
     per spec-review-gw-generation-guards-v0) — pass an explicit value to override.
 
+    json_mode=True degrade (agents-core-post-chat-json-object-degrade-v0): some
+    OpenAI-compat engines reject response_format:{"type":"json_object"} with HTTP 400.
+    On the first such 400, response_format is stripped and the request is retried once
+    with a plain-text payload — this never alters the first (json_object) request, so
+    the happy path stays byte-identical. The loop reserves one extra "breath" slot
+    beyond max_retries so the degrade is guaranteed to fire even if the 400 lands on
+    the final transient attempt; the degraded payload can still use its own max_retries
+    budget for further transient errors. Non-400 errors and json_mode=False are
+    unaffected. The degraded response is returned as-is — this core does not validate
+    its JSON-ness; that is the downstream caller's job.
+
     Used by _call_gravitywell_backend, call_swarm, and other chat-completion callers.
     """
     payload = {
@@ -477,7 +488,8 @@ def _post_chat_completion(
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
-    for attempt in range(max_retries):
+    degrade_used = False
+    for attempt in range(max_retries + 1):
         try:
             resp = requests.post(
                 f"{base_url}/v1/chat/completions",
@@ -491,7 +503,24 @@ def _post_chat_completion(
                 requests.exceptions.ConnectionError,
                 requests.exceptions.HTTPError,
                 requests.exceptions.ChunkedEncodingError) as e:
-            if attempt < max_retries - 1:
+            if (not degrade_used and json_mode
+                    and isinstance(e, requests.exceptions.HTTPError)
+                    and e.response is not None and e.response.status_code == 400
+                    and "response_format" in payload):
+                degrade_used = True
+                payload = {k: v for k, v in payload.items() if k != "response_format"}
+                _log.warning(
+                    "response_format:json_object rejected (HTTP 400) by %s; "
+                    "retrying WITHOUT response_format - downstream may receive "
+                    "unstructured text", base_url,
+                )
+                continue
+            # last_attempt is the boundary before the terminal raise. It is
+            # max_retries - 1 normally, but shifts out by one once the degrade
+            # has consumed its reserved "extra breath" slot, so the degraded
+            # payload still gets its own full max_retries budget.
+            last_attempt = max_retries if degrade_used else max_retries - 1
+            if attempt < last_attempt:
                 if attempt == 0:
                     backoff = 2
                 elif attempt == 1:
