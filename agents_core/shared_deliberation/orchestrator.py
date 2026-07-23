@@ -291,17 +291,34 @@ async def _council_subprocess(
         # Stub mode for testing
         return (True, "stub-council-id", {"status": "resolved", "positions": []}, None)
 
-    run_id = await asyncio.to_thread(_submit_council, text, voicing, gw_principal)
-    if not run_id:
-        return (False, None, None, "Failed to submit council")
-
     # Read timeout from env; default 1800s (30 min)
     timeout_s = int(os.environ.get("SHARED_DELIBERATION_COUNCIL_TIMEOUT_S", "1800"))
-    council_data, error = await asyncio.to_thread(_poll_council, run_id, timeout_s)
-    if error:
-        return (False, run_id, None, error)
+    # Bounded retry (defense-in-depth): a liveness died/stalled fast-fail can be a
+    # false positive from serial-queue contention on the single-model GW endpoint.
+    # Re-submit once with a fresh run_id before giving up. Does NOT fire on a
+    # terminal Council status (error is None) or on a genuine timeout_s backstop
+    # (error has no "died/stalled" marker) — only on the structured liveness signal.
+    max_retries = int(os.environ.get("COUNCIL_MAX_RETRIES", "1"))
 
-    return (True, run_id, council_data, None)
+    attempt = 0
+    while True:
+        run_id = await asyncio.to_thread(_submit_council, text, voicing, gw_principal)
+        if not run_id:
+            return (False, None, None, "Failed to submit council")
+
+        council_data, error = await asyncio.to_thread(_poll_council, run_id, timeout_s)
+        if not error:
+            return (True, run_id, council_data, None)
+
+        if "died/stalled" in error and attempt < max_retries:
+            attempt += 1
+            log.warning(
+                f"Council liveness fast-fail on run_id={run_id}; "
+                f"retrying ({attempt}/{max_retries}): {error}"
+            )
+            continue
+
+        return (False, run_id, None, error)
 
 
 def _submit_council(text: str, voicing: str, gw_principal: Optional[str] = None) -> Optional[str]:
@@ -340,16 +357,54 @@ def _submit_council(text: str, voicing: str, gw_principal: Optional[str] = None)
         return None
 
 
+def _queue_task_alive(run_id: str) -> Optional[bool]:
+    """Consult ClaudeQueue for run_id's presence among pending/active tasks.
+
+    Returns True if the task is still queued or running — the worker is not dead,
+    just serialized behind another task on the single-model GW endpoint (queued !=
+    dead). Returns False if the queue is reachable but run_id is absent from both
+    lists (never enqueued, or already reaped). Returns None if the queue itself
+    cannot be consulted (import failure, lookup error) — this must never
+    propagate as a poller failure; callers treat None the same as False (degrade
+    to the tolerant startup-grace fallback, never to a false positive).
+    """
+    try:
+        from agents_core.claude_queue import ClaudeQueue
+        queue = ClaudeQueue()
+        for task in queue.get_pending():
+            if task.get("id") == run_id:
+                return True
+        for task in queue.get_active():
+            if task.get("id") == run_id:
+                return True
+        return False
+    except Exception as e:
+        log.warning(f"Council queue liveness check failed for run_id={run_id}: {e}")
+        return None
+
+
 def _poll_council(run_id: str, timeout_s: int = 1800) -> tuple[Optional[dict], Optional[str]]:
     """Poll council run YAML until terminal status or timeout.
 
     Returns (council_data, error_message).
     council_data extracts status, landing, confidence, open_questions, positions.
 
-    COUNCIL_STALL_S (env, default 180s): fast-fail threshold. If heartbeat_at is
-    stale beyond this threshold while status is non-terminal, the worker is declared
-    dead/stalled and the function returns immediately with a legible error rather than
-    waiting for timeout_s. Fixes the 30-minute silent hang when the worker dies.
+    Liveness ladder (queued != dead), most-live rung first:
+      1. heartbeat_at present -> tight COUNCIL_STALL_S (env, default 180s)
+         inter-heartbeat clock, unchanged from before.
+      2. else started_at present (worker running, pre-first-heartbeat) ->
+         COUNCIL_STARTUP_GRACE_S (env, default 400s) clock from started_at.
+         Covers the doorman-acquire window (~210s) plus first-call/GC headroom.
+      3. else still queued (neither field set) -> ask ClaudeQueue. Pending/running
+         there means keep polling, bounded only by the timeout_s backstop below —
+         serial-queue wait must never read as worker death. Absent from the queue,
+         or the queue lookup itself failing, degrades to the COUNCIL_STARTUP_GRACE_S
+         clock from created_at (never the tight stall clock — a missing/lying queue
+         must degrade to tolerant, not to a false positive).
+
+    The timeout_s backstop is the ultimate ceiling on every rung, including the
+    queued rung: a queue that never stops reporting "pending" can at worst delay
+    the verdict to timeout_s, never hang the gate.
     """
     import yaml
 
@@ -357,6 +412,7 @@ def _poll_council(run_id: str, timeout_s: int = 1800) -> tuple[Optional[dict], O
     start_time = time.time()
     poll_interval = 5
     stall_s = int(os.environ.get("COUNCIL_STALL_S", "180"))
+    startup_grace_s = int(os.environ.get("COUNCIL_STARTUP_GRACE_S", "400"))
 
     while time.time() - start_time < timeout_s:
         run_path = council_dir / f"{run_id}.yaml"
@@ -389,16 +445,33 @@ def _poll_council(run_id: str, timeout_s: int = 1800) -> tuple[Optional[dict], O
                     None,
                 )
 
-            # Liveness fast-fail: detect dead/stalled worker by heartbeat staleness.
-            # Use heartbeat_at if present; fall back to created_at for initial startup window.
+            # Liveness ladder (queued != dead) — see docstring. Most-live rung first.
             last_heartbeat = run.get("heartbeat_at")
-            ref_str = last_heartbeat or run.get("created_at")
+            started_at = run.get("started_at")
+            if last_heartbeat:
+                ref_str = last_heartbeat
+                clock_s = stall_s
+            elif started_at:
+                ref_str = started_at
+                clock_s = startup_grace_s
+            else:
+                queue_alive = _queue_task_alive(run_id)
+                if queue_alive is True:
+                    # Still queued behind another serialized task — alive, keep
+                    # polling. Bounded only by the timeout_s backstop below.
+                    time.sleep(poll_interval)
+                    continue
+                # Absent from the queue, or the queue lookup failed/unavailable —
+                # tolerant fallback, never the tight stall clock.
+                ref_str = run.get("created_at")
+                clock_s = startup_grace_s
+
             if ref_str:
                 try:
                     ref_ts = datetime.fromisoformat(ref_str).timestamp()
                 except (ValueError, TypeError):
                     ref_ts = None
-                if ref_ts is not None and time.time() - ref_ts > stall_s:
+                if ref_ts is not None and time.time() - ref_ts > clock_s:
                     reason = "heartbeat_stale" if last_heartbeat else "no_heartbeat_after_startup"
                     error = (
                         f"council worker died/stalled "

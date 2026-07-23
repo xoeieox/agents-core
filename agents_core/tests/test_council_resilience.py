@@ -1,18 +1,26 @@
-"""Tests for spec-review-council-keepawake-resilience-v0.
+"""Tests for spec-review-council-keepawake-resilience-v0, extended by
+
+agents-core-council-liveness-queue-aware-v0.
 
 Covers:
-  AC1 — Deliberation-spanning GW keepawake hold: placed at start, heartbeat-coupled
+  AC1  — Deliberation-spanning GW keepawake hold: placed at start, heartbeat-coupled
          TTL so zombie hold auto-expires (no unconditional pinning).
-  AC2 — _poll_council fast-fails within COUNCIL_STALL_S on stale heartbeat (not 1800s).
-  AC3 — No automatic retry on fast-fail; structured failure signal is well-formed.
-  AC4 — Happy path: healthy deliberation still reaches terminal status (stub regression).
+  AC2  — _poll_council fast-fails within COUNCIL_STALL_S on stale heartbeat (not 1800s).
+  AC2b — Queue-aware liveness ladder: queued != dead. A run still waiting in
+         ClaudeQueue's serial queue (single-model GW, --parallel 1) must not
+         read as a dead worker. started_at distinguishes running-pre-heartbeat
+         from still-queued; COUNCIL_STARTUP_GRACE_S is the startup-grace clock,
+         separate from COUNCIL_STALL_S.
+  AC3  — Bounded retry (once) on a liveness fast-fail, not on terminal status or
+         a genuine timeout_s backstop; structured failure signal is well-formed
+         after retries are exhausted. Revises AC3's prior "never retry" rule.
+  AC4  — Happy path: healthy deliberation still reaches terminal status (stub regression).
 """
 
 from __future__ import annotations
 
 import os
 import time
-from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -265,7 +273,39 @@ def test_deliberation_hold_failure_does_not_abort(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # AC2 — _poll_council fast-fail on stale heartbeat / no heartbeat
+#
+# NOTE on isolation: room_path("council") is resolved fresh on every
+# _poll_council call from ROOM_ROOT (env, default /room) + "council", so
+# pointing ROOM_ROOT at tmp_path is what actually isolates these tests from
+# real /srv/lapis/council data (a prior version of these tests patched
+# orchestrator.Path, which room_path() never consults — dead mock, silently
+# reading real production /srv/lapis/council and hanging to the outer timeout).
 # ---------------------------------------------------------------------------
+
+def _install_council_run(tmp_path, monkeypatch, run_id, run_data):
+    monkeypatch.setenv("ROOM_ROOT", str(tmp_path))
+    council_dir = tmp_path / "council"
+    council_dir.mkdir(parents=True, exist_ok=True)
+    (council_dir / f"{run_id}.yaml").write_text(yaml.safe_dump(run_data))
+
+
+def _mock_queue(get_pending=None, get_active=None, side_effect=None):
+    """Build a patch context for agents_core.claude_queue.ClaudeQueue.
+
+    _queue_task_alive does `from agents_core.claude_queue import ClaudeQueue`
+    lazily inside the function, so patching the class at its source module is
+    picked up on every call regardless of import order.
+    """
+    mock_cls = MagicMock()
+    if side_effect is not None:
+        mock_cls.side_effect = side_effect
+    else:
+        mock_instance = MagicMock()
+        mock_instance.get_pending.return_value = get_pending or []
+        mock_instance.get_active.return_value = get_active or []
+        mock_cls.return_value = mock_instance
+    return patch("agents_core.claude_queue.ClaudeQueue", mock_cls), mock_cls
+
 
 def test_poll_council_fast_fails_on_stale_heartbeat(tmp_path, monkeypatch):
     """_poll_council fast-fails when heartbeat_at is stale beyond COUNCIL_STALL_S.
@@ -281,22 +321,12 @@ def test_poll_council_fast_fails_on_stale_heartbeat(tmp_path, monkeypatch):
         "created_at": "2020-01-01T00:00:00",
         "heartbeat_at": "2020-01-01T00:00:01",  # very stale
     }
-    (tmp_path / f"{run_id}.yaml").write_text(yaml.safe_dump(run_data))
-
+    _install_council_run(tmp_path, monkeypatch, run_id, run_data)
     monkeypatch.setenv("COUNCIL_STALL_S", "5")
 
-    real_path = Path
-
-    def path_redirect(*args, **kwargs):
-        p = real_path(*args, **kwargs)
-        if str(p) == "/srv/lapis/council":
-            return tmp_path
-        return p
-
-    with patch("agents_core.shared_deliberation.orchestrator.Path", side_effect=path_redirect):
-        t0 = time.time()
-        data, error = orchestrator._poll_council(run_id, timeout_s=3600)
-        elapsed = time.time() - t0
+    t0 = time.time()
+    data, error = orchestrator._poll_council(run_id, timeout_s=3600)
+    elapsed = time.time() - t0
 
     assert data is None
     assert error is not None
@@ -308,9 +338,10 @@ def test_poll_council_fast_fails_on_stale_heartbeat(tmp_path, monkeypatch):
 
 
 def test_poll_council_fast_fails_on_no_heartbeat_after_startup(tmp_path, monkeypatch):
-    """_poll_council fast-fails when no heartbeat_at and created_at is stale.
+    """_poll_council fast-fails when no heartbeat_at/started_at and the queue
 
-    Covers the case where the worker died before emitting any heartbeat.
+    has no record of the task (never enqueued, or already reaped) — the
+    dead-worker fallback path of the queue-aware ladder.
     """
     from agents_core.shared_deliberation import orchestrator
 
@@ -319,21 +350,13 @@ def test_poll_council_fast_fails_on_no_heartbeat_after_startup(tmp_path, monkeyp
         "run_id": run_id,
         "status": "deliberating",
         "created_at": "2020-01-01T00:00:00",
-        # No heartbeat_at — worker died before first turn
+        # No heartbeat_at, no started_at — worker died before first turn/dequeue
     }
-    (tmp_path / f"{run_id}.yaml").write_text(yaml.safe_dump(run_data))
+    _install_council_run(tmp_path, monkeypatch, run_id, run_data)
+    monkeypatch.setenv("COUNCIL_STARTUP_GRACE_S", "5")
 
-    monkeypatch.setenv("COUNCIL_STALL_S", "5")
-
-    real_path = Path
-
-    def path_redirect(*args, **kwargs):
-        p = real_path(*args, **kwargs)
-        if str(p) == "/srv/lapis/council":
-            return tmp_path
-        return p
-
-    with patch("agents_core.shared_deliberation.orchestrator.Path", side_effect=path_redirect):
+    queue_patch, _ = _mock_queue(get_pending=[], get_active=[])
+    with queue_patch:
         data, error = orchestrator._poll_council(run_id, timeout_s=3600)
 
     assert data is None
@@ -357,22 +380,12 @@ def test_poll_council_does_not_fast_fail_with_fresh_heartbeat(tmp_path, monkeypa
         "created_at": fresh_ts,
         "heartbeat_at": fresh_ts,
     }
-    (tmp_path / f"{run_id}.yaml").write_text(yaml.safe_dump(run_data))
-
+    _install_council_run(tmp_path, monkeypatch, run_id, run_data)
     # Tiny timeout so the test completes quickly
     monkeypatch.setenv("COUNCIL_STALL_S", "300")
 
-    real_path = Path
-
-    def path_redirect(*args, **kwargs):
-        p = real_path(*args, **kwargs)
-        if str(p) == "/srv/lapis/council":
-            return tmp_path
-        return p
-
-    with patch("agents_core.shared_deliberation.orchestrator.Path", side_effect=path_redirect):
-        # timeout_s=1 so we exit via wall-clock timeout, NOT stall detection
-        data, error = orchestrator._poll_council(run_id, timeout_s=1)
+    # timeout_s=1 so we exit via wall-clock timeout, NOT stall detection
+    data, error = orchestrator._poll_council(run_id, timeout_s=1)
 
     # Must time-out normally, not produce a stale-heartbeat error
     assert data is None
@@ -400,18 +413,9 @@ def test_poll_council_returns_terminal_status(tmp_path, monkeypatch):
             "positions": [],
         },
     }
-    (tmp_path / f"{run_id}.yaml").write_text(yaml.safe_dump(run_data))
+    _install_council_run(tmp_path, monkeypatch, run_id, run_data)
 
-    real_path = Path
-
-    def path_redirect(*args, **kwargs):
-        p = real_path(*args, **kwargs)
-        if str(p) == "/srv/lapis/council":
-            return tmp_path
-        return p
-
-    with patch("agents_core.shared_deliberation.orchestrator.Path", side_effect=path_redirect):
-        data, error = orchestrator._poll_council(run_id, timeout_s=10)
+    data, error = orchestrator._poll_council(run_id, timeout_s=10)
 
     assert error is None
     assert data is not None
@@ -420,37 +424,334 @@ def test_poll_council_returns_terminal_status(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# AC3 — No automatic retry; structured failure signal is well-formed
+# AC2b — Queue-aware liveness ladder (agents-core-council-liveness-queue-aware-v0)
+#
+# Root cause: the poller was measuring worker-startup from enqueue-time
+# created_at, so a run still waiting in ClaudeQueue's serial queue (GW
+# --parallel 1) looked indistinguishable from a dead worker. Fix: queued !=
+# dead. See orchestrator._poll_council docstring for the full ladder.
 # ---------------------------------------------------------------------------
 
-def test_no_retry_on_council_fast_fail():
-    """_council_subprocess does not re-submit when _poll_council fast-fails.
+def test_poll_council_queued_and_pending_in_queue_does_not_fast_fail(tmp_path, monkeypatch):
+    """Core regression: a queued (not yet started) run whose task is still
 
-    Verify _submit_council called exactly once and the failure signal carries
-    run_id + reason (Unit 2 trigger contract).
+    pending in ClaudeQueue must NOT fast-fail, even with created_at aged well
+    past COUNCIL_STALL_S. It keeps polling, bounded only by the timeout_s
+    backstop — asserted here by driving to that backstop and checking the
+    error is a plain timeout, not died/stalled.
+    """
+    from agents_core.shared_deliberation import orchestrator
+
+    run_id = "2026-01-01-000000-queued01"
+    run_data = {
+        "run_id": run_id,
+        "status": "deliberating",
+        "created_at": "2020-01-01T00:00:00",  # ancient — would trip old logic
+        # No started_at, no heartbeat_at — still sitting in the serial queue
+    }
+    _install_council_run(tmp_path, monkeypatch, run_id, run_data)
+    monkeypatch.setenv("COUNCIL_STALL_S", "5")
+    monkeypatch.setenv("COUNCIL_STARTUP_GRACE_S", "5")
+
+    queue_patch, mock_cls = _mock_queue(get_pending=[{"id": run_id}], get_active=[])
+    with queue_patch:
+        data, error = orchestrator._poll_council(run_id, timeout_s=1)
+
+    assert data is None
+    assert error is not None
+    assert "timeout" in error
+    assert "died/stalled" not in error
+    mock_cls.assert_called()
+
+
+def test_poll_council_started_at_within_grace_does_not_fast_fail(tmp_path, monkeypatch):
+    """Running-pre-heartbeat, started_at recent → grace clock, no fast-fail.
+
+    created_at is ancient (would trip the old created_at-based logic); only
+    started_at should matter once the worker has actually dequeued.
+    """
+    from agents_core.shared_deliberation import orchestrator
+    from datetime import datetime
+
+    run_id = "2026-01-01-000000-grace01"
+    run_data = {
+        "run_id": run_id,
+        "status": "deliberating",
+        "created_at": "2020-01-01T00:00:00",
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        # No heartbeat_at yet
+    }
+    _install_council_run(tmp_path, monkeypatch, run_id, run_data)
+
+    queue_patch, mock_cls = _mock_queue(side_effect=AssertionError("queue must not be consulted"))
+    with queue_patch:
+        data, error = orchestrator._poll_council(run_id, timeout_s=1)
+
+    assert data is None
+    assert error is not None
+    assert "timeout" in error
+    assert "died/stalled" not in error
+    # started_at present resolves rung 2 directly — the queue is never touched.
+    mock_cls.assert_not_called()
+
+
+def test_poll_council_started_at_past_grace_fast_fails(tmp_path, monkeypatch):
+    """Running-pre-heartbeat, started_at aged past COUNCIL_STARTUP_GRACE_S → fast-fail."""
+    from agents_core.shared_deliberation import orchestrator
+
+    run_id = "2026-01-01-000000-grace02"
+    run_data = {
+        "run_id": run_id,
+        "status": "deliberating",
+        "created_at": "2020-01-01T00:00:00",
+        "started_at": "2020-01-01T00:00:01",
+        # No heartbeat_at
+    }
+    _install_council_run(tmp_path, monkeypatch, run_id, run_data)
+    monkeypatch.setenv("COUNCIL_STARTUP_GRACE_S", "5")
+
+    t0 = time.time()
+    data, error = orchestrator._poll_council(run_id, timeout_s=3600)
+    elapsed = time.time() - t0
+
+    assert data is None
+    assert error is not None
+    assert "died/stalled" in error
+    assert "no_heartbeat_after_startup" in error
+    assert elapsed < 30, f"Expected fast-fail, took {elapsed:.1f}s"
+
+
+def test_poll_council_queue_absent_task_uses_grace_fallback_from_created_at(tmp_path, monkeypatch):
+    """Queued rung, queue reachable but task absent (never enqueued / reaped) →
+
+    dead-worker fallback: COUNCIL_STARTUP_GRACE_S clock from created_at.
+    """
+    from agents_core.shared_deliberation import orchestrator
+
+    run_id = "2026-01-01-000000-absent01"
+    run_data = {
+        "run_id": run_id,
+        "status": "deliberating",
+        "created_at": "2020-01-01T00:00:00",
+        # No started_at, no heartbeat_at
+    }
+    _install_council_run(tmp_path, monkeypatch, run_id, run_data)
+    monkeypatch.setenv("COUNCIL_STARTUP_GRACE_S", "5")
+
+    queue_patch, mock_cls = _mock_queue(get_pending=[], get_active=[])
+    with queue_patch:
+        data, error = orchestrator._poll_council(run_id, timeout_s=3600)
+
+    assert data is None
+    assert error is not None
+    assert "died/stalled" in error
+    assert "no_heartbeat_after_startup" in error
+    mock_cls.assert_called()
+
+
+def test_poll_council_queue_lookup_raises_degrades_gracefully(tmp_path, monkeypatch):
+    """Hung/lying-queue guard (Facets Trickster + Council OQ#3): if the queue
+
+    lookup itself raises on the queued rung, the poller must not propagate
+    that as a poll error, and must not false-positive as died/stalled. It
+    degrades to the tolerant grace fallback and stays bounded by the
+    timeout_s backstop — a queue that never stops reporting "pending" (or
+    can't be read at all) can at worst delay the verdict, never hang the gate.
+    """
+    from agents_core.shared_deliberation import orchestrator
+    from datetime import datetime
+
+    run_id = "2026-01-01-000000-hungqueue01"
+    run_data = {
+        "run_id": run_id,
+        "status": "deliberating",
+        "created_at": datetime.now().isoformat(timespec="seconds"),  # recent
+        # No started_at, no heartbeat_at — queued rung
+    }
+    _install_council_run(tmp_path, monkeypatch, run_id, run_data)
+
+    queue_patch, mock_cls = _mock_queue(side_effect=RuntimeError("queue backend unreachable"))
+    with queue_patch:
+        data, error = orchestrator._poll_council(run_id, timeout_s=1)
+
+    assert data is None
+    assert error is not None
+    assert "timeout" in error
+    assert "died/stalled" not in error
+    mock_cls.assert_called()
+
+
+def test_poll_council_queue_unavailable_started_at_present_is_tolerant(tmp_path, monkeypatch):
+    """Graceful degrade: with started_at present (no heartbeat_at yet), the
+
+    queue is irrelevant to the ladder decision — even a broken/unavailable
+    ClaudeQueue must not cause a false-positive fast-fail against the tight
+    COUNCIL_STALL_S clock. Same scenario as
+    test_poll_council_started_at_within_grace_does_not_fast_fail, asserted
+    from the "queue unavailable" angle named explicitly in the DoD.
+    """
+    from agents_core.shared_deliberation import orchestrator
+    from datetime import datetime
+
+    run_id = "2026-01-01-000000-degrade01"
+    run_data = {
+        "run_id": run_id,
+        "status": "deliberating",
+        "created_at": "2020-01-01T00:00:00",
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _install_council_run(tmp_path, monkeypatch, run_id, run_data)
+    monkeypatch.setenv("COUNCIL_STALL_S", "5")
+
+    queue_patch, mock_cls = _mock_queue(side_effect=RuntimeError("queue import failure"))
+    with queue_patch:
+        data, error = orchestrator._poll_council(run_id, timeout_s=1)
+
+    assert data is None
+    assert error is not None
+    assert "timeout" in error
+    assert "died/stalled" not in error
+
+
+def test_poll_council_absolute_backstop_bounds_queued_rung(tmp_path, monkeypatch):
+    """Absolute timeout_s backstop is never exceeded, even when the queue
+
+    keeps reporting the task as pending forever.
+    """
+    from agents_core.shared_deliberation import orchestrator
+
+    run_id = "2026-01-01-000000-backstop01"
+    run_data = {
+        "run_id": run_id,
+        "status": "deliberating",
+        "created_at": "2020-01-01T00:00:00",
+    }
+    _install_council_run(tmp_path, monkeypatch, run_id, run_data)
+
+    queue_patch, mock_cls = _mock_queue(get_pending=[{"id": run_id}], get_active=[])
+    with queue_patch:
+        t0 = time.time()
+        data, error = orchestrator._poll_council(run_id, timeout_s=2)
+        elapsed = time.time() - t0
+
+    assert data is None
+    assert "timeout" in error
+    assert "died/stalled" not in error
+    # Loop must exit at/near the timeout_s backstop, not hang indefinitely.
+    assert elapsed < 30, f"Expected bounded exit near timeout_s=2, took {elapsed:.1f}s"
+
+
+# ---------------------------------------------------------------------------
+# AC3 — Bounded retry on liveness fast-fail; structured failure signal is
+# well-formed after retries are exhausted (Part B,
+# agents-core-council-liveness-queue-aware-v0).
+#
+# Deliberate invariant revision: the prior "submit exactly once, never retry"
+# rule (spec-review-council-keepawake-resilience-v0 AC3) is intentionally
+# replaced by "retry once, then fast-fail with the contract preserved" — a
+# single liveness fast-fail can be a false positive from serial-queue
+# contention on the single-model GW endpoint, so one bounded re-submit with a
+# fresh run_id is defense-in-depth atop the queued != dead fix in AC2b.
+# ---------------------------------------------------------------------------
+
+def test_retry_once_then_fast_fail():
+    """_council_subprocess retries once on a liveness fast-fail, then returns
+
+    the failure. _submit_council is called twice (fresh run_id on retry); the
+    final error still carries run_id/last_heartbeat/reason (Unit 2 contract).
     """
     from agents_core.shared_deliberation import orchestrator
     import asyncio
 
-    fake_run_id = "2026-01-01-000000-noretry"
-    fake_error = (
-        f"council worker died/stalled "
-        f"(run_id={fake_run_id}, last_heartbeat='2020-01-01T00:00:01', "
-        f"reason=heartbeat_stale)"
-    )
+    run_id_1 = "2026-01-01-000000-retry01a"
+    run_id_2 = "2026-01-01-000000-retry01b"
 
-    with patch.object(orchestrator, "_submit_council", return_value=fake_run_id) as mock_submit, \
-         patch.object(orchestrator, "_poll_council", return_value=(None, fake_error)):
+    def fake_error(rid):
+        return (
+            f"council worker died/stalled "
+            f"(run_id={rid}, last_heartbeat='2020-01-01T00:00:01', "
+            f"reason=heartbeat_stale)"
+        )
+
+    with patch.object(
+        orchestrator, "_submit_council", side_effect=[run_id_1, run_id_2]
+    ) as mock_submit, patch.object(
+        orchestrator,
+        "_poll_council",
+        side_effect=[(None, fake_error(run_id_1)), (None, fake_error(run_id_2))],
+    ) as mock_poll:
         ok, run_id, data, error = asyncio.run(
             orchestrator._council_subprocess("some decision", "gravitywell")
         )
 
     assert ok is False
-    assert run_id == fake_run_id
+    assert data is None
+    # The returned failure is from the retry (fresh run_id), not the first attempt.
+    assert run_id == run_id_2
+    assert error == fake_error(run_id_2)
+    assert mock_submit.call_count == 2
+    assert mock_poll.call_count == 2
+    # Unit 2 trigger contract preserved after retries are exhausted.
+    assert run_id_2 in error
+    assert "last_heartbeat=" in error
+    assert "reason=" in error
+
+
+def test_no_retry_on_terminal_council_status():
+    """Retry does NOT fire on a terminal Council status — only on the
+
+    liveness died/stalled fast-fail.
+    """
+    from agents_core.shared_deliberation import orchestrator
+    import asyncio
+
+    run_id = "2026-01-01-000000-terminal01"
+    council_data = {"status": "resolved", "positions": []}
+
+    with patch.object(
+        orchestrator, "_submit_council", return_value=run_id
+    ) as mock_submit, patch.object(
+        orchestrator, "_poll_council", return_value=(council_data, None)
+    ) as mock_poll:
+        ok, out_run_id, data, error = asyncio.run(
+            orchestrator._council_subprocess("some decision", "gravitywell")
+        )
+
+    assert ok is True
+    assert out_run_id == run_id
+    assert data == council_data
+    assert error is None
+    mock_submit.assert_called_once()
+    mock_poll.assert_called_once()
+
+
+def test_no_retry_on_timeout_backstop():
+    """Retry does NOT fire on a genuine timeout_s backstop — doubling GW load
+
+    on a real 1800s hang would be worse, not better.
+    """
+    from agents_core.shared_deliberation import orchestrator
+    import asyncio
+
+    run_id = "2026-01-01-000000-timeout01"
+    fake_error = "Council poll timeout after 1800s"
+
+    with patch.object(
+        orchestrator, "_submit_council", return_value=run_id
+    ) as mock_submit, patch.object(
+        orchestrator, "_poll_council", return_value=(None, fake_error)
+    ) as mock_poll:
+        ok, out_run_id, data, error = asyncio.run(
+            orchestrator._council_subprocess("some decision", "gravitywell")
+        )
+
+    assert ok is False
+    assert out_run_id == run_id
     assert data is None
     assert error == fake_error
-    # _submit_council must be called exactly once — no retry
+    assert "died/stalled" not in error
     mock_submit.assert_called_once()
+    mock_poll.assert_called_once()
 
 
 def test_fast_fail_signal_is_structured():
@@ -566,6 +867,45 @@ def test_stub_deliberation_stamps_heartbeat_at(monkeypatch):
     from datetime import datetime
     ts = datetime.fromisoformat(run["heartbeat_at"])
     assert ts is not None
+
+    run_file.unlink(missing_ok=True)
+
+
+def test_run_deliberation_stamps_started_at(monkeypatch):
+    """run_deliberation stamps started_at, distinct from the enqueue-time
+
+    created_at (agents-core-council-liveness-queue-aware-v0, Part A.1). This
+    lets the poller's liveness ladder tell a running-but-pre-heartbeat worker
+    apart from one still sitting in the serial GW queue.
+    """
+    from agents_core.council import cli
+    from datetime import datetime, timedelta
+
+    run_id = "2026-01-01-000000-started01"
+    created_at = (datetime.now() - timedelta(seconds=30)).isoformat(timespec="seconds")
+    run_data = {
+        "run_id": run_id,
+        "status": "deliberating",
+        "mode": "deliberation",
+        "decision": "test started_at stamp",
+        "voicing": "gravitywell",
+        "created_at": created_at,
+        "turns_cap": 2,
+        "turns": [],
+        "selected_entities": [],
+    }
+    cli.COUNCIL_DIR.mkdir(parents=True, exist_ok=True)
+    run_file = cli.COUNCIL_DIR / f"{run_id}.yaml"
+    run_file.write_text(yaml.safe_dump(run_data))
+
+    monkeypatch.setenv("COUNCIL_ENGINE_STUB", "1")
+
+    with patch("agents_core.doorman_client.DoormanClient", side_effect=Exception("no doorman")):
+        cli.run_deliberation(run_id)
+
+    run = yaml.safe_load(run_file.read_text())
+    assert "started_at" in run
+    assert datetime.fromisoformat(run["started_at"]) >= datetime.fromisoformat(created_at)
 
     run_file.unlink(missing_ok=True)
 

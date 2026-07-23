@@ -935,7 +935,13 @@ def run_deliberation(run_id: str) -> None:
         # created_at as the stall clock reference while this process is alive but
         # blocked in the doorman acquire (which can take up to _gw_acquire_timeout()
         # ~210s on a cold GW wake — longer than COUNCIL_STALL_S).
-        run["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
+        # started_at is distinct from the enqueue-time created_at: it marks actual
+        # worker start (post-dequeue), letting the poller's liveness ladder tell a
+        # running-but-pre-heartbeat worker apart from one still sitting in the
+        # serial GW queue (queued != dead).
+        _now = datetime.now().isoformat(timespec="seconds")
+        run["started_at"] = _now
+        run["heartbeat_at"] = _now
         save_run(run)
     except Exception as _startup_exc:
         _tb = traceback.format_exc()
