@@ -8,6 +8,8 @@ Covers:
 No real network calls — all backends are mocked.
 """
 
+import json
+
 import pytest
 from unittest.mock import MagicMock, patch, call
 
@@ -1093,3 +1095,230 @@ def test_call_operator_quest_omits_chat_template_kwargs():
     assert result == "quest answer"
     posted_data = mock_post.call_args[1]["json"]
     assert "chat_template_kwargs" not in posted_data
+
+
+# ---------------------------------------------------------------------------
+# _post_chat_completion json_object degrade (agents-core-post-chat-json-object-degrade-v0)
+# ---------------------------------------------------------------------------
+
+def _make_json_response(body: dict):
+    """A 200 requests.Response mock whose message content is the JSON-encoded body."""
+    import json as _json
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {
+        "choices": [{"message": {"content": _json.dumps(body), "reasoning_content": None}}]
+    }
+    return resp
+
+
+def _make_400_error():
+    """An HTTPError as raised by Response.raise_for_status() for a 400, with
+    .response.status_code populated (mirrors requests' real behavior)."""
+    import requests as req
+    fake_resp = MagicMock()
+    fake_resp.status_code = 400
+    err = req.exceptions.HTTPError("400 Client Error: Bad Request")
+    err.response = fake_resp
+    return err
+
+
+def test_post_chat_completion_json_mode_happy_path_byte_identical():
+    """DoD-1: json_mode=True, 200 on first try — exactly one POST, response_format
+    present, every other payload field unchanged, degrade path never entered."""
+    from agents_core.llm import _post_chat_completion
+
+    resp = _make_json_response({"answer": "x", "citations": []})
+
+    with patch("agents_core.llm.requests.post", return_value=resp) as mock_post, \
+         patch("agents_core.llm._log") as mock_log:
+        result = _post_chat_completion(
+            base_url="http://fake:1234", model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            json_mode=True, cache_prompt=True,
+        )
+
+    assert mock_post.call_count == 1
+    payload = mock_post.call_args[1]["json"]
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["model"] == "m"
+    assert payload["messages"] == [{"role": "user", "content": "hi"}]
+    assert payload["temperature"] == 0.7
+    assert payload["cache_prompt"] is True
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert result is not None
+    mock_log.warning.assert_not_called()
+
+
+def test_post_chat_completion_degrades_on_400_then_succeeds():
+    """DoD-2/DoD-3: first POST 400s on json_object, second POST (no response_format)
+    succeeds with a parseable JSON body — the function returns that text."""
+    from agents_core.llm import _post_chat_completion
+
+    body = {"answer": "x", "citations": []}
+    success_resp = _make_json_response(body)
+
+    with patch("agents_core.llm.requests.post",
+               side_effect=[_make_400_error(), success_resp]) as mock_post, \
+         patch("agents_core.llm.time.sleep"):
+        result = _post_chat_completion(
+            base_url="http://fake:1234", model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            json_mode=True,
+        )
+
+    assert mock_post.call_count == 2
+    first_payload = mock_post.call_args_list[0][1]["json"]
+    second_payload = mock_post.call_args_list[1][1]["json"]
+    assert first_payload["response_format"] == {"type": "json_object"}
+    assert "response_format" not in second_payload
+    for key in ("model", "messages", "temperature", "max_tokens", "chat_template_kwargs"):
+        assert first_payload[key] == second_payload[key]
+
+    assert isinstance(result, str)
+    assert json.loads(result) == body
+
+
+def test_post_chat_completion_json_mode_false_400_unchanged():
+    """DoD-4: json_mode=False — a 400 is just a normal transient error; existing
+    retry ladder applies, no response_format ever appears, no extra request."""
+    from agents_core.llm import _post_chat_completion, OperatorUnreachableError
+
+    with patch("agents_core.llm.requests.post",
+               side_effect=_make_400_error()) as mock_post, \
+         patch("agents_core.llm.time.sleep"):
+        with pytest.raises(OperatorUnreachableError):
+            _post_chat_completion(
+                base_url="http://fake:1234", model="m",
+                messages=[{"role": "user", "content": "hi"}],
+                json_mode=False,
+            )
+
+    assert mock_post.call_count == 3
+    for c in mock_post.call_args_list:
+        assert "response_format" not in c[1]["json"]
+
+
+def test_post_chat_completion_degrade_bounded_then_terminal():
+    """DoD-5: both the json_object POST and the degraded POST (and its own
+    retries) keep 400ing — degrade fires exactly once, then the function
+    follows the existing terminal path with a bounded number of requests."""
+    import itertools
+    from agents_core.llm import _post_chat_completion, OperatorUnreachableError
+
+    with patch("agents_core.llm.requests.post",
+               side_effect=itertools.repeat(_make_400_error())) as mock_post, \
+         patch("agents_core.llm.time.sleep"):
+        with pytest.raises(OperatorUnreachableError):
+            _post_chat_completion(
+                base_url="http://fake:1234", model="m",
+                messages=[{"role": "user", "content": "hi"}],
+                json_mode=True, max_retries=3,
+            )
+
+    # Bounded: 1 json_object attempt + max_retries degraded attempts, then terminal.
+    assert mock_post.call_count == 4
+    payloads = [c[1]["json"] for c in mock_post.call_args_list]
+    assert "response_format" in payloads[0]
+    assert all("response_format" not in p for p in payloads[1:])
+
+
+def test_post_chat_completion_degrade_fires_on_final_transient_attempt():
+    """DoD-6: the qualifying 400 lands on what would have been the last transient
+    attempt under the old (non-degraded) ladder — the degraded POST must still fire."""
+    from agents_core.llm import _post_chat_completion
+    import requests as req
+
+    body = {"answer": "recovered"}
+    with patch("agents_core.llm.requests.post",
+               side_effect=[
+                   req.exceptions.Timeout("t1"),
+                   req.exceptions.Timeout("t2"),
+                   _make_400_error(),
+                   _make_json_response(body),
+               ]) as mock_post, \
+         patch("agents_core.llm.time.sleep"):
+        result = _post_chat_completion(
+            base_url="http://fake:1234", model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            json_mode=True, max_retries=3,
+        )
+
+    assert mock_post.call_count == 4
+    assert json.loads(result) == body
+    last_payload = mock_post.call_args_list[-1][1]["json"]
+    assert "response_format" not in last_payload
+
+
+def test_post_chat_completion_transient_errors_preserved():
+    """DoD-7: ConnectionError, Timeout, and non-400 HTTPError (503) still retry with
+    the existing backoff and raise OperatorUnreachableError after max_retries —
+    the degrade never engages for non-400 failures."""
+    import itertools
+    from agents_core.llm import _post_chat_completion, OperatorUnreachableError
+    import requests as req
+
+    def make_503():
+        fake_resp = MagicMock()
+        fake_resp.status_code = 503
+        err = req.exceptions.HTTPError("503 Service Unavailable")
+        err.response = fake_resp
+        return err
+
+    for err_factory in (
+        lambda: req.exceptions.ConnectionError("conn"),
+        lambda: req.exceptions.Timeout("timeout"),
+        make_503,
+    ):
+        with patch("agents_core.llm.requests.post",
+                   side_effect=itertools.repeat(err_factory())) as mock_post, \
+             patch("agents_core.llm.time.sleep") as mock_sleep:
+            with pytest.raises(OperatorUnreachableError):
+                _post_chat_completion(
+                    base_url="http://fake:1234", model="m",
+                    messages=[{"role": "user", "content": "hi"}],
+                    json_mode=True, max_retries=3,
+                )
+
+        assert mock_post.call_count == 3
+        assert mock_sleep.call_count == 2
+        mock_sleep.assert_any_call(2)
+        mock_sleep.assert_any_call(4)
+
+
+def test_post_chat_completion_signature_unchanged():
+    """DoD-8: the public signature carries no new required parameter."""
+    import inspect
+    from agents_core.llm import _post_chat_completion
+
+    sig = inspect.signature(_post_chat_completion)
+    required = [
+        name for name, p in sig.parameters.items()
+        if p.default is inspect.Parameter.empty
+    ]
+    assert required == ["base_url", "model", "messages"]
+
+
+def test_post_chat_completion_degrade_emits_warning_log(caplog):
+    """DoD-9: the degrade emits a WARNING-level log naming the response_format
+    pivot; no in-core JSON validation happens (there is none by design)."""
+    import logging
+    from agents_core.llm import _post_chat_completion
+
+    success_resp = _make_json_response({"answer": "x"})
+
+    with patch("agents_core.llm.requests.post",
+               side_effect=[_make_400_error(), success_resp]), \
+         patch("agents_core.llm.time.sleep"), \
+         caplog.at_level(logging.WARNING, logger="agents_core.llm"):
+        _post_chat_completion(
+            base_url="http://fake:1234", model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            json_mode=True,
+        )
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        "response_format" in r.getMessage() and "400" in r.getMessage()
+        for r in warnings
+    )
