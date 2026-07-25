@@ -1289,12 +1289,12 @@ def test_handler_supervision_enabled_builds_hook_routed_through_claude_cli(tmp_p
         assert handler_hook(ctx) is None
 
 
-@pytest.mark.parametrize("supervision_cfg", [None, {"enabled": False}])
-def test_handler_supervision_off_passes_none_hook_and_empty_objective(tmp_path, supervision_cfg):
-    """DoD10: absent handler_supervision key and enabled=False both resolve to
-    handler_hook=None, handler_objective='' - today's behavior, unchanged."""
-    overrides = {} if supervision_cfg is None else {"handler_supervision": supervision_cfg}
-    spec = json.loads(_make_spec(tmp_path, **overrides).read_text())
+def test_handler_supervision_off_passes_none_hook_and_empty_objective(tmp_path):
+    """handler-supervision-enable-local-fixer-v0: explicit enabled=False is still
+    a true no-op - handler_hook=None, handler_objective='' (opt-out unchanged)."""
+    spec = json.loads(_make_spec(
+        tmp_path, handler_supervision={"enabled": False},
+    ).read_text())
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
@@ -1320,6 +1320,38 @@ def test_handler_supervision_off_passes_none_hook_and_empty_objective(tmp_path, 
     assert captured_kwargs, "call_gw_agent not called"
     assert captured_kwargs[0]["handler_hook"] is None
     assert captured_kwargs[0]["handler_objective"] == ""
+
+
+def test_handler_supervision_default_on_for_local_fixer(tmp_path):
+    """handler-supervision-enable-local-fixer-v0 (DoD-1): absent handler_supervision
+    key now defaults to enabled - handler_hook is not None, handler_objective is
+    prompt-derived (flips the old off-by-default contract for the local-fixer engine)."""
+    spec = json.loads(_make_spec(tmp_path, prompt="Fix the thing.").read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    captured_kwargs: list[dict] = []
+
+    def fake_gw_agent(**kwargs):
+        captured_kwargs.append(kwargs)
+        return (_good_fixer_result(), [])
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw_agent),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", return_value={"html_url": "http://x/p/1"}),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        sr._run_local_fixer(spec, str(tmp_path))
+
+    assert captured_kwargs, "call_gw_agent not called"
+    assert captured_kwargs[0]["handler_hook"] is not None
+    assert captured_kwargs[0]["handler_objective"].startswith("Fix the thing.")
 
 
 def test_handler_supervision_unsupported_backend_fails_loud(tmp_path, capsys):

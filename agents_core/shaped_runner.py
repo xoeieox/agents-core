@@ -265,23 +265,35 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         import agents_core.forgejo as _forgejo
 
         # Handler supervision config (agents-core-handler-operative-live-supervision-v0).
-        # Off by default: an absent key, a malformed (non-dict) value, or enabled
-        # falsy/missing all resolve to handler_hook=None - byte-identical to today.
+        # On by default for the local-fixer engine (handler-supervision-enable-local-fixer-v0):
+        # an absent key, a malformed (non-dict) value, or an empty/missing-"enabled" dict all
+        # resolve to enabled with defaults. Only an explicit {"enabled": False} opts out
+        # (handler_hook=None - byte-identical to the old off-by-default behavior).
         # Unknown extra keys are ignored (superset-tolerant).
         _handler_hook = None
         _handler_objective = ""
         _handler_max_interventions = 2
         _supervision_cfg = spec.get("handler_supervision")
-        if isinstance(_supervision_cfg, dict) and _supervision_cfg.get("enabled"):
-            _backend = _supervision_cfg.get("backend", "claude_cli")
+        _supervision_enabled = (
+            _supervision_cfg.get("enabled", True)
+            if isinstance(_supervision_cfg, dict)
+            else True
+        )
+        if _supervision_enabled:
+            _backend = (
+                _supervision_cfg.get("backend", "claude_cli")
+                if isinstance(_supervision_cfg, dict)
+                else "claude_cli"
+            )
             if _backend != "claude_cli":
                 raise ValueError(
                     f"handler_supervision backend {_backend!r} not supported in v0, "
                     "use claude_cli"
                 )
-            _handler_model = _supervision_cfg.get("model", "haiku")
-            _hook_timeout_s = int(_supervision_cfg.get("hook_timeout_s", 60))
-            _handler_max_interventions = int(_supervision_cfg.get("max_interventions", 2))
+            _cfg = _supervision_cfg if isinstance(_supervision_cfg, dict) else {}
+            _handler_model = _cfg.get("model", "haiku")
+            _hook_timeout_s = int(_cfg.get("hook_timeout_s", 60))
+            _handler_max_interventions = int(_cfg.get("max_interventions", 2))
             _handler_objective = (spec.get("prompt") or "")[:1500]
             _handler_hook = _build_handler_hook(_handler_objective, _handler_model, _hook_timeout_s)
 
