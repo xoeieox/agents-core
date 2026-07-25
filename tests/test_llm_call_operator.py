@@ -1751,3 +1751,114 @@ def test_ac8_creative_payload_identical_with_and_without_gw_backend_vllm():
             _os.environ["GW_BACKEND"] = prior
 
     assert without_env == with_env
+
+
+# ---------------------------------------------------------------------------
+# gravitywell: acquire_lease bypass (call-operator-gravitywell-lease-bypass-v0)
+#
+# A caller that already holds a GravityWell mode-controller lease self-deadlocks
+# against its own lease when call_operator("gravitywell") does its normal worker
+# acquire. acquire_lease=False (kwarg, default True) skips the doorman entirely
+# and dispatches straight to _call_gravitywell_backend. See gw_agent.py:953 for
+# the sibling call_gw_agent(acquire_lease=...) precedent this mirrors.
+# ---------------------------------------------------------------------------
+
+def test_gravitywell_acquire_lease_false_never_touches_doorman(monkeypatch):
+    """R4(a): acquire_lease=False performs no DoormanClient construction/acquire/release
+    and still returns the backend result."""
+    monkeypatch.setenv("GW_BACKEND", "llamacpp")
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    dc, mock_client = _gw_dc(status="serving")
+
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.post", side_effect=_make_gw_sse_resp("ok")):
+        result = call_operator("gravitywell", prompt="test", acquire_lease=False)
+
+    assert result == "ok"
+    dc.assert_not_called()
+    mock_client.acquire.assert_not_called()
+    mock_client.release.assert_not_called()
+
+
+def test_gravitywell_acquire_lease_false_bypasses_deferring_doorman():
+    """R4(b): the incident regression. Even when a stubbed doorman would defer
+    (mode-controller lease held elsewhere), acquire_lease=False must still reach
+    _call_gravitywell_backend rather than short-circuiting to on_wake_fail."""
+    dc, _mock_client = _gw_dc(status="deferred")
+    prov = []
+
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="bypassed-ok") as mock_backend:
+        result = call_operator(
+            "gravitywell", prompt="test", acquire_lease=False,
+            on_wake_fail="skip", _provenance_out=prov,
+        )
+
+    assert result == "bypassed-ok"
+    mock_backend.assert_called_once()
+    dc.assert_not_called()
+    assert ("success", "gravitywell") in prov
+    assert not any(r in ("gw_deferred_swarm", "gw_not_serving") for r, _ in prov)
+
+
+def test_gravitywell_acquire_lease_false_bypasses_enforce_and_shadow_mode(monkeypatch):
+    """R4(b) extension: the bypass short-circuits regardless of GW_ADMISSION_MODE, not
+    just the off/direct-dispatch path — a lease-holder bypasses ALL doorman admission."""
+    dc, _mock_client = _gw_dc(status="deferred")
+
+    for mode in ("enforce", "shadow"):
+        monkeypatch.setenv("GW_ADMISSION_MODE", mode)
+        with patch("agents_core.doorman_client.DoormanClient", dc), \
+             patch("agents_core.llm._call_gravitywell_backend", return_value="bypassed-ok") as mock_backend:
+            result = call_operator("gravitywell", prompt="test", acquire_lease=False)
+        assert result == "bypassed-ok", f"mode={mode}"
+        mock_backend.assert_called_once()
+        dc.assert_not_called()
+
+
+def test_gravitywell_acquire_lease_true_default_unchanged():
+    """R4(c): the default (acquire_lease omitted, i.e. True) path is byte-identical —
+    still acquires, still honors is_deferred, still releases."""
+    dc, mock_client = _gw_dc(status="deferred")
+    with patch("agents_core.doorman_client.DoormanClient", dc):
+        result = call_operator("gravitywell", prompt="test", on_wake_fail="skip")
+    assert result is None
+    mock_client.acquire.assert_called_once()
+
+    dc2, mock_client2 = _gw_dc(status="serving")
+    with patch("agents_core.doorman_client.DoormanClient", dc2), \
+         patch("requests.post", side_effect=_make_gw_sse_resp("ok")):
+        result2 = call_operator("gravitywell", prompt="test", acquire_lease=True)
+    assert result2 == "ok"
+    mock_client2.acquire.assert_called_once()
+    mock_client2.release.assert_called_once()
+
+
+def test_gravitywell_acquire_lease_not_leaked_to_backend(monkeypatch):
+    """acquire_lease must be stripped before forwarding — never reaches
+    _call_gravitywell_backend as a stray kwarg (would TypeError otherwise)."""
+    monkeypatch.setenv("GW_BACKEND", "llamacpp")
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    dc, _mock_client = _gw_dc(status="serving")
+
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.post", side_effect=_make_gw_sse_resp("ok")):
+        result = call_operator("gravitywell", prompt="test", acquire_lease=False)
+    assert result == "ok"
+
+
+def test_gravitywell_acquire_lease_false_is_a_trust_contract_not_enforced():
+    """R4(d) — contract-witness test. acquire_lease=False is honored purely on the
+    caller's word; call_operator performs NO lease-ownership check before bypassing
+    the doorman. This is deliberate (Erah-ratified 2026-07-24, Scope boundary section
+    of call-operator-gravitywell-lease-bypass-v0): the bypass is an opt-in trust
+    contract identical to call_gw_agent(acquire_lease=False), not a runtime-enforced
+    guard. A caller with NO lease at all still bypasses successfully — proving there
+    is no ownership check to defeat."""
+    with patch("agents_core.doorman_client.DoormanClient") as dc, \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="ok") as mock_backend:
+        result = call_operator("gravitywell", prompt="test", acquire_lease=False)
+
+    assert result == "ok"
+    mock_backend.assert_called_once()
+    dc.assert_not_called()

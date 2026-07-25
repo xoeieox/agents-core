@@ -921,6 +921,15 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
     gravitywell routes via the doorman to the GravityWell llama.cpp endpoint (:8081).
     On unreachable, falls back per on_wake_fail policy.
 
+    gravitywell also accepts acquire_lease: bool = True (via kwargs). If False,
+    skip doorman lease acquisition entirely - no acquire, no enforce/shadow
+    admission, no release - and dispatch straight to the backend. For callers
+    that already hold a GravityWell mode-controller lease (e.g. a gate.flip
+    node), so a plain call_operator() call doesn't self-deadlock against their
+    own lease. With defaults (True), behavior is byte-identical. Opt-in trust
+    contract identical to call_gw_agent(acquire_lease=False) - the caller's word
+    is not verified against actual lease ownership.
+
     gravitywell-creative routes directly to the Llama-70B endpoint (:8093, GW_CREATIVE_URL).
     No DoormanClient, no admission control, no wake_fail fallback. Raises
     CreativeOperatorUnavailable on network failure — never silently falls back.
@@ -1015,11 +1024,33 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         think = kwargs.get("think", False)
         on_wake_fail = kwargs.get("on_wake_fail", "skip")
         timeout = int(kwargs.get("timeout", 300))
+        acquire_lease = kwargs.get("acquire_lease", True)
         work_id = f"op-gravitywell-{uuid.uuid4().hex}"
         wake_fail_kwargs = {
             k: v for k, v in kwargs.items()
-            if k not in ("on_wake_fail", "think", "bundle_ids", "_provenance_out")
+            if k not in ("on_wake_fail", "think", "bundle_ids", "_provenance_out", "acquire_lease")
         }
+
+        # --- LEASE-HOLDER BYPASS: caller already owns a GW mode-controller lease,
+        # so doorman admission would self-deadlock. Skip acquire/enforce/shadow
+        # entirely (regardless of GW_ADMISSION_MODE) and dispatch straight to the
+        # backend. Opt-in trust contract, mirrors call_gw_agent(acquire_lease=False)
+        # - no lease-ownership check is performed here; see gw_agent.py:953.
+        if not acquire_lease:
+            try:
+                result = _call_gravitywell_backend(prompt=prompt, think=think, **gw_kwargs)
+                if _provenance_out is not None:
+                    _provenance_out.append(
+                        ("stream_culled", "gravitywell")
+                        if _is_gw_result_degraded(result)
+                        else ("success", "gravitywell")
+                    )
+                return result
+            except OperatorUnreachableError:
+                if _provenance_out is not None:
+                    _provenance_out.append(("serving_http_error", "gravitywell"))
+                return _apply_wake_fail(on_wake_fail, operator_class, prompt,
+                                       _provenance_out=_provenance_out, **wake_fail_kwargs)
 
         from agents_core.doorman_client import DoormanClient, DoormanUnreachable, _gw_acquire_timeout
 
