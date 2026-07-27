@@ -86,6 +86,7 @@ class GravityWellAdapter:
             on_wake_fail=self.on_wake_fail,
             principal=self.principal,
             _provenance_out=provenance,
+            lease_class="protected",
         )
         # provenance is a list of (reason, operator) tuples.
         # Find the effective operator and the actual failure reason (if any).

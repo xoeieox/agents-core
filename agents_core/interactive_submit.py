@@ -84,6 +84,7 @@ def submit(
             prompt=turn,
             system=system,
             _provenance_out=provenance,
+            lease_class="deferrable",
         )
         return {
             "result": result,

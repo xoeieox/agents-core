@@ -279,6 +279,132 @@ def test_gravitywell_successful_call_records_provenance():
     assert ("success", "gravitywell") in provenance
 
 
+# ---------------------------------------------------------------------------
+# lease_class threading (doorman-lease-class-consumers-v0)
+# ---------------------------------------------------------------------------
+
+def test_call_operator_gravitywell_default_lease_class_is_deferrable():
+    """Omitting lease_class sends class=deferrable to the doorman (the safe default)."""
+    from agents_core import llm as llm_mod
+    from agents_core.doorman_client import DoormanClient
+
+    with patch.object(DoormanClient, "acquire", return_value={"status": "serving"}) as mock_acquire, \
+         patch.object(DoormanClient, "release"), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="gw answer"):
+
+        result = llm_mod.call_operator("gravitywell", prompt="test")
+
+    assert result == "gw answer"
+    assert mock_acquire.call_args.kwargs["lease_class"] == "deferrable"
+
+
+def test_call_operator_gravitywell_explicit_protected_lease_class():
+    """A measured-gate caller passing lease_class='protected' reaches the doorman."""
+    from agents_core import llm as llm_mod
+    from agents_core.doorman_client import DoormanClient
+
+    with patch.object(DoormanClient, "acquire", return_value={"status": "serving"}) as mock_acquire, \
+         patch.object(DoormanClient, "release"), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="gw answer"):
+
+        llm_mod.call_operator("gravitywell", prompt="test", lease_class="protected")
+
+    assert mock_acquire.call_args.kwargs["lease_class"] == "protected"
+
+
+def test_call_operator_gravitywell_explicit_deferrable_lease_class():
+    """A background caller passing lease_class='deferrable' explicitly reaches the doorman
+    (deliverable #3: explicit, not relying on the default)."""
+    from agents_core import llm as llm_mod
+    from agents_core.doorman_client import DoormanClient
+
+    with patch.object(DoormanClient, "acquire", return_value={"status": "serving"}) as mock_acquire, \
+         patch.object(DoormanClient, "release"), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="gw answer"):
+
+        llm_mod.call_operator("gravitywell", prompt="test", lease_class="deferrable")
+
+    assert mock_acquire.call_args.kwargs["lease_class"] == "deferrable"
+
+
+def test_call_operator_new_caller_forgetting_lease_class_still_lands_deferrable():
+    """Adversarial case (trickster): a new caller that forgets lease_class must land
+    deferrable, not silently escalate to protected - this is what proves the default
+    is an enforcement barrier and not merely documentation."""
+    from agents_core import llm as llm_mod
+    from agents_core.doorman_client import DoormanClient
+
+    with patch.object(DoormanClient, "acquire", return_value={"status": "serving"}) as mock_acquire, \
+         patch.object(DoormanClient, "release"), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="gw answer"):
+
+        # Simulates a brand-new call site nobody updated for lease_class yet.
+        llm_mod.call_operator("gravitywell", prompt="test", on_wake_fail="skip", timeout=42)
+
+    assert mock_acquire.call_args.kwargs["lease_class"] == "deferrable"
+
+
+def test_call_operator_lease_class_omission_warns_once_per_module(caplog):
+    """Omitting lease_class emits one WARN naming the calling module - once per
+    process, not once per call (a busy night DAG must not drown the log)."""
+    import logging
+    from agents_core import llm as llm_mod
+    from agents_core.doorman_client import DoormanClient
+
+    llm_mod._lease_class_default_warned.clear()
+
+    with patch.object(DoormanClient, "acquire", return_value={"status": "serving"}), \
+         patch.object(DoormanClient, "release"), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="gw answer"), \
+         caplog.at_level(logging.WARNING, logger="agents_core.llm"):
+
+        llm_mod.call_operator("gravitywell", prompt="test one")
+        llm_mod.call_operator("gravitywell", prompt="test two")
+
+    warn_records = [r for r in caplog.records if "lease-class" in r.getMessage()]
+    assert len(warn_records) == 1
+
+
+def test_call_operator_explicit_lease_class_never_warns():
+    """A caller that passes lease_class explicitly (either value) never trips the
+    silence warning - only omission does."""
+    import logging
+    from agents_core import llm as llm_mod
+    from agents_core.doorman_client import DoormanClient
+
+    llm_mod._lease_class_default_warned.clear()
+
+    with patch.object(DoormanClient, "acquire", return_value={"status": "serving"}), \
+         patch.object(DoormanClient, "release"), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="gw answer"), \
+         patch.object(llm_mod, "_warn_lease_class_defaulted") as mock_warn:
+
+        llm_mod.call_operator("gravitywell", prompt="test", lease_class="deferrable")
+        llm_mod.call_operator("gravitywell", prompt="test", lease_class="protected")
+
+    mock_warn.assert_not_called()
+
+
+def test_call_operator_acquire_lease_false_bypass_lease_class_ignored():
+    """The acquire_lease=False bypass takes no lease at all, so lease_class is moot -
+    no acquire() call is made and no silence-warning fires (C2b: out of scope for
+    classification, since there is no lease to classify)."""
+    from agents_core import llm as llm_mod
+    from agents_core.doorman_client import DoormanClient
+
+    llm_mod._lease_class_default_warned.clear()
+
+    with patch.object(DoormanClient, "acquire") as mock_acquire, \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="gw answer"), \
+         patch.object(llm_mod, "_warn_lease_class_defaulted") as mock_warn:
+
+        result = llm_mod.call_operator("gravitywell", prompt="test", acquire_lease=False)
+
+    assert result == "gw answer"
+    mock_acquire.assert_not_called()
+    mock_warn.assert_not_called()
+
+
 def test_gravitywell_fallback_on_doorman_unreachable():
     """call_operator('gravitywell') appends doorman_unreachable reason when doorman is down."""
     from agents_core import llm as llm_mod

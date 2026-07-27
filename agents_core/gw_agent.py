@@ -954,6 +954,7 @@ def call_gw_agent(
     writeable: bool = False,
     no_progress_steps: int | None = None,
     principal: str | None = None,
+    lease_class: str = "deferrable",
     verdict_schema: dict | None = None,
     tool_executors: dict[str, ToolExecutor] | None = None,
     cancel_check: Callable[[], bool] | None = None,
@@ -996,6 +997,13 @@ def call_gw_agent(
                        With defaults (True), behavior is byte-identical: acquire/release
                        are called, POST is to GW_URL. Only set both backend_url and
                        acquire_lease=False when running on swarm.
+        lease_class: foreground-priority gate class for the doorman lease this run
+                     acquires (doorman-lease-class-consumers-v0). "protected" for a
+                     measured gate or live interactive session (never deferred);
+                     "deferrable" (the default) for background/worker runs. call_gw_agent
+                     serves both, so the caller must pass this explicitly rather than
+                     it being inferred here. Ignored when acquire_lease=False (no lease
+                     is taken).
         writeable: If True, add write tools (write_file, apply_edit, run_tests) and return
                    (FixerResult, transcript). Default False keeps behavior byte-identical to
                    read-only callers. The return_transcript argument is ignored for writeable
@@ -1166,6 +1174,7 @@ def call_gw_agent(
                     reason="gw_agent",
                     timeout=_gw_acquire_timeout(),
                     principal=principal,
+                    lease_class=lease_class,
                 )
             except DoormanUnreachable as e:
                 if log:

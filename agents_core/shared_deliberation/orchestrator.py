@@ -547,6 +547,7 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
                 timeout=_gw_acquire_timeout(),
                 principal=_span_principal,
                 lease_kind="coordination",
+                lease_class="protected",
             )
             _hold_status = _hold_res.get("status")
             if _hold_status == "serving":
@@ -587,6 +588,7 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
                                     timeout=10.0,
                                     principal=_principal,
                                     lease_kind="coordination",
+                                    lease_class="protected",
                                 )
                             except Exception as _ref_err:
                                 log.warning(

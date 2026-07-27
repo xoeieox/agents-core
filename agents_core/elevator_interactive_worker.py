@@ -108,6 +108,9 @@ def serve_interactive_baton(item: dict) -> bool:
         # Call GravityWell with on_wake_fail="skip" (no paid fallback).
         # _admission_bypass=True: the interactive worker's claimed baton IS its admission;
         # re-entering the elevator would self-deadlock.
+        # deferrable (doorman-lease-class-consumers-v0 C3): "interactive" here means the
+        # elevator queue, not an Erah-at-a-keyboard session - it waits for queue depth,
+        # not a human cursor, so it's background work no matter how promptly it runs.
         result = call_operator(
             "gravitywell",
             prompt=prompt,
@@ -115,6 +118,7 @@ def serve_interactive_baton(item: dict) -> bool:
             on_wake_fail="skip",
             _provenance_out=provenance,
             _admission_bypass=True,
+            lease_class="deferrable",
         )
 
         if result is not None:
