@@ -22,7 +22,12 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
-from agents_core.llm import _gw_stream_attempt, _call_gravitywell_backend, OperatorUnreachableError
+from agents_core.llm import (
+    _gw_stream_attempt,
+    _call_gravitywell_backend,
+    _is_gw_result_degraded,
+    OperatorUnreachableError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -252,8 +257,11 @@ def test_ac4_reasoning_content_resets_idle(monkeypatch):
         )
 
     assert cull is None
-    # reasoning_content fallback when content is empty
-    assert text == "think0think1think2"
+    # reasoning_content fallback when content is empty - amended by
+    # gw-reasoning-only-response-hardening-v0 to carry a degraded marker so
+    # downstream consumers can tell a salvaged reasoning trace from real content.
+    assert text.startswith("think0think1think2")
+    assert _is_gw_result_degraded(text)
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +334,8 @@ def test_ac5_clean_stream_returns_text(monkeypatch):
 
     assert cull is None
     assert text == "Hello world"
+    # Regression guard: real content must never be spuriously marked degraded.
+    assert _is_gw_result_degraded(text) is False
 
 
 def test_ac5_reasoning_content_fallback(monkeypatch):
@@ -349,7 +359,65 @@ def test_ac5_reasoning_content_fallback(monkeypatch):
         )
 
     assert cull is None
-    assert text == "thinking deeply more"
+    # reasoning_content fallback when content is empty - amended by
+    # gw-reasoning-only-response-hardening-v0 to carry a degraded marker so
+    # downstream consumers can tell a salvaged reasoning trace from real content.
+    assert text.startswith("thinking deeply more")
+    assert _is_gw_result_degraded(text)
+
+
+def test_ac5_no_done_no_cull_reasoning_only_marked_degraded(monkeypatch):
+    """Stream ends without [DONE] and without a watchdog cull (connection close),
+    reasoning_content-only -> returned text carries the degraded marker (same as the
+    clean_end branch). This branch previously had no dedicated test for either the
+    content or reasoning case."""
+    monkeypatch.setenv("GW_IDLE_GAP_SECS", "10")
+    monkeypatch.setenv("GW_FIRST_TOKEN_GAP_SECS", "60")
+    monkeypatch.setenv("GW_LIVENESS_HARD_CEILING_SECS", "1800")
+
+    chunks = [(None, "musing"), (None, " onward")]
+    resp = make_sse_resp(chunks, stall_after=False, add_done=False)
+
+    with patch("requests.post", return_value=resp):
+        idle_gap = 10.0
+        first_token_gap = 60.0
+        hard_ceiling = 1800.0
+        call_start = time.monotonic()
+        payload = {"model": "gravitywell-122b", "messages": [], "stream": True}
+        text, cull, _served_model = _gw_stream_attempt(
+            "http://gw", "gravitywell-122b", payload,
+            idle_gap, first_token_gap, hard_ceiling, call_start, None,
+        )
+
+    assert cull is None
+    assert text.startswith("musing onward")
+    assert _is_gw_result_degraded(text)
+
+
+def test_ac5_no_done_no_cull_content_unaffected(monkeypatch):
+    """Regression guard: the no-[DONE]/no-cull branch with real content is unaffected -
+    returns clean, unmarked text."""
+    monkeypatch.setenv("GW_IDLE_GAP_SECS", "10")
+    monkeypatch.setenv("GW_FIRST_TOKEN_GAP_SECS", "60")
+    monkeypatch.setenv("GW_LIVENESS_HARD_CEILING_SECS", "1800")
+
+    chunks = [("real ", None), ("content", None)]
+    resp = make_sse_resp(chunks, stall_after=False, add_done=False)
+
+    with patch("requests.post", return_value=resp):
+        idle_gap = 10.0
+        first_token_gap = 60.0
+        hard_ceiling = 1800.0
+        call_start = time.monotonic()
+        payload = {"model": "gravitywell-122b", "messages": [], "stream": True}
+        text, cull, _served_model = _gw_stream_attempt(
+            "http://gw", "gravitywell-122b", payload,
+            idle_gap, first_token_gap, hard_ceiling, call_start, None,
+        )
+
+    assert cull is None
+    assert text == "real content"
+    assert _is_gw_result_degraded(text) is False
 
 
 def test_ac5_empty_content_returns_none(monkeypatch):

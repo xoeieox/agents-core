@@ -628,6 +628,42 @@ def test_select_entities_real_path_with_mocked_call_operator(tmp_path, monkeypat
     assert "reasoning" in result
 
 
+def test_select_entities_degraded_response_raises_distinct_error(tmp_path, monkeypatch):
+    """A GW_DEGRADED_MARKER-tagged raw response raises a distinct 'degraded GravityWell
+    response' error, not the generic 'Selection returned N entities' message
+    (gw-reasoning-only-response-hardening-v0)."""
+    from agents_core.council import cli as council_cli
+    from agents_core.llm import _gw_degraded_marker
+
+    monkeypatch.delenv("COUNCIL_ENGINE_STUB", raising=False)
+
+    roster = [
+        {"character_id": "a", "character_name": "A", "pool": "test", "cultural_context": ""},
+        {"character_id": "b", "character_name": "B", "pool": "test", "cultural_context": ""},
+    ]
+
+    degraded_raw = "the model's raw reasoning trace" + _gw_degraded_marker(
+        "reasoning_only_no_content", 12.3, 0.0
+    )
+
+    def mock_call_operator(operator, prompt, **kwargs):
+        prov_out = kwargs.get("_provenance_out")
+        if prov_out is not None:
+            prov_out.append(("success", operator))
+        return degraded_raw
+
+    monkeypatch.setattr(council_cli, "call_operator", mock_call_operator)
+    monkeypatch.setattr(council_cli, "find_card_path", lambda cid: Path(f"/fake/{cid}.yaml"))
+
+    with pytest.raises(RuntimeError, match="degraded GravityWell response"):
+        council_cli.select_entities(
+            decision="test",
+            roster=roster,
+            context={"terms": [], "hits": []},
+            n=2,
+        )
+
+
 def test_cmd_submit_run_dict_includes_selection_provenance(tmp_path, monkeypatch):
     """Verify run dict includes selection_voicing and selection_degraded."""
     from agents_core.council import cli as council_cli
@@ -752,3 +788,39 @@ def test_paid_spend_flag_false_for_free_voicing(tmp_path, monkeypatch):
         "voicing": "gravitywell",
     }
     assert council_cli._calculate_paid_spend(run) is False
+
+
+# ---------------------------------------------------------------------------
+# _extract_json: <think> stripping (gw-reasoning-only-response-hardening-v0)
+# ---------------------------------------------------------------------------
+
+def test_extract_json_strips_complete_think_block():
+    """A complete <think>...</think> block ahead of real JSON is stripped, not mistaken
+    for content — the real JSON object is recovered."""
+    from agents_core.council import cli as council_cli
+
+    raw = (
+        "<think>Let's analyze each constraint step-by-step to determine whether it "
+        'is satisfied {"not": "this"}</think>'
+        '{"selected": ["a", "b"], "reasoning": "productive tension"}'
+    )
+
+    result = council_cli._extract_json(raw)
+
+    assert result == {"selected": ["a", "b"], "reasoning": "productive tension"}
+
+
+def test_extract_json_unterminated_think_returns_empty_dict():
+    """An unterminated <think> with no closing tag and nothing usable after it returns
+    {} — matches today's contract for 'no JSON found', now reached via explicit
+    stripping instead of accidentally matching a stray brace pair in the reasoning."""
+    from agents_core.council import cli as council_cli
+
+    raw = (
+        "<think>Let's analyze each constraint step-by-step to determine whether it "
+        'is satisfied or not satisfied by the given JSON response {"selected": ["x"]}'
+    )
+
+    result = council_cli._extract_json(raw)
+
+    assert result == {}
