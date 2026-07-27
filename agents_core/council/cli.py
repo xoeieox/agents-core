@@ -58,7 +58,7 @@ from pathlib import Path
 
 import yaml
 
-from agents_core.llm import call_operator  # noqa: E402
+from agents_core.llm import call_operator, _is_gw_result_degraded  # noqa: E402
 from agents_core.cards import cards_root, load_deck_cards
 from agents_core.council.gravitywell_adapter import GravityWellAdapter
 from agents_core.room_paths import room_path
@@ -565,6 +565,12 @@ Respond with ONLY a JSON object:
     )
     if not raw:
         raise RuntimeError("Entity selection failed — Claude CLI returned nothing")
+    if _is_gw_result_degraded(raw):
+        raise RuntimeError(
+            f"Entity selection received a degraded GravityWell response "
+            f"(reasoning-only, no real content emitted — not a parse bug, a generation "
+            f"failure). Raw: {raw[:300]}"
+        )
 
     data = _extract_json(raw)
     selected = data.get("selected") or []
@@ -618,6 +624,13 @@ Respond with ONLY a JSON object:
             log=log,
             _provenance_out=_sel_prov,
         )
+        if raw2 and _is_gw_result_degraded(raw2):
+            raise RuntimeError(
+                f"Entity selection received a degraded GravityWell response "
+                f"(reasoning-only, no real content emitted — not a parse bug, a generation "
+                f"failure). Raw: {raw2[:300]}"
+            )
+
         data2 = _extract_json(raw2 or "")
         active_data = data2
         selected2 = data2.get("selected") or []
@@ -663,7 +676,15 @@ Respond with ONLY a JSON object:
     }
 
 
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
 def _extract_json(text: str) -> dict:
+    text = text.strip()
+    text = _THINK_RE.sub("", text)
+    open_idx = text.lower().find("<think>")
+    if open_idx != -1:
+        text = text[:open_idx]
     text = text.strip()
     for candidate in (text, re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())):
         try:

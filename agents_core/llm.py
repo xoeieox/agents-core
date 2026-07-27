@@ -641,7 +641,14 @@ def _gw_stream_attempt(base_url, model, payload, idle_gap, first_token_gap, hard
 
     # If stream ended cleanly, ignore any watchdog cull (race condition safe-fallback)
     if clean_end:
-        text = "".join(content_parts) or "".join(reasoning_parts)
+        if content_parts:
+            text = "".join(content_parts)
+        elif reasoning_parts:
+            text = "".join(reasoning_parts) + _gw_degraded_marker(
+                "reasoning_only_no_content", time.monotonic() - call_start, 0.0
+            )
+        else:
+            text = ""
         return (text if text.strip() else None, None, _state["served_model"])
 
     if _state["cull"]:
@@ -654,7 +661,14 @@ def _gw_stream_attempt(base_url, model, payload, idle_gap, first_token_gap, hard
         return (None, _state["cull"], _state["served_model"])
 
     # Stream ended without [DONE] and no cull - return what we have
-    text = "".join(content_parts) or "".join(reasoning_parts)
+    if content_parts:
+        text = "".join(content_parts)
+    elif reasoning_parts:
+        text = "".join(reasoning_parts) + _gw_degraded_marker(
+            "reasoning_only_no_content", time.monotonic() - call_start, 0.0
+        )
+    else:
+        text = ""
     return (text if text.strip() else None, None, _state["served_model"])
 
 
