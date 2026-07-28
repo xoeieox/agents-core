@@ -936,7 +936,7 @@ def _resolve_int_env(env_name: str, default: int, log: Callable[[str], None] | N
 # ---------------------------------------------------------------------------
 
 
-def call_gw_agent(
+def _call_gw_agent_impl(
     prompt: str,
     system: str = "",
     cwd: str | None = None,
@@ -1720,6 +1720,114 @@ def call_gw_agent(
                 if log:
                     log(f"[gw_agent] failed to release lease: {e}")
         client.close()
+
+
+def _locality_record_call_gw_agent(*, model, on_wake_fail, served, start, ok):
+    """Derive and write one locality-ledger record for a call_gw_agent() run
+    (chokepoint C, agents-core-locality-ledger-v0).
+
+    call_gw_agent makes N POSTs per run, so served[-1] (the last echoed
+    "model" field) is the deciding served model. A run that fell back to
+    call_claude_cli (on_wake_fail="claude", doorman unreachable/not-serving)
+    never reaches a POST at all, so `served` stays empty — that emptiness,
+    combined with on_wake_fail=="claude", is the only signal available here
+    to flag fallback_fired without threading a new side-channel through the
+    wake-fail branches (which don't populate reason_out today). The actual
+    paid spend is recorded separately and precisely by call_claude_cli's own
+    chokepoint (_fallback_claude_cli calls it directly).
+    """
+    try:
+        from agents_core.locality import record as _locality_record
+
+        fallback_fired = (on_wake_fail == "claude") and not served
+        fallback_reason = "gw_agent_wake_fail" if fallback_fired else None
+        served_model = served[-1] if served else model
+        duration_ms = (time.time() - start) * 1000
+
+        _locality_record(
+            requested_operator="gravitywell",
+            served_model=served_model,
+            host=GW_URL,
+            cost_class="local-gw",
+            fallback_fired=fallback_fired,
+            fallback_reason=fallback_reason,
+            seam="call_gw_agent",
+            duration_ms=duration_ms,
+            ok=ok,
+        )
+    except Exception as e:
+        logger.warning("[locality] ledger write failed in call_gw_agent: %s", e)
+
+
+def call_gw_agent(
+    prompt: str,
+    system: str = "",
+    cwd: str | None = None,
+    tools: dict[str, dict[str, Any]] | None = None,
+    max_steps: int = 24,
+    timeout: int = 300,
+    json_mode: bool = False,
+    think: bool = False,
+    on_wake_fail: str = "skip",
+    work_id: str | None = None,
+    return_transcript: bool = False,
+    log: Callable[[str], None] | None = None,
+    backend_url: str | None = None,
+    acquire_lease: bool = True,
+    writeable: bool = False,
+    no_progress_steps: int | None = None,
+    principal: str | None = None,
+    lease_class: str = "deferrable",
+    verdict_schema: dict | None = None,
+    tool_executors: dict[str, ToolExecutor] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    before_tool: Callable[[str, dict], dict] | None = None,
+    reason_out: list[str] | None = None,
+    served_model_out: list | None = None,
+    model: str | None = None,
+    handler_hook: Callable[[dict], dict] | None = None,
+    handler_objective: str = "",
+    handler_max_interventions: int = 2,
+) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
+    """Locality-ledger side-write wrapper around _call_gw_agent_impl().
+
+    Pure side-write: same public signature, same return value, same raised
+    exceptions as the implementation below — the only addition is one
+    locality.record() call per run (chokepoint C, at run exit), which never
+    raises and never changes what's returned. See _call_gw_agent_impl for the
+    full docstring.
+
+    Uses time.time() (wall clock), not time.monotonic(), purely so this
+    side-write never consumes values from the tightly-calibrated
+    time.monotonic() side_effect sequences several existing tests patch onto
+    this module for the impl's own deadline arithmetic (test_gw_agent_budget_
+    conclusion.py) — an extra call here would exhaust their iterators.
+    """
+    _locality_start = time.time()
+    _locality_served = served_model_out if served_model_out is not None else []
+
+    ok = True
+    try:
+        return _call_gw_agent_impl(
+            prompt, system=system, cwd=cwd, tools=tools, max_steps=max_steps,
+            timeout=timeout, json_mode=json_mode, think=think, on_wake_fail=on_wake_fail,
+            work_id=work_id, return_transcript=return_transcript, log=log,
+            backend_url=backend_url, acquire_lease=acquire_lease, writeable=writeable,
+            no_progress_steps=no_progress_steps, principal=principal, lease_class=lease_class,
+            verdict_schema=verdict_schema, tool_executors=tool_executors,
+            cancel_check=cancel_check, before_tool=before_tool,
+            reason_out=reason_out, served_model_out=_locality_served,
+            model=model, handler_hook=handler_hook, handler_objective=handler_objective,
+            handler_max_interventions=handler_max_interventions,
+        )
+    except Exception:
+        ok = False
+        raise
+    finally:
+        _locality_record_call_gw_agent(
+            model=model, on_wake_fail=on_wake_fail,
+            served=_locality_served, start=_locality_start, ok=ok,
+        )
 
 
 # ---------------------------------------------------------------------------
