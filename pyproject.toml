@@ -15,7 +15,7 @@ dependencies = [
     "fastapi",
     "uvicorn[standard]",
     "psutil>=5.9",
-    "mcp>=1.0",
+    "mcp>=1.0,<2.0",
 ]
 
 [project.optional-dependencies]
