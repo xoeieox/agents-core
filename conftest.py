@@ -12,6 +12,12 @@ a real network call otherwise. Tests that specifically exercise the
 handshake or discovery probe (agents-core-gw-voicing-vllm-repoint-v0,
 agents-core-gw-backend-auto-detect-when-unset-v0) clear/repopulate the
 relevant cache themselves for the (url, model) tuple under test.
+
+Also isolates the locality ledger (agents-core-locality-ledger-v0): call_operator/
+call_claude_cli/call_gw_agent now side-write a ledger record on every call, so
+without this every test in the suite would append real records into the live
+/srv/lapis/locality on this host. Individual tests are still free to override
+LOCALITY_LEDGER_ROOT themselves (e.g. to assert on the written records).
 """
 import time
 
@@ -32,3 +38,8 @@ def _gw_handshake_precached():
     with llm_mod._gw_handshake_lock:
         llm_mod._gw_handshake_cache.clear()
         llm_mod._gw_discovery_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _locality_ledger_isolated(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALITY_LEDGER_ROOT", str(tmp_path / "locality-ledger"))

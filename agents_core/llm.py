@@ -105,6 +105,7 @@ def _persist_gw_cull_partial(
 #   admission_shadow:principal_group_collision_risk — shadow mode: unique work_id principal used.
 #   drain_count_unavailable          — doorman honored acquire but drain_cleared absent (pre-atomic doorman); proceeding on elevator gate alone.
 #   doorman_unreachable              — doorman acquire failed; routed to wake_fail.
+#   fallback                         — _apply_wake_fail re-dispatched to a paid operator (haiku/sonnet/opus) after wake_fail; the effective_operator is the fallback policy, not "gravitywell".
 #   gw_deferred_swarm                — doorman deferred to swarm; requeueing (precedence ladder).
 #   gw_member_deadline               — per-member watchdog fired (AC2); ticket failed, lease released.
 #   gw_member_error                  — unexpected exception from backend dispatch (AC1); ticket failed.
@@ -112,6 +113,7 @@ def _persist_gw_cull_partial(
 #   serving_http_error               — OperatorUnreachableError from backend HTTP layer.
 #   slot_pool_down                   — GW slot pool unavailable (precedence ladder).
 #   slot_queued_timeout              — wait deadline expired before admission (precedence ladder).
+#   stream_culled                    — backend result carries the GW_DEGRADED_MARKER (a culled/salvaged partial stream), not a clean completion.
 #   success                          — backend returned successfully; ticket ack'd.
 #
 # GW_PROVENANCE_PRECEDENCE orders the gating reasons for gw_highest_precedence_reason (AC11).
@@ -937,12 +939,12 @@ def _forward_supported_kwargs(func, kwargs: dict) -> dict:
     return {k: v for k, v in kwargs.items() if k in params}
 
 
-def call_operator(operator_class: str, prompt: str, model: str = None,
-                  _provenance_out: list | None = None,
-                  principal: str | None = None,
-                  lease_class: str = _LEASE_CLASS_UNSET,
-                  _admission_bypass: bool = False,
-                  **kwargs) -> str | None:
+def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
+                       _provenance_out: list | None = None,
+                       principal: str | None = None,
+                       lease_class: str = _LEASE_CLASS_UNSET,
+                       _admission_bypass: bool = False,
+                       **kwargs) -> str | None:
     """Route a completion request to the appropriate backend operator.
 
     operator_class ∈ {"qwen", "quest", "sonnet", "opus", "haiku", "gravitywell", "gravitywell-creative"}.
@@ -1077,7 +1079,8 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
             )
         gw_kwargs = {
             k: kwargs[k] for k in (
-                "system", "timeout", "json_mode", "temperature", "log", "max_tokens"
+                "system", "timeout", "json_mode", "temperature", "log", "max_tokens",
+                "_served_model_out",
             ) if k in kwargs
         }
         think = kwargs.get("think", False)
@@ -1489,6 +1492,126 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
     )
 
 
+# Locality ledger chokepoint B (cost_class derivation table, agents-core-locality-ledger-v0).
+_LOCALITY_COST_CLASS_BY_OPERATOR = {
+    "qwen": "local-sh",
+    "quest": "local-gw",
+    "gravitywell": "local-gw",
+    "gravitywell-creative": "local-gw",
+    "sonnet": "paid-anthropic",
+    "opus": "paid-anthropic",
+    "haiku": "paid-anthropic",
+}
+
+_LOCALITY_HOST_BY_OPERATOR = {
+    "qwen": LLAMACPP_URL,
+    "quest": QUEST_URL,
+    "gravitywell": GW_URL,
+    "gravitywell-creative": GW_CREATIVE_URL,
+    "sonnet": "claude-cli",
+    "opus": "claude-cli",
+    "haiku": "claude-cli",
+}
+
+
+def _locality_record_call_operator(*, operator_class, model, prov, served, start, ok):
+    """Derive and write one ledger record for a call_operator() invocation.
+
+    prov is the (reason, effective_operator) list _call_operator_impl populated
+    (whether or not the caller supplied their own — see call_operator() below).
+    fallback_fired/fallback_reason are read from it: _apply_wake_fail appends
+    ("fallback", policy) after its own recursive call_operator() returns, so the
+    reason immediately preceding that entry (skipping "success"/"fallback"
+    entries, which can belong to the nested fallback call sharing this same
+    list) is why the original operator failed.
+    """
+    try:
+        from agents_core.locality import record as _locality_record
+
+        fallback_fired = False
+        fallback_reason = None
+        for i, (reason, _effective_operator) in enumerate(prov):
+            if reason == "fallback":
+                fallback_fired = True
+                for prior_reason, _ in reversed(prov[:i]):
+                    if prior_reason not in ("success", "fallback"):
+                        fallback_reason = prior_reason
+                        break
+                break
+
+        served_model = served[-1] if served else (model or OPERATOR_DEFAULTS.get(operator_class))
+        cost_class = _LOCALITY_COST_CLASS_BY_OPERATOR.get(operator_class, "unknown")
+        host = _LOCALITY_HOST_BY_OPERATOR.get(operator_class)
+        duration_ms = (time.monotonic() - start) * 1000
+
+        _locality_record(
+            requested_operator=operator_class,
+            served_model=served_model,
+            host=host,
+            cost_class=cost_class,
+            fallback_fired=fallback_fired,
+            fallback_reason=fallback_reason,
+            seam="call_operator",
+            duration_ms=duration_ms,
+            ok=ok,
+        )
+    except Exception as e:
+        _log.warning("[locality] ledger write failed in call_operator: %s", e)
+
+
+def call_operator(operator_class: str, prompt: str, model: str = None,
+                  _provenance_out: list | None = None,
+                  principal: str | None = None,
+                  lease_class: str = _LEASE_CLASS_UNSET,
+                  _admission_bypass: bool = False,
+                  **kwargs) -> str | None:
+    """Locality-ledger side-write wrapper around _call_operator_impl().
+
+    Pure side-write: same public signature, same return value, same raised
+    exceptions as the implementation below — the only addition is one
+    locality.record() call per invocation (chokepoint B), which never raises
+    and never changes what's returned. See _call_operator_impl for the full
+    docstring (operator classes, defaults, kwargs, return contract).
+
+    A GW→paid fallback recurses through this same wrapper (via
+    _apply_wake_fail's own call_operator() call), so a fallback produces two
+    ledger records — the failed local attempt and the paid fallback — both
+    tagged seam="call_operator" and distinguishable via fallback_fired/
+    fallback_reason. This is the double-counting the seam field exists to
+    make attributable, not a bug.
+    """
+    _locality_start = time.monotonic()
+    _locality_prov = _provenance_out if _provenance_out is not None else []
+    _locality_served: list = []
+    _impl_kwargs = dict(kwargs)
+    if operator_class == "gravitywell":
+        # Only the gravitywell branch's gw_kwargs allowlist forwards this key
+        # (llm.py ~1078-1082); injecting it for other operator classes would
+        # leak an unused kwarg into backends that don't expect it (e.g. a
+        # non-autospec test mock of _call_qwen_backend accepts and records
+        # any kwarg, breaking assert_called_once_with(prompt=...) assertions).
+        _impl_kwargs.setdefault("_served_model_out", _locality_served)
+
+    ok = True
+    try:
+        return _call_operator_impl(
+            operator_class, prompt, model=model,
+            _provenance_out=_locality_prov,
+            principal=principal, lease_class=lease_class,
+            _admission_bypass=_admission_bypass,
+            **_impl_kwargs,
+        )
+    except Exception:
+        ok = False
+        raise
+    finally:
+        _locality_record_call_operator(
+            operator_class=operator_class, model=model,
+            prov=_locality_prov, served=_locality_served,
+            start=_locality_start, ok=ok,
+        )
+
+
 def call_llm(prompt: str, system: str = None, timeout: int = 600,
              json_mode: bool = False, temperature: float = 0.7,
              log=None, bundle_ids: list[str] = None) -> str | None:
@@ -1631,7 +1754,41 @@ def call_claude_cli(
     if json_mode:
         user_input = prompt + "\n\nRespond ONLY with valid JSON. No markdown fences."
 
+    _locality_call_start = time.monotonic()
+
     def _ret(text, envelope):
+        # Locality ledger chokepoint A — covers all paid Anthropic spend via
+        # `claude -p`, after the envelope is parsed so cost_usd is available
+        # when the CLI provided one. Never raises (locality.record() is
+        # itself exception-safe); this call must never affect the return
+        # value below.
+        try:
+            from agents_core.locality import record as _locality_record
+
+            cost_usd = None
+            duration_ms = None
+            if isinstance(envelope, dict):
+                raw_cost = envelope.get("total_cost_usd")
+                if isinstance(raw_cost, (int, float)):
+                    cost_usd = raw_cost
+                raw_duration = envelope.get("duration_ms")
+                if isinstance(raw_duration, (int, float)):
+                    duration_ms = raw_duration
+            if duration_ms is None:
+                duration_ms = (time.monotonic() - _locality_call_start) * 1000
+
+            _locality_record(
+                requested_operator=model,
+                served_model=model,
+                host="claude-cli",
+                cost_class="paid-anthropic",
+                seam="call_claude_cli",
+                cost_usd=cost_usd,
+                duration_ms=duration_ms,
+                ok=text is not None,
+            )
+        except Exception as e:
+            _log.warning("[locality] ledger write failed in call_claude_cli: %s", e)
         return (text, envelope) if return_envelope else text
 
     try:

@@ -367,6 +367,12 @@ class = "C"
 env_var = "AGENT_OBSERVATIONS_ROOT"
 access = "both"
 
+[keys.locality]
+subpath = "locality"
+class = "C"
+env_var = "LOCALITY_LEDGER_ROOT"
+access = "both"
+
 [keys.backcaster]
 subpath = "backcaster"
 class = "C"
