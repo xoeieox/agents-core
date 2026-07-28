@@ -221,7 +221,13 @@ def _read_entries(*, since=None, until=None) -> list[dict]:
 def summarize(*, since=None, until=None) -> dict:
     """Aggregate ledger entries in [since, until] into a locality/cost summary.
 
-    pct_local is on a 0-100 scale (42.5 means 42.5% of calls served locally).
+    pct_local is on a 0-100 scale (42.5 means 42.5% of calls served locally)
+    and is computed over *successful* calls only (local_ok / total_ok * 100)
+    — a refused call (ok=false) never reached a model and must not inflate
+    the locality number just because it was routed at a local cost class.
+    total and by_cost_class still count every record, successful or not, so
+    the raw census stays auditable; failed_count and by_cost_class_failed
+    make the denominator shift visible instead of silent.
     paid_cost_usd is None when no entry in the window carried a cost_usd value
     (the claude -p envelope's total_cost_usd is optional and unverified) —
     callers must not treat None as zero.
@@ -230,7 +236,10 @@ def summarize(*, since=None, until=None) -> dict:
 
     total = len(entries)
     by_cost_class: dict[str, int] = {}
-    local_count = 0
+    by_cost_class_failed: dict[str, int] = {}
+    local_ok = 0
+    total_ok = 0
+    failed_count = 0
     fallback_count = 0
     by_fallback_reason: dict[str, int] = {}
     paid_cost_usd = None
@@ -241,8 +250,15 @@ def summarize(*, since=None, until=None) -> dict:
         if cost_class not in COST_CLASSES:
             cost_class = "unknown"
         by_cost_class[cost_class] = by_cost_class.get(cost_class, 0) + 1
-        if cost_class in ("local-gw", "local-sh"):
-            local_count += 1
+
+        ok = entry.get("ok", True)
+        if ok:
+            total_ok += 1
+            if cost_class in ("local-gw", "local-sh"):
+                local_ok += 1
+        else:
+            failed_count += 1
+            by_cost_class_failed[cost_class] = by_cost_class_failed.get(cost_class, 0) + 1
 
         if entry.get("fallback_fired"):
             fallback_count += 1
@@ -258,7 +274,7 @@ def summarize(*, since=None, until=None) -> dict:
         op_bucket = by_requested_operator.setdefault(requested_operator, {"served": {}})
         op_bucket["served"][served_model] = op_bucket["served"].get(served_model, 0) + 1
 
-    pct_local = (local_count / total * 100.0) if total else 0.0
+    pct_local = (local_ok / total_ok * 100.0) if total_ok else 0.0
 
     since_aware = _to_aware_utc(since)
     until_aware = _to_aware_utc(until)
@@ -267,6 +283,8 @@ def summarize(*, since=None, until=None) -> dict:
         "total": total,
         "pct_local": pct_local,
         "by_cost_class": by_cost_class,
+        "failed_count": failed_count,
+        "by_cost_class_failed": by_cost_class_failed,
         "fallback_count": fallback_count,
         "by_fallback_reason": by_fallback_reason,
         "paid_cost_usd": paid_cost_usd,

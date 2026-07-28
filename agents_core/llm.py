@@ -1524,6 +1524,15 @@ def _locality_record_call_operator(*, operator_class, model, prov, served, start
     reason immediately preceding that entry (skipping "success"/"fallback"
     entries, which can belong to the nested fallback call sharing this same
     list) is why the original operator failed.
+
+    `ok` reflects both the exception path (set False by the caller when the
+    implementation raised) and a clean-return refusal (implementation
+    returned None, e.g. on_wake_fail="skip") — see call_operator() below. On
+    a failed call nothing answered, so served_model is recorded as None
+    rather than guessed; on success with no observed served model the
+    OPERATOR_DEFAULTS guess is kept (needed by by_requested_operator) but
+    tagged served_model_observed=False in extra so the guess is legible
+    rather than indistinguishable from a real observation.
     """
     try:
         from agents_core.locality import record as _locality_record
@@ -1539,7 +1548,12 @@ def _locality_record_call_operator(*, operator_class, model, prov, served, start
                         break
                 break
 
-        served_model = served[-1] if served else (model or OPERATOR_DEFAULTS.get(operator_class))
+        if ok:
+            served_model = served[-1] if served else (model or OPERATOR_DEFAULTS.get(operator_class))
+            extra = {"served_model_observed": bool(served)}
+        else:
+            served_model = None
+            extra = None
         cost_class = _LOCALITY_COST_CLASS_BY_OPERATOR.get(operator_class, "unknown")
         host = _LOCALITY_HOST_BY_OPERATOR.get(operator_class)
         duration_ms = (time.monotonic() - start) * 1000
@@ -1554,6 +1568,7 @@ def _locality_record_call_operator(*, operator_class, model, prov, served, start
             seam="call_operator",
             duration_ms=duration_ms,
             ok=ok,
+            extra=extra,
         )
     except Exception as e:
         _log.warning("[locality] ledger write failed in call_operator: %s", e)
@@ -1593,18 +1608,22 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         _impl_kwargs.setdefault("_served_model_out", _locality_served)
 
     ok = True
+    _locality_result = None
     try:
-        return _call_operator_impl(
+        _locality_result = _call_operator_impl(
             operator_class, prompt, model=model,
             _provenance_out=_locality_prov,
             principal=principal, lease_class=lease_class,
             _admission_bypass=_admission_bypass,
             **_impl_kwargs,
         )
+        return _locality_result
     except Exception:
         ok = False
         raise
     finally:
+        if ok:
+            ok = _locality_result is not None
         _locality_record_call_operator(
             operator_class=operator_class, model=model,
             prov=_locality_prov, served=_locality_served,
