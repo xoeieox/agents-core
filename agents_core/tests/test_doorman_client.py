@@ -552,6 +552,25 @@ def test_acquire_pending_defer_status():
     assert result["status"] == "pending_defer"
 
 
+def test_acquire_surfaces_protected_cleared_release_fields():
+    """acquire() surfaces waited_seconds and release_reason='protected-cleared' verbatim
+    when a deferrable acquire that had waited resolves after the protected lease clears
+    (doorman-lease-class-consumers-v0 C5: the router must be observed to actually
+    arbitrate, not just carry a class field)."""
+    resp_body = {
+        "status": "serving",
+        "work_id": "fixer-1",
+        "class": "deferrable",
+        "waited_seconds": 12.5,
+        "release_reason": "protected-cleared",
+    }
+    c = _client_with([(200, resp_body)])
+    result = c.acquire("gravitywell", "fixer-1", ttl_sec=120, reason="fixer work", lease_class="deferrable")
+    assert result["status"] == "serving"
+    assert result["waited_seconds"] == 12.5
+    assert result["release_reason"] == "protected-cleared"
+
+
 def test_is_pending_defer_true_for_pending_defer_response():
     resp = {"status": "pending_defer", "work_id": "fixer-1"}
     assert DoormanClient.is_pending_defer(resp) is True

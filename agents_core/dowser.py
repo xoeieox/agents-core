@@ -345,7 +345,8 @@ def _call_read_operator(operator: str, prompt: str, json_mode: bool = False) -> 
             return call_claude_cli(prompt + suffix, model=operator, timeout=120)
         else:
             # quest or other GW-side operators
-            return call_operator(operator, prompt, json_mode=json_mode, on_wake_fail="skip")
+            return call_operator(operator, prompt, json_mode=json_mode, on_wake_fail="skip",
+                                 lease_class="deferrable")
     except Exception as e:
         _log.warning("[dowser] read operator %r failed: %s", operator, e)
         return None
@@ -354,7 +355,8 @@ def _call_read_operator(operator: str, prompt: str, json_mode: bool = False) -> 
 def _call_critic_operator(operator: str, prompt: str, json_mode: bool = False) -> str | None:
     """Call only the critic operator. Never calls the reader."""
     try:
-        return call_operator(operator, prompt, json_mode=json_mode, on_wake_fail="skip")
+        return call_operator(operator, prompt, json_mode=json_mode, on_wake_fail="skip",
+                             lease_class="deferrable")
     except Exception as e:
         _log.warning("[dowser] critic operator %r failed: %s", operator, e)
         return None

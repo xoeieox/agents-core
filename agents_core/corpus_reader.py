@@ -277,7 +277,8 @@ def _call_read_operator(operator: str, prompt: str, json_mode: bool = False) -> 
             suffix = "\n\nRespond ONLY with valid JSON." if json_mode else ""
             return call_claude_cli(prompt + suffix, model=operator, timeout=120)
         else:
-            return call_operator(operator, prompt, json_mode=json_mode, on_wake_fail="skip")
+            return call_operator(operator, prompt, json_mode=json_mode, on_wake_fail="skip",
+                                 lease_class="deferrable")
     except Exception as e:
         _log.warning("[corpus_reader] read operator %r failed: %s", operator, e)
         return None

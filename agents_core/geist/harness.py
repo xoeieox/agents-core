@@ -142,6 +142,7 @@ def answer_item(item: dict, model: str) -> dict:
         timeout=MODEL_TIMEOUT_SEC,
         on_wake_fail="error",
         _provenance_out=provenance,
+        lease_class="deferrable",
     )
     latency_sec = time.monotonic() - t0
 

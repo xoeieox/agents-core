@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -122,6 +123,38 @@ GW_PROVENANCE_PRECEDENCE = (
 )
 
 _log = logging.getLogger(__name__)
+
+# doorman-lease-class-consumers-v0: sentinel distinguishing "caller omitted
+# lease_class" from "caller explicitly passed 'deferrable'" - both resolve to
+# the same effective class, but only the former should trip the once-per-
+# process silence warning below. A plain str default can't make this
+# distinction (Python binds the default before the function body runs).
+_LEASE_CLASS_UNSET = object()
+_LEASE_CLASS_DEFAULT = "deferrable"
+_lease_class_default_warned: set[str] = set()
+
+
+def _warn_lease_class_defaulted() -> None:
+    """WARN once per calling module when call_operator's gravitywell path
+    takes the default lease_class because the caller passed none.
+
+    Once-per-process (not per-call): a busy night DAG calling an unclassed
+    path repeatedly should not drown the log in an identical warning.
+    """
+    try:
+        caller_frame = sys._getframe(2)
+        calling_module = caller_frame.f_globals.get("__name__", "<unknown>")
+    except ValueError:
+        calling_module = "<unknown>"
+    if calling_module in _lease_class_default_warned:
+        return
+    _lease_class_default_warned.add(calling_module)
+    _log.warning(
+        "[lease-class] call_operator invoked without lease_class from module=%s "
+        "- defaulting to %r. Pass lease_class explicitly (protected for measured "
+        "gates/interactive sessions, deferrable for background work).",
+        calling_module, _LEASE_CLASS_DEFAULT,
+    )
 
 
 def gw_highest_precedence_reason(provenance: list) -> str | None:
@@ -907,6 +940,7 @@ def _forward_supported_kwargs(func, kwargs: dict) -> dict:
 def call_operator(operator_class: str, prompt: str, model: str = None,
                   _provenance_out: list | None = None,
                   principal: str | None = None,
+                  lease_class: str = _LEASE_CLASS_UNSET,
                   _admission_bypass: bool = False,
                   **kwargs) -> str | None:
     """Route a completion request to the appropriate backend operator.
@@ -934,6 +968,17 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
 
     gravitywell routes via the doorman to the GravityWell llama.cpp endpoint (:8081).
     On unreachable, falls back per on_wake_fail policy.
+
+    lease_class: foreground-priority gate class for the doorman lease this call
+    acquires (gw-router-phase1-foreground-gate / doorman-lease-class-consumers-v0).
+    "protected" for measured gates and interactive sessions (never deferred);
+    "deferrable" (the default) for background/worker callers. Only meaningful
+    for operator_class="gravitywell" - ignored by every other operator, since
+    only the gravitywell path takes a doorman lease. Do NOT infer this from
+    principal/operator_class/reason; pass it explicitly. Omitting it emits a
+    WARN once per calling module (not per call) naming the module, so an
+    unclassed caller is discoverable without trawling the doorman log - the
+    default is a safety net, not a declaration.
 
     gravitywell also accepts acquire_lease: bool = True (via kwargs). If False,
     skip doorman lease acquisition entirely - no acquire, no enforce/shadow
@@ -1039,6 +1084,15 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         on_wake_fail = kwargs.get("on_wake_fail", "skip")
         timeout = int(kwargs.get("timeout", 300))
         acquire_lease = kwargs.get("acquire_lease", True)
+        if acquire_lease:
+            if lease_class is _LEASE_CLASS_UNSET:
+                _warn_lease_class_defaulted()
+                effective_lease_class = _LEASE_CLASS_DEFAULT
+            else:
+                effective_lease_class = lease_class
+        else:
+            # acquire_lease=False takes no lease at all - nothing to classify (C2b).
+            effective_lease_class = None
         work_id = f"op-gravitywell-{uuid.uuid4().hex}"
         wake_fail_kwargs = {
             k: v for k, v in kwargs.items()
@@ -1182,6 +1236,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
                                 reason="call_operator", timeout=_gw_acquire_timeout(),
                                 principal=effective_principal,
                                 require_drain_clear=(not is_ride_along),
+                                lease_class=effective_lease_class,
                             )
                         except DoormanUnreachable:
                             # AC5b: transport failure — fail-ticket, not loud-proceed (would reopen race).
@@ -1339,7 +1394,8 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         try:
             res = client.acquire(
                 "gravitywell", work_id, ttl_sec=timeout + 60, reason="call_operator",
-                timeout=_gw_acquire_timeout(), principal=effective_principal
+                timeout=_gw_acquire_timeout(), principal=effective_principal,
+                lease_class=effective_lease_class,
             )
             if DoormanClient.is_deferred(res):
                 if _provenance_out is not None:

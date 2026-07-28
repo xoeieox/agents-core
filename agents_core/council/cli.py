@@ -562,6 +562,7 @@ Respond with ONLY a JSON object:
         on_wake_fail="sonnet",
         log=log,
         _provenance_out=_sel_prov,
+        lease_class="protected",
     )
     if not raw:
         raise RuntimeError("Entity selection failed — Claude CLI returned nothing")
@@ -623,6 +624,7 @@ Respond with ONLY a JSON object:
             on_wake_fail="sonnet",
             log=log,
             _provenance_out=_sel_prov,
+            lease_class="protected",
         )
         if raw2 and _is_gw_result_degraded(raw2):
             raise RuntimeError(
@@ -995,6 +997,7 @@ def run_deliberation(run_id: str) -> None:
                 reason="council-deliberation-hold",
                 timeout=_gw_acquire_timeout(),
                 principal=_hold_principal,
+                lease_class="protected",
             )
             _hold_active = _hold_res.get("status") == "serving"
             print(
@@ -1110,6 +1113,7 @@ def run_deliberation(run_id: str) -> None:
                                 reason="council-deliberation-heartbeat",
                                 timeout=5.0,
                                 principal=_hold_principal,
+                                lease_class="protected",
                             )
                         except Exception as _ref_err:
                             print(

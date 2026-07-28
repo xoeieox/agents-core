@@ -345,6 +345,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             max_steps=_max_steps,
             backend_url=spec.get("backend_url"),
             acquire_lease=spec.get("acquire_lease", True),
+            lease_class="deferrable",
             model=spec.get("model"),
             handler_hook=_handler_hook,
             handler_objective=_handler_objective,
@@ -536,6 +537,7 @@ def _run_local_reviewer(spec: dict, base_cwd: str | None) -> str:
         model=model,
         backend_url=spec.get("backend_url"),
         acquire_lease=spec.get("acquire_lease", True),
+        lease_class="deferrable",
     )
     return result or ""
 
