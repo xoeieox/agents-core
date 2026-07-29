@@ -84,7 +84,7 @@ def run_ensemble(
     cards = load_deck_cards(DECKS_ROOT / deck)
 
     shared_principal = principal or run_id
-    adapter = GravityWellAdapter(principal=shared_principal, on_wake_fail="sonnet")
+    adapter = GravityWellAdapter(principal=shared_principal, on_wake_fail="park")
 
     roster: list[VoiceEntry] = []
     for card in cards:
