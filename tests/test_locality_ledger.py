@@ -181,6 +181,37 @@ def test_summarize_seeded_fixture_pct_local_and_fallback_breakdown(tmp_path, mon
     assert result["paid_cost_usd"] == pytest.approx(0.021)
 
 
+def test_summarize_pct_local_over_successful_calls_only(tmp_path, monkeypatch):
+    """agents-core-locality-phantom-call-fidelity-v0 DoD 7/8: a refused local
+    call (ok=False) must not inflate pct_local, and failed_count /
+    by_cost_class_failed must attribute it."""
+    monkeypatch.setenv("LOCALITY_LEDGER_ROOT", str(tmp_path))
+
+    locality.record(requested_operator="gravitywell", served_model="gravitywell-122b",
+                     host="h", cost_class="local-gw", seam="call_operator", ok=True)
+    locality.record(requested_operator="gravitywell", served_model=None,
+                     host="h", cost_class="local-gw", seam="call_operator", ok=False)
+
+    result = locality.summarize()
+
+    assert result["total"] == 2
+    assert result["pct_local"] == pytest.approx(100.0)
+    assert result["failed_count"] == 1
+    assert result["by_cost_class_failed"] == {"local-gw": 1}
+    assert result["by_cost_class"]["local-gw"] == 2
+
+
+def test_summarize_pct_local_zero_when_all_calls_failed(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALITY_LEDGER_ROOT", str(tmp_path))
+    locality.record(requested_operator="gravitywell", served_model=None,
+                     host="h", cost_class="local-gw", seam="call_operator", ok=False)
+
+    result = locality.summarize()
+    assert result["pct_local"] == 0.0
+    assert result["total"] == 1
+    assert result["failed_count"] == 1
+
+
 def test_summarize_since_until_window_filters_entries(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALITY_LEDGER_ROOT", str(tmp_path))
     locality.record(requested_operator="qwen", served_model="qwen3.6-35b-a3b",
@@ -305,6 +336,36 @@ def test_call_operator_anthropic_path_writes_paid_anthropic_record(tmp_path, mon
     assert entries[0]["seam"] == "call_operator"
     assert entries[0]["requested_operator"] == "haiku"
     assert entries[0]["cost_class"] == "paid-anthropic"
+
+
+def test_call_operator_none_return_writes_ok_false_and_null_served_model(tmp_path, monkeypatch):
+    """agents-core-locality-phantom-call-fidelity-v0 DoD 1/3: an implementation
+    that returns None on a clean refusal (e.g. on_wake_fail="skip") must not
+    write ok=True, and must not guess a served_model."""
+    monkeypatch.setenv("LOCALITY_LEDGER_ROOT", str(tmp_path))
+    from agents_core.llm import call_operator
+
+    with patch("agents_core.llm._call_qwen_backend", return_value=None):
+        result = call_operator("qwen", prompt="hi")
+    assert result is None
+
+    entries = _read_all_entries(tmp_path)
+    assert len(entries) == 1
+    assert entries[0]["ok"] is False
+    assert entries[0]["served_model"] is None
+
+
+def test_call_operator_success_tags_served_model_observed_extra(tmp_path, monkeypatch):
+    """DoD 4: a successful call carries extra.served_model_observed reflecting
+    whether the served model came from an observation vs. the static guess."""
+    monkeypatch.setenv("LOCALITY_LEDGER_ROOT", str(tmp_path))
+    from agents_core.llm import call_operator
+
+    with patch("agents_core.llm._call_qwen_backend", return_value="ok"):
+        call_operator("qwen", prompt="hi")
+
+    entries = _read_all_entries(tmp_path)
+    assert entries[0]["extra"]["served_model_observed"] is False
 
 
 def test_call_operator_gravitywell_ledger_uses_observed_served_model_not_static_default(
@@ -461,6 +522,54 @@ def test_call_gw_agent_exception_still_writes_record_then_reraises(tmp_path, mon
     entries = _read_all_entries(tmp_path)
     assert len(entries) == 1
     assert entries[0]["ok"] is False
+
+
+def test_call_gw_agent_none_return_writes_ok_false_and_null_served_model(tmp_path, monkeypatch):
+    """agents-core-locality-phantom-call-fidelity-v0 DoD 2/3: on_wake_fail="skip"
+    returns None rather than raising — the ledger must not record that as a
+    successful local call."""
+    monkeypatch.setenv("LOCALITY_LEDGER_ROOT", str(tmp_path))
+    from agents_core import gw_agent as gw_agent_mod
+
+    with patch.object(gw_agent_mod, "_call_gw_agent_impl", return_value=None):
+        result = gw_agent_mod.call_gw_agent(prompt="hi", on_wake_fail="skip")
+
+    assert result is None
+    entries = _read_all_entries(tmp_path)
+    assert len(entries) == 1
+    assert entries[0]["ok"] is False
+    assert entries[0]["served_model"] is None
+
+
+def test_call_gw_agent_tuple_none_payload_writes_ok_false(tmp_path, monkeypatch):
+    """DoD 2: return_transcript=True wraps the payload in a tuple — the None
+    check must be on the payload (index 0), not the tuple wrapper, so
+    (None, transcript) is still recorded as a failure."""
+    monkeypatch.setenv("LOCALITY_LEDGER_ROOT", str(tmp_path))
+    from agents_core import gw_agent as gw_agent_mod
+
+    with patch.object(
+        gw_agent_mod, "_call_gw_agent_impl",
+        return_value=(None, [{"role": "assistant", "content": "partial"}]),
+    ):
+        result = gw_agent_mod.call_gw_agent(prompt="hi", return_transcript=True)
+
+    assert result == (None, [{"role": "assistant", "content": "partial"}])
+    entries = _read_all_entries(tmp_path)
+    assert len(entries) == 1
+    assert entries[0]["ok"] is False
+    assert entries[0]["served_model"] is None
+
+
+def test_call_gw_agent_success_tags_served_model_observed_extra(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALITY_LEDGER_ROOT", str(tmp_path))
+    from agents_core import gw_agent as gw_agent_mod
+
+    with patch.object(gw_agent_mod, "_call_gw_agent_impl", return_value="answer"):
+        gw_agent_mod.call_gw_agent(prompt="hi")
+
+    entries = _read_all_entries(tmp_path)
+    assert entries[0]["extra"]["served_model_observed"] is False
 
 
 def test_call_gw_agent_served_model_out_prefers_last_echoed_model(tmp_path, monkeypatch):

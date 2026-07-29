@@ -1735,13 +1735,26 @@ def _locality_record_call_gw_agent(*, model, on_wake_fail, served, start, ok):
     wake-fail branches (which don't populate reason_out today). The actual
     paid spend is recorded separately and precisely by call_claude_cli's own
     chokepoint (_fallback_claude_cli calls it directly).
+
+    `ok` is False both when an exception escaped and when the run returned
+    cleanly with no result payload (e.g. on_wake_fail="skip" refusing rather
+    than raising — see call_gw_agent() below). On a failed run nothing
+    answered, so served_model is recorded as None rather than guessed; on a
+    successful run with no observed served model the `model` guess is kept
+    (needed by by_requested_operator) but tagged
+    served_model_observed=False in extra.
     """
     try:
         from agents_core.locality import record as _locality_record
 
         fallback_fired = (on_wake_fail == "claude") and not served
         fallback_reason = "gw_agent_wake_fail" if fallback_fired else None
-        served_model = served[-1] if served else model
+        if ok:
+            served_model = served[-1] if served else model
+            extra = {"served_model_observed": bool(served)}
+        else:
+            served_model = None
+            extra = None
         duration_ms = (time.time() - start) * 1000
 
         _locality_record(
@@ -1754,6 +1767,7 @@ def _locality_record_call_gw_agent(*, model, on_wake_fail, served, start, ok):
             seam="call_gw_agent",
             duration_ms=duration_ms,
             ok=ok,
+            extra=extra,
         )
     except Exception as e:
         logger.warning("[locality] ledger write failed in call_gw_agent: %s", e)
@@ -1807,8 +1821,9 @@ def call_gw_agent(
     _locality_served = served_model_out if served_model_out is not None else []
 
     ok = True
+    _locality_result = None
     try:
-        return _call_gw_agent_impl(
+        _locality_result = _call_gw_agent_impl(
             prompt, system=system, cwd=cwd, tools=tools, max_steps=max_steps,
             timeout=timeout, json_mode=json_mode, think=think, on_wake_fail=on_wake_fail,
             work_id=work_id, return_transcript=return_transcript, log=log,
@@ -1820,10 +1835,21 @@ def call_gw_agent(
             model=model, handler_hook=handler_hook, handler_objective=handler_objective,
             handler_max_interventions=handler_max_interventions,
         )
+        return _locality_result
     except Exception:
         ok = False
         raise
     finally:
+        if ok:
+            # return_transcript=True yields a (payload, transcript) tuple —
+            # the None-check belongs on the payload, not the tuple wrapper,
+            # so a (None, transcript) refusal is still recorded as failed.
+            _locality_payload = (
+                _locality_result[0]
+                if isinstance(_locality_result, tuple)
+                else _locality_result
+            )
+            ok = _locality_payload is not None
         _locality_record_call_gw_agent(
             model=model, on_wake_fail=on_wake_fail,
             served=_locality_served, start=_locality_start, ok=ok,
