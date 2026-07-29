@@ -5,9 +5,11 @@ under the doorman. Implements the LanguageModel protocol (duck-typed; does not
 import from lapis_engine).
 
 Per-call doorman lease is safe: the doorman's 600s idle-grace keeps GW warm
-across a deliberation's voices. on_wake_fail='sonnet' means council voicing
-falls back to paid Sonnet on any GW unreachable shape (wake-fail, doorman-down,
-or serving-then-HTTP-exhausted), returning str always, never raising.
+across a deliberation's voices. on_wake_fail='park' means council voicing is
+parked (GWParkedError raised, no paid fallback attempted) on any GW
+unreachable shape (wake-fail, doorman-down, or serving-then-HTTP-exhausted)
+per decision/independence-blueprint-ratified-2026-07-28 — fail-closed, not a
+silent degrade.
 """
 
 from __future__ import annotations
@@ -43,7 +45,8 @@ class GravityWellAdapter:
     """LanguageModel adapter routing council voicing to the GravityWell 122B
     via call_operator() under the doorman.
 
-    Quality surface → on_wake_fail='sonnet' (paid fallback, logged loudly).
+    Quality surface → on_wake_fail='park' (fail-closed by default; parked, not
+    degraded — no paid fallback is attempted when GW is unreachable).
     Per-call doorman lease keeps GW warm across a deliberation's voices.
 
     Tracks effective operator per turn in voicing_events for observability.
@@ -54,7 +57,7 @@ class GravityWellAdapter:
     """
     temperature: float = 0.8
     timeout: int = 300
-    on_wake_fail: str = "sonnet"
+    on_wake_fail: str = "park"
     voicing_events: list = None
     principal: str | None = None
 
@@ -71,8 +74,10 @@ class GravityWellAdapter:
 
         Returns:
             str: The voiced response (empty string if GW returns None).
-            Never raises OperatorUnreachableError (on_wake_fail handles all
-            GW-unreachable shapes and returns str or falls back to Sonnet).
+            With the default on_wake_fail='park', raises GWParkedError
+            (a subclass of OperatorUnreachableError) when GW is unreachable —
+            no paid fallback is attempted. Callers passing a paid-fallback
+            on_wake_fail (e.g. 'sonnet') get str always, never raising.
 
         Side effect: appends to voicing_events list with per-call provenance.
         """

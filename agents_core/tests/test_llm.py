@@ -487,6 +487,57 @@ def test_non_gravitywell_operator_records_success_provenance():
 
 
 # ---------------------------------------------------------------------------
+# on_wake_fail="park" tests (agents-core-council-park-not-degrade-v0)
+# ---------------------------------------------------------------------------
+
+def test_apply_wake_fail_park_raises_and_makes_no_fallback_call():
+    """_apply_wake_fail(policy='park') raises GWParkedError and never calls call_operator
+    (i.e. no paid fallback is dispatched — this is the one behavior a naive test could
+    pass without actually proving no spend occurred)."""
+    from agents_core import llm as llm_mod
+
+    with patch.object(llm_mod, "call_operator") as mock_call_operator:
+        with pytest.raises(llm_mod.GWParkedError) as exc_info:
+            llm_mod._apply_wake_fail("park", "gravitywell", "test prompt")
+
+    mock_call_operator.assert_not_called()
+    assert "gravitywell" in str(exc_info.value)
+    assert "no paid fallback" in str(exc_info.value).lower()
+
+
+def test_gwparked_error_is_operator_unreachable_subclass():
+    """GWParkedError is a distinguishable OperatorUnreachableError subclass (callers that
+    catch OperatorUnreachableError generically still catch it; callers that need the
+    parked-vs-generic-fault distinction can catch GWParkedError specifically)."""
+    from agents_core.llm import GWParkedError, OperatorUnreachableError
+
+    assert issubclass(GWParkedError, OperatorUnreachableError)
+
+
+def test_gravitywell_park_raises_gwparked_error_makes_no_paid_call():
+    """call_operator('gravitywell', on_wake_fail='park') raises GWParkedError when GW is
+    unreachable and never invokes the paid-operator (Claude CLI / submit_and_wait) path."""
+    from agents_core import llm as llm_mod
+    from agents_core.doorman_client import DoormanClient, DoormanUnreachable
+
+    provenance = []
+    with patch.object(DoormanClient, "acquire", side_effect=DoormanUnreachable("doorman down")), \
+         patch.object(DoormanClient, "release"), \
+         patch("agents_core.claude_queue_sync.submit_and_wait") as mock_submit:
+
+        with pytest.raises(llm_mod.GWParkedError):
+            llm_mod.call_operator(
+                "gravitywell", prompt="test",
+                on_wake_fail="park",
+                _provenance_out=provenance,
+            )
+
+    mock_submit.assert_not_called()
+    assert ("doorman_unreachable", "gravitywell") in provenance
+    assert not any(reason == "fallback" for reason, _ in provenance)
+
+
+# ---------------------------------------------------------------------------
 # GravityWell Retry Hardening Tests (gw-backend-retry-hardening-v0)
 # ---------------------------------------------------------------------------
 

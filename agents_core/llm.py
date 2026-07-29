@@ -196,6 +196,27 @@ class CreativeOperatorUnavailable(Exception):
         super().__init__(f"Creative operator (Llama-70B) unreachable at {url}: {last_error}")
 
 
+class GWParkedError(OperatorUnreachableError):
+    """Raised when GW cannot be woken and on_wake_fail='park' (fail-closed default).
+
+    Per decision/independence-blueprint-ratified-2026-07-28 and Machine Rhythm ruling 6:
+    "before any unattended loop runs, GW-unavailable must PARK, not degrade... a silent
+    degrade is a 76x cost event." No paid fallback is attempted and no result is returned
+    silently — the caller must retry once GravityWell is serving again.
+    """
+
+    def __init__(self, operator_class: str, url: str, last_error: Exception):
+        self.operator_class = operator_class
+        Exception.__init__(
+            self,
+            f"[gravitywell] parked: GW unavailable for operator_class={operator_class!r} "
+            f"at {url} — no paid fallback was attempted (on_wake_fail='park'). "
+            f"Retry once GravityWell is serving again. last_error={last_error}",
+        )
+        self.url = url
+        self.last_error = last_error
+
+
 class GWServingModeMismatchError(Exception):
     """Raised when the GravityWell endpoint serves a different model than GW_BACKEND/GW_MODEL
     claim (config/serving-mode drift) — e.g. GW_BACKEND=vllm resolves to gravitywell-27b but
@@ -885,6 +906,10 @@ def _apply_wake_fail(
           logs loudly before spending tokens per claude-p-api-pricing-june11).
       "skip" / None — return None (batch/optional surfaces; no paid spend).
       "error" — raise OperatorUnreachableError so the caller decides.
+      "park" — raise GWParkedError; no paid fallback is attempted and nothing is
+          returned silently (fail-closed default per
+          decision/independence-blueprint-ratified-2026-07-28, Machine Rhythm ruling 6:
+          "GW-unavailable must PARK, not degrade").
 
     If the fallback call_operator() itself raises, the exception propagates unchanged.
 
@@ -892,6 +917,13 @@ def _apply_wake_fail(
                      which operator actually answered (used by adapters for observability).
     """
     policy = on_wake_fail or "skip"
+
+    if policy == "park":
+        raise GWParkedError(
+            operator_class,
+            GW_URL,
+            Exception(f"GW wake_failed and on_wake_fail='park' for {operator_class!r}"),
+        )
 
     if policy in ("haiku", "sonnet", "opus"):
         warnings.warn(

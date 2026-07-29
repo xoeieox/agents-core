@@ -8,6 +8,8 @@ Covers:
   - Distinct failure reasons are recorded (doorman_unreachable, serving_http_error, gw_not_serving)
 """
 
+import json
+
 import pytest
 from unittest.mock import MagicMock, patch
 from dataclasses import dataclass
@@ -132,6 +134,117 @@ def test_gravitywell_adapter_mixed_events():
     assert len(adapter.voicing_events) == 2
     assert adapter.voicing_events[0]["effective_operator"] == "gravitywell"
     assert adapter.voicing_events[1]["effective_operator"] == "sonnet"
+
+
+# ---------------------------------------------------------------------------
+# park-not-degrade tests (agents-core-council-park-not-degrade-v0)
+# ---------------------------------------------------------------------------
+
+def test_gravitywell_adapter_default_on_wake_fail_is_park():
+    """GravityWellAdapter's default on_wake_fail is 'park' (fail-closed by default per
+    decision/independence-blueprint-ratified-2026-07-28), not 'sonnet'. On GW unreachable,
+    chat() raises GWParkedError uncaught rather than silently spending on Sonnet."""
+    from agents_core.council.gravitywell_adapter import GravityWellAdapter
+    from agents_core.doorman_client import DoormanClient, DoormanUnreachable
+    from agents_core.llm import GWParkedError
+
+    adapter = GravityWellAdapter(temperature=0.8, timeout=300)
+    assert adapter.on_wake_fail == "park"
+
+    @dataclass
+    class Message:
+        role: str
+        content: str
+
+    with patch.object(DoormanClient, "acquire", side_effect=DoormanUnreachable("down")), \
+         patch.object(DoormanClient, "release"), \
+         patch("agents_core.claude_queue_sync.submit_and_wait") as mock_submit:
+
+        with pytest.raises(GWParkedError):
+            adapter.chat(system="sys", messages=[Message(role="user", content="test")])
+
+    mock_submit.assert_not_called()
+    assert adapter.voicing_events == []
+
+
+def _sample_roster():
+    return [
+        {
+            "character_id": "alpha", "character_name": "Alpha", "pool": "reviewer",
+            "cultural_context": "test context alpha.",
+        },
+        {
+            "character_id": "beta", "character_name": "Beta", "pool": "reviewer",
+            "cultural_context": "test context beta.",
+        },
+    ]
+
+
+def test_select_entities_gw_unreachable_raises_gwparked_error(monkeypatch):
+    """select_entities() propagates GWParkedError (not a RuntimeWarning-and-continue)
+    when GravityWell is unreachable, per the park-not-degrade default."""
+    from agents_core.council import cli
+    from agents_core.doorman_client import DoormanClient, DoormanUnreachable
+    from agents_core.llm import GWParkedError
+
+    monkeypatch.delenv("COUNCIL_ENGINE_STUB", raising=False)
+
+    with patch.object(cli, "find_card_path", return_value=object()), \
+         patch.object(DoormanClient, "acquire", side_effect=DoormanUnreachable("down")), \
+         patch.object(DoormanClient, "release"), \
+         patch("agents_core.claude_queue_sync.submit_and_wait") as mock_submit:
+
+        with pytest.raises(GWParkedError):
+            cli.select_entities(
+                decision="test decision",
+                roster=_sample_roster(),
+                context={"hits": [], "cohesion_findings": []},
+                n=2,
+                mode="deliberation",
+            )
+
+    mock_submit.assert_not_called()
+
+
+def test_select_entities_poison_pill_sonnet_regression_is_detected(monkeypatch):
+    """Poison-pill test (spec-review Facets synthesis, 2026-07-29): if a future edit
+    reintroduces on_wake_fail='sonnet' at the select_entities() call site, this test
+    harness must be able to catch it — proving the AC2 grep-is-clean check is backed by
+    a runtime invariant, not just a static snapshot.
+
+    Simulates the regression by forcing call_operator's on_wake_fail kwarg to 'sonnet'
+    at the exact seam cli.select_entities() calls through (agents_core.council.cli.call_operator),
+    then asserts the paid-Sonnet fallback actually fires when GW is unreachable.
+    """
+    from agents_core.council import cli
+    from agents_core.llm import call_operator as real_call_operator
+    from agents_core.doorman_client import DoormanClient, DoormanUnreachable
+
+    monkeypatch.delenv("COUNCIL_ENGINE_STUB", raising=False)
+
+    def _regressed_call_operator(*args, **kwargs):
+        kwargs["on_wake_fail"] = "sonnet"
+        return real_call_operator(*args, **kwargs)
+
+    sonnet_json = json.dumps({"selected": ["alpha", "beta"], "reasoning": "poison-pill probe"})
+
+    with patch.object(cli, "find_card_path", return_value=object()), \
+         patch.object(cli, "call_operator", side_effect=_regressed_call_operator), \
+         patch.object(DoormanClient, "acquire", side_effect=DoormanUnreachable("down")), \
+         patch.object(DoormanClient, "release"), \
+         patch("agents_core.claude_queue_sync.submit_and_wait", return_value=sonnet_json) as mock_submit:
+
+        result = cli.select_entities(
+            decision="test decision",
+            roster=_sample_roster(),
+            context={"hits": [], "cohesion_findings": []},
+            n=2,
+            mode="deliberation",
+        )
+
+    mock_submit.assert_called()
+    assert result["selection_operator"] == "sonnet"
+    assert sorted(result["selected"]) == ["alpha", "beta"]
 
 
 # ---------------------------------------------------------------------------

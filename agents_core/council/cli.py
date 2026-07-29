@@ -559,7 +559,7 @@ Respond with ONLY a JSON object:
         temperature=0.4,
         timeout=300,
         json_mode=True,
-        on_wake_fail="sonnet",
+        on_wake_fail="park",
         log=log,
         _provenance_out=_sel_prov,
         lease_class="protected",
@@ -621,7 +621,7 @@ Respond with ONLY a JSON object:
             temperature=0.4,
             timeout=300,
             json_mode=True,
-            on_wake_fail="sonnet",
+            on_wake_fail="park",
             log=log,
             _provenance_out=_sel_prov,
             lease_class="protected",
@@ -659,7 +659,9 @@ Respond with ONLY a JSON object:
         )
 
     # Derive selection_operator from provenance (last success entry).
-    # call_operator with on_wake_fail="sonnet" always appends a success entry or raises,
+    # call_operator with on_wake_fail="park" always appends a success entry or raises
+    # (a GW-unreachable window raises GWParkedError uncaught here, matching the
+    # existing on_wake_fail="error" convention — no top-level catch in main()),
     # so selection_operator is guaranteed to be set (never "unknown").
     selection_operator = "unknown"
     if _sel_prov:
@@ -1553,7 +1555,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             flush=True,
         )
 
-    print("[council] selecting entities (via gravitywell, fallback=sonnet)...", flush=True)
+    print("[council] selecting entities (via gravitywell, fallback=park)...", flush=True)
     selection = select_entities(
         decision=args.decision,
         roster=roster,
