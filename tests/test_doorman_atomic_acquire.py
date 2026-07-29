@@ -42,9 +42,21 @@ def node():
 class TestAtomicAcquireConcurrency:
     """AC1 / AC3 / AC4: concurrent distinct-principal acquire under require_drain_clear."""
 
-    @pytest.mark.parametrize("n_threads", [2, 5, 8])
+    @pytest.mark.parametrize("n_threads", [2, 5, 8, 20])
     def test_exactly_one_true_rest_contended(self, node, n_threads):
         """N threads with distinct principals → exactly 1 True, rest CONTENDED.
+
+        Threads line up on a Barrier and rush acquire_lease() simultaneously (an
+        "uncoordinated rush") — this is the real concurrency exercise for the
+        drain-gate TOCTOU that gw-admission-drain-gate-atomic-acquire-v0 closed:
+        it must be possible for one distinct-principal worker to observe drain=0
+        while another concurrently registers, and exactly one may win. The n=20
+        case is the Barrier-guaranteed maximum-collision cohort (AC5); the smaller
+        sizes are cheap sanity checks of the same property.
+
+        No thread holds node.lock externally — acquire_lease() takes it internally
+        exactly once per call (agents-core-doorman-acquire-lease-nonreentrant-deadlock-v0);
+        holding it here would self-deadlock against that internal acquisition.
 
         All leases are held until every thread has reported its result so that
         the test is not sensitive to release-before-acquire races in the teardown.
@@ -56,11 +68,10 @@ class TestAtomicAcquireConcurrency:
         def _worker(idx):
             principal = f"group-{idx}-{uuid.uuid4().hex[:4]}"
             barrier.wait()  # all threads start simultaneously
-            with node.lock:
-                ok = node.acquire_lease(
-                    work_ids[idx], 60, "test", role="worker",
-                    principal=principal, require_drain_clear=True,
-                )
+            ok = node.acquire_lease(
+                work_ids[idx], 60, "test", role="worker",
+                principal=principal, require_drain_clear=True,
+            )
             results[idx] = ok
             # Do NOT release here — hold the lease until all threads finish
             # so later threads still see the active lease.
@@ -96,16 +107,14 @@ class TestAtomicAcquireConcurrency:
         principal_b = "group-beta"
 
         # Group A acquires first (no drain constraint needed — it's the first)
-        with node.lock:
-            ok_a = node.acquire_lease(wid_a, 60, "test", role="worker", principal=principal_a)
+        ok_a = node.acquire_lease(wid_a, 60, "test", role="worker", principal=principal_a)
         assert ok_a is True
 
         # Group B tries atomic acquire → should see group A's lease → CONTENDED
-        with node.lock:
-            ok_b = node.acquire_lease(
-                wid_b, 60, "test", role="worker", principal=principal_b,
-                require_drain_clear=True,
-            )
+        ok_b = node.acquire_lease(
+            wid_b, 60, "test", role="worker", principal=principal_b,
+            require_drain_clear=True,
+        )
         assert ok_b is CONTENDED, f"group B must be CONTENDED while group A holds; got {ok_b}"
 
         # Cleanup
@@ -117,19 +126,17 @@ class TestAtomicAcquireConcurrency:
         wid_a = "wid-a-release"
         wid_b = "wid-b-release"
 
-        with node.lock:
-            ok_a = node.acquire_lease(wid_a, 60, "test", role="worker", principal="alpha")
+        ok_a = node.acquire_lease(wid_a, 60, "test", role="worker", principal="alpha")
         assert ok_a is True
 
         with node.lock:
             node.leases.pop(wid_a, None)
 
         # Now group B acquires with require_drain_clear=True → drain is clear → True
-        with node.lock:
-            ok_b = node.acquire_lease(
-                wid_b, 60, "test", role="worker", principal="beta",
-                require_drain_clear=True,
-            )
+        ok_b = node.acquire_lease(
+            wid_b, 60, "test", role="worker", principal="beta",
+            require_drain_clear=True,
+        )
         assert ok_b is True, f"group B must succeed after group A releases; got {ok_b}"
 
         with node.lock:
@@ -149,13 +156,11 @@ class TestRideAlongUnaffected:
         wid1 = "wid-shared-1"
         wid2 = "wid-shared-2"
 
-        with node.lock:
-            ok1 = node.acquire_lease(wid1, 60, "test", role="worker", principal=P)
+        ok1 = node.acquire_lease(wid1, 60, "test", role="worker", principal=P)
         assert ok1 is True
 
         # Ride-along: same principal, no drain flag
-        with node.lock:
-            ok2 = node.acquire_lease(wid2, 60, "test", role="worker", principal=P)
+        ok2 = node.acquire_lease(wid2, 60, "test", role="worker", principal=P)
         assert ok2 is True, "same-principal ride-along must succeed without require_drain_clear"
 
         # Cleanup
@@ -168,13 +173,11 @@ class TestRideAlongUnaffected:
         wid_a = "wid-old-a"
         wid_b = "wid-old-b"
 
-        with node.lock:
-            ok_a = node.acquire_lease(wid_a, 60, "test", role="worker", principal="group-x")
+        ok_a = node.acquire_lease(wid_a, 60, "test", role="worker", principal="group-x")
         assert ok_a is True
 
         # Old-style acquire (no require_drain_clear) → not gated (byte-identical to before)
-        with node.lock:
-            ok_b = node.acquire_lease(wid_b, 60, "test", role="worker", principal="group-y")
+        ok_b = node.acquire_lease(wid_b, 60, "test", role="worker", principal="group-y")
         assert ok_b is True, "require_drain_clear=False must preserve old behavior"
 
         with node.lock:
@@ -208,11 +211,10 @@ class TestGhostSafety:
 
         # Fresh group acquires with require_drain_clear=True → ghost blocks it
         with caplog.at_level(logging.CRITICAL, logger="doorman-server"):
-            with node.lock:
-                ok = node.acquire_lease(
-                    fresh_wid, 60, "test", role="worker",
-                    principal=fresh_principal, require_drain_clear=True,
-                )
+            ok = node.acquire_lease(
+                fresh_wid, 60, "test", role="worker",
+                principal=fresh_principal, require_drain_clear=True,
+            )
 
         assert ok is CONTENDED, f"ghost must cause CONTENDED; got {ok}"
         assert any(
@@ -238,11 +240,10 @@ class TestGhostSafety:
                 "principal": "flip-controller",
             }
 
-        with node.lock:
-            ok = node.acquire_lease(
-                worker_wid, 60, "test", role="worker",
-                principal="some-group", require_drain_clear=True,
-            )
+        ok = node.acquire_lease(
+            worker_wid, 60, "test", role="worker",
+            principal="some-group", require_drain_clear=True,
+        )
 
         assert ok is True, f"non-worker lease must not gate drain check; got {ok}"
 
