@@ -1091,23 +1091,16 @@ class _NodeState:
                       responsible for the defer-check; this method only stamps the
                       lease with its class.
 
-        self.lock is held only for the short bookkeeping at the start (idle-tracking
-        reset) and end (lease registration + _place_hold()) — NOT across ensure_serving(),
-        which can block for minutes on a cold wake. ensure_serving() serializes concurrent
-        wakes internally via its own wake_lock, so other node state (reads via /status,
-        /v0/drain-count, /lease/release, etc.) stays responsive while a wake is in flight.
+        self.lock is taken exactly once per call, for the short bookkeeping that spans
+        idle-tracking reset, the atomic drain-gate check, and lease registration (see the
+        comment on that block below) — NOT across ensure_serving(), which can block for
+        minutes on a cold wake. ensure_serving() serializes concurrent wakes internally via
+        its own wake_lock, so other node state (reads via /status, /v0/drain-count,
+        /lease/release, etc.) stays responsive while a wake is in flight.
         """
-        # Clear idle tracking: an arriving lease means the node is no longer idle
-        with self.lock:
-            was_idle = self.idle_since is not None
-            self.idle_since = None
-            self._idle_since_source = None
-            lease_count_for_log = len(self.leases)
-        if was_idle:
-            _write_idle_log(self.node_name, "resumed", lease_count_for_log)
-
         # ensure_serving serializes concurrent wakes internally via its own wake_lock —
-        # this call intentionally runs without self.lock held.
+        # this call intentionally runs without self.lock held, so a cold wake never freezes
+        # the bookkeeping critical section below for other callers.
         ok = self.ensure_serving(role=role)
         if ok is CREATIVE_OCCUPIED:
             return CREATIVE_OCCUPIED
@@ -1131,11 +1124,23 @@ class _NodeState:
         if not ok:
             return False
 
-        # Atomic drain-gate check (AC3): count cross-group worker leases and register
-        # the new lease in one critical section — check-and-register atomic; closes the
-        # drain-gate TOCTOU where separate drain_count + acquire calls let multiple
-        # distinct-principal workers all observe drain=0 before any registers.
+        # Single critical section (agents-core-doorman-acquire-lease-nonreentrant-deadlock-v0):
+        # idle-tracking reset, the atomic drain-gate check (AC3), and lease registration all
+        # happen under ONE self.lock acquisition — previously these were three separate
+        # lock/unlock cycles, which left a window where another thread's acquire_lease could
+        # interleave between idle-reset and the drain-gate check (idle_since feeds GW's
+        # idle-suspend logic elsewhere, so a torn read there isn't cosmetic) and, separately,
+        # left the drain-gate check-then-register itself non-atomic despite the intent. This
+        # merge closes both gaps in one pass and is also what makes the non-reentrant self.lock
+        # safe to acquire in a single call — no caller (production or test) may hold self.lock
+        # externally around acquire_lease().
         with self.lock:
+            was_idle = self.idle_since is not None
+            self.idle_since = None
+            self._idle_since_source = None
+            lease_count_for_log = len(self.leases)
+
+            contended = False
             if require_drain_clear and role == "worker":
                 effective_principal = principal if principal is not None else GHOST_PRINCIPAL
                 for _wid, _info in self.leases.items():
@@ -1154,24 +1159,29 @@ class _NodeState:
                             "acquire() call to prevent drain-gate freeze",
                             _wid,
                         )
-                        return CONTENDED
+                        contended = True
+                        break
                     if _p != effective_principal:
-                        return CONTENDED
+                        contended = True
+                        break
 
-        with self.lock:
-            lease_entry: dict = {
-                "acquired_at": time.time(),
-                "ttl_sec": ttl_sec,
-                "reason": reason,
-                "role": role,
-                "lease_kind": lease_kind,
-                "class": lease_class,
-            }
-            if role == "worker":
-                lease_entry["principal"] = principal if principal is not None else GHOST_PRINCIPAL
-            self.leases[work_id] = lease_entry
-            self._place_hold()
-        return True
+            if not contended:
+                lease_entry: dict = {
+                    "acquired_at": time.time(),
+                    "ttl_sec": ttl_sec,
+                    "reason": reason,
+                    "role": role,
+                    "lease_kind": lease_kind,
+                    "class": lease_class,
+                }
+                if role == "worker":
+                    lease_entry["principal"] = principal if principal is not None else GHOST_PRINCIPAL
+                self.leases[work_id] = lease_entry
+                self._place_hold()
+
+        if was_idle:
+            _write_idle_log(self.node_name, "resumed", lease_count_for_log)
+        return CONTENDED if contended else True
 
     def release_lease(self, work_id: str) -> None:
         """Drop a lease. If it was the last, record idle_since and release the hold."""

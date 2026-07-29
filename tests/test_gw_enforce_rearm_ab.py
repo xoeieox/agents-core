@@ -562,22 +562,23 @@ class TestS4AtomicDrainGate:
         rng = random.Random(seed)
 
         results = [None] * n_groups
+        # Precomputed before spawning threads: random.Random isn't thread-safe, and
+        # generating these inside _worker had every thread calling the shared rng
+        # unsynchronized (agents-core-doorman-acquire-lease-nonreentrant-deadlock-v0).
+        work_ids = [f"s4-wid-{i}-{uuid.uuid4().hex[:4]}" for i in range(n_groups)]
+        principals = [f"s4-group-{i}-{rng.randint(0, 9999)}" for i in range(n_groups)]
         peak_in_flight = [0]
         active_count = [0]
         peak_lock = threading.Lock()
         barrier = threading.Barrier(n_groups)
 
         def _worker(idx):
-            principal = f"s4-group-{idx}-{rng.randint(0, 9999)}"
-            work_id = f"s4-wid-{idx}-{uuid.uuid4().hex[:4]}"
-
             barrier.wait()  # burst: all start simultaneously
 
-            with node.lock:
-                ok = node.acquire_lease(
-                    work_id, 60, "call_operator", role="worker",
-                    principal=principal, require_drain_clear=True,
-                )
+            ok = node.acquire_lease(
+                work_ids[idx], 60, "call_operator", role="worker",
+                principal=principals[idx], require_drain_clear=True,
+            )
 
             results[idx] = ok
 
@@ -586,21 +587,25 @@ class TestS4AtomicDrainGate:
                     active_count[0] += 1
                     if active_count[0] > peak_in_flight[0]:
                         peak_in_flight[0] = active_count[0]
-
-                # Simulate brief work then release
-                time.sleep(rng.uniform(0.001, 0.005))
-
-                with node.lock:
-                    node.leases.pop(work_id, None)
-
-                with peak_lock:
-                    active_count[0] -= 1
+                # Do NOT release here — hold the lease until every thread has
+                # reported its result. Releasing mid-burst would let a later
+                # distinct-principal worker legitimately re-open the drain gate
+                # (correct behavior once a holder releases) and inflate
+                # true_count without indicating any atomicity failure; holding
+                # until all report keeps "exactly one winner" a meaningful
+                # single-burst assertion (mirrors test_doorman_atomic_acquire.py
+                # ::test_exactly_one_true_rest_contended).
 
         threads = [threading.Thread(target=_worker, args=(i,)) for i in range(n_groups)]
         for t in threads:
             t.start()
         for t in threads:
             t.join(timeout=10)
+
+        # Release all leases after collecting results
+        with node.lock:
+            for wid in work_ids:
+                node.leases.pop(wid, None)
 
         assert peak_in_flight[0] <= 1, (
             f"seed={seed}: peak_in_flight={peak_in_flight[0]} must be ≤ 1 "
@@ -621,22 +626,19 @@ class TestS4AtomicDrainGate:
         wid_ride = f"s4-ride-{uuid.uuid4().hex[:6]}"
 
         # Main group member acquires (no drain flag — it's first)
-        with node.lock:
-            ok_main = node.acquire_lease(wid_main, 60, "test", role="worker", principal=P)
+        ok_main = node.acquire_lease(wid_main, 60, "test", role="worker", principal=P)
         assert ok_main is True
 
         # Ride-along (same principal, require_drain_clear=False) succeeds
-        with node.lock:
-            ok_ride = node.acquire_lease(wid_ride, 60, "test", role="worker", principal=P)
+        ok_ride = node.acquire_lease(wid_ride, 60, "test", role="worker", principal=P)
         assert ok_ride is True, "same-principal ride-along must succeed alongside the main member"
 
         # Distinct group is still blocked
-        with node.lock:
-            from agents_core.doorman_server import CONTENDED
-            ok_other = node.acquire_lease(
-                "other-wid", 60, "test", role="worker", principal="other-group",
-                require_drain_clear=True,
-            )
+        from agents_core.doorman_server import CONTENDED
+        ok_other = node.acquire_lease(
+            "other-wid", 60, "test", role="worker", principal="other-group",
+            require_drain_clear=True,
+        )
         assert ok_other is CONTENDED, "distinct group must still be CONTENDED while P holds leases"
 
         # Cleanup

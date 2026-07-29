@@ -555,20 +555,18 @@ class TestDrainGatePrincipalUnification:
         voice_wid = f"voice-{uuid.uuid4().hex[:6]}"
 
         # Reference leg acquires (inference, no drain constraint — it's the first)
-        with node.lock:
-            ok_ref = node.acquire_lease(
-                ref_wid, 60, "gw_agent", role="worker",
-                principal=P, lease_kind="inference",
-            )
+        ok_ref = node.acquire_lease(
+            ref_wid, 60, "gw_agent", role="worker",
+            principal=P, lease_kind="inference",
+        )
         assert ok_ref is True
 
         # Voice/persona tries to ride along under the same principal
-        with node.lock:
-            ok_voice = node.acquire_lease(
-                voice_wid, 60, "gw_voice", role="worker",
-                principal=P, lease_kind="inference",
-                require_drain_clear=True,
-            )
+        ok_voice = node.acquire_lease(
+            voice_wid, 60, "gw_voice", role="worker",
+            principal=P, lease_kind="inference",
+            require_drain_clear=True,
+        )
         assert ok_voice is True, (
             f"same-principal voice must be GRANTED (ride-along); got {ok_voice!r}"
         )
@@ -585,28 +583,25 @@ class TestDrainGatePrincipalUnification:
         voice_wid = f"voice-{uuid.uuid4().hex[:6]}"
 
         # Span hold (coordination — excluded from drain-gate count)
-        with node.lock:
-            ok_span = node.acquire_lease(
-                span_wid, 60, "span-hold", role="worker",
-                principal=P, lease_kind="coordination",
-            )
+        ok_span = node.acquire_lease(
+            span_wid, 60, "span-hold", role="worker",
+            principal=P, lease_kind="coordination",
+        )
         assert ok_span is True
 
         # Reference leg (inference)
-        with node.lock:
-            ok_ref = node.acquire_lease(
-                ref_wid, 60, "gw_agent", role="worker",
-                principal=P, lease_kind="inference",
-            )
+        ok_ref = node.acquire_lease(
+            ref_wid, 60, "gw_agent", role="worker",
+            principal=P, lease_kind="inference",
+        )
         assert ok_ref is True
 
         # Voice (require_drain_clear, same principal)
-        with node.lock:
-            ok_voice = node.acquire_lease(
-                voice_wid, 60, "gw_voice", role="worker",
-                principal=P, lease_kind="inference",
-                require_drain_clear=True,
-            )
+        ok_voice = node.acquire_lease(
+            voice_wid, 60, "gw_voice", role="worker",
+            principal=P, lease_kind="inference",
+            require_drain_clear=True,
+        )
         assert ok_voice is True, (
             f"voice must be GRANTED under shared principal even with span+ref leases; got {ok_voice!r}"
         )
@@ -622,18 +617,16 @@ class TestDrainGatePrincipalUnification:
         ref_wid = f"ref-{uuid.uuid4().hex[:6]}"
         voice_wid = f"voice-{uuid.uuid4().hex[:6]}"
 
-        with node.lock:
-            node.acquire_lease(
-                ref_wid, 60, "gw_agent", role="worker",
-                principal=P, lease_kind="inference",
-            )
+        node.acquire_lease(
+            ref_wid, 60, "gw_agent", role="worker",
+            principal=P, lease_kind="inference",
+        )
 
-        with node.lock:
-            ok = node.acquire_lease(
-                voice_wid, 60, "gw_voice", role="worker",
-                principal=Q, lease_kind="inference",
-                require_drain_clear=True,
-            )
+        ok = node.acquire_lease(
+            voice_wid, 60, "gw_voice", role="worker",
+            principal=Q, lease_kind="inference",
+            require_drain_clear=True,
+        )
         assert ok is CONTENDED, (
             f"different-principal voice must be CONTENDED; got {ok!r}"
         )
@@ -662,12 +655,11 @@ class TestDrainGatePrincipalUnification:
 
         # Voice tries to acquire with a named principal → ghost blocks it
         with caplog.at_level(logging.CRITICAL, logger="doorman-server"):
-            with node.lock:
-                ok = node.acquire_lease(
-                    voice_wid, 60, "gw_voice", role="worker",
-                    principal=P, lease_kind="inference",
-                    require_drain_clear=True,
-                )
+            ok = node.acquire_lease(
+                voice_wid, 60, "gw_voice", role="worker",
+                principal=P, lease_kind="inference",
+                require_drain_clear=True,
+            )
 
         assert ok is CONTENDED, (
             f"ghost reference leg must cause CONTENDED for named-principal voice; got {ok!r}"
@@ -687,19 +679,17 @@ class TestDrainGatePrincipalUnification:
         span_wid = f"span-{uuid.uuid4().hex[:6]}"
         voice_wid = f"voice-{uuid.uuid4().hex[:6]}"
 
-        with node.lock:
-            node.acquire_lease(
-                span_wid, 60, "span-hold", role="worker",
-                principal=P, lease_kind="coordination",
-            )
+        node.acquire_lease(
+            span_wid, 60, "span-hold", role="worker",
+            principal=P, lease_kind="coordination",
+        )
 
         # Voice from a DIFFERENT principal — coordination span is excluded from drain-gate
-        with node.lock:
-            ok = node.acquire_lease(
-                voice_wid, 60, "gw_voice", role="worker",
-                principal="other-delib", lease_kind="inference",
-                require_drain_clear=True,
-            )
+        ok = node.acquire_lease(
+            voice_wid, 60, "gw_voice", role="worker",
+            principal="other-delib", lease_kind="inference",
+            require_drain_clear=True,
+        )
         assert ok is True, (
             f"coordination span alone must not block voice (excluded from drain-gate); got {ok!r}"
         )
