@@ -34,7 +34,13 @@ DEFAULT_ROOT = room_path("locality")
 # added: do not narrow or reassign an existing value's meaning, only append
 # new ones. "unknown" is the sink for anything unrecognised at write or read
 # time and must never be silently reclassified later.
-COST_CLASSES = ("local-gw", "local-sh", "paid-anthropic", "unknown")
+#
+# "paid-phala-tee" (agents_core.phala_tee) is a PRIVACY claim, not a TRUST
+# claim: it means the call went through Phala's attested, e2ee-sealed
+# channel, never that the model behind that channel is more trustworthy than
+# a local or paid-anthropic call. See agents_core/phala_tee.py's module
+# docstring for the full Mirror Council gate this cost class carries.
+COST_CLASSES = ("local-gw", "local-sh", "paid-anthropic", "paid-phala-tee", "unknown")
 
 _DEFAULT_MAX_BYTES = 50 * 1024 * 1024  # 50 MiB per day-file before rotation
 
