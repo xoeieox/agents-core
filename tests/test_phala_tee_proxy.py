@@ -267,7 +267,7 @@ def test_models_catalog_excludes_bad_includes_good():
 )
 def test_integration_proxy_live_round_trip():
     """Run locally:  PHALA_API_KEY=... pytest -m integration tests/test_phala_tee_proxy.py"""
-    model = os.environ.get("PHALA_MODEL", "deepseek-ai/DeepSeek-V3")
+    model = os.environ.get("PHALA_MODEL", "deepseek/deepseek-v3.2")
     app = TestClient(phala_tee_proxy.create_app())
     resp = app.post("/v1/chat/completions", json={
         "model": model,
