@@ -19,10 +19,10 @@ read "verified" in this module as "fully verified" — read it as "Level 2
 verified, Level 1 assumed."
 
 Streaming, ``prompt``/``input`` (completions/embeddings) field paths, and
-multi-field response decryption (audio, reasoning_content) are out of scope
-for v0 — only ``messages[].content`` request sealing and
-``choices[].message.content`` response opening are implemented. Add more
-when a caller needs them.
+audio response decryption are out of scope for v0 — request sealing covers
+``messages[].content``; response opening covers ``choices[].message.content``
+and ``choices[].message.reasoning_content``. Add more when a caller needs
+them.
 
 CONFIDENTIALITY IS NOT CONTENT-TRUST (Mirror Council gate, 2026-07-29). A
 successful ``verify_report_binding`` and the resulting ``report_verified``
@@ -55,9 +55,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import requests
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
     X25519PublicKey,
@@ -70,6 +72,8 @@ from agents_core import locality
 DEFAULT_BASE_URL = "https://inference.phala.com"
 E2EE_ALGO = "x25519-aes-256-gcm-hkdf-sha256"
 _HKDF_INFO = b"aci.e2ee.v2.x25519"
+# secp256k1 group order — canonicality bound for raw r||s endorsement signatures.
+SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
 
 # ---------------------------------------------------------------------------
@@ -88,12 +92,14 @@ class AciFormatError(AciError):
 
 
 class UnsupportedAlgorithmError(AciError):
-    """A signature/identity algorithm this module cannot verify (only ed25519 is supported)."""
+    """A signature/identity algorithm this module cannot verify (only ed25519
+    and ecdsa-secp256k1 are supported)."""
 
     def __init__(self, algorithm: str, context: str):
         super().__init__(
             f'unsupported algorithm "{algorithm}" for {context}: this client '
-            f"verifies only ed25519. Do not treat an unverifiable report as verified."
+            f"verifies only ed25519 and ecdsa-secp256k1. Do not treat an "
+            f"unverifiable report as verified."
         )
         self.algorithm = algorithm
 
@@ -114,6 +120,27 @@ class E2eeNotAppliedError(AciError):
     """Raised when a request asked for e2ee but the gateway's response did
     not carry ``x-e2ee-applied: true``. A caller must never believe a
     request was confidential when the gateway didn't apply it."""
+
+
+class ReasoningContentDecryptionError(AciError):
+    """Raised by `E2eeChannel.open_response` when a choice's
+    `reasoning_content` field is present but cannot be decrypted (tamper,
+    corruption, wrong nonce). A caller catching this must never substitute
+    an empty string or placeholder text and continue as if decryption
+    succeeded — a plain string in a text field is indistinguishable from
+    real content to any downstream code that doesn't specifically check for
+    this exception, which would recreate the exact truth-leakage this error
+    exists to prevent. The correct response is to refuse the choice (or the
+    whole response), not to paper over it."""
+
+    def __init__(self, index: int, reason: str):
+        super().__init__(
+            f"choices.{index}.message.reasoning_content: failed to decrypt "
+            f"({reason}) — refusing to substitute placeholder text for "
+            f"unopened ciphertext"
+        )
+        self.index = index
+        self.reason = reason
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +227,7 @@ def keyset_endorsement_payload(workload_keyset_digest: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Signature verification (crypto.ts port) — ed25519 only.
+# Signature verification (crypto.ts port) — ed25519 and ecdsa-secp256k1.
 # ---------------------------------------------------------------------------
 
 
@@ -213,6 +240,37 @@ def verify_ed25519(public_key_raw: bytes, signature: bytes, message: bytes) -> b
         return True
     except (InvalidSignature, ValueError):
         return False
+
+
+def verify_ecdsa_secp256k1(public_key_raw: bytes, signature_raw: bytes, message: bytes) -> bool:
+    """Verify an ECDSA secp256k1 signature over SHA-256(message).
+    `public_key_raw` is an uncompressed SEC1 point (65 bytes, `04 || X || Y`).
+    `signature_raw` is a raw `r || s` pair (64 bytes) — not DER; it is
+    re-encoded to DER internally before verification. Returns False on a bad
+    signature or malformed key/signature bytes — never raises for those
+    (same contract as `verify_ed25519`). Rejects any signature that is not
+    exactly 64 raw bytes, and rejects non-canonical/out-of-range `r`/`s`
+    (zero or >= the curve order) before ever calling into the underlying
+    verify — those must never reach it."""
+    if len(signature_raw) != 64:
+        return False
+    r = int.from_bytes(signature_raw[:32], "big")
+    s = int.from_bytes(signature_raw[32:], "big")
+    if not (1 <= r < SECP256K1_ORDER) or not (1 <= s < SECP256K1_ORDER):
+        return False
+    try:
+        key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256K1(), public_key_raw)
+        der_signature = encode_dss_signature(r, s)
+        key.verify(der_signature, message, ec.ECDSA(hashes.SHA256()))
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
+_KEYSET_ENDORSEMENT_VERIFIERS = {
+    "ed25519": verify_ed25519,
+    "ecdsa-secp256k1": verify_ecdsa_secp256k1,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -283,11 +341,11 @@ def verify_report_binding(report: dict, nonce, *, now: int | None = None) -> Rep
                 f'endorsement.algo {endorsement_algo!r} != identity key algo {identity_algo!r}',
             )
         )
-    elif identity_algo != "ed25519":
+    elif identity_algo not in _KEYSET_ENDORSEMENT_VERIFIERS:
         raise UnsupportedAlgorithmError(identity_algo, "keyset endorsement")
     else:
         try:
-            ok = verify_ed25519(
+            ok = _KEYSET_ENDORSEMENT_VERIFIERS[identity_algo](
                 bytes.fromhex(identity_key["public_key"]),
                 bytes.fromhex(endorsement["value"]),
                 keyset_endorsement_payload(workload_keyset_digest),
@@ -458,7 +516,18 @@ class E2eeChannel:
         return sealed, headers
 
     def open_response(self, response: dict) -> dict:
-        """Decrypt `choices[].message.content` in a buffered chat-completion response."""
+        """Decrypt `choices[].message.content` and, when present,
+        `choices[].message.reasoning_content` in a buffered chat-completion
+        response. An absent `reasoning_content` field is a no-op, not an
+        error.
+
+        Raises `ReasoningContentDecryptionError` if a present
+        `reasoning_content` blob fails to decrypt (tamper, corruption, wrong
+        nonce). A caller catching that exception must never substitute an
+        empty string or placeholder text and continue as if decryption
+        succeeded — that would recreate the exact truth-leakage this check
+        exists to prevent; the correct response is to refuse the choice (or
+        the whole response)."""
         if self._sent is None:
             raise AciError("open_response: call seal_messages first")
         sent = self._sent
@@ -485,6 +554,14 @@ class E2eeChannel:
                     message = dict(message)
                     if isinstance(message.get("content"), str):
                         message["content"] = dec_field(message["content"], f"choices.{idx}.message.content")
+                    if isinstance(message.get("reasoning_content"), str):
+                        try:
+                            message["reasoning_content"] = dec_field(
+                                message["reasoning_content"],
+                                f"choices.{idx}.message.reasoning_content",
+                            )
+                        except (AciFormatError, InvalidTag, ValueError) as e:
+                            raise ReasoningContentDecryptionError(idx, str(e)) from e
                     c["message"] = message
                 new_choices.append(c)
             out["choices"] = new_choices

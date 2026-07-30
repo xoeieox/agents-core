@@ -13,7 +13,9 @@ import time
 
 import pytest
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 from agents_core import phala_tee
@@ -59,6 +61,22 @@ def test_response_aad_matches_fixed_vector():
     )
     assert aad == (
         b'{"algo":"x25519-aes-256-gcm-hkdf-sha256","field":"choices.0.message.content",'
+        b'"id":"resp-1","model":"m","nonce":"deadbeef",'
+        b'"purpose":"aci.e2ee.response.v2","ts":1700000000}'
+    )
+
+
+def test_response_aad_matches_fixed_vector_for_reasoning_content():
+    aad = phala_tee.response_aad(
+        algo="x25519-aes-256-gcm-hkdf-sha256",
+        model="m",
+        id="resp-1",
+        field="choices.0.message.reasoning_content",
+        nonce="deadbeef",
+        ts=1700000000,
+    )
+    assert aad == (
+        b'{"algo":"x25519-aes-256-gcm-hkdf-sha256","field":"choices.0.message.reasoning_content",'
         b'"id":"resp-1","model":"m","nonce":"deadbeef",'
         b'"purpose":"aci.e2ee.response.v2","ts":1700000000}'
     )
@@ -229,6 +247,178 @@ def test_require_verified_report_binding_passes_valid_report():
 
 
 # ---------------------------------------------------------------------------
+# verify_ecdsa_secp256k1 — unit-level, one test per failure mode.
+# ---------------------------------------------------------------------------
+
+
+def _ecdsa_sign_raw(private_key, message: bytes) -> bytes:
+    from cryptography.hazmat.primitives import hashes
+
+    der_sig = private_key.sign(message, ec.ECDSA(hashes.SHA256()))
+    r, s = decode_dss_signature(der_sig)
+    return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+
+def _ecdsa_pub_raw(private_key) -> bytes:
+    return private_key.public_key().public_bytes(
+        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
+    )
+
+
+def test_verify_ecdsa_secp256k1_accepts_valid_signature():
+    priv = ec.generate_private_key(ec.SECP256K1())
+    message = b"some message"
+    sig_raw = _ecdsa_sign_raw(priv, message)
+    assert phala_tee.verify_ecdsa_secp256k1(_ecdsa_pub_raw(priv), sig_raw, message) is True
+
+
+def test_verify_ecdsa_secp256k1_rejects_wrong_pubkey():
+    priv = ec.generate_private_key(ec.SECP256K1())
+    other_priv = ec.generate_private_key(ec.SECP256K1())
+    message = b"some message"
+    sig_raw = _ecdsa_sign_raw(priv, message)
+    assert phala_tee.verify_ecdsa_secp256k1(_ecdsa_pub_raw(other_priv), sig_raw, message) is False
+
+
+def test_verify_ecdsa_secp256k1_rejects_wrong_signature_bytes():
+    priv = ec.generate_private_key(ec.SECP256K1())
+    message = b"some message"
+    sig_raw = bytearray(_ecdsa_sign_raw(priv, message))
+    sig_raw[0] ^= 0xFF
+    assert phala_tee.verify_ecdsa_secp256k1(_ecdsa_pub_raw(priv), bytes(sig_raw), message) is False
+
+
+def test_verify_ecdsa_secp256k1_rejects_non_64_byte_signature():
+    priv = ec.generate_private_key(ec.SECP256K1())
+    message = b"some message"
+    sig_raw = _ecdsa_sign_raw(priv, message)
+    assert phala_tee.verify_ecdsa_secp256k1(_ecdsa_pub_raw(priv), sig_raw[:-1], message) is False
+    assert phala_tee.verify_ecdsa_secp256k1(_ecdsa_pub_raw(priv), sig_raw + b"\x00", message) is False
+
+
+def test_verify_ecdsa_secp256k1_rejects_r_zero():
+    priv = ec.generate_private_key(ec.SECP256K1())
+    message = b"some message"
+    sig_raw = bytearray(_ecdsa_sign_raw(priv, message))
+    sig_raw[0:32] = b"\x00" * 32
+    assert phala_tee.verify_ecdsa_secp256k1(_ecdsa_pub_raw(priv), bytes(sig_raw), message) is False
+
+
+def test_verify_ecdsa_secp256k1_rejects_s_zero():
+    priv = ec.generate_private_key(ec.SECP256K1())
+    message = b"some message"
+    sig_raw = bytearray(_ecdsa_sign_raw(priv, message))
+    sig_raw[32:64] = b"\x00" * 32
+    assert phala_tee.verify_ecdsa_secp256k1(_ecdsa_pub_raw(priv), bytes(sig_raw), message) is False
+
+
+def test_verify_ecdsa_secp256k1_rejects_r_at_or_above_curve_order():
+    priv = ec.generate_private_key(ec.SECP256K1())
+    message = b"some message"
+    sig_raw = bytearray(_ecdsa_sign_raw(priv, message))
+    sig_raw[0:32] = phala_tee.SECP256K1_ORDER.to_bytes(32, "big")
+    assert phala_tee.verify_ecdsa_secp256k1(_ecdsa_pub_raw(priv), bytes(sig_raw), message) is False
+
+
+def test_verify_ecdsa_secp256k1_rejects_s_at_or_above_curve_order():
+    priv = ec.generate_private_key(ec.SECP256K1())
+    message = b"some message"
+    sig_raw = bytearray(_ecdsa_sign_raw(priv, message))
+    sig_raw[32:64] = phala_tee.SECP256K1_ORDER.to_bytes(32, "big")
+    assert phala_tee.verify_ecdsa_secp256k1(_ecdsa_pub_raw(priv), bytes(sig_raw), message) is False
+
+
+# ---------------------------------------------------------------------------
+# verify_report_binding / require_verified_report_binding — ecdsa-secp256k1
+# keyset endorsement, mirroring the ed25519 report-binding tests above.
+# ---------------------------------------------------------------------------
+
+
+def _build_valid_ecdsa_report(*, not_after=None, nonce="test-nonce-123"):
+    from cryptography.hazmat.primitives import hashes
+
+    identity_priv = ec.generate_private_key(ec.SECP256K1())
+    identity_pub_hex = _ecdsa_pub_raw(identity_priv).hex()
+
+    service_priv = X25519PrivateKey.generate()
+    service_pub_hex = service_priv.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    ).hex()
+
+    if not_after is None:
+        not_after = int(time.time()) + 3600
+
+    keyset = {
+        "workload_identity": {
+            "public_key": {"algo": "ecdsa-secp256k1", "public_key": identity_pub_hex}
+        },
+        "keyset_epoch": {"version": 1, "not_after": not_after},
+        "receipt_signing_keys": [],
+        "e2ee_public_keys": [{"algo": phala_tee.E2EE_ALGO, "public_key": service_pub_hex}],
+    }
+
+    workload_id = phala_tee.compute_workload_id(keyset["workload_identity"]["public_key"])
+    workload_keyset_digest = phala_tee.compute_keyset_digest(keyset)
+    report_data = phala_tee.compute_report_data(workload_id, workload_keyset_digest, nonce)
+    endorsement_sig = _ecdsa_sign_raw(
+        identity_priv, phala_tee.keyset_endorsement_payload(workload_keyset_digest)
+    ).hex()
+
+    report = {
+        "api_version": "1",
+        "workload_id": workload_id,
+        "workload_keyset_digest": workload_keyset_digest,
+        "attestation": {
+            "workload_keyset": keyset,
+            "report_data": report_data,
+            "keyset_endorsement": {"algo": "ecdsa-secp256k1", "value": endorsement_sig},
+        },
+    }
+    return report, nonce, identity_priv, service_priv
+
+
+def test_verify_report_binding_accepts_valid_ecdsa_secp256k1_report():
+    report, nonce, _, _ = _build_valid_ecdsa_report()
+    verification = phala_tee.verify_report_binding(report, nonce)
+    assert verification.ok is True
+    assert all(c.ok for c in verification.checks)
+
+
+def test_verify_report_binding_rejects_tampered_ecdsa_endorsement():
+    report, nonce, _, _ = _build_valid_ecdsa_report()
+    tampered = bytearray(bytes.fromhex(report["attestation"]["keyset_endorsement"]["value"]))
+    tampered[0] ^= 0xFF
+    report["attestation"]["keyset_endorsement"]["value"] = bytes(tampered).hex()
+    verification = phala_tee.verify_report_binding(report, nonce)
+    assert verification.ok is False
+    failed = {c.name for c in verification.checks if not c.ok}
+    assert "keyset_endorsement" in failed
+
+
+def test_verify_report_binding_rejects_ecdsa_algo_mismatch():
+    report, nonce, _, _ = _build_valid_ecdsa_report()
+    report["attestation"]["keyset_endorsement"]["algo"] = "ed25519"
+    verification = phala_tee.verify_report_binding(report, nonce)
+    assert verification.ok is False
+    failed = {c.name for c in verification.checks if not c.ok}
+    assert "keyset_endorsement" in failed
+
+
+def test_verify_report_binding_raises_for_unrecognized_algorithm():
+    report, nonce, _, _ = _build_valid_ecdsa_report()
+    report["attestation"]["workload_keyset"]["workload_identity"]["public_key"]["algo"] = "rsa-4096"
+    report["attestation"]["keyset_endorsement"]["algo"] = "rsa-4096"
+    with pytest.raises(phala_tee.UnsupportedAlgorithmError):
+        phala_tee.verify_report_binding(report, nonce)
+
+
+def test_require_verified_report_binding_passes_valid_ecdsa_secp256k1_report():
+    report, nonce, _, _ = _build_valid_ecdsa_report()
+    verification = phala_tee.require_verified_report_binding(report, nonce)
+    assert verification.ok is True
+
+
+# ---------------------------------------------------------------------------
 # open_e2ee_channel / E2eeChannel full seal-open flow against a verified
 # synthetic report (still no network — the "gateway" side is simulated
 # locally with the service's own X25519 private key).
@@ -288,6 +478,88 @@ def test_e2ee_channel_seal_and_simulated_gateway_round_trip():
     }
     opened = channel.open_response(response)
     assert opened["choices"][0]["message"]["content"] == reply_text
+
+
+def test_open_response_decrypts_reasoning_content():
+    report, nonce, _, service_priv = _build_valid_report()
+    verification = phala_tee.require_verified_report_binding(report, nonce)
+    channel = phala_tee.open_e2ee_channel(report, verification)
+
+    sealed, headers = channel.seal_messages(
+        [{"role": "user", "content": "how many rs in strawberry?"}], model="some-model"
+    )
+    nonce_hdr = headers["X-E2EE-Nonce"]
+    ts_hdr = int(headers["X-E2EE-Timestamp"])
+    client_pub_raw = bytes.fromhex(headers["X-Client-Pub-Key"])
+    response_id = "resp-reasoning"
+
+    content_aad = phala_tee.response_aad(
+        algo=phala_tee.E2EE_ALGO, model="some-model", id=response_id,
+        field="choices.0.message.content", nonce=nonce_hdr, ts=ts_hdr,
+    )
+    reasoning_aad = phala_tee.response_aad(
+        algo=phala_tee.E2EE_ALGO, model="some-model", id=response_id,
+        field="choices.0.message.reasoning_content", nonce=nonce_hdr, ts=ts_hdr,
+    )
+    content_blob = phala_tee.seal_field(client_pub_raw, b"three", content_aad)
+    reasoning_blob = phala_tee.seal_field(
+        client_pub_raw, b"count the letters: s-t-r-a-w-b-e-r-r-y", reasoning_aad
+    )
+
+    response = {
+        "id": response_id,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content_blob, "reasoning_content": reasoning_blob},
+        }],
+    }
+    opened = channel.open_response(response)
+    assert opened["choices"][0]["message"]["content"] == "three"
+    assert opened["choices"][0]["message"]["reasoning_content"] == "count the letters: s-t-r-a-w-b-e-r-r-y"
+
+
+def test_open_response_raises_on_corrupted_reasoning_content():
+    report, nonce, _, service_priv = _build_valid_report()
+    verification = phala_tee.require_verified_report_binding(report, nonce)
+    channel = phala_tee.open_e2ee_channel(report, verification)
+
+    sealed, headers = channel.seal_messages(
+        [{"role": "user", "content": "how many rs in strawberry?"}], model="some-model"
+    )
+    nonce_hdr = headers["X-E2EE-Nonce"]
+    ts_hdr = int(headers["X-E2EE-Timestamp"])
+    client_pub_raw = bytes.fromhex(headers["X-Client-Pub-Key"])
+    response_id = "resp-reasoning-corrupt"
+
+    content_aad = phala_tee.response_aad(
+        algo=phala_tee.E2EE_ALGO, model="some-model", id=response_id,
+        field="choices.0.message.content", nonce=nonce_hdr, ts=ts_hdr,
+    )
+    content_blob = phala_tee.seal_field(client_pub_raw, b"three", content_aad)
+
+    reasoning_aad = phala_tee.response_aad(
+        algo=phala_tee.E2EE_ALGO, model="some-model", id=response_id,
+        field="choices.0.message.reasoning_content", nonce=nonce_hdr, ts=ts_hdr,
+    )
+    reasoning_blob = bytearray(
+        bytes.fromhex(phala_tee.seal_field(client_pub_raw, b"secret reasoning", reasoning_aad))
+    )
+    reasoning_blob[-1] ^= 0xFF  # corrupt the GCM tag
+
+    response = {
+        "id": response_id,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": content_blob,
+                "reasoning_content": bytes(reasoning_blob).hex(),
+            },
+        }],
+    }
+    with pytest.raises(phala_tee.ReasoningContentDecryptionError) as excinfo:
+        channel.open_response(response)
+    assert excinfo.value.index == 0
 
 
 # ---------------------------------------------------------------------------
