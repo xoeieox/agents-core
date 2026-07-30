@@ -1,0 +1,21 @@
+[Unit]
+Description=Phala TEE proxy — local OpenAI-compatible endpoint over PhalaTeeClient (port 8413)
+After=network.target
+# Don't let a tight crash-loop trip the start limit and wedge the service.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# python -m form (not a console script) so it runs without a pip reinstall on the
+# PEP-668 BRIX system interpreter. agents_core resolves from PYTHONPATH=/srv/agents.
+ExecStart=/usr/bin/env python3 -m agents_core.phala_tee_proxy
+Environment=PYTHONPATH=/srv/agents
+Restart=on-failure
+RestartSec=5
+# Sources PHALA_API_KEY (consumed by PhalaTeeClient's own os.environ fallback) and,
+# if ever configured, PHALA_TEE_PROXY_BEARER_TOKEN / PHALA_TEE_PROXY_BIND_HOST.
+# Default (no env file) binds 127.0.0.1:8413 — BRIX-local only, no token needed.
+EnvironmentFile=-/srv/agents/config/phala.env
+
+[Install]
+WantedBy=default.target
