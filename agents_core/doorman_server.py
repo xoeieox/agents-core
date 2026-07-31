@@ -100,6 +100,7 @@ import json
 import logging
 import os
 import random
+import re
 import subprocess
 import threading
 import time
@@ -266,6 +267,43 @@ def _write_idle_log(
             fh.write(json.dumps(entry) + "\n")
     except Exception as exc:
         log.warning(f"idle log write failed ({DOORMAN_IDLE_LOG}): {exc}")
+
+
+# gw-serve's stop_all() prints "  stopping <unit>" (leading whitespace, literal
+# tab/space indent) per unit it actually stops. Deliberately rigid — [ \t], not
+# \s — so any drift in gw-serve's output format *fails* this match rather than
+# loosely capturing something wrong (agents-core-doorman-stop-log-unit-accuracy-v0).
+_STOPPING_UNIT_RE = re.compile(r"^[ \t]+stopping[ \t]+(\S+)[ \t]*$", re.MULTILINE)
+
+
+def _describe_stopped_units(stdout: str | None, node_name: str) -> str:
+    """Describe which units gw-serve stop actually stopped, from its stdout.
+
+    A vague-but-true description beats a specific-but-false one: any failure
+    to parse stdout with confidence falls back to unit-free wording (and never
+    raises — the stop already succeeded, a logging problem must not undo that).
+    """
+    try:
+        if not stdout or not stdout.strip():
+            raise ValueError("stdout was empty")
+        units = _STOPPING_UNIT_RE.findall(stdout)
+        if units:
+            return f"{', '.join(units)} stopped"
+        if "stopping" not in stdout.lower():
+            # No unit-stop lines and nothing even claims to be stopping —
+            # distinct from a parse failure: gw-serve ran and had nothing to do.
+            return "nothing was serving"
+        raise ValueError("stdout did not match the expected 'stopping <unit>' format")
+    except Exception as exc:
+        try:
+            snippet = str(stdout)[:200] if stdout else ""
+        except Exception:
+            snippet = "<unprintable stdout>"
+        log.warning(
+            f"[{node_name}] could not parse gw-serve stop stdout ({exc}) — "
+            f"falling back to generic stop message. stdout snippet: {snippet!r}"
+        )
+        return "GW serving stopped"
 
 
 # ---------------------------------------------------------------------------
@@ -1434,9 +1472,12 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                                         state._idle_since_source = None
                                         state._cached_serving = False
                                         state._serving_checked_at = time.time()
+                                        stopped_desc = _describe_stopped_units(
+                                            stop_proc.stdout, node_name
+                                        )
                                         log.warning(
                                             f"[{node_name}] gw-serve stop succeeded — "
-                                            f"llama-server.service stopped, host now "
+                                            f"{stopped_desc}, host now "
                                             f"suspend-eligible via guard"
                                         )
                                         _write_idle_log(

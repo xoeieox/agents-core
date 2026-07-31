@@ -41,6 +41,7 @@ from agents_core.doorman_server import (
     DOORMAN_CONTROLLER_NAME,
     GHOST_PRINCIPAL,
     _NodeState,
+    _describe_stopped_units,
     _write_idle_log,
     create_app,
 )
@@ -825,6 +826,135 @@ class TestDeferredStop:
             t.join(timeout=2.0)
 
         assert len(stop_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Idle-stop log unit accuracy (agents-core-doorman-stop-log-unit-accuracy-v0)
+# ---------------------------------------------------------------------------
+
+class TestDescribeStoppedUnits:
+    """Direct tests for _describe_stopped_units: the idle-stop log line must
+    name the units gw-serve stop actually stopped, not a hardcoded unit."""
+
+    def test_dual_slot_stdout_names_both_units(self):
+        stdout = (
+            "gw-serve: stopping dual slots\n"
+            "  stopping vllm-slot1.service\n"
+            "  stopping vllm-slot2.service\n"
+        )
+        desc = _describe_stopped_units(stdout, "gravitywell")
+        assert desc == "vllm-slot1.service, vllm-slot2.service stopped"
+        assert "llama-server.service" not in desc
+
+    def test_single_unit_stdout_names_that_unit(self):
+        stdout = "  stopping llama-server.service\n"
+        desc = _describe_stopped_units(stdout, "gravitywell")
+        assert desc == "llama-server.service stopped"
+
+    def test_nothing_active_says_so_explicitly(self):
+        stdout = "gw-serve: nothing to stop\n"
+        desc = _describe_stopped_units(stdout, "gravitywell")
+        assert desc == "nothing was serving"
+        assert "stopped" not in desc
+
+    def test_empty_stdout_falls_back_and_warns_with_snippet(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="doorman-server"):
+            desc = _describe_stopped_units("", "gravitywell")
+
+        assert desc == "GW serving stopped"
+        assert any(
+            "could not parse gw-serve stop stdout" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_none_stdout_falls_back_and_warns(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="doorman-server"):
+            desc = _describe_stopped_units(None, "gravitywell")
+
+        assert desc == "GW serving stopped"
+        assert len(caplog.records) == 1
+
+    def test_drifted_format_falls_back_and_warns_with_snippet(self, caplog):
+        """Capitalized, unindented drift — the stand-aside's exact example
+        from the gate — must fail the strict regex and take the fallback,
+        not be silently mis-parsed as 'nothing was serving'."""
+        import logging
+
+        stdout = "Stopping vllm-slot1.service\n"
+        with caplog.at_level(logging.WARNING, logger="doorman-server"):
+            desc = _describe_stopped_units(stdout, "gravitywell")
+
+        assert desc == "GW serving stopped"
+        assert "vllm-slot1.service" not in desc
+        warnings = [rec.message for rec in caplog.records]
+        assert any("could not parse gw-serve stop stdout" in w for w in warnings)
+        assert any("Stopping vllm-slot1.service" in w for w in warnings)
+
+    def test_malformed_stdout_never_raises(self):
+        # No garbage input may propagate an exception — the stop already
+        # succeeded; a logging problem must not undo that (DoD 5).
+        for garbage in ["\x00\x01", "{{{not json", "   \n\n  ", 12345, object()]:
+            desc = _describe_stopped_units(garbage, "gravitywell")
+            assert isinstance(desc, str) and desc
+
+    def test_whitespace_only_stdout_falls_back(self):
+        # Empty-after-strip stdout is explicitly the DoD-4 fallback case.
+        assert _describe_stopped_units("   \n\n  ", "gravitywell") == "GW serving stopped"
+
+    def test_fallback_wording_matches_spec_exactly(self):
+        assert _describe_stopped_units("", "gravitywell") == "GW serving stopped"
+
+
+class TestIdleStopLogNamesActualUnits:
+    """Integration: the refresh thread's idle-stop log line must reflect the
+    real subprocess stdout, end to end."""
+
+    def _make_nodes_idle(self, idle_secs: float = 700) -> tuple[dict, _NodeState]:
+        state = _NodeState(GW_URL_DEFAULT)
+        state.idle_since = time.time() - idle_secs
+        nodes = {"gravitywell": state}
+        return nodes, state
+
+    def test_idle_stop_log_names_dual_slots_not_llama_server(self, caplog):
+        import logging
+        from agents_core.doorman_server import _start_refresh_thread
+
+        nodes, state = self._make_nodes_idle(idle_secs=700)
+
+        def fake_run(cmd, **kwargs):
+            if "gw-serve" in str(cmd) and "stop" in str(cmd):
+                return MagicMock(
+                    returncode=0,
+                    stderr="",
+                    stdout=(
+                        "  stopping vllm-slot1.service\n"
+                        "  stopping vllm-slot2.service\n"
+                    ),
+                )
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        with caplog.at_level(logging.WARNING, logger="doorman-server"), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("time.sleep", side_effect=lambda s: None), \
+             patch("agents_core.doorman_server.DOORMAN_PROBE_LLAMA_ACTIVITY", False), \
+             patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0), \
+             patch("agents_core.doorman_server.GW_STOP_GRACE_SEC", 600), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            t = _start_refresh_thread(nodes)
+            t.join(timeout=2.0)
+
+        assert state.service_stopped is True
+        success_lines = [
+            rec.message for rec in caplog.records if "gw-serve stop succeeded" in rec.message
+        ]
+        assert success_lines, "expected a 'gw-serve stop succeeded' log line"
+        assert "llama-server.service" not in success_lines[0]
+        assert "vllm-slot1.service" in success_lines[0]
+        assert "vllm-slot2.service" in success_lines[0]
 
 
 # ---------------------------------------------------------------------------
