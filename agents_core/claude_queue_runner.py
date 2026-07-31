@@ -390,19 +390,34 @@ def _classify_runner_failure(combined: str, rc: int) -> tuple[str, str]:
 
     Contract source: ``agents_core.shaped_runner``.  That module emits
     ``ERROR: worktree_setup: <exception>`` as the *first token of a line*
-    when the worktree setup itself raises.  All other failure modes
-    (call_claude_cli returning None, shape failures, unknown return codes)
-    do NOT emit that prefix.
+    when the worktree setup itself raises, and
+    ``ERROR: local reviewer produced no verdict (reason=<why>)`` as the
+    first token of a line when ``_run_local_reviewer`` gets no result from
+    ``call_gw_agent``. All other failure modes (call_claude_cli returning
+    None, shape failures, unknown return codes) do NOT emit either prefix.
+
+    The local-reviewer line is surfaced verbatim (not collapsed to a bare
+    prefix like the worktree case) so the reason string reaches the queue
+    record's ``error`` field — a leg that produced nothing must not be
+    recorded as ``completed / error: null``, nor as a bare ``EXIT 1`` that
+    hides why.
 
     Any future prefix added to shaped_runner must be reflected here with an
     explicit line-anchored check — do NOT revert to substring ``in combined``
     matching, which was the source of the 2026-04-27 misclassification bug.
     """
-    has_setup_err = any(
-        line.startswith("ERROR: worktree_setup")
-        for line in combined.splitlines()
+    lines = combined.splitlines()
+    has_setup_err = any(line.startswith("ERROR: worktree_setup") for line in lines)
+    reviewer_err_line = next(
+        (line for line in lines if line.startswith("ERROR: local reviewer produced no verdict")),
+        None,
     )
-    prefix = "ERROR: worktree_setup" if has_setup_err else f"EXIT {rc}"
+    if has_setup_err:
+        prefix = "ERROR: worktree_setup"
+    elif reviewer_err_line is not None:
+        prefix = reviewer_err_line
+    else:
+        prefix = f"EXIT {rc}"
     return prefix, prefix[:200]
 
 

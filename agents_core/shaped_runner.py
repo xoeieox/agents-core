@@ -507,12 +507,19 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                 print(f"WARN: local-fixer: worktree teardown failed: {exc}", file=sys.stderr)
 
 
-def _run_local_reviewer(spec: dict, base_cwd: str | None) -> str:
+def _run_local_reviewer(spec: dict, base_cwd: str | None) -> str | None:
     """Read-only reviewer runner for local GW agent.
 
-    Calls call_gw_agent(writeable=False, json_mode=True) and returns
-    the text result. No git, no PR creation — but the caller (main())
-    routes worktree_required=True dispatches (always true for this engine)
+    Calls call_gw_agent(writeable=False, json_mode=True) and returns the
+    text result, or None if call_gw_agent produced no verdict at all. On
+    a None result, the reason from reason_out (or "no_content_no_reason"
+    if reason_out was never populated) is logged to stderr, and None is
+    returned rather than "" — the caller in main() converts a None result
+    into a non-zero exit so claude_queue_runner's failure branch records
+    the real reason instead of silently reporting a completed task with
+    no verdict (agents-core-local-reviewer-no-silent-empty-verdict-v0).
+    No git, no PR creation — but the caller (main()) routes
+    worktree_required=True dispatches (always true for this engine)
     through the same worktree-setup path as other engines, so base_cwd here
     is already a worktree checked out to existing_branch (verified against
     origin) or base_branch, not the raw shared clone.
@@ -523,6 +530,7 @@ def _run_local_reviewer(spec: dict, base_cwd: str | None) -> str:
     cwd = base_cwd or "/srv/agents"
     model = spec.get("model")
 
+    reason: list[str] = []
     result = call_gw_agent(
         prompt=spec["prompt"],
         system=spec.get("system", ""),
@@ -538,8 +546,13 @@ def _run_local_reviewer(spec: dict, base_cwd: str | None) -> str:
         backend_url=spec.get("backend_url"),
         acquire_lease=spec.get("acquire_lease", True),
         lease_class="deferrable",
+        reason_out=reason,
     )
-    return result or ""
+    if result is None:
+        why = reason[0] if reason else "no_content_no_reason"
+        print(f"ERROR: local reviewer produced no verdict (reason={why})", file=sys.stderr)
+        return None
+    return result
 
 
 def main():
