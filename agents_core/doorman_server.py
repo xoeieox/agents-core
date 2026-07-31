@@ -549,7 +549,14 @@ class _NodeState:
         # Single topology resolution — outside the lock (blocking HTTP).
         topology_state = None
         if DOORMAN_MODE_AWARE_ADMISSION:
-            topology_state = gw_serving_state(endpoint=self.gw_url)
+            try:
+                topology_state = gw_serving_state(endpoint=self.gw_url)
+            except Exception as exc:
+                log.warning(
+                    f"[{self.node_name}] gw_serving_state() raised, degrading to "
+                    f"unknown topology resolution: {exc}"
+                )
+                topology_state = None
 
         # Optional dual-slot activity probe — outside the lock (blocking HTTP).
         # Tri-state: True (confirmed activity), False (confirmed idle), None
@@ -569,13 +576,17 @@ class _NodeState:
                 # big_probe_state (Council open question 2): "refuted" = the models
                 # endpoint answered and the 122B canonical id is absent — we looked
                 # and it is not there. "unknown" = the resolution itself failed
-                # (authority_gap, or the models endpoint never answered) — we could
-                # not look. mode_inferred is never read here.
-                models_answered = (
-                    topology_state.source_freshness.get("models_endpoint", {}).get("status")
-                    == "answered"
-                )
-                if topology_state.authority_gap or not models_answered:
+                # (authority_gap, or the models endpoint never answered, or the
+                # resolver call raised/returned None) — we could not look.
+                # mode_inferred is never read here.
+                if topology_state is None:
+                    models_answered = False
+                else:
+                    models_answered = (
+                        topology_state.source_freshness.get("models_endpoint", {}).get("status")
+                        == "answered"
+                    )
+                if topology_state is None or topology_state.authority_gap or not models_answered:
                     self._big_probe_state = "unknown"
                 elif GW_BIG_MODEL_ID in topology_state.served_ids:
                     self._big_probe_state = "confirmed"
@@ -592,7 +603,7 @@ class _NodeState:
                     self._serving_is_big = None
                     log.warning(
                         f"[{self.node_name}] topology resolution unknown "
-                        f"(authority_gap={topology_state.authority_gap}, "
+                        f"(authority_gap={None if topology_state is None else topology_state.authority_gap}, "
                         f"models_answered={models_answered}) — serving_is_big left "
                         f"None rather than guessed; topology_resolution_unknown"
                     )
@@ -1462,8 +1473,15 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
             first_iteration = False
             backoff = 0.0
             for node_name, state in nodes.items():
-                # Refresh serving cache OUTSIDE the lock (probing is a blocking network call)
-                state._refresh_serving_cache()
+                # Refresh serving cache OUTSIDE the lock (probing is a blocking network call).
+                # Must never let an exception from a probe (e.g. _probe_slot_activity)
+                # escape and kill this daemon thread.
+                try:
+                    state._refresh_serving_cache()
+                except Exception as exc:
+                    log.warning(
+                        f"[{node_name}] _refresh_serving_cache() raised, skipping this tick: {exc}"
+                    )
                 with state.lock:
                     state._gc_stale()
                     # Foreground-priority gate (gw-router-phase1-foreground-gate):
