@@ -45,6 +45,7 @@ from agents_core.doorman_server import (
     _write_idle_log,
     create_app,
 )
+from agents_core.llm import GwServingState
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +60,47 @@ def _client_no_auth() -> TestClient:
 
 def _make_state(gw_url: str = GW_URL_DEFAULT) -> _NodeState:
     return _NodeState(gw_url)
+
+
+def _make_topology_state(
+    mode="big",
+    served_ids=("gravitywell-122b",),
+    authority_gap=False,
+    unknown_model=False,
+    distinct_second_model=False,
+    models_answered=True,
+    endpoint=GW_URL_DEFAULT,
+) -> GwServingState:
+    """Build a GwServingState for _refresh_serving_cache / status_snapshot tests
+    (agents-core-doorman-serving-mode-topology-truthful-v0) — never a live call."""
+    served_ids = list(served_ids)
+    return GwServingState(
+        endpoint=endpoint,
+        reachable=True,
+        serving=bool(served_ids),
+        served_id=served_ids[0] if served_ids else None,
+        served_ids=served_ids,
+        canonical=None,
+        unknown_model=unknown_model,
+        mode=None if authority_gap else mode,
+        mode_inferred=None,
+        authority_gap=authority_gap,
+        units={},
+        in_flight_flip=False,
+        distinct_second_model=distinct_second_model,
+        source_freshness={
+            "flip_controller": {
+                "status": "unreachable" if authority_gap else "answered",
+                "checked_at": None,
+            },
+            "models_endpoint": {
+                "status": "answered" if models_answered else "unreachable",
+                "checked_at": None,
+            },
+            "health": {"status": "answered", "checked_at": None},
+            "slot2": {"status": "unreachable", "checked_at": None},
+        },
+    )
 
 
 class _StopRefreshLoop(Exception):
@@ -1813,6 +1855,203 @@ class TestModeAwareAdmission:
 
 
 # ---------------------------------------------------------------------------
+# Truthful topology serving_mode (agents-core-doorman-serving-mode-topology-
+# truthful-v0) — serving_mode derives from the single cached GwServingState,
+# never a hardcoded "big" and never a second independent probe.
+# ---------------------------------------------------------------------------
+
+class TestTopologyServingMode:
+    """DoD 1-6, 9 — serving_mode reports the actual topology, degrades to
+    'unknown' on any resolver failure mode, and never contradicts big_probe_state."""
+
+    def _snapshot_with_topology(self, state, topology, controller_owns=False):
+        """Drive the real _refresh_serving_cache (mocking only the HTTP-issuing
+        gw_serving_state call) so _big_probe_state / _serving_is_big / serving_mode
+        all come from the single resolution the same way production does."""
+        if controller_owns:
+            state.leases["flip-controller-gw"] = {
+                "acquired_at": time.time(), "ttl_sec": 240,
+                "reason": "mode control", "role": "mode-controller",
+            }
+        with patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+            state._refresh_serving_cache()
+            return state.status_snapshot()
+
+    def test_dod1_dual_topology_reports_dual_not_big(self):
+        """DoD 1: dual-coder on both slots -> serving_mode='dual', not 'big'."""
+        state = _make_state()
+        topology = _make_topology_state(
+            mode="dual",
+            served_ids=["gravitywell-a3b-nvfp4", "gravitywell-a3b-coder"],
+            distinct_second_model=True,
+        )
+        snapshot = self._snapshot_with_topology(state, topology)
+        assert snapshot["serving_mode"] == "dual"
+        assert snapshot["serving"] is True
+        assert snapshot["serving_is_big"] is False
+        assert snapshot["big_probe_state"] == "refuted"
+
+    def test_dod2_big_topology_reports_big(self):
+        """DoD 2: llama-server up, slots parked -> serving_mode='big'."""
+        state = _make_state()
+        topology = _make_topology_state(mode="big", served_ids=["gravitywell-122b"])
+        snapshot = self._snapshot_with_topology(state, topology)
+        assert snapshot["serving_mode"] == "big"
+        assert snapshot["serving"] is True
+        assert snapshot["serving_is_big"] is True
+        assert snapshot["big_probe_state"] == "confirmed"
+
+    def test_dod3_big_and_refuted_never_co_occur(self):
+        """DoD 3: flip-controller claims 'big' but the SAME resolution's models
+        probe refutes the 122B (real split-brain) -> serving_mode='unknown', not 'big'."""
+        state = _make_state()
+        topology = _make_topology_state(mode="big", served_ids=["some-other-model"])
+        snapshot = self._snapshot_with_topology(state, topology)
+        assert snapshot["big_probe_state"] == "refuted"
+        assert snapshot["serving_mode"] != "big"
+        assert snapshot["serving_mode"] == "unknown"
+        assert not (snapshot["serving_mode"] == "big" and snapshot["big_probe_state"] == "refuted")
+
+    def test_dod4a_authority_gap_is_unknown(self):
+        """DoD 4(a): flip-controller unreachable (authority_gap=True, mode is None) -> 'unknown'."""
+        state = _make_state()
+        topology = _make_topology_state(
+            mode="big", served_ids=["gravitywell-122b"], authority_gap=True,
+        )
+        assert topology.mode is None
+        snapshot = self._snapshot_with_topology(state, topology)
+        assert snapshot["serving_mode"] == "unknown"
+
+    def test_dod4b_unknown_model_is_unknown(self):
+        """DoD 4(b): served id absent from gw_models.yaml -> 'unknown'."""
+        state = _make_state()
+        topology = _make_topology_state(
+            mode="dual", served_ids=["some-brand-new-model"],
+            unknown_model=True, distinct_second_model=True,
+        )
+        snapshot = self._snapshot_with_topology(state, topology)
+        assert snapshot["serving_mode"] == "unknown"
+
+    def test_dod4c_endpoint_unreachable_existing_branches_unchanged(self):
+        """DoD 4(c): GW endpoint unreachable (serving=False) -> existing stopped/unknown
+        branches, unaffected by topology resolution."""
+        state = _make_state()
+        state._cached_serving = False
+        state._serving_checked_at = time.time()
+        state.service_stopped = True
+        with patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+            snapshot = state.status_snapshot()
+        assert snapshot["serving_mode"] == "stopped"
+
+        state2 = _make_state()
+        state2._cached_serving = False
+        state2._serving_checked_at = time.time()
+        state2.service_stopped = False
+        with patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+            snapshot2 = state2.status_snapshot()
+        assert snapshot2["serving_mode"] == "unknown"
+
+    def test_dod4_mode_inferred_never_read_in_derivation(self):
+        """DoD 4: mode_inferred must not be READ anywhere in the serving_mode /
+        big_probe_state derivation (require_authoritative_mode's contract) — no
+        `.mode_inferred` attribute access in the deriving methods (prose mentions
+        in comments/docstrings are fine)."""
+        import inspect
+        from agents_core.doorman_server import _NodeState
+        src = inspect.getsource(_NodeState._topology_serving_mode) + inspect.getsource(
+            _NodeState._refresh_serving_cache
+        )
+        assert ".mode_inferred" not in src
+
+    def test_dod5_half_converged_dual_reports_unknown(self):
+        """DoD 5: authoritative mode says dual but distinct_second_model is False
+        (one slot dead) -> 'unknown', not 'dual'."""
+        state = _make_state()
+        topology = _make_topology_state(
+            mode="dual", served_ids=["gravitywell-a3b-nvfp4"], distinct_second_model=False,
+        )
+        snapshot = self._snapshot_with_topology(state, topology)
+        assert snapshot["serving_mode"] == "unknown"
+
+    def test_dod6_deferred_wins_over_resolver_authority_gap(self):
+        """DoD 6: controller owns the mode AND the resolver has authority_gap ->
+        'deferred', not 'unknown' — controller_owns is local lease state, not
+        resolver state, so it still takes precedence."""
+        state = _make_state()
+        topology = _make_topology_state(mode="big", served_ids=["gravitywell-122b"], authority_gap=True)
+        snapshot = self._snapshot_with_topology(state, topology, controller_owns=True)
+        assert snapshot["serving_mode"] == "deferred"
+
+    def test_dod9_status_snapshot_makes_no_network_call_with_topology_cached(self):
+        """DoD 9: status_snapshot reads pre-resolved cached topology only."""
+        state = _make_state()
+        topology = _make_topology_state(mode="dual", served_ids=["gravitywell-a3b-nvfp4", "gravitywell-a3b-coder"], distinct_second_model=True)
+        state._cached_serving = True
+        state._serving_checked_at = time.time()
+        state._cached_topology_state = topology
+        with patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True), \
+             patch("agents_core.doorman_server.gw_serving_state") as mock_resolve, \
+             patch("agents_core.doorman_server.requests") as mock_requests:
+            snapshot = state.status_snapshot()
+        mock_resolve.assert_not_called()
+        mock_requests.get.assert_not_called()
+        assert snapshot["serving_mode"] == "dual"
+
+    def test_pre_first_refresh_no_cached_topology_is_unknown(self):
+        """Race window: serving already True but _refresh_serving_cache hasn't run
+        with the flag on yet (_cached_topology_state is None) -> 'unknown', never
+        a confident guess."""
+        state = _make_state()
+        state._cached_serving = True
+        state._serving_checked_at = time.time()
+        assert state._cached_topology_state is None
+        with patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+            snapshot = state.status_snapshot()
+        assert snapshot["serving_mode"] == "unknown"
+
+
+class TestServingIsBigStoppedVsUnknown:
+    """DoD 10 — serving_is_big is False (known absence) in the stopped state,
+    and None only pre-first-refresh or on a resolution failure — the two must
+    be distinguishable."""
+
+    def test_stopped_state_serving_is_big_false(self):
+        state = _make_state()
+        state.service_stopped = True
+        state._serving_is_big = None  # never refreshed under the flag
+        with patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+            snapshot = state.status_snapshot()
+        assert snapshot["serving_is_big"] is False
+
+    def test_pre_first_refresh_serving_is_big_none_not_stopped(self):
+        state = _make_state()
+        state.service_stopped = False
+        assert state._serving_is_big is None
+        with patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+            snapshot = state.status_snapshot()
+        assert snapshot["serving_is_big"] is None
+
+    def test_resolution_failure_serving_is_big_none_not_stopped(self):
+        """A resolved-but-unknown probe (models endpoint never answered) also
+        stays None while service_stopped is False — distinct from the stopped
+        state's False."""
+        state = _make_state()
+        state.service_stopped = False
+        topology = _make_topology_state(mode="big", served_ids=[], models_answered=False)
+
+        with patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+            state._refresh_serving_cache()
+            snapshot = state.status_snapshot()
+
+        assert snapshot["serving_is_big"] is None
+        assert snapshot["big_probe_state"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
 # Three-state big-model probe (AC6, AC7, AC11)
 # ---------------------------------------------------------------------------
 
@@ -1825,77 +2064,81 @@ class TestModeAwareBigPredicate:
         assert ds.GW_BIG_MODEL_ID == "gravitywell-122b"
 
     def test_ac6a_confirmed_probe_serving_is_big_true(self):
-        """AC6(A): probe confirmed, no controller lease, cached_serving True -> serving_is_big=True."""
+        """AC6(A): resolution confirmed, no controller lease, serving True -> serving_is_big=True."""
         state = _make_state()
+        topology = _make_topology_state(mode="big", served_ids=["gravitywell-122b"])
 
-        def mock_models(url, **kwargs):
-            m = MagicMock()
-            m.status_code = 200
-            m.json.return_value = {"data": [{"id": "gravitywell-122b"}]}
-            return m
-
-        with patch("agents_core.doorman_server.requests.get", side_effect=mock_models), \
+        with patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
              patch.object(state, "_is_serving", return_value=True), \
              patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
             state._refresh_serving_cache()
 
         assert state._serving_is_big is True
         assert state._big_probe_state == "confirmed"
+        assert state._cached_topology_state is topology
 
     def test_ac6b_refuted_probe_serving_is_big_false(self):
-        """AC6(B): probe returns swarm id -> serving_is_big=False, big_probe_state='refuted'."""
+        """AC6(B): resolution's models endpoint answered with a non-122B id ->
+        serving_is_big=False, big_probe_state='refuted' — we looked and it's absent."""
         state = _make_state()
-        get_calls = []
+        topology = _make_topology_state(mode="big", served_ids=["swarm-coder-7b"])
+        calls = []
 
-        def mock_models(url, **kwargs):
-            get_calls.append(url)
-            m = MagicMock()
-            m.status_code = 200
-            m.json.return_value = {"data": [{"id": "swarm-coder-7b"}]}
-            return m
+        def fake_gw_serving_state(endpoint=None, **kwargs):
+            calls.append(endpoint)
+            return topology
 
-        with patch("agents_core.doorman_server.requests.get", side_effect=mock_models), \
+        with patch("agents_core.doorman_server.gw_serving_state", side_effect=fake_gw_serving_state), \
              patch.object(state, "_is_serving", return_value=True), \
              patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
             state._refresh_serving_cache()
 
         assert state._serving_is_big is False
         assert state._big_probe_state == "refuted"
-        # Assert GET was actually issued (AC6-B: real split-brain scenario)
-        assert len(get_calls) >= 1
-        assert any("v1/models" in url for url in get_calls)
+        # Single resolution: gw_serving_state was called once, against this node's endpoint.
+        assert calls == [GW_URL_DEFAULT]
 
-    def test_ac6c_inconclusive_probe_fallback_to_legacy_no_raise(self):
-        """AC6(C): probe timeout, cached_serving True, no controller -> serving_is_big=True, no exception."""
+    def test_ac6c_unknown_resolution_serving_is_big_none_no_raise(self):
+        """AC6(C): resolution failed (models endpoint never answered) -> serving_is_big=None
+        (never a legacy guess — a resolution failure must degrade to unknown)."""
         state = _make_state()
-        import requests as req_lib
+        topology = _make_topology_state(mode="big", served_ids=[], models_answered=False)
 
-        def mock_timeout(url, **kwargs):
-            raise req_lib.exceptions.Timeout("simulated probe timeout")
-
-        with patch("agents_core.doorman_server.requests.get", side_effect=mock_timeout), \
+        with patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
              patch.object(state, "_is_serving", return_value=True), \
              patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
             state._refresh_serving_cache()  # must not raise
 
-        assert state._serving_is_big is True   # legacy: serving + no controller = True
-        assert state._big_probe_state == "inconclusive"
+        assert state._serving_is_big is None
+        assert state._big_probe_state == "unknown"
+
+    def test_ac6c2_authority_gap_alone_is_unknown_probe_state(self):
+        """authority_gap=True forces big_probe_state='unknown' even if the models
+        endpoint itself answered (Council open question 2: unknown = the resolution
+        ITSELF failed, authority_gap OR models-endpoint failure)."""
+        state = _make_state()
+        topology = _make_topology_state(
+            mode="big", served_ids=["gravitywell-122b"], authority_gap=True, models_answered=True,
+        )
+
+        with patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+            state._refresh_serving_cache()
+
+        assert state._big_probe_state == "unknown"
+        assert state._serving_is_big is None
 
     def test_ac6d_controller_wins_over_confirmed_probe(self):
-        """AC6(D): probe confirmed but controller lease present -> serving_is_big=False."""
+        """AC6(D): resolution confirmed but controller lease present -> serving_is_big=False."""
         state = _make_state()
         state.leases["flip-controller-gw"] = {
             "acquired_at": time.time(), "ttl_sec": 240,
             "reason": "mode control", "role": "mode-controller",
         }
+        topology = _make_topology_state(mode="big", served_ids=["gravitywell-122b"])
 
-        def mock_models(url, **kwargs):
-            m = MagicMock()
-            m.status_code = 200
-            m.json.return_value = {"data": [{"id": "gravitywell-122b"}]}
-            return m
-
-        with patch("agents_core.doorman_server.requests.get", side_effect=mock_models), \
+        with patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
              patch.object(state, "_is_serving", return_value=True), \
              patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
             state._refresh_serving_cache()
@@ -1904,28 +2147,39 @@ class TestModeAwareBigPredicate:
         assert state._big_probe_state == "confirmed"
 
     def test_ac11_probe_runs_outside_lock(self):
-        """AC11: /v1/models probe is called with self.lock NOT held."""
+        """AC11: the topology resolution is called with self.lock NOT held."""
         state = _make_state()
         lock_held_during_probe = {"yes": False}
+        topology = _make_topology_state(mode="big", served_ids=["gravitywell-122b"])
 
-        def mock_models(url, **kwargs):
+        def fake_gw_serving_state(endpoint=None, **kwargs):
             # Try to acquire the lock without blocking — must succeed (lock is free)
             acquired = state.lock.acquire(blocking=False)
             if not acquired:
                 lock_held_during_probe["yes"] = True
             else:
                 state.lock.release()
-            m = MagicMock()
-            m.status_code = 200
-            m.json.return_value = {"data": [{"id": "gravitywell-122b"}]}
-            return m
+            return topology
 
-        with patch("agents_core.doorman_server.requests.get", side_effect=mock_models), \
+        with patch("agents_core.doorman_server.gw_serving_state", side_effect=fake_gw_serving_state), \
              patch.object(state, "_is_serving", return_value=True), \
              patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
             state._refresh_serving_cache()
 
         assert lock_held_during_probe["yes"] is False
+
+    def test_flag_off_never_calls_gw_serving_state(self):
+        """DOORMAN_MODE_AWARE_ADMISSION False -> _refresh_serving_cache never resolves
+        topology at all (no cost added to the dark-launch default path)."""
+        state = _make_state()
+
+        with patch("agents_core.doorman_server.gw_serving_state") as mock_resolve, \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", False):
+            state._refresh_serving_cache()
+
+        mock_resolve.assert_not_called()
+        assert state._cached_topology_state is None
 
 
 # ---------------------------------------------------------------------------
@@ -1952,12 +2206,12 @@ class TestDrainCount:
             assert key in snapshot
 
     def test_ac8b_drain_count_independent_of_probe(self):
-        """AC8(b): probe inconclusive -> drain_count still correct from registry."""
+        """AC8(b): resolution unknown -> drain_count still correct from registry."""
         state = _make_state()
         now = time.time()
         state.leases["w1"] = {"acquired_at": now, "ttl_sec": 300, "reason": "t", "role": "worker"}
         state.leases["w2"] = {"acquired_at": now, "ttl_sec": 300, "reason": "t", "role": "worker"}
-        state._big_probe_state = "inconclusive"
+        state._big_probe_state = "unknown"
 
         snapshot = state.status_snapshot()
         assert snapshot["drain_count"] == 2

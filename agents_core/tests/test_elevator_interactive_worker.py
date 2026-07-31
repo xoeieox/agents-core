@@ -1,7 +1,7 @@
 """Tests for elevator_interactive_worker — mode-peek, provenance classification, requeue.
 
 Covers:
-  AC1 — swarm-window peek skips claim (baton stays pending)
+  AC1 — not-big-window peek skips claim (baton stays pending)
   AC2 — big-mode peek claims + serves
   AC3 — hardened fail: last-known mode + bounded backoff, NOT blind-claim
   AC4 — _classify_deferred_reason reads provenance first (no /status call)
@@ -33,13 +33,21 @@ from agents_core.elevator_interactive_worker import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_status(serving: bool, serving_mode: str = "big") -> dict:
-    return {"nodes": {"gravitywell": {"serving": serving, "serving_mode": serving_mode}}}
+def _make_status(serving: bool, serving_is_big: bool | None = True, serving_mode: str = "big") -> dict:
+    return {
+        "nodes": {
+            "gravitywell": {
+                "serving": serving,
+                "serving_is_big": serving_is_big,
+                "serving_mode": serving_mode,
+            }
+        }
+    }
 
 
-def _make_client(serving: bool = True, serving_mode: str = "big"):
+def _make_client(serving: bool = True, serving_is_big: bool | None = True, serving_mode: str = "big"):
     client = mock.MagicMock()
-    client.status.return_value = _make_status(serving, serving_mode)
+    client.status.return_value = _make_status(serving, serving_is_big, serving_mode)
     return client
 
 
@@ -243,17 +251,32 @@ def test_serve_wake_failed_fails_after_max_retries(tmp_db):
 # ---------------------------------------------------------------------------
 
 def test_peek_serve_big_true_when_big():
-    client = _make_client(serving=True, serving_mode="big")
+    client = _make_client(serving=True, serving_is_big=True, serving_mode="big")
     assert _peek_serve_big(client) is True
 
 
-def test_peek_serve_big_false_when_swarm():
-    client = _make_client(serving=True, serving_mode="swarm")
+def test_peek_serve_big_false_when_dual():
+    """A dual snapshot (serving_is_big=False) must read as not-big."""
+    client = _make_client(serving=True, serving_is_big=False, serving_mode="dual")
     assert _peek_serve_big(client) is False
 
 
 def test_peek_serve_big_false_when_not_serving():
-    client = _make_client(serving=False, serving_mode="big")
+    client = _make_client(serving=False, serving_is_big=True, serving_mode="big")
+    assert _peek_serve_big(client) is False
+
+
+def test_peek_serve_big_false_when_serving_is_big_none():
+    """serving_is_big=None (pre-first-refresh or resolver failure) must read as
+    not-serving, not "uncertain, retry" — `is True` is required, not truthiness."""
+    client = _make_client(serving=True, serving_is_big=None, serving_mode="unknown")
+    assert _peek_serve_big(client) is False
+
+
+def test_peek_serve_big_decoupled_from_serving_mode_string():
+    """The predicate reads serving_is_big, not serving_mode — a stale/wrong
+    serving_mode="big" string must not flip it when serving_is_big says otherwise."""
+    client = _make_client(serving=True, serving_is_big=False, serving_mode="big")
     assert _peek_serve_big(client) is False
 
 
@@ -306,11 +329,12 @@ def test_peek_state_resets_on_success():
 
 
 # ---------------------------------------------------------------------------
-# AC1 — swarm-window peek skips claim
+# AC1 — dual-window peek skips claim
 # ---------------------------------------------------------------------------
 
-def test_worker_loop_skips_claim_when_swarm(tmp_db):
-    """AC1: peek returns swarm → elevator.claim NOT called; baton stays pending."""
+def test_worker_loop_skips_claim_when_dual(tmp_db):
+    """AC1: peek returns dual (serving_is_big=False) → elevator.claim NOT called;
+    baton stays pending."""
     db_path, store = tmp_db
     item_id = store.enqueue(
         lane="interactive", kind="session-turn",
@@ -318,8 +342,8 @@ def test_worker_loop_skips_claim_when_swarm(tmp_db):
         principal="s1", latency_class="interactive",
     )
 
-    # Swarm client → will trigger skip
-    swarm_client = _make_client(serving=True, serving_mode="swarm")
+    # Dual client → will trigger skip
+    dual_client = _make_client(serving=True, serving_is_big=False, serving_mode="dual")
 
     call_count = {"n": 0}
 
@@ -339,7 +363,7 @@ def test_worker_loop_skips_claim_when_swarm(tmp_db):
         mock_time.monotonic = time.monotonic
 
         try:
-            worker_loop(_peek_state=peek_state, _doorman_client=swarm_client)
+            worker_loop(_peek_state=peek_state, _doorman_client=dual_client)
         except KeyboardInterrupt:
             pass  # expected exit
 

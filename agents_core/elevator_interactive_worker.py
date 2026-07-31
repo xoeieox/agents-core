@@ -210,10 +210,18 @@ class _ModePeekState:
 
 
 def _peek_serve_big(client: DoormanClient) -> bool:
-    """Return True iff the cached doorman /status says GW is in big mode."""
+    """Return True iff the cached doorman /status says the 122B is actually serving.
+
+    Reads serving_is_big (bool | None), not the serving_mode string — decouples
+    this predicate from the topology-name vocabulary, so a future topology (e.g.
+    "dual") can't silently flip it the way a serving_mode string comparison would
+    (agents-core-doorman-serving-mode-topology-truthful-v0). `is True` is required,
+    not truthiness: serving_is_big is None until the first refresh (and on a
+    resolver failure), which must read as not-serving.
+    """
     status = client.status()
     gw = status.get("nodes", {}).get("gravitywell", {})
-    return bool(gw.get("serving") is True and gw.get("serving_mode") == "big")
+    return bool(gw.get("serving") is True and gw.get("serving_is_big") is True)
 
 
 def worker_loop(

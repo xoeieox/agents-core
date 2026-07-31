@@ -17,3 +17,19 @@ models:
     operator_alias: gravitywell
     display_label: qwen3.5-122b-a10b
     weights_hint: "Qwen3.5-122B-A10B"
+
+  # dual-coder topology (ratified 2026-07-30 as GravityWell's home posture,
+  # agents-core-doorman-serving-mode-topology-truthful-v0) — slot1 :8081 nvfp4,
+  # slot2 :8082 coder. Both imply mode_alias "dual"; a lookup keyed on either
+  # served id resolves unknown_model=False so gw_serving_state() can tell
+  # "dual" apart from "unknown" on this box.
+  - canonical_id: gravitywell-a3b-nvfp4
+    mode_alias: dual
+    operator_alias: gravitywell
+    display_label: qwen3.6-35b-a3b-nvfp4
+    weights_hint: "Qwen3.6-35B-A3B-NVFP4"
+  - canonical_id: gravitywell-a3b-coder
+    mode_alias: dual
+    operator_alias: gravitywell
+    display_label: qwen3.6-35b-a3b-fp8-coder
+    weights_hint: "Qwen3.6-35B-A3B-FP8-dynamic"

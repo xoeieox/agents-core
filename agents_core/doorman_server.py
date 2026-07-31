@@ -111,6 +111,8 @@ import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from agents_core.llm import gw_serving_state
+
 log = logging.getLogger("doorman-server")
 
 GW_URL_DEFAULT = "http://203.0.113.11:8081"
@@ -163,8 +165,11 @@ DOORMAN_CONTROLLER_NAME = os.environ.get("DOORMAN_CONTROLLER_NAME", "flip-contro
 
 # Mode-aware admission guard — dark / default-OFF. When True:
 #   ensure_serving checks deference BEFORE _is_serving() (HOLE 1 fix);
-#   status_snapshot.serving_mode is controller-lease-aware (HOLE 2 fix);
-#   _refresh_serving_cache probes /v1/models for the three-state serving_is_big predicate.
+#   status_snapshot.serving_mode is controller-lease-aware (HOLE 2 fix) and reports
+#   the actual topology (big/dual), not a hardcoded "big" (agents-core-doorman-
+#   serving-mode-topology-truthful-v0);
+#   _refresh_serving_cache resolves gw_serving_state() once per tick, feeding
+#   serving_mode, the three-state serving_is_big predicate, and big_probe_state.
 DOORMAN_MODE_AWARE_ADMISSION = os.environ.get(
     "DOORMAN_MODE_AWARE_ADMISSION", ""
 ).lower() in ("1", "true", "yes")
@@ -346,7 +351,13 @@ class _NodeState:
         self._cached_creative_serving: bool = False
         # Mode-aware big predicate (populated only when DOORMAN_MODE_AWARE_ADMISSION is True)
         self._serving_is_big: bool | None = None   # None until first refresh with flag ON
-        self._big_probe_state: str | None = None   # 'confirmed'|'refuted'|'inconclusive'
+        self._big_probe_state: str | None = None   # 'confirmed'|'refuted'|'unknown'
+        # Single-resolution topology cache (agents-core-doorman-serving-mode-topology-
+        # truthful-v0): set by _refresh_serving_cache (flag ON) from ONE call to
+        # agents_core.llm.gw_serving_state(). serving_mode's big/dual branch,
+        # _serving_is_big, and _big_probe_state all derive from this one object —
+        # never a second independent probe of the same truth.
+        self._cached_topology_state = None   # GwServingState | None until first refresh with flag ON
         # llama-server /slots activity probe (doorman-probe-llama-activity-v0)
         self._last_probed_task_by_slot: dict[int, int] = {}
         self._idle_since_source: str | None = None  # 'lease' | 'probe' | None
@@ -389,32 +400,6 @@ class _NodeState:
             return r.status_code == 200 and r.json().get("status") == "ok"
         except Exception:
             return False
-
-    def _probe_big_model(self) -> tuple[bool | None, str]:
-        """Probe /v1/models to determine whether the big model is resident.
-
-        Returns (big_probe_raw, big_probe_state):
-          confirmed    — GW_BIG_MODEL_ID in model list
-          refuted      — a different model id is served (fail-closed: real split-brain)
-          inconclusive — timeout / network error (caller degrades to legacy judgment)
-
-        Must be called OUTSIDE self.lock (blocking HTTP, ~2.5s timeout).
-        """
-        try:
-            resp = requests.get(f"{self.gw_url}/v1/models", timeout=2.5)
-            if resp.status_code == 200:
-                model_ids = [m.get("id", "") for m in resp.json().get("data", [])]
-                if GW_BIG_MODEL_ID in model_ids:
-                    return True, "confirmed"
-                if model_ids:
-                    # non-empty list without our model — a competing model is resident
-                    return False, "refuted"
-                # empty list — registry not yet populated during startup
-                return None, "inconclusive"
-            return None, "inconclusive"
-        except Exception as exc:
-            log.debug(f"[{self.node_name}] big-model probe inconclusive: {exc}")
-            return None, "inconclusive"
 
     def _probe_llama_slots_activity(self) -> bool:
         """Probe A: llama.cpp's own /slots for unmediated-caller activity (big mode).
@@ -547,8 +532,12 @@ class _NodeState:
         within an already-held self.lock context or it will deadlock
         (threading.Lock is non-reentrant).
 
-        When DOORMAN_MODE_AWARE_ADMISSION is True, also probes /v1/models for
-        the three-state serving_is_big predicate (outside the lock, AC11).
+        When DOORMAN_MODE_AWARE_ADMISSION is True, also resolves GW's topology via
+        ONE call to agents_core.llm.gw_serving_state() (outside the lock, ~4s ×
+        up to 4 HTTP calls) — the single resolution that feeds serving_mode's
+        big/dual branch, serving_is_big, and big_probe_state (agents-core-doorman-
+        serving-mode-topology-truthful-v0). status_snapshot() only ever reads the
+        cached result; it never calls gw_serving_state() itself.
 
         When DOORMAN_PROBE_LLAMA_ACTIVITY is True, also probes both llama.cpp's
         /slots and vLLM's /metrics (both dual slots) for unmediated-caller activity
@@ -557,10 +546,17 @@ class _NodeState:
         serving = self._is_serving(timeout=2.0)
         creative_serving = self._is_creative_serving()
 
-        # Optional big-model probe — outside the lock (blocking HTTP, AC11)
-        big_probe_state: str | None = None
+        # Single topology resolution — outside the lock (blocking HTTP).
+        topology_state = None
         if DOORMAN_MODE_AWARE_ADMISSION:
-            _, big_probe_state = self._probe_big_model()
+            try:
+                topology_state = gw_serving_state(endpoint=self.gw_url)
+            except Exception as exc:
+                log.warning(
+                    f"[{self.node_name}] gw_serving_state() raised, degrading to "
+                    f"unknown topology resolution: {exc}"
+                )
+                topology_state = None
 
         # Optional dual-slot activity probe — outside the lock (blocking HTTP).
         # Tri-state: True (confirmed activity), False (confirmed idle), None
@@ -574,19 +570,42 @@ class _NodeState:
             self._cached_creative_serving = creative_serving
             self._serving_checked_at = time.time()
             if DOORMAN_MODE_AWARE_ADMISSION:
-                self._big_probe_state = big_probe_state
+                self._cached_topology_state = topology_state
                 controller_owns = self._controller_lease_active()
-                if big_probe_state == "refuted":
+
+                # big_probe_state (Council open question 2): "refuted" = the models
+                # endpoint answered and the 122B canonical id is absent — we looked
+                # and it is not there. "unknown" = the resolution itself failed
+                # (authority_gap, or the models endpoint never answered, or the
+                # resolver call raised/returned None) — we could not look.
+                # mode_inferred is never read here.
+                if topology_state is None:
+                    models_answered = False
+                else:
+                    models_answered = (
+                        topology_state.source_freshness.get("models_endpoint", {}).get("status")
+                        == "answered"
+                    )
+                if topology_state is None or topology_state.authority_gap or not models_answered:
+                    self._big_probe_state = "unknown"
+                elif GW_BIG_MODEL_ID in topology_state.served_ids:
+                    self._big_probe_state = "confirmed"
+                else:
+                    self._big_probe_state = "refuted"
+
+                if self._big_probe_state == "refuted":
+                    # We looked and the 122B is definitively absent.
                     self._serving_is_big = False
-                elif big_probe_state == "confirmed":
+                elif self._big_probe_state == "confirmed":
                     # Controller win takes precedence over probe confirmation (AC6-D)
                     self._serving_is_big = bool(serving and not controller_owns)
-                else:  # inconclusive — fall back to legacy controller-lease judgment
-                    self._serving_is_big = bool(serving and not controller_owns)
+                else:  # unknown — could not look; a guess here reproduces the bug this fixes
+                    self._serving_is_big = None
                     log.warning(
-                        f"[{self.node_name}] big-model probe inconclusive — "
-                        f"falling back to legacy controller-lease judgment "
-                        f"(serving_is_big={self._serving_is_big}); probe_inconclusive"
+                        f"[{self.node_name}] topology resolution unknown "
+                        f"(authority_gap={None if topology_state is None else topology_state.authority_gap}, "
+                        f"models_answered={models_answered}) — serving_is_big left "
+                        f"None rather than guessed; topology_resolution_unknown"
                     )
 
             # Probe-driven idle keepalive (doorman-probe-llama-activity-v0, extended by
@@ -617,6 +636,33 @@ class _NodeState:
                 and now <= lease_info["acquired_at"] + lease_info["ttl_sec"]):
                 return True
         return False
+
+    def _topology_serving_mode(self) -> str:
+        """Derive serving_mode's "what topology is actually serving" branch from
+        the single cached GwServingState (agents-core-doorman-serving-mode-
+        topology-truthful-v0). Read-only, no network call — must be called under
+        self.lock. Never called when controller_owns or not serving (those branches
+        are decided in status_snapshot() before reaching here).
+
+        A resolution failure — no resolution yet, authority_gap, or unknown_model —
+        always degrades to "unknown", never a confident "big"/"dual" guess.
+        mode_inferred is never read here (require_authoritative_mode's contract).
+        """
+        state = self._cached_topology_state
+        if state is None or state.authority_gap or state.unknown_model:
+            return "unknown"
+        if state.mode == "dual":
+            # Half-converged dual (Council open question 1): configured dual with
+            # only one slot actually up must not report "dual".
+            return "dual" if state.distinct_second_model else "unknown"
+        if state.mode == "big":
+            # DoD 3 non-contradiction: the models-endpoint half of this SAME
+            # resolution already refuted the 122B being served — a flip-controller
+            # "big" claim under that condition is a real split-brain, not big.
+            if self._big_probe_state == "refuted":
+                return "unknown"
+            return "big"
+        return "unknown"
 
     # ------------------------------------------------------------------
     # Foreground-priority gate (gw-router-phase1-foreground-gate)
@@ -1248,7 +1294,7 @@ class _NodeState:
                 if controller_owns:
                     serving_mode = "deferred"
                 elif serving:
-                    serving_mode = "big"
+                    serving_mode = self._topology_serving_mode()
                 elif self.service_stopped:
                     serving_mode = "stopped"
                 else:
@@ -1283,7 +1329,10 @@ class _NodeState:
                 "mode_owner": DOORMAN_CONTROLLER_NAME if controller_owns else None,
                 "drain_count": drain_count,
                 "worker_lease_count": drain_count,
-                "serving_is_big": self._serving_is_big,
+                # stopped is a KNOWN absence (122B definitively not serving) — False,
+                # not None. None is reserved for genuine uncertainty: pre-first-refresh
+                # or a resolution failure (Council stand-aside, adopted).
+                "serving_is_big": False if self.service_stopped else self._serving_is_big,
                 "big_probe_state": self._big_probe_state,
                 "creative_serving": self._cached_creative_serving,
                 "probe_activity_enabled": DOORMAN_PROBE_LLAMA_ACTIVITY,
@@ -1424,8 +1473,15 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
             first_iteration = False
             backoff = 0.0
             for node_name, state in nodes.items():
-                # Refresh serving cache OUTSIDE the lock (probing is a blocking network call)
-                state._refresh_serving_cache()
+                # Refresh serving cache OUTSIDE the lock (probing is a blocking network call).
+                # Must never let an exception from a probe (e.g. _probe_slot_activity)
+                # escape and kill this daemon thread.
+                try:
+                    state._refresh_serving_cache()
+                except Exception as exc:
+                    log.warning(
+                        f"[{node_name}] _refresh_serving_cache() raised, skipping this tick: {exc}"
+                    )
                 with state.lock:
                     state._gc_stale()
                     # Foreground-priority gate (gw-router-phase1-foreground-gate):
