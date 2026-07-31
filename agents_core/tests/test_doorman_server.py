@@ -40,6 +40,7 @@ from agents_core.doorman_server import (
     DOORMAN_DEFER_TO_CONTROLLER,
     DOORMAN_CONTROLLER_NAME,
     GHOST_PRINCIPAL,
+    VALID_SERVE_MODES,
     _NodeState,
     _describe_stopped_units,
     _write_idle_log,
@@ -1243,6 +1244,235 @@ class TestDeference:
 
 
 # ---------------------------------------------------------------------------
+# Mode-bearing acquire tests (agents-core-doorman-mode-bearing-acquire-v0)
+# ---------------------------------------------------------------------------
+
+class TestModeBearingAcquire:
+    """A mode-controller acquire that supplies a valid mode commands the posture
+    instead of deferring, while every existing deference behaviour is preserved
+    for omitted/foreign/non-controller cases."""
+
+    def test_no_mode_byte_identical_default_dispatch_dual(self):
+        """AC1: mode=None, DOORMAN_DEFAULT_SERVE_MODE=dual -> unchanged dispatch."""
+        state = _make_state()
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
+             patch.object(state, "_wake_big") as mock_big, \
+             patch.object(state, "_wake_dual", return_value=True) as mock_dual, \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "dual"):
+            result = state.ensure_serving(role="worker", mode=None)
+
+        assert result is True
+        mock_dual.assert_called_once()
+        mock_big.assert_not_called()
+
+    def test_no_mode_byte_identical_default_dispatch_big(self):
+        """AC1: mode=None, DOORMAN_DEFAULT_SERVE_MODE=big -> unchanged dispatch."""
+        state = _make_state()
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
+             patch.object(state, "_wake_big", return_value=True) as mock_big, \
+             patch.object(state, "_wake_dual") as mock_dual, \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "big"):
+            result = state.ensure_serving(role="worker", mode=None)
+
+        assert result is True
+        mock_big.assert_called_once()
+        mock_dual.assert_not_called()
+
+    def test_empty_string_mode_treated_as_omission(self):
+        """AC1/AC4a: mode="" is treated as omission, not an invalid mode."""
+        state = _make_state()
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
+             patch.object(state, "_wake_dual", return_value=True) as mock_dual, \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "dual"):
+            result = state.ensure_serving(role="mode-controller", mode="")
+
+        # Empty mode must NOT trigger the mode-bearing branch — falls through to
+        # the existing role=="mode-controller" -> DEFERRED short-circuit.
+        assert result is DEFERRED
+        mock_dual.assert_not_called()
+
+    def test_mode_controller_with_mode_overrides_default_serve_mode(self):
+        """AC2: role='mode-controller' + mode='dual' overrides DOORMAN_DEFAULT_SERVE_MODE=big."""
+        state = _make_state()
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
+             patch.object(state, "_wake_big") as mock_big, \
+             patch.object(state, "_wake_dual", return_value=True) as mock_dual, \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "big"), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            result = state.ensure_serving(role="mode-controller", mode="dual", work_id="flip-1")
+
+        assert result is True
+        mock_dual.assert_called_once()
+        mock_big.assert_not_called()
+        assert result is not DEFERRED
+
+    def test_foreign_controller_still_wins_with_mode_supplied(self):
+        """AC3: a non-expired FOREIGN mode-controller lease defers regardless of a supplied mode."""
+        state = _make_state()
+        state.leases["foreign-controller"] = {
+            "acquired_at": time.time(),
+            "ttl_sec": 240,
+            "reason": "mode control",
+            "role": "mode-controller",
+        }
+        gw_serve_called = []
+
+        def fake_run(cmd, **kwargs):
+            if "gw-serve" in str(cmd):
+                gw_serve_called.append(cmd)
+            return MagicMock(returncode=0, stderr="")
+
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            result = state.ensure_serving(role="mode-controller", mode="big", work_id="flip-2")
+
+        assert result is DEFERRED
+        assert len(gw_serve_called) == 0  # no gw-serve subprocess spawned
+
+    def test_own_controller_lease_serves_rather_than_defers_to_self(self):
+        """AC3a: the caller's OWN active controller lease must not cause self-deferral."""
+        state = _make_state()
+        state.leases["flip-1"] = {
+            "acquired_at": time.time(),
+            "ttl_sec": 240,
+            "reason": "mode control",
+            "role": "mode-controller",
+        }
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
+             patch.object(state, "_wake_dual", return_value=True) as mock_dual, \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            result = state.ensure_serving(role="mode-controller", mode="dual", work_id="flip-1")
+
+        assert result is True
+        mock_dual.assert_called_once()
+
+    def test_non_controller_mode_discarded_no_error(self):
+        """AC2a: mode supplied by role != 'mode-controller' is discarded, default dispatch runs."""
+        state = _make_state()
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
+             patch.object(state, "_wake_dual", return_value=True) as mock_dual, \
+             patch.object(state, "_wake_big") as mock_big, \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "dual"), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            result = state.ensure_serving(role="worker", mode="dual")
+
+        assert result is True
+        mock_dual.assert_called_once()
+        mock_big.assert_not_called()
+
+    def test_valid_serve_modes_constant(self):
+        """AC4: one named constant is the vocabulary source of truth."""
+        assert VALID_SERVE_MODES == frozenset({"big", "dual"})
+
+    def test_endpoint_rejects_invalid_mode_before_subprocess(self):
+        """AC4/AC6: an unrecognised mode is rejected 400 with status=invalid_mode,
+        naming the rejected value and accepted set, before any subprocess call."""
+        c = _client_no_auth()
+        with patch("subprocess.run") as mock_run, \
+             patch("agents_core.doorman_server._NodeState._is_creative_serving", return_value=False):
+            r = c.post("/lease/acquire", json={
+                "node": "gravitywell", "work_id": "flip-1", "ttl_sec": 120,
+                "reason": "flip", "role": "mode-controller", "mode": "nonsense",
+            })
+        assert r.status_code == 400
+        body = r.json()
+        assert body["status"] == "invalid_mode"
+        assert "nonsense" in body["detail"]
+        assert "big" in body["detail"] and "dual" in body["detail"]
+        mock_run.assert_not_called()
+
+    def test_endpoint_no_mode_and_empty_mode_identical(self):
+        """AC4a: mode absent and mode="" both take the byte-identical default path."""
+        c = _client_no_auth()
+        with patch("agents_core.doorman_server._NodeState.acquire_lease") as mock_acquire, \
+             patch("agents_core.doorman_server._NodeState._is_creative_serving", return_value=False):
+            mock_acquire.return_value = True
+            c.post("/lease/acquire", json={
+                "node": "gravitywell", "work_id": "w1", "ttl_sec": 120,
+                "reason": "x", "role": "worker",
+            })
+            c.post("/lease/acquire", json={
+                "node": "gravitywell", "work_id": "w2", "ttl_sec": 120,
+                "reason": "x", "role": "worker", "mode": "",
+            })
+
+        assert mock_acquire.call_count == 2
+        for call_args in mock_acquire.call_args_list:
+            assert call_args.kwargs["mode"] is None
+
+    def test_concurrent_mode_bearing_acquires_serialize(self):
+        """AC7: two concurrent mode-bearing acquires for different modes serialize —
+        self.wake_lock (held for the whole ensure_serving body) means the second
+        caller cannot even reach the wake-dispatch branch until the first has fully
+        finished; by then GW is already serving, so its fast path returns True
+        without a second gw-serve. No competing gw-serve is ever issued."""
+        state = _make_state()
+        wake_calls = []
+        serving_flag = {"value": False}
+        entered_wake_lock = threading.Event()
+        release_first = threading.Event()
+
+        def fake_is_serving(_timeout=3.0):
+            return serving_flag["value"]
+
+        def fake_wake_dual():
+            # First caller: signal it's inside the critical section, then hold
+            # until the test releases it — proves the second caller is blocked
+            # out of the wake dispatch entirely while this is in flight.
+            wake_calls.append("dual")
+            entered_wake_lock.set()
+            release_first.wait(timeout=5)
+            serving_flag["value"] = True
+            return True
+
+        with patch.object(state, "_is_serving", side_effect=fake_is_serving), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
+             patch.object(state, "_wake_dual", side_effect=fake_wake_dual), \
+             patch.object(state, "_wake_big") as mock_big, \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+
+            results = []
+
+            def run():
+                results.append(state.ensure_serving(role="mode-controller", mode="dual", work_id="flip-1"))
+
+            t1 = threading.Thread(target=run)
+            t1.start()
+            assert entered_wake_lock.wait(timeout=5)  # t1 is inside the wake_lock critical section
+
+            t2 = threading.Thread(target=run)
+            t2.start()
+            # t2 must be blocked on wake_lock, not racing into _wake_dual itself.
+            time.sleep(0.1)
+            assert len(wake_calls) == 1
+
+            release_first.set()
+            t1.join(timeout=5)
+            t2.join(timeout=5)
+
+        # Only one caller ever reached the wake dispatch — the other's fast path
+        # (GW now serving) short-circuited before any gw-serve was issued.
+        assert len(wake_calls) == 1
+        mock_big.assert_not_called()
+        assert all(r is True for r in results)
+
+
+# ---------------------------------------------------------------------------
 # Deference HTTP endpoint tests (doorman-mode-deference-v0)
 # ---------------------------------------------------------------------------
 
@@ -2399,7 +2629,7 @@ class TestLeaseKindDrainGate:
 
     def _serving_state(self) -> _NodeState:
         s = self._make_state()
-        s.ensure_serving = lambda role="worker": True  # type: ignore[method-assign]
+        s.ensure_serving = lambda role="worker", mode=None, work_id=None: True  # type: ignore[method-assign]
         s._place_hold = lambda: None  # type: ignore[method-assign]
         return s
 
@@ -3348,7 +3578,7 @@ class TestWakeLockDecoupledFromStateLock:
         wake_started = threading.Event()
         release_wake = threading.Event()
 
-        def blocking_ensure_serving(role=None):
+        def blocking_ensure_serving(role=None, mode=None, work_id=None):
             wake_started.set()
             assert release_wake.wait(timeout=5), "release never signaled"
             return True
@@ -3377,7 +3607,7 @@ class TestWakeLockDecoupledFromStateLock:
         wake_started = threading.Event()
         release_wake = threading.Event()
 
-        def blocking_ensure_serving(self, role=None):
+        def blocking_ensure_serving(self, role=None, mode=None, work_id=None):
             wake_started.set()
             assert release_wake.wait(timeout=5), "release never signaled"
             return True
@@ -3413,7 +3643,7 @@ class TestWakeLockDecoupledFromStateLock:
         wake_started = threading.Event()
         release_wake = threading.Event()
 
-        def blocking_ensure_serving(self, role=None):
+        def blocking_ensure_serving(self, role=None, mode=None, work_id=None):
             wake_started.set()
             assert release_wake.wait(timeout=5), "release never signaled"
             return True
@@ -3449,7 +3679,7 @@ class TestWakeLockDecoupledFromStateLock:
         wake_started = threading.Event()
         release_wake = threading.Event()
 
-        def blocking_ensure_serving(self, role=None):
+        def blocking_ensure_serving(self, role=None, mode=None, work_id=None):
             wake_started.set()
             assert release_wake.wait(timeout=5), "release never signaled"
             return True
@@ -3486,7 +3716,7 @@ class TestWakeLockDecoupledFromStateLock:
         wake_started = threading.Event()
         release_wake = threading.Event()
 
-        def blocking_ensure_serving(self, role=None):
+        def blocking_ensure_serving(self, role=None, mode=None, work_id=None):
             wake_started.set()
             assert release_wake.wait(timeout=5), "release never signaled"
             return True

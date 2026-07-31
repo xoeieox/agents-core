@@ -172,13 +172,20 @@ class DoormanClient:
         except httpx.TimeoutException as e:
             raise DoormanUnreachable(f"doorman timeout at {self._base_url}: {e}") from e
 
-    def acquire(self, node: str, work_id: str, ttl_sec: int, reason: str, role: str = "worker", timeout: float | None = None, principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference", lease_class: str | None = None) -> dict:
+    def acquire(self, node: str, work_id: str, ttl_sec: int, reason: str, role: str = "worker", timeout: float | None = None, principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference", lease_class: str | None = None, mode: str | None = None) -> dict:
         """Acquire a lease for node.
 
         Args:
           role: optional role descriptor (default "worker"). Use "mode-controller"
                 if acquiring as the flip-controller so the doorman recognizes
                 controller ownership and defers to it.
+          mode: optional requested serve mode ("big" or "dual"). Only honored when
+                role=="mode-controller" and no foreign controller lease is active —
+                then ensure_serving issues gw-serve <mode> instead of deferring,
+                overriding DOORMAN_DEFAULT_SERVE_MODE for this acquire
+                (agents-core-doorman-mode-bearing-acquire-v0). Omitted or empty
+                string is treated as no mode supplied — byte-identical to omission.
+                Ignored (not an error) when role != "mode-controller".
           timeout: optional per-request timeout override (default uses client timeout).
                    For GW acquire, pass _gw_acquire_timeout() to ensure the HTTP
                    timeout outlives the server's GW_WAKE_DEADLINE_SEC.
@@ -209,6 +216,8 @@ class DoormanClient:
           "pending_defer" — a `deferrable` acquire is queued behind an active `protected`
                             lease/brake; no lease registered — retry to check for release
           "wake_failed" — GW failed to wake
+          "invalid_mode" — mode was supplied but is not in the accepted set (only
+                            possible when a mode was supplied); no subprocess was invoked
           {"ok": False, "contended": True} — drain gate active; another group holds a lease
           {"ok": False, "creative_occupied": True} — Llama-3.3-70B holds the GPU; check is_creative_occupied()
         """
@@ -227,6 +236,8 @@ class DoormanClient:
             body["lease_kind"] = lease_kind
         if lease_class is not None:
             body["class"] = lease_class
+        if mode:
+            body["mode"] = mode
         return self._post("/lease/acquire", body, timeout=timeout)
 
     def release(self, node: str, work_id: str) -> None:

@@ -215,6 +215,11 @@ DOORMAN_IDLE_LOG = os.environ.get("DOORMAN_IDLE_LOG", "/var/log/doorman-idle.jso
 LEASE_CLASSES = ("protected", "deferrable")
 DEFAULT_LEASE_CLASS = "deferrable"
 
+# Single source of truth for the requested-serve-mode vocabulary
+# (agents-core-doorman-mode-bearing-acquire-v0, AC4). "big" and "dual" both route
+# to their existing _wake_big()/_wake_dual() dispatch — no other value is valid.
+VALID_SERVE_MODES = frozenset({"big", "dual"})
+
 # The "iron rod": absolute, non-resettable max-hold for a deferrable job
 # waiting on the pending-defer wait-list, anchored to its own enqueue
 # timestamp — never extended by newly-arriving protected leases.
@@ -637,6 +642,24 @@ class _NodeState:
                 return True
         return False
 
+    def _foreign_controller_lease_active(self, work_id: str | None) -> bool:
+        """Check if a non-expired mode-controller lease is held by a DIFFERENT work_id.
+
+        Must be called under self.lock. Identity-aware counterpart to
+        _controller_lease_active() (AC3a, agents-core-doorman-mode-bearing-acquire-v0):
+        that method returns a bare bool and cannot distinguish self from other, so a
+        controller's own second acquire would defer to itself. This method is used
+        only by the mode-bearing acquire path — every other caller of
+        _controller_lease_active() is unaffected.
+        """
+        now = time.time()
+        for wid, lease_info in self.leases.items():
+            if (lease_info.get("role") == "mode-controller"
+                    and wid != work_id
+                    and now <= lease_info["acquired_at"] + lease_info["ttl_sec"]):
+                return True
+        return False
+
     def _topology_serving_mode(self) -> str:
         """Derive serving_mode's "what topology is actually serving" branch from
         the single cached GwServingState (agents-core-doorman-serving-mode-
@@ -821,7 +844,7 @@ class _NodeState:
     # ensure_serving — serializes wakes via self.wake_lock, not self.lock
     # ------------------------------------------------------------------
 
-    def ensure_serving(self, role: str | None = None) -> bool | object:
+    def ensure_serving(self, role: str | None = None, mode: str | None = None, work_id: str | None = None) -> bool | object:
         """Wake GW if needed, start the serving unit, and wait until it serves.
 
         Returns True on success, DEFERRED if controller owns the mode, False on failure.
@@ -837,6 +860,16 @@ class _NodeState:
           role: optional role of the caller (e.g., "mode-controller" for flip-controller).
                 If role=="mode-controller", this is the controller's own acquire and
                 short-circuits to DEFERRED without needing a pre-registered lease.
+          mode: optional requested serve mode ("big" or "dual"; already validated against
+                VALID_SERVE_MODES by the caller before this method runs — never validated
+                here). Only acted on when role=="mode-controller" and no FOREIGN
+                mode-controller lease is active (agents-core-doorman-mode-bearing-
+                acquire-v0, AC2/AC3/AC3a): then this commands gw-serve <mode> instead of
+                deferring, overriding DOORMAN_DEFAULT_SERVE_MODE. Omitted (None) is
+                byte-identical to the pre-mode-bearing-acquire behavior (AC1). Ignored
+                when role != "mode-controller" (AC2a).
+          work_id: the caller's own work_id, used only for the identity-aware foreign-
+                   controller check (AC3a) when mode is supplied and role=="mode-controller".
 
         Flow (gravitywell-doorman-clean-stop-v0 + doorman-mode-deference-v0):
           0. Mode-aware deference (HOLE 1 fix, flag ON only): if controller owns the
@@ -846,14 +879,19 @@ class _NodeState:
           1. Fast-path: _is_serving() → return True (service already up).
           2. wake-gravitywell: idempotent host-wake (no-op if already up).
           3. Check deference: if DOORMAN_DEFER_TO_CONTROLLER and (role=="mode-controller"
-             or an active mode-controller lease exists), return DEFERRED (no wake issued).
-          4. Issue gw-serve ${DOORMAN_DEFAULT_SERVE_MODE} (gw-doorman-wake-to-default-mode-v0):
+             or an active mode-controller lease exists), return DEFERRED (no wake issued) —
+             UNLESS this is a mode-bearing controller acquire (role=="mode-controller" and
+             mode is supplied) and no FOREIGN controller lease is active, in which case it
+             commands gw-serve <mode> instead (AC2).
+          4. Issue gw-serve ${DOORMAN_DEFAULT_SERVE_MODE} (gw-doorman-wake-to-default-mode-v0),
+             or gw-serve <mode> for a mode-bearing controller acquire (step 3 above):
              "big" (_wake_big) — start llama-server.service if stopped (idempotent),
              synchronous ~60s subprocess, poll until serving or GW_WAKE_DEADLINE_SEC.
              "dual" (_wake_dual, default) — async-initiate gw-serve dual (fast-returning
              backgrounded launch; the ~488s Devstral cold-init happens off the subprocess),
              then poll both slots until GW_DUAL_WAKE_DEADLINE_SEC.
         """
+        mode = mode or None  # AC1/AC4a: empty string is omission, defensively re-normalized here too
         with self.wake_lock:
             # Block co-load if creative 70B holds the GPU lane
             if self._is_creative_serving():
@@ -903,6 +941,29 @@ class _NodeState:
             if DOORMAN_DEFER_TO_CONTROLLER:
                 with self.lock:
                     controller_owns = self._controller_lease_active()
+
+                # Mode-bearing controller acquire (agents-core-doorman-mode-bearing-
+                # acquire-v0, AC2): a caller that BOTH claims mode-controller AND
+                # supplies a mode commands the posture instead of deferring to it.
+                # AC3/AC3a: a FOREIGN controller lease still wins unconditionally —
+                # identity-aware, so a controller's own repeat acquire never defers
+                # to itself. mode is already validated (VALID_SERVE_MODES) by the
+                # caller before this method runs.
+                if role == "mode-controller" and mode is not None:
+                    with self.lock:
+                        foreign_controller_owns = self._foreign_controller_lease_active(work_id)
+                    if foreign_controller_owns:
+                        log.info(
+                            f"[{self.node_name}] mode-bearing controller acquire deferring — "
+                            f"foreign controller owns mode (work_id={work_id!r})"
+                        )
+                        return DEFERRED
+                    log.info(
+                        f"[{self.node_name}] mode-bearing controller acquire — "
+                        f"commanding gw-serve {mode} (overrides DOORMAN_DEFAULT_SERVE_MODE)"
+                    )
+                    return self._wake_big() if mode == "big" else self._wake_dual()
+
                 if role == "mode-controller" or controller_owns:
                     log.info(
                         f"[{self.node_name}] GW not serving but controller owns mode — "
@@ -1144,7 +1205,7 @@ class _NodeState:
             _write_idle_log(self.node_name, "idle_start", 0)
         return expired
 
-    def acquire_lease(self, work_id: str, ttl_sec: int, reason: str, role: str = "worker", principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference", lease_class: str = DEFAULT_LEASE_CLASS) -> bool | object:
+    def acquire_lease(self, work_id: str, ttl_sec: int, reason: str, role: str = "worker", principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference", lease_class: str = DEFAULT_LEASE_CLASS, mode: str | None = None) -> bool | object:
         """Try to ensure GW is serving, then register the lease.
 
         Returns True on success, DEFERRED if a foreign caller acquires during controller
@@ -1174,6 +1235,9 @@ class _NodeState:
                       by the endpoint before this method). Caller (the endpoint) is
                       responsible for the defer-check; this method only stamps the
                       lease with its class.
+          mode: optional requested serve mode, already validated by the endpoint
+                (agents-core-doorman-mode-bearing-acquire-v0). Passed through to
+                ensure_serving(); see that method for when it's acted on vs. ignored.
 
         self.lock is taken exactly once per call, for the short bookkeeping that spans
         idle-tracking reset, the atomic drain-gate check, and lease registration (see the
@@ -1185,7 +1249,7 @@ class _NodeState:
         # ensure_serving serializes concurrent wakes internally via its own wake_lock —
         # this call intentionally runs without self.lock held, so a cold wake never freezes
         # the bookkeeping critical section below for other callers.
-        ok = self.ensure_serving(role=role)
+        ok = self.ensure_serving(role=role, mode=mode, work_id=work_id)
         if ok is CREATIVE_OCCUPIED:
             return CREATIVE_OCCUPIED
         if ok is DEFERRED:
@@ -1732,6 +1796,7 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         require_drain_clear = bool(body.get("require_drain_clear", False))
         lease_kind = body.get("lease_kind", "inference")
         lease_class = body.get("class", DEFAULT_LEASE_CLASS)  # missing → deferrable (safe)
+        mode = body.get("mode") or None  # missing/empty string → None (AC1 — omission)
 
         if node not in nodes:
             return JSONResponse(
@@ -1750,6 +1815,16 @@ def create_app(gw_url: str | None = None) -> FastAPI:
                     "bad_request",
                     f"invalid class {lease_class!r}; must be one of {LEASE_CLASSES}",
                 ),
+            )
+        # AC4/AC6: validated before any lock is taken and before any subprocess
+        # could be invoked — a bad mode never reaches gw-serve as a shell argument.
+        if mode is not None and mode not in VALID_SERVE_MODES:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "invalid_mode",
+                    "detail": f"mode {mode!r} not in accepted set {sorted(VALID_SERVE_MODES)}",
+                },
             )
 
         state = nodes[node]
@@ -1772,7 +1847,7 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         ok = state.acquire_lease(
             work_id, ttl_sec, reason, role=role, principal=principal,
             require_drain_clear=require_drain_clear, lease_kind=lease_kind,
-            lease_class=lease_class,
+            lease_class=lease_class, mode=mode,
         )
 
         if ok is CREATIVE_OCCUPIED:
