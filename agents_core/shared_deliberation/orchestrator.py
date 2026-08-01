@@ -11,6 +11,7 @@ from datetime import datetime
 import json
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -24,6 +25,14 @@ from agents_core.room_paths import room_path
 log = logging.getLogger("shared-deliberation")
 
 _COUNCIL_STATION_ID = "council/worker-fast-fail"
+_GROUNDING_STATION_ID = "shared-deliberation/facets-grounding-denied"
+
+# Root under which every repo's persistent local clone lives, and the suffix on the
+# clone dir name. Single constant so a future multi-host port has one place to change --
+# this module already hardcodes /srv/git/facets-working elsewhere (see facets_repo below),
+# so this does not make the module portable on its own.
+_GROUNDING_CLONE_ROOT = "/srv/git"
+_GROUNDING_CLONE_SUFFIX = "-working"
 
 
 class GroundingHandoffError(Exception):
@@ -59,6 +68,178 @@ def _escalate_council_fast_fail(run_id: str, last_heartbeat, reason: str) -> Non
     except Exception:
         log.exception("repair-station escalation failed for council fast-fail — suppressed")
 
+
+def _resolve_grounding_target(context: dict) -> tuple[Optional[str], str, dict]:
+    """Resolve a trustworthy, read-only grounding target for Facets codebase verification.
+
+    Grounds against a detached worktree of the EXISTING LOCAL CLONE's `origin/main` ref
+    (Erah ruling, 2026-08-01) -- purely local, no `git clone`, no `git fetch`, no
+    hardcoded remote URL. `origin/main` in a local clone is only as current as that
+    clone's last fetch; the resolved sha is captured in provenance so a reader can tell
+    what was actually verified against, rather than assuming it is current.
+
+    Returns (path, skip_reason, provenance). Never raises -- any failure yields
+    (None, <reason>, {}) so a missing/stale grounding target never fails the
+    deliberation itself.
+    """
+    raw_repo = (context or {}).get("repo")
+    if not raw_repo or not isinstance(raw_repo, str) or not raw_repo.strip():
+        return (None, "no_repo_in_context", {})
+
+    repo = raw_repo.strip().rsplit("/", 1)[-1]
+    if not repo or any(ch.isspace() for ch in repo) or ".." in repo or "/" in repo or "\\" in repo:
+        return (None, "no_repo_in_context", {})
+
+    clone_dir = Path(_GROUNDING_CLONE_ROOT) / f"{repo}{_GROUNDING_CLONE_SUFFIX}"
+    if not clone_dir.is_dir():
+        return (None, "grounding_target_unavailable", {})
+
+    tmpdir = tempfile.mkdtemp(prefix=f"grounding-{repo}-")
+    try:
+        subprocess.run(
+            ["git", "-C", str(clone_dir), "worktree", "add", "--detach", tmpdir, "origin/main"],
+            check=True, capture_output=True, text=True, timeout=60,
+        )
+        sha_result = subprocess.run(
+            ["git", "-C", str(clone_dir), "rev-parse", "origin/main"],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+    except Exception as exc:
+        log.warning(
+            "[shared-deliberation:grounding] worktree resolution failed for repo=%s: %s",
+            repo, exc,
+        )
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return (None, "grounding_target_unavailable", {})
+
+    provenance = {
+        "source_repo": repo,
+        "resolved_sha": sha_result.stdout.strip(),
+        "clone_dir": str(clone_dir),
+        "worktree_path": tmpdir,
+    }
+    return (tmpdir, "", provenance)
+
+
+def _cleanup_grounding_worktree(provenance: dict) -> None:
+    """Remove a worktree created by `_resolve_grounding_target`. Never raises."""
+    clone_dir = (provenance or {}).get("clone_dir")
+    worktree_path = (provenance or {}).get("worktree_path")
+    if not clone_dir or not worktree_path:
+        return
+    try:
+        subprocess.run(
+            ["git", "-C", clone_dir, "worktree", "remove", "--force", worktree_path],
+            check=False, capture_output=True, text=True, timeout=60,
+        )
+    except Exception as exc:
+        log.warning(
+            "[shared-deliberation:grounding] worktree cleanup failed for %s: %s",
+            worktree_path, exc,
+        )
+    finally:
+        shutil.rmtree(worktree_path, ignore_errors=True)
+
+
+def _extract_denied_codebase_surfaces(facets_dict: Optional[dict]) -> tuple[list, list, list]:
+    """Scan every non-final round's sim_failures for codebase-surface entries.
+
+    Pinned to round index (round_num != max round_num among the rounds present), not to
+    shape: the final round's sim_failures is always {} by adapter.py invariant 2
+    (unfulfilled final-round sim_requests are recorded, never treated as failures), but
+    this exemption is enforced explicitly here rather than relied upon implicitly.
+    """
+    rounds = (facets_dict or {}).get("rounds") or []
+    if not rounds:
+        return ([], [], [])
+
+    max_round_num = max((r.get("round_num", 0) for r in rounds), default=0)
+    surfaces: list = []
+    reasons: list = []
+    rounds_affected: list = []
+    for rnd in rounds:
+        if rnd.get("round_num") == max_round_num:
+            continue
+        sim_failures = rnd.get("sim_failures") or {}
+        hit = False
+        for key, reason in sim_failures.items():
+            if key.split(":", 1)[0] == "codebase":
+                surfaces.append(key)
+                reasons.append(reason)
+                hit = True
+        if hit:
+            rounds_affected.append(rnd.get("round_num"))
+    return (surfaces, reasons, rounds_affected)
+
+
+def _maybe_escalate_grounding_denial(
+    *,
+    context: dict,
+    grounding_result_file: Optional[str],
+    skip_reason: str,
+    provenance: dict,
+    facets_dict: Optional[dict],
+) -> None:
+    """Fire the facets-grounding-denied repair station, at most once per deliberation.
+
+    Mirrors `_escalate_council_fast_fail` for structure: module-level station-ID
+    constant, lazy import of repair_station (not loaded on every orchestrator import),
+    bare except-suppress. That except is load-bearing, not cosmetic -- `escalate()`
+    calls `get_db()` outside its own try block, so an unwritable dir or corrupt DB
+    raises straight out of the call.
+    """
+    try:
+        # Suppressions that apply regardless of case -- none of these leave anything
+        # real to report: the elevator path already grounded fully, the leg never ran
+        # (stub/disabled/missing-repo), or the leg died with no rounds to inspect.
+        if grounding_result_file:
+            return
+        if os.getenv("SHARED_DELIBERATION_FACETS_STUB") == "1":
+            return
+        if os.getenv("FACETS_DISPATCH_DISABLED") == "1":
+            return
+        if not Path("/srv/git/facets-working").exists():
+            return
+        if facets_dict is None:
+            return
+
+        denied_surfaces, reasons, rounds_affected = _extract_denied_codebase_surfaces(facets_dict)
+
+        if skip_reason:
+            case = "absent"
+        elif denied_surfaces:
+            case = "denied"
+        else:
+            return
+
+        from agents_core.repair_station import escalate, Tier, first
+
+        tier = Tier.HIGH if case == "denied" else Tier.LOW
+
+        error_signal = {
+            "case": case,
+            "repo": (context or {}).get("repo"),
+            "skip_reason": skip_reason,
+            "denied_surfaces": sorted(set(denied_surfaces)),
+            "reasons": sorted(set(reasons)),
+            "rounds_affected": sorted(set(rounds_affected)),
+            "source_repo": provenance.get("source_repo") if provenance else None,
+            "resolved_sha": provenance.get("resolved_sha") if provenance else None,
+        }
+
+        escalate(
+            station_id=_GROUNDING_STATION_ID,
+            stable_pointer="agents_core/shared_deliberation/orchestrator.py",
+            error_signal=error_signal,
+            author_intent="Facets codebase grounding was denied or structurally unavailable",
+            escalation_policy=first(),
+            tier=tier,
+            owning_module="agents_core.shared_deliberation.orchestrator",
+        )
+    except Exception:
+        log.exception("repair-station escalation failed for grounding denial — suppressed")
+
+
 # Bounded concurrency for Facets subprocesses (gate against GW lane stampede)
 _facets_semaphore: Optional[asyncio.Semaphore] = None
 
@@ -88,6 +269,7 @@ async def _facets_subprocess(
     operator: str = "gravitywell",
     grounding_result_file: Optional[str] = None,
     gw_principal: Optional[str] = None,
+    target_repo: Optional[str] = None,
 ) -> tuple[bool, Optional[dict], Optional[str], Optional[str]]:
     """Invoke Facets via subprocess. Returns (ok, deliberation_dict, deliberation_id, errors).
 
@@ -109,7 +291,8 @@ async def _facets_subprocess(
 
     async with _facets_semaphore:
         return await asyncio.to_thread(
-            _run_facets_subprocess, text, context, operator, facets_repo, grounding_result_file, gw_principal
+            _run_facets_subprocess, text, context, operator, facets_repo,
+            grounding_result_file, gw_principal, target_repo,
         )
 
 
@@ -120,6 +303,7 @@ def _run_facets_subprocess(
     facets_repo: Path,
     grounding_result_file: Optional[str] = None,
     gw_principal: Optional[str] = None,
+    target_repo: Optional[str] = None,
 ) -> tuple[bool, Optional[dict], Optional[str], Optional[str]]:
     """Synchronous subprocess invocation (runs in thread)."""
     # Grounding handoff guard: validate before building argv.
@@ -140,7 +324,7 @@ def _run_facets_subprocess(
     try:
         # Create temp context file
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump({"text": text, **context}, f)
+            json.dump({"text": text, "spec_text": text, **context}, f)
             context_file = f.name
 
         try:
@@ -160,6 +344,9 @@ def _run_facets_subprocess(
             ]
             if operator and operator != "haiku":
                 argv += ["--persona-operator", operator, "--synthesis-operator", operator]
+
+            if target_repo:
+                argv += ["--target-repo", target_repo]
 
             if grounding_result_file is not None:
                 argv += ["--grounding-result-file", grounding_result_file, "--no-auto-ground"]
@@ -609,6 +796,15 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
                 _hold_err,
             )
 
+    _grounding_path, _grounding_skip_reason, _grounding_provenance = await asyncio.to_thread(
+        _resolve_grounding_target, request.context
+    )
+    if _grounding_skip_reason:
+        log.info(
+            "[shared-deliberation:grounding] no target resolved request_id=%s reason=%s",
+            request_id, _grounding_skip_reason,
+        )
+
     try:
         # Run both legs concurrently via asyncio.gather
         async def _facets_leg():
@@ -618,6 +814,7 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
                 request.facets_operator,
                 request.grounding_result_file,
                 request.gw_principal,
+                _grounding_path,
             )
 
         async def _council_leg():
@@ -637,6 +834,14 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
 
         facets_ok, facets_dict, facets_id, facets_error = facets_result
         council_ok, council_run_id, council_data, council_error = council_result
+
+        _maybe_escalate_grounding_denial(
+            context=request.context,
+            grounding_result_file=request.grounding_result_file,
+            skip_reason=_grounding_skip_reason,
+            provenance=_grounding_provenance,
+            facets_dict=facets_dict,
+        )
 
         # Extract operator info from Facets
         operator_requested = None
@@ -703,6 +908,9 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
 
         return envelope
     finally:
+        # Remove the grounding worktree (if one was created) on any exit path.
+        if _grounding_provenance:
+            await asyncio.to_thread(_cleanup_grounding_worktree, _grounding_provenance)
         # Stop the refresh thread and release the span hold on any exit path.
         _span_stop.set()
         if _span_refresh_thread is not None:
