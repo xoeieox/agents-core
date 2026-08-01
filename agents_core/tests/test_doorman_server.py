@@ -4160,6 +4160,149 @@ class TestProtectedGate:
         assert pending["status"] == "pending_defer"
 
 
+class TestForegroundGatePrincipalAware:
+    """agents-core-doorman-principal-aware-foreground-gate-v0: a caller must not
+    be deferred against a protected lease held by its own admission group."""
+
+    def test_same_principal_served_not_deferred(self):
+        """DoD 5: protected lease held under principal P, deferrable acquire
+        under P is served, not deferred."""
+        state = _make_state()
+        state.leases["pm-session"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "interactive",
+            "role": "worker", "class": "protected", "principal": "P",
+        }
+        pending, release_info = state.acquire_or_defer("fixer-1", "t", "worker", "deferrable", "P")
+        assert pending is None
+        assert release_info is None
+        assert "fixer-1" not in state.wait_list
+
+    def test_different_principal_still_deferred(self):
+        """DoD 6: same setup, deferrable acquire under a different principal Q
+        is still deferred."""
+        state = _make_state()
+        state.leases["pm-session"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "interactive",
+            "role": "worker", "class": "protected", "principal": "P",
+        }
+        pending, release_info = state.acquire_or_defer("fixer-1", "t", "worker", "deferrable", "Q")
+        assert pending is not None
+        assert pending["status"] == "pending_defer"
+        assert "fixer-1" in state.wait_list
+
+    def test_ghost_protected_lease_always_defers(self):
+        """DoD 7: a ghost protected lease (no principal, or explicit
+        GHOST_PRINCIPAL) still defers any caller, regardless of principal."""
+        state = _make_state()
+        state.leases["ghost-session"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "interactive",
+            "role": "worker", "class": "protected", "principal": GHOST_PRINCIPAL,
+        }
+        pending, _ = state.acquire_or_defer("fixer-1", "t", "worker", "deferrable", "P")
+        assert pending is not None
+        assert pending["status"] == "pending_defer"
+
+    def test_protected_lease_no_principal_key_always_defers(self):
+        """DoD 8: a protected lease taken under a role that stores no
+        `principal` key at all still gates every caller."""
+        state = _make_state()
+        state.leases["role-only-session"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "interactive",
+            "role": "mode-controller", "class": "protected",
+        }
+        pending, _ = state.acquire_or_defer("fixer-1", "t", "worker", "deferrable", "P")
+        assert pending is not None
+        assert pending["status"] == "pending_defer"
+
+    def test_exclude_principal_none_matches_prior_global_behaviour(self):
+        """DoD 9: exclude_principal=None (every pre-existing caller) behaves
+        exactly as before this unit — any protected lease gates."""
+        state = _make_state()
+        state.leases["pm-session"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "interactive",
+            "role": "worker", "class": "protected", "principal": "P",
+        }
+        assert state._protected_lease_active() is True
+        assert state._protected_lease_active(None) is True
+
+    def test_exemption_logs_info(self):
+        """DoD 4: an exemption emits an info log naming work_id and principal."""
+        state = _make_state()
+        state.leases["pm-session"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "interactive",
+            "role": "worker", "class": "protected", "principal": "P",
+        }
+        with patch("agents_core.doorman_server.log.info") as mock_log:
+            assert state._protected_lease_active("P") is False
+        exempt_calls = [c for c in mock_log.call_args_list if "foreground_gate_exempt" in str(c)]
+        assert len(exempt_calls) == 1
+        assert "pm-session" in str(exempt_calls[0])
+        assert "P" in str(exempt_calls[0])
+
+    def test_timeout_releases_despite_gating_principal(self):
+        """DoD 10: a timed-out wait-list entry is released even though its own
+        principal would still be gated (converse: timeout beats a still-gating
+        principal, not just a would-be-exempted one)."""
+        state = _make_state()
+        state.leases["pm-session"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "interactive",
+            "role": "worker", "class": "protected", "principal": "OTHER",
+        }
+        state.wait_list["fixer-1"] = {
+            "enqueued_at": time.time() - 1000, "reason": "t", "role": "worker",
+            "principal": "Q",
+        }
+        with patch("agents_core.doorman_server.DOORMAN_MAX_HOLD_TIMEOUT_SEC", 900), \
+             patch("agents_core.doorman_server.DOORMAN_RELEASE_JITTER_MAX_SEC", 0.0):
+            released = state._sweep_wait_list()
+        assert len(released) == 1
+        assert released[0]["reason"] == "max-hold-timeout"
+        assert "fixer-1" not in state.wait_list
+
+    def test_timeout_releases_despite_exemptable_principal(self):
+        """DoD 10: a timed-out wait-list entry is released even though its own
+        principal would now exempt it — the iron rod holds either direction."""
+        state = _make_state()
+        state.leases["pm-session"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "interactive",
+            "role": "worker", "class": "protected", "principal": "P",
+        }
+        state.wait_list["fixer-1"] = {
+            "enqueued_at": time.time() - 1000, "reason": "t", "role": "worker",
+            "principal": "P",
+        }
+        with patch("agents_core.doorman_server.DOORMAN_MAX_HOLD_TIMEOUT_SEC", 900), \
+             patch("agents_core.doorman_server.DOORMAN_RELEASE_JITTER_MAX_SEC", 0.0):
+            released = state._sweep_wait_list()
+        assert len(released) == 1
+        assert released[0]["reason"] == "max-hold-timeout"
+        assert "fixer-1" not in state.wait_list
+
+    def test_wait_list_entry_without_principal_key_gates_as_ghost(self):
+        """DoD 10a: a wait-list entry with no `principal` key at all is
+        treated as GHOST_PRINCIPAL and gates, rather than raising KeyError."""
+        state = _make_state()
+        state.leases["pm-session"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "interactive",
+            "role": "worker", "class": "protected", "principal": "P",
+        }
+        state.wait_list["fixer-1"] = {"enqueued_at": time.time() - 5, "reason": "t", "role": "worker"}
+        released = state._sweep_wait_list()
+        assert released == []
+        assert "fixer-1" in state.wait_list
+
+    def test_brake_defers_regardless_of_principal(self):
+        """DoD 11: the brake defers regardless of principal match — the brake
+        half of the gate stays global, never principal-scoped."""
+        state = _make_state()
+        state.brake_reason = "urgent"
+        state.brake_expires_at = time.time() + 900
+
+        pending, _ = state.acquire_or_defer("fixer-1", "t", "worker", "deferrable", "P")
+        assert pending is not None
+        assert pending["status"] == "pending_defer"
+
+
 class TestWaitListRelease:
     """Wait-list release: protected-cleared, non-resetting max-hold-timeout,
     jitter, structured events (AC1, AC3, AC7)."""
