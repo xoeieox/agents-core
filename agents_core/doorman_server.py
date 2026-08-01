@@ -660,6 +660,51 @@ class _NodeState:
                 return True
         return False
 
+    def _resolve_live_posture(self) -> str:
+        """Resolve GW's current serving posture directly on the mode-bearing
+        acquire path (agents-core-doorman-warm-box-mode-convergence-v0, AC5) —
+        never from _cached_topology_state, independent of
+        DOORMAN_MODE_AWARE_ADMISSION (which gates only the background-tick
+        cache, and defaults off). Called at most once per mode-bearing
+        acquire, outside self.lock (self.wake_lock is held).
+
+        Mirrors _topology_serving_mode's big/dual/unknown rules plus the
+        big-probe split-brain check _refresh_serving_cache derives into
+        _big_probe_state — computed here from a freshly-resolved state so it
+        works even when _big_probe_state was never populated (flag off).
+        A resolver exception degrades to "unknown" and never propagates out
+        of ensure_serving() (AC5).
+        """
+        try:
+            state = gw_serving_state(endpoint=self.gw_url)
+        except Exception as exc:
+            log.warning(
+                f"[{self.node_name}] gw_serving_state() raised during mode-bearing "
+                f"acquire, degrading to unknown topology resolution: {exc}"
+            )
+            return "unknown"
+
+        if state is None or state.authority_gap or state.unknown_model:
+            return "unknown"
+        if state.mode == "dual":
+            # Half-converged dual: configured dual with only one slot actually
+            # up must not report "dual".
+            return "dual" if state.distinct_second_model else "unknown"
+        if state.mode == "big":
+            models_answered = (
+                state.source_freshness.get("models_endpoint", {}).get("status")
+                == "answered"
+            )
+            if not models_answered:
+                return "unknown"
+            if GW_BIG_MODEL_ID not in state.served_ids:
+                # We looked and the 122B is definitively absent — split-brain,
+                # not a confident "big" (mirrors _refresh_serving_cache's
+                # big_probe_state="refuted" branch).
+                return "unknown"
+            return "big"
+        return "unknown"
+
     def _topology_serving_mode(self) -> str:
         """Derive serving_mode's "what topology is actually serving" branch from
         the single cached GwServingState (agents-core-doorman-serving-mode-
@@ -911,8 +956,61 @@ class _NodeState:
                     )
                     return DEFERRED
 
-            # Fast path: already awake and serving
+            # Mode-bearing controller acquire (agents-core-doorman-mode-bearing-
+            # acquire-v0, AC2, extended by agents-core-doorman-warm-box-mode-
+            # convergence-v0): a caller that BOTH claims mode-controller AND
+            # supplies a valid mode wants that posture commanded, not deferred
+            # to — and (this unit) not silently accepted via the _is_serving()
+            # fast path either when the warm box is in a different posture.
+            # mode is already validated (VALID_SERVE_MODES) by the caller
+            # before this method runs.
+            mode_bearing = role == "mode-controller" and mode is not None
+
+            # Fast path: already awake and serving.
             if self._is_serving():
+                if mode_bearing:
+                    # AC5: resolve topology directly on this path — never from
+                    # _cached_topology_state, never gated on
+                    # DOORMAN_MODE_AWARE_ADMISSION (that flag defaults off and
+                    # would leave this resolution permanently "unknown").
+                    resolved_posture = self._resolve_live_posture()
+                    if resolved_posture == "unknown":
+                        # AC4/AC4a: an unconfident read never triggers a flip —
+                        # take the fast path, but record it as a structured,
+                        # machine-parseable WARN so this isn't indistinguishable
+                        # from the silent-success defect this unit fixes.
+                        log.warning(json.dumps({
+                            "reason": "TOPOLOGY_UNRESOLVED_SKIP",
+                            "requested_mode": mode,
+                            "resolved_posture": "unknown",
+                            "action": "fast_path_taken",
+                        }))
+                    elif resolved_posture != mode:
+                        # AC2: warm box serving a confidently-resolved, different
+                        # posture — bypass the fast path and converge it.
+                        # AC7: the foreign-controller guard still applies, warm
+                        # or cold.
+                        with self.lock:
+                            foreign_controller_owns = self._foreign_controller_lease_active(work_id)
+                        if foreign_controller_owns:
+                            log.info(
+                                f"[{self.node_name}] mode-bearing controller acquire deferring — "
+                                f"foreign controller owns mode (work_id={work_id!r})"
+                            )
+                            return DEFERRED
+                        # AC8: legible warm-convergence log line.
+                        log.info(
+                            f"[{self.node_name}] warm-box convergence: requested mode={mode!r}, "
+                            f"resolved posture={resolved_posture!r} — bypassing fast path, "
+                            f"commanding gw-serve {mode}"
+                        )
+                        with self.lock:
+                            self.last_error = None
+                            self.service_stopped = False
+                        return self._wake_big() if mode == "big" else self._wake_dual()
+                    # else resolved_posture == mode: AC3, already the requested
+                    # posture — fall through to the idempotent True below. No
+                    # gw-serve is issued.
                 with self.lock:
                     self.last_error = None
                     self.service_stopped = False
@@ -937,32 +1035,30 @@ class _NodeState:
                     self.last_error = err
                 return False
 
+            # AC6: a supplied mode is honoured independent of
+            # DOORMAN_DEFER_TO_CONTROLLER — a requested mode is a property of
+            # the acquire, not conditional on the deference policy. AC3/AC3a: a
+            # FOREIGN controller lease still wins unconditionally — identity-
+            # aware, so a controller's own repeat acquire never defers to itself.
+            if mode_bearing:
+                with self.lock:
+                    foreign_controller_owns = self._foreign_controller_lease_active(work_id)
+                if foreign_controller_owns:
+                    log.info(
+                        f"[{self.node_name}] mode-bearing controller acquire deferring — "
+                        f"foreign controller owns mode (work_id={work_id!r})"
+                    )
+                    return DEFERRED
+                log.info(
+                    f"[{self.node_name}] mode-bearing controller acquire — "
+                    f"commanding gw-serve {mode} (overrides DOORMAN_DEFAULT_SERVE_MODE)"
+                )
+                return self._wake_big() if mode == "big" else self._wake_dual()
+
             # Deference guard: if controller owns the mode, don't issue gw-serve big
             if DOORMAN_DEFER_TO_CONTROLLER:
                 with self.lock:
                     controller_owns = self._controller_lease_active()
-
-                # Mode-bearing controller acquire (agents-core-doorman-mode-bearing-
-                # acquire-v0, AC2): a caller that BOTH claims mode-controller AND
-                # supplies a mode commands the posture instead of deferring to it.
-                # AC3/AC3a: a FOREIGN controller lease still wins unconditionally —
-                # identity-aware, so a controller's own repeat acquire never defers
-                # to itself. mode is already validated (VALID_SERVE_MODES) by the
-                # caller before this method runs.
-                if role == "mode-controller" and mode is not None:
-                    with self.lock:
-                        foreign_controller_owns = self._foreign_controller_lease_active(work_id)
-                    if foreign_controller_owns:
-                        log.info(
-                            f"[{self.node_name}] mode-bearing controller acquire deferring — "
-                            f"foreign controller owns mode (work_id={work_id!r})"
-                        )
-                        return DEFERRED
-                    log.info(
-                        f"[{self.node_name}] mode-bearing controller acquire — "
-                        f"commanding gw-serve {mode} (overrides DOORMAN_DEFAULT_SERVE_MODE)"
-                    )
-                    return self._wake_big() if mode == "big" else self._wake_dual()
 
                 if role == "mode-controller" or controller_owns:
                     log.info(

@@ -1473,6 +1473,142 @@ class TestModeBearingAcquire:
 
 
 # ---------------------------------------------------------------------------
+# Warm-box mode convergence (agents-core-doorman-warm-box-mode-convergence-v0)
+# ---------------------------------------------------------------------------
+
+class TestWarmBoxModeConvergence:
+    """A mode-bearing controller acquire against an already-serving (warm) box
+    must converge posture rather than silently taking the _is_serving() fast
+    path — the fast path is structurally mode-blind, so before this unit a
+    warm box in the wrong posture returned True with no gw-serve issued."""
+
+    def test_warm_box_wrong_posture_converges(self):
+        """AC2/verification 1: warm box resolved dual, acquire mode="big" ->
+        _wake_big() called exactly once, result True. _is_serving is NOT
+        patched to False — the point is it returns True and the path proceeds
+        anyway."""
+        state = _make_state()
+        topology = _make_topology_state(mode="dual", served_ids=["some-dual-model"],
+                                         distinct_second_model=True)
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
+             patch.object(state, "_wake_big", return_value=True) as mock_big, \
+             patch.object(state, "_wake_dual") as mock_dual:
+            result = state.ensure_serving(role="mode-controller", mode="big", work_id="flip-1")
+
+        assert result is True
+        mock_big.assert_called_once()
+        mock_dual.assert_not_called()
+
+    def test_warm_box_matching_posture_is_idempotent(self):
+        """AC3/verification 2: warm box resolved big, acquire mode="big" ->
+        no gw-serve subprocess, result True."""
+        state = _make_state()
+        topology = _make_topology_state(mode="big", served_ids=["gravitywell-122b"])
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
+             patch.object(state, "_wake_big") as mock_big, \
+             patch.object(state, "_wake_dual") as mock_dual:
+            result = state.ensure_serving(role="mode-controller", mode="big", work_id="flip-1")
+
+        assert result is True
+        mock_big.assert_not_called()
+        mock_dual.assert_not_called()
+
+    def test_warm_box_unresolved_topology_returns_unknown_skips_flip(self):
+        """AC4/AC4a/verification 3: resolver returns unresolved (authority_gap)
+        -> no gw-serve, result True, structured WARN log line present."""
+        state = _make_state()
+        topology = _make_topology_state(authority_gap=True)
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
+             patch.object(state, "_wake_big") as mock_big, \
+             patch.object(state, "_wake_dual") as mock_dual, \
+             patch("agents_core.doorman_server.log") as mock_log:
+            result = state.ensure_serving(role="mode-controller", mode="big", work_id="flip-1")
+
+        assert result is True
+        mock_big.assert_not_called()
+        mock_dual.assert_not_called()
+        warn_payloads = [c.args[0] for c in mock_log.warning.call_args_list]
+        assert any("TOPOLOGY_UNRESOLVED_SKIP" in p for p in warn_payloads)
+
+    def test_warm_box_resolver_raises_skips_flip(self):
+        """AC4/AC4a/verification 3: resolver raises -> degrades to unknown,
+        no gw-serve, result True, WARN present."""
+        state = _make_state()
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("agents_core.doorman_server.gw_serving_state", side_effect=RuntimeError("boom")), \
+             patch.object(state, "_wake_big") as mock_big, \
+             patch.object(state, "_wake_dual") as mock_dual, \
+             patch("agents_core.doorman_server.log") as mock_log:
+            result = state.ensure_serving(role="mode-controller", mode="big", work_id="flip-1")
+
+        assert result is True
+        mock_big.assert_not_called()
+        mock_dual.assert_not_called()
+        warn_payloads = [c.args[0] for c in mock_log.warning.call_args_list]
+        assert any("TOPOLOGY_UNRESOLVED_SKIP" in p for p in warn_payloads)
+
+    def test_warm_box_foreign_controller_lease_defers(self):
+        """AC7/verification 4: warm box, mode="dual", a FOREIGN mode-controller
+        lease active -> DEFERRED, no gw-serve."""
+        state = _make_state()
+        state.leases["foreign-controller"] = {
+            "acquired_at": time.time(),
+            "ttl_sec": 240,
+            "reason": "mode control",
+            "role": "mode-controller",
+        }
+        topology = _make_topology_state(mode="big", served_ids=["gravitywell-122b"])
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
+             patch.object(state, "_wake_big") as mock_big, \
+             patch.object(state, "_wake_dual") as mock_dual:
+            result = state.ensure_serving(role="mode-controller", mode="dual", work_id="flip-2")
+
+        assert result is DEFERRED
+        mock_big.assert_not_called()
+        mock_dual.assert_not_called()
+
+    def test_worker_warm_box_never_calls_resolver(self):
+        """AC1/verification 5: role="worker" with a mode supplied -> fast path,
+        no resolver call at all. Spy asserts zero invocations, not just the
+        outcome — the cost this criterion protects is added latency."""
+        state = _make_state()
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("agents_core.doorman_server.gw_serving_state") as mock_resolve:
+            result = state.ensure_serving(role="worker", mode="dual")
+
+        assert result is True
+        mock_resolve.assert_not_called()
+
+    def test_defer_to_controller_false_still_honours_mode(self):
+        """AC6/verification 6: DOORMAN_DEFER_TO_CONTROLLER=False, mode-controller,
+        mode="dual", DOORMAN_DEFAULT_SERVE_MODE="big" -> _wake_dual(), not
+        _wake_big(). Cold box (not yet serving)."""
+        state = _make_state()
+        with patch.object(state, "_is_serving", return_value=False), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
+             patch.object(state, "_wake_big") as mock_big, \
+             patch.object(state, "_wake_dual", return_value=True) as mock_dual, \
+             patch("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "big"), \
+             patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", False):
+            result = state.ensure_serving(role="mode-controller", mode="dual", work_id="flip-1")
+
+        assert result is True
+        mock_dual.assert_called_once()
+        mock_big.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Deference HTTP endpoint tests (doorman-mode-deference-v0)
 # ---------------------------------------------------------------------------
 
