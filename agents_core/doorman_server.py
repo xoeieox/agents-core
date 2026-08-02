@@ -736,17 +736,34 @@ class _NodeState:
     # Foreground-priority gate (gw-router-phase1-foreground-gate)
     # ------------------------------------------------------------------
 
-    def _protected_lease_active(self) -> bool:
-        """True iff a non-expired lease with class=='protected' currently exists.
+    def _protected_lease_active(self, exclude_principal: str | None = None) -> bool:
+        """True iff a non-expired lease with class=='protected' currently exists
+        that is not exempted by exclude_principal.
 
         Must be called under self.lock. A missing class defaults to
         "deferrable" (agents_core.doorman_server.DEFAULT_LEASE_CLASS), so
         pre-gate leases (no `class` field) never count as protected.
+
+        exclude_principal=None (the default) reproduces the original global
+        behaviour exactly — any protected lease gates. When a real principal
+        is supplied, a protected lease whose stored principal equals it is
+        skipped (the caller's own admission group never blocks itself). A
+        lease stamped GHOST_PRINCIPAL, or one with no `principal` key at all
+        (mirrors _worker_lease_blockers' `info.get("principal", GHOST_PRINCIPAL)`
+        fail-safe read), always gates — ghosts are never exempted.
         """
         now = time.time()
-        for info in self.leases.values():
+        for wid, info in self.leases.items():
             if (info.get("class", DEFAULT_LEASE_CLASS) == "protected"
                     and now <= info["acquired_at"] + info["ttl_sec"]):
+                if exclude_principal is not None:
+                    p = info.get("principal", GHOST_PRINCIPAL)
+                    if p != GHOST_PRINCIPAL and p == exclude_principal:
+                        log.info(
+                            f"[{self.node_name}] foreground_gate_exempt work_id={wid} "
+                            f"principal={exclude_principal}"
+                        )
+                        continue
                 return True
         return False
 
@@ -797,11 +814,13 @@ class _NodeState:
         gated on anyone polling for it.
         """
         now = time.time()
-        gated = self._protected_lease_active() or self._brake_active()
+        brake_gated = self._brake_active()
         released: list[dict] = []
         for wid, entry in list(self.wait_list.items()):
             elapsed = now - entry["enqueued_at"]
             timed_out = elapsed >= DOORMAN_MAX_HOLD_TIMEOUT_SEC
+            entry_principal = entry.get("principal", GHOST_PRINCIPAL)
+            gated = brake_gated or self._protected_lease_active(entry_principal)
             releasable = timed_out or not gated
 
             if not releasable:
@@ -832,7 +851,7 @@ class _NodeState:
                 released.append({"job_id": wid, "reason": entry["_release_reason"], "waited_seconds": waited})
         return released
 
-    def acquire_or_defer(self, work_id: str, reason: str, role: str, lease_class: str) -> tuple[dict | None, dict | None]:
+    def acquire_or_defer(self, work_id: str, reason: str, role: str, lease_class: str, principal: str | None = None) -> tuple[dict | None, dict | None]:
         """The dispatch-layer defer-check for a `deferrable`-class acquire.
 
         Must be called under self.lock. `protected`-class acquires are never
@@ -872,9 +891,12 @@ class _NodeState:
         if release_info is not None:
             return None, release_info
 
-        if self._protected_lease_active() or self._brake_active():
+        if self._protected_lease_active(principal) or self._brake_active():
             enqueued_at = time.time()
-            self.wait_list[work_id] = {"enqueued_at": enqueued_at, "reason": reason, "role": role}
+            self.wait_list[work_id] = {
+                "enqueued_at": enqueued_at, "reason": reason, "role": role,
+                "principal": principal if principal is not None else GHOST_PRINCIPAL,
+            }
             return {
                 "status": "pending_defer",
                 "work_id": work_id,
@@ -1932,7 +1954,7 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         # wait-list entry finalized its release this call.
         with state.lock:
             state._gc_stale()
-            pending_resp, release_info = state.acquire_or_defer(work_id, reason, role, lease_class)
+            pending_resp, release_info = state.acquire_or_defer(work_id, reason, role, lease_class, principal)
         if pending_resp is not None:
             return pending_resp
 
