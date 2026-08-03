@@ -1745,6 +1745,121 @@ def call_llm_streaming(prompt: str, system: str = None, timeout: int = 600,
 # Claude CLI client (Max subscription via `claude -p`)
 # ---------------------------------------------------------------------------
 
+def _write_stream_line(path, line: str) -> None:
+    """Append one complete JSONL line to the stream log, corruption-safe.
+
+    open, write, flush, close per line — no fsync. A killed *process* cannot
+    touch data flush() has already handed to the OS's file buffer; fsync()
+    would additionally force it to physical disk, which only matters against
+    a full host crash (not this unit's threat model, a queue-runner
+    SIGKILL/timeout) and risks blocking if the disk subsystem stalls. Any
+    failure here is swallowed so a bad line can never kill the read loop.
+    """
+    try:
+        f = open(path, "a", encoding="utf-8", errors="replace")
+        try:
+            f.write(line)
+            if not line.endswith("\n"):
+                f.write("\n")
+            f.flush()
+        finally:
+            f.close()
+    except OSError:
+        pass
+
+
+def _call_claude_cli_streaming(cmd, user_input, cwd, timeout, stream_log_path, log, _ret):
+    """Popen + line-by-line stdout read for the opt-in stream-json mode.
+
+    Reconstructs the same (text, envelope) shape the --output-format json
+    path returns, from the stream's terminal type:"result" event. Never
+    accumulates the full stream in memory — the file on disk is the
+    authoritative record; this only tracks the terminal event needed to
+    build the return value.
+    """
+    log_path = Path(stream_log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.touch(exist_ok=True)
+
+    terminal_envelope = None
+    proc = None
+    watchdog = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=cwd or "/srv/agents",
+        )
+        try:
+            proc.stdin.write(user_input)
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+        # A blocking readline() below can stall past `timeout` waiting on the
+        # child; a watchdog kills the process from outside the read loop
+        # rather than checking a deadline between reads.
+        watchdog = threading.Timer(timeout, proc.kill)
+        watchdog.daemon = True
+        watchdog.start()
+
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip("\n")
+            if not line:
+                continue
+            _write_stream_line(log_path, line)
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                event = None
+            if isinstance(event, dict) and event.get("type") == "result":
+                terminal_envelope = event
+
+        proc.wait()
+    except Exception as e:
+        if log:
+            log(f"claude -p (stream) failed to launch: {e}")
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.wait()
+            except Exception:
+                pass
+        return _ret(None, None)
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+
+    if terminal_envelope is None:
+        if log:
+            log(f"claude -p (stream) ended without a terminal result event "
+                f"(returncode={proc.returncode})")
+        return _ret(None, None)
+
+    if not isinstance(terminal_envelope, dict):
+        if log:
+            log(f"claude -p (stream) returned non-dict envelope: "
+                f"{type(terminal_envelope).__name__}")
+        return _ret(str(terminal_envelope) if terminal_envelope else None, None)
+
+    text = terminal_envelope.get("result") or ""
+    if not isinstance(text, str):
+        text = str(text) if text else ""
+    if not text.strip():
+        if log:
+            log(f"claude -p (stream) returned empty result. envelope keys: "
+                f"{list(terminal_envelope.keys())}, "
+                f"is_error={terminal_envelope.get('is_error')}, "
+                f"type={terminal_envelope.get('type')}")
+        return _ret(None, terminal_envelope)
+    return _ret(text, terminal_envelope)
+
+
 def call_claude_cli(
     prompt: str,
     system: str = "",
@@ -1755,6 +1870,7 @@ def call_claude_cli(
     return_envelope: bool = False,
     cwd: str | None = None,
     permission_mode: str | None = None,
+    stream_log_path: str | None = None,
 ):
     """Call Claude via `claude -p` CLI (Max subscription).
 
@@ -1785,6 +1901,15 @@ def call_claude_cli(
             agents running headless should pass "bypassPermissions" so
             their Write/Edit work without a human to approve. None means
             don't pass the flag (current behavior).
+        stream_log_path: Opt-in streaming mode. When set, invokes with
+            `--output-format stream-json` and writes each JSONL event line
+            to this path as it arrives (one open/write/flush/close per
+            line), so a killed subprocess leaves a partial, uncorrupted
+            record on disk. The file, once it exists, is the authoritative
+            record of what happened during the run; the in-memory return
+            value here is always a bounded summary, never a substitute for
+            it. Default None reproduces today's `--output-format json`
+            behavior byte-for-byte.
 
     Returns:
         str | None on default (text or None on failure), or
@@ -1794,7 +1919,7 @@ def call_claude_cli(
         "claude", "-p",
         "--model", model,
         "--no-session-persistence",
-        "--output-format", "json",
+        "--output-format", "stream-json" if stream_log_path else "json",
     ]
     if permission_mode:
         cmd += ["--permission-mode", permission_mode]
@@ -1841,6 +1966,11 @@ def call_claude_cli(
         except Exception as e:
             _log.warning("[locality] ledger write failed in call_claude_cli: %s", e)
         return (text, envelope) if return_envelope else text
+
+    if stream_log_path:
+        return _call_claude_cli_streaming(
+            cmd, user_input, cwd, timeout, stream_log_path, log, _ret,
+        )
 
     try:
         result = subprocess.run(

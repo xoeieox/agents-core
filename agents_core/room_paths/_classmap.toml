@@ -173,6 +173,11 @@ subpath = "claude-queue/history.jsonl"
 class = "B"
 access = "both"
 
+[keys."claude_queue.stream_logs"]
+subpath = "claude-queue/stream-logs"
+class = "B"
+access = "write"
+
 [keys.intentions]
 subpath = "intentions"
 class = "B"
