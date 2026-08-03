@@ -29,6 +29,11 @@ from pathlib import Path
 from agents_core.llm import call_claude_cli
 from agents_core.room_paths import room_path
 
+# Opt-in stream-json log dir for spec_reviewer shaped-runner tasks
+# (agents-core-shaped-runner-stream-log-v0). mkdir'd explicitly before first
+# use — room_path() only resolves the Path, it does not create directories.
+STREAM_LOG_DIR = room_path("claude_queue.stream_logs")
+
 
 # ---------------------------------------------------------------------------
 # Handler supervision (agents-core-handler-operative-live-supervision-v0)
@@ -665,6 +670,10 @@ def main():
                 # Sidecar is best-effort; never block the result on it.
                 print(f"WARN: meta sidecar write failed: {e}", file=sys.stderr)
         else:
+            stream_log_path = None
+            if spec.get("agent_type") == "spec_reviewer":
+                STREAM_LOG_DIR.mkdir(parents=True, exist_ok=True)
+                stream_log_path = str(STREAM_LOG_DIR / f"{spec['task_id']}.jsonl")
             result = call_claude_cli(
                 prompt=spec["prompt"],
                 system=spec.get("system", ""),
@@ -673,6 +682,7 @@ def main():
                 json_mode=bool(spec.get("json_mode", False)),
                 cwd=cwd,
                 permission_mode=permission_mode,
+                stream_log_path=stream_log_path,
             )
     finally:
         if worktree_path is not None:
