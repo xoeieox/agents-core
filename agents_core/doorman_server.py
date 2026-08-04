@@ -105,6 +105,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -140,6 +141,18 @@ DOORMAN_PROBE_BLINDNESS_SEC = int(os.environ.get("DOORMAN_PROBE_BLINDNESS_SEC", 
 # GW's boot-default resting posture is now dual (Slot 1 27B :8081 + Slot 2 Devstral :8082,
 # see gw-dual-boot.service); "big" restores the exact prior gw-serve big wake path.
 DOORMAN_DEFAULT_SERVE_MODE = os.environ.get("DOORMAN_DEFAULT_SERVE_MODE", "dual").strip().lower()
+
+# The declared home posture (agents-core-doorman-wake-honors-declared-posture-v0,
+# Part 2) lives in GW_HOME_MODE inside the live conductor.env — NOT in this
+# process's own environment. The doorman's systemd unit only loads
+# ~/.config/doorman/server.env (EnvironmentFile=-%h/.config/doorman/server.env);
+# conductor.env is a different, host-local, non-repo-tracked file, so it must be
+# read directly rather than via os.environ (flip_controller.py:56 can read
+# GW_HOME_MODE from os.environ only because ITS unit sources conductor.env —
+# the doorman's does not). Overridable for tests.
+GW_HOME_MODE_ENV_PATH = os.environ.get(
+    "GW_HOME_MODE_ENV_PATH", "/srv/agents/config/conductor.env"
+)
 
 # Both above Devstral's measured ~488s cold-init and under gw-dual's own TimeoutStartSec=900.
 # Only consulted when DOORMAN_DEFAULT_SERVE_MODE == "dual".
@@ -252,6 +265,20 @@ GHOST_PRINCIPAL = "__GHOST_LEASE__"
 
 def _error(code: str, message: str) -> dict:
     return {"error": {"code": code, "message": message}}
+
+
+def _gw_topology_importable() -> bool:
+    """Cheap, side-effect-free check of whether `from scripts import
+    gw_topology` (the exact form _wake_generic_posture uses — A3) would
+    succeed right now, for /status visibility. Never crashes the caller;
+    an unexpected error from the import itself just reads as unavailable."""
+    try:
+        from scripts import gw_topology  # noqa: F401
+        return True
+    except ImportError:
+        return False
+    except Exception:
+        return False
 
 
 def _write_idle_log(
@@ -1089,11 +1116,22 @@ class _NodeState:
                     )
                     return DEFERRED
 
-            # Issue the configured cold-wake serving target (gw-doorman-wake-to-default-mode-v0).
-            # DOORMAN_DEFAULT_SERVE_MODE=big is byte-identical to the pre-dual-default behavior.
-            if DOORMAN_DEFAULT_SERVE_MODE == "big":
+            # Resolve, then dispatch, the cold-wake posture (agents-core-doorman-
+            # wake-honors-declared-posture-v0, Part 1). The prior two-way branch
+            # here fought any declared home posture that wasn't its own literal
+            # value — the resolution ladder replaces that with: declared posture
+            # (Part 2) > DOORMAN_DEFAULT_SERVE_MODE as the last-resort literal
+            # (unchanged fallback semantics — this precedence keeps "big" byte-
+            # identical to the pre-dual-default behavior when nothing else
+            # resolves). "big"/"dual" dispatch to the unchanged wake functions;
+            # any other posture name goes through the generic check-then-act
+            # path (Part 1b/A1/A2) — never a blind guess.
+            posture = self._resolve_cold_wake_posture()
+            if posture == "big":
                 return self._wake_big()
-            return self._wake_dual()
+            if posture == "dual":
+                return self._wake_dual()
+            return self._wake_generic_posture(posture)
 
     def _wake_big(self) -> bool:
         """Synchronous gw-serve big wake — unchanged timings (~60s subprocess,
@@ -1236,6 +1274,241 @@ class _NodeState:
         parts = urlsplit(self.gw_url)
         netloc = f"{parts.hostname}:{GW_SLOT2_PORT}"
         return urlunsplit((parts.scheme, netloc, "", "", ""))
+
+    # ------------------------------------------------------------------
+    # Declared-posture resolution + generic wake dispatch
+    # (agents-core-doorman-wake-honors-declared-posture-v0)
+    # ------------------------------------------------------------------
+
+    def _resolve_cold_wake_posture(self) -> str:
+        """Part 1 resolution ladder for the cold-wake fallback path, reached
+        only after ensure_serving()'s mode-bearing-acquire precedence (line
+        ~1076, unchanged, still highest precedence) and controller-deference
+        checks have already been resolved:
+
+          1. The declared home posture (GW_HOME_MODE in the live
+             conductor.env — Part 2). Consumed, not forked.
+          2. DOORMAN_DEFAULT_SERVE_MODE, the last-resort literal — reached
+             only when the declaration itself is unreadable (file missing,
+             unparseable, or no GW_HOME_MODE key). Unchanged semantics.
+
+        Never guesses: an unreadable declaration degrades loudly to the
+        literal (logged inside _read_declared_home_posture), it never
+        substitutes a different posture silently.
+        """
+        declared = self._read_declared_home_posture()
+        if declared is not None:
+            return declared
+        return DOORMAN_DEFAULT_SERVE_MODE
+
+    def _read_declared_home_posture(self) -> str | None:
+        """Read GW_HOME_MODE from the live conductor.env (Part 2) — the
+        single source of the declared home posture; this method consumes
+        it, it does not restate or fork the declaration.
+
+        conductor.env is host-local and NOT sourced into the doorman's own
+        process environment (see GW_HOME_MODE_ENV_PATH's comment), so this
+        reads the file directly rather than via os.environ.
+
+        Returns None — an "unreadable declaration" — when the file is
+        missing/unreadable or carries no GW_HOME_MODE key, logging a loud
+        WAKE_DEGRADED WARN. This is deliberately NOT a refusal (A6): an
+        unreadable declaration is a weaker signal than a missing actuator,
+        and mirrors _topology_serving_mode's existing degrade-to-"unknown"
+        contract rather than the check-then-act refusal path used once a
+        posture name IS in hand (see _wake_generic_posture).
+        """
+        try:
+            text = Path(GW_HOME_MODE_ENV_PATH).read_text(encoding="utf-8")
+        except OSError as e:
+            log.warning(
+                f'[{self.node_name}] WAKE_DEGRADED reason=POSTURE_UNDECLARED '
+                f'detail="conductor.env unreadable at {GW_HOME_MODE_ENV_PATH}: {e}"'
+            )
+            return None
+
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, _, value = stripped.partition("=")
+            if key.strip() == "GW_HOME_MODE":
+                posture = value.strip().strip('"').strip("'")
+                if posture:
+                    return posture
+                break
+
+        log.warning(
+            f'[{self.node_name}] WAKE_DEGRADED reason=POSTURE_UNDECLARED '
+            f'detail="GW_HOME_MODE not set in {GW_HOME_MODE_ENV_PATH}"'
+        )
+        return None
+
+    def _refuse_wake(self, reason: str, detail: str) -> bool:
+        """Emit a WAKE_REFUSED record (A6) and set last_error to the same
+        structured shape, so the refusal category is readable from /status
+        without parsing prose. Refused BEFORE any wake command was issued —
+        zero side effects (A1/A2) — and must never be confused with
+        _fail_wake's attempted-and-failed shape."""
+        record = f'WAKE_REFUSED reason={reason} detail="{detail}"'
+        log.error(f"[{self.node_name}] {record}")
+        with self.lock:
+            self.last_error = record
+        return False
+
+    def _fail_wake(self, reason: str, detail: str) -> bool:
+        """Emit a WAKE_FAILED record (A6) for an attempted-then-failed
+        outcome (TopologyReachBusy/TopologyReachFailed) — a command WAS
+        issued. Distinct record shape from _refuse_wake so the Ruling-1
+        distinction ("refused before acting" vs "attempted and timed out")
+        survives in logs and last_error."""
+        record = f'WAKE_FAILED reason={reason} detail="{detail}"'
+        log.error(f"[{self.node_name}] {record}")
+        with self.lock:
+            self.last_error = record
+        return False
+
+    def _wake_generic_posture(self, posture_name: str) -> bool:
+        """Cold-wake dispatch for any declared posture other than "big"/
+        "dual" (Part 1's third branch). Calls gw_topology.reach() — which
+        already implements check-then-act with zero side effects on refusal
+        (A1/A2) — rather than re-implementing actuability checking here.
+        Must be called from ensure_serving() while holding self.wake_lock.
+
+        Import form is load-bearing (A3): the doorman runs with
+        PYTHONPATH=/srv/agents, NOT /srv/agents/scripts, so it must use
+        `from scripts import gw_topology`, never the bare `import
+        gw_topology` (which raises ModuleNotFoundError under the live
+        service's PYTHONPATH — see the poison-pill test). An unimportable
+        gw_topology is a REFUSAL (Erah ruling, A3), never a fallback to
+        DOORMAN_DEFAULT_SERVE_MODE — this method does not call
+        _resolve_cold_wake_posture or touch that constant. force_unproven
+        is never set from this cold-wake path (A2).
+        """
+        try:
+            from scripts import gw_topology
+        except ImportError as e:
+            # The eye is broken — cannot determine what is actuable at all.
+            return self._refuse_wake("ACTUATOR_UNAVAILABLE", repr(e))
+
+        try:
+            topology = gw_topology.load_topology()
+        except Exception as e:
+            # Same blindness class as an unimportable module: the registry
+            # itself could not be read/parsed, so what's actuable can't be
+            # determined either. Refuse, don't guess.
+            return self._refuse_wake("ACTUATOR_UNAVAILABLE", repr(e))
+
+        # reach() is the single source of truth on whether posture_name is
+        # even a real registered posture (TopologyUnknown) — deliberately
+        # NOT pre-checked here via topology.topologies[posture_name], which
+        # would just be a second, redundant place that same fact could go
+        # stale or be gotten wrong. Slot ports are only read out afterward,
+        # once reach() has confirmed the posture is real and actuable.
+        try:
+            gw_topology.reach(posture_name, topology=topology, ssh_host="gravitywell")
+        except (gw_topology.TopologyUnknown, gw_topology.TopologyNotProven,
+                gw_topology.TopologyOverCeiling, gw_topology.ForceUnprovenReasonRequired) as e:
+            # The road is barred — reach() answered, this specific posture
+            # is refused. Zero side effects per reach()'s own contract.
+            return self._refuse_wake("POSTURE_INVALID", str(e))
+        except gw_topology.TopologyReachBusy as e:
+            return self._fail_wake("REACH_BUSY", str(e))
+        except gw_topology.TopologyReachFailed as e:
+            return self._fail_wake("REACH_FAILED", str(e))
+
+        # reach() already confirmed posture_name is a real, registered entry
+        # (it would have raised TopologyUnknown above otherwise), so this is
+        # a plain read of the same declaration, not a second actuability
+        # check — nothing here should ordinarily raise.
+        ports = self._posture_slot_ports(topology, posture_name)
+        return self._poll_posture_ready(ports)
+
+    def _posture_slot_ports(self, topology, posture_name: str) -> list[int]:
+        """The ports the resolved posture's own composition declares —
+        read from the same `topologies:` index reach() resolves against
+        (Part 2: consume the declaration, never re-derive via GW_SLOT2_PORT
+        arithmetic). A mode-kind entry's slots carry their ports directly
+        (see gw-topology.yaml's `slot1-solo`); a pairing-kind entry's slots
+        are slot1/slot2. Ports are de-duped, order-preserving; a slot with
+        no `port` field (e.g. `big`'s single llama-cpp slot) contributes
+        nothing here — `big` never reaches this method, it dispatches to
+        the unchanged _wake_big() instead."""
+        entry = topology.topologies[posture_name]
+        if entry["kind"] == "mode":
+            slots = topology.modes[entry["ref"]]["slots"]
+        else:
+            pairing = topology.pairings[entry["ref"]]
+            slots = [pairing["slot1"], pairing["slot2"]]
+
+        ports: list[int] = []
+        for slot in slots:
+            port = slot.get("port")
+            if port is not None and int(port) not in ports:
+                ports.append(int(port))
+        return ports
+
+    def _is_port_serving(self, port: int, timeout: float = 3.0) -> bool:
+        """Health-probe an arbitrary GW-hosted port, same host as gw_url."""
+        from urllib.parse import urlsplit, urlunsplit
+        parts = urlsplit(self.gw_url)
+        netloc = f"{parts.hostname}:{port}"
+        url = urlunsplit((parts.scheme, netloc, "", "", ""))
+        try:
+            resp = requests.get(f"{url}/health", timeout=timeout)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def _poll_posture_ready(self, ports: list[int]) -> bool:
+        """Poll exactly the ports the resolved posture declares until each
+        shows two consecutive healthy /health 200s, or
+        GW_DUAL_WAKE_DEADLINE_SEC elapses — the posture-driven readiness
+        gate (Part 1, the doorman_server.py:1190-1204 false-negative this
+        unit removes). A single-slot posture is satisfied by that one port
+        and never waits on a port it doesn't declare."""
+        if not ports:
+            # Nothing declared to poll (schema-only/live-composition entry)
+            # — reach() already converged synchronously, so there is
+            # nothing left to wait on.
+            with self.lock:
+                self.last_wake_at = time.time()
+                self.last_error = None
+                self.service_stopped = False
+                self._cached_serving = True
+                self._serving_checked_at = time.time()
+            self._place_hold()
+            return True
+
+        deadline = time.time() + GW_DUAL_WAKE_DEADLINE_SEC
+        poll_interval = GW_DUAL_POLL_INITIAL_SEC
+        streaks = {p: 0 for p in ports}
+        while time.time() < deadline:
+            for p in ports:
+                streaks[p] = streaks[p] + 1 if self._is_port_serving(p) else 0
+            if all(streaks[p] >= 2 for p in ports):
+                elapsed = GW_DUAL_WAKE_DEADLINE_SEC - (deadline - time.time())
+                log.info(f"[{self.node_name}] posture serving (ports={ports}) after ~{elapsed:.0f}s")
+                with self.lock:
+                    self.last_wake_at = time.time()
+                    self.last_error = None
+                    self.service_stopped = False
+                    self._cached_serving = True
+                    self._serving_checked_at = time.time()
+                self._place_hold()
+                return True
+            time.sleep(poll_interval)
+            poll_interval = min(poll_interval * GW_DUAL_POLL_BACKOFF_FACTOR, GW_DUAL_POLL_MAX_SEC)
+
+        ready = {p: streaks[p] >= 2 for p in ports}
+        err = (
+            f"GW posture did not reach readiness on ports {ports} within "
+            f"{GW_DUAL_WAKE_DEADLINE_SEC}s after wake (ready={ready})"
+        )
+        log.error(f"[{self.node_name}] {err}")
+        with self.lock:
+            self.last_error = err
+        return False
 
     def _cleanup_failed_dual_initiation(self) -> None:
         """Best-effort cleanup after a failed dual-mode launch, so a launch error
@@ -1528,6 +1801,13 @@ class _NodeState:
                      "waited_seconds": time.time() - entry["enqueued_at"]}
                     for wid, entry in self.wait_list.items()
                 ],
+                # A3: surface the generic-posture actuator's importability directly
+                # in /status, so a broken deploy tree ("the eye is broken") is
+                # visible without having to attempt a wake first. Cheap (no
+                # execution beyond import machinery) and uses the exact same
+                # import form the wake path itself uses (`from scripts import
+                # gw_topology`) — a single source of truth about importability.
+                "actuator_available": _gw_topology_importable(),
             }
 
     # ------------------------------------------------------------------
