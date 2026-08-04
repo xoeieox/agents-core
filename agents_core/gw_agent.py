@@ -24,7 +24,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Final
 
 import requests
 
@@ -36,6 +36,176 @@ GW_AGENT_TOOL_INPUT_CAP = 65536
 GW_AGENT_CTX_CAP = 120000
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Per-step POST failure vocabulary (D1: agents-core-gw-agent-failure-reasons-
+# bounded-retry-v0). Additive extension of the reason_out vocabulary documented
+# on call_gw_agent (see its reason_out docstring) - "gw_unreachable",
+# "gw_not_serving", "no_choices", etc. stay as they are; these are the
+# machine-consumable classes for the per-step POST exception/response site,
+# aligned with lapis_pm/contractor_seat.py's classification so the two surfaces
+# speak one language. Defined once as typed module-level constants so no
+# inline string literal ever drifts from this vocabulary at a return site.
+# GW_REASON_REQUEST_FAILED remains the terminal fallback for anything
+# unclassified - existing consumers matching that plain string keep working.
+# ---------------------------------------------------------------------------
+GW_REASON_RATE_LIMITED: Final[str] = "rate_limited"
+GW_REASON_BACKEND_UNREACHABLE: Final[str] = "backend_unreachable"
+GW_REASON_REQUEST_TIMEOUT: Final[str] = "request_timeout"
+GW_REASON_SERVER_ERROR: Final[str] = "server_error"
+GW_REASON_REQUEST_FAILED: Final[str] = "request_failed"
+GW_REASON_NO_CHOICES: Final[str] = "no_choices"
+
+# D2: only these classes are transient enough to warrant a bounded in-step
+# retry. A 4xx other than 429, a malformed-JSON success body, or anything
+# unclassified (GW_REASON_REQUEST_FAILED) returns on the first attempt.
+GW_TRANSIENT_REASONS: Final[frozenset] = frozenset({
+    GW_REASON_RATE_LIMITED,
+    GW_REASON_BACKEND_UNREACHABLE,
+    GW_REASON_REQUEST_TIMEOUT,
+    GW_REASON_SERVER_ERROR,
+})
+
+GW_STEP_MAX_RETRIES: Final[int] = 2
+GW_RETRY_AFTER_CAP_S: Final[float] = 30.0
+GW_RETRY_BACKOFF_BASE_S: Final[float] = 1.0
+
+
+def _classify_response(resp: "requests.Response") -> tuple[str, float | None]:
+    """Classify a non-2xx HTTP response into (reason, retry_after_s).
+
+    retry_after_s is only ever populated for a 429 with a parseable
+    Retry-After header; every other case returns None for it.
+    """
+    status = resp.status_code
+    if status == 429:
+        retry_after = None
+        header = resp.headers.get("Retry-After")
+        if header is not None:
+            try:
+                retry_after = float(header)
+            except (TypeError, ValueError):
+                retry_after = None
+        return GW_REASON_RATE_LIMITED, retry_after
+    if 500 <= status < 600:
+        return GW_REASON_SERVER_ERROR, None
+    # Any other 4xx (or a status raise_for_status flagged for another reason)
+    # is not classified as transient - falls to the terminal fallback.
+    return GW_REASON_REQUEST_FAILED, None
+
+
+def _classify_exception(exc: Exception) -> tuple[str, float | None]:
+    """Classify a requests exception raised by the per-step POST into (reason, retry_after_s).
+
+    Timeout is checked before ConnectionError because requests.exceptions.
+    ConnectTimeout subclasses BOTH - a connect that times out should classify
+    as request_timeout, matching "the per-step timeout fired" (D1), not
+    backend_unreachable.
+    """
+    if isinstance(exc, requests.exceptions.Timeout):
+        return GW_REASON_REQUEST_TIMEOUT, None
+    if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
+        return _classify_response(exc.response)
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return GW_REASON_BACKEND_UNREACHABLE, None
+    return GW_REASON_REQUEST_FAILED, None
+
+
+def _post_step_with_bounded_retry(
+    backend_url: str,
+    payload: dict,
+    now: float,
+    deadline: float,
+    conclusion_reserve_s: float,
+    log: Callable[[str], None] | None,
+    step_num: int,
+) -> tuple[dict | None, str | None]:
+    """POST one agent step with bounded retry for transient failure classes (D2).
+
+    `now` is the caller's already-computed time.monotonic() reading for this loop
+    iteration (the same one used to derive `_per_step_timeout`) - reused for the
+    first attempt so a successful first attempt costs zero extra monotonic() calls
+    over the pre-retry implementation. time.monotonic() is called again only when
+    actually retrying, i.e. only on the failure path.
+
+    Returns (data, None) on success (data is the parsed JSON response body), or
+    (None, reason) on terminal failure - reason is always one of the typed
+    GW_REASON_* constants (D1), never a raw exception/string built ad hoc.
+
+    Retry is double-bounded: GW_STEP_MAX_RETRIES caps the attempt count, AND the
+    `_per_step_timeout` envelope (deadline - conclusion_reserve_s) is the
+    absolute governor - remaining budget is recomputed before every attempt
+    (shrinking that attempt's request timeout) and again before every retry
+    sleep, aborting immediately with the already-classified reason whenever the
+    required wait would not fit. A fixed retry count alone would not honor
+    that bound. Only classes in GW_TRANSIENT_REASONS retry; everything else
+    (a 4xx other than 429, an unclassified exception) returns on attempt one.
+    """
+    attempt = 0
+    reason = GW_REASON_REQUEST_FAILED
+    while True:
+        if attempt > 0:
+            now = time.monotonic()
+        remaining = deadline - now - conclusion_reserve_s
+        if attempt > 0 and remaining <= 0:
+            if log:
+                log(
+                    f"[gw_agent] step {step_num + 1}: no budget remaining for retry "
+                    f"attempt {attempt + 1}, returning '{reason}'"
+                )
+            return None, reason
+        per_step_timeout = max(20.0, remaining)
+
+        retry_after = None
+        try:
+            resp = requests.post(
+                f"{backend_url}/v1/chat/completions",
+                json=payload,
+                timeout=per_step_timeout,
+            )
+            resp.raise_for_status()
+            return resp.json(), None
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None:
+                reason, retry_after = _classify_response(e.response)
+            else:
+                reason = GW_REASON_REQUEST_FAILED
+        except Exception as e:
+            reason, retry_after = _classify_exception(e)
+            if reason == GW_REASON_REQUEST_FAILED and log:
+                log(f"[gw_agent] step {step_num + 1}: unclassified request exception: {e}")
+
+        if log:
+            log(
+                f"[gw_agent] step {step_num + 1} attempt {attempt + 1} failed: {reason}"
+            )
+
+        if reason not in GW_TRANSIENT_REASONS or attempt >= GW_STEP_MAX_RETRIES:
+            return None, reason
+
+        if reason == GW_REASON_RATE_LIMITED and retry_after is not None:
+            wait_s = min(max(retry_after, 0.0), GW_RETRY_AFTER_CAP_S)
+        else:
+            wait_s = GW_RETRY_BACKOFF_BASE_S * (2 ** attempt)
+
+        now = time.monotonic()
+        remaining = deadline - now - conclusion_reserve_s
+        if wait_s > remaining:
+            if log:
+                log(
+                    f"[gw_agent] step {step_num + 1}: retry wait {wait_s:.1f}s exceeds "
+                    f"remaining budget {remaining:.1f}s, aborting with '{reason}'"
+                )
+            return None, reason
+
+        if log:
+            log(
+                f"[gw_agent] step {step_num + 1}: retrying in {wait_s:.1f}s "
+                f"(attempt {attempt + 2}/{GW_STEP_MAX_RETRIES + 1})"
+            )
+        time.sleep(wait_s)
+        attempt += 1
 
 
 # ---------------------------------------------------------------------------
@@ -1027,7 +1197,11 @@ def _call_gw_agent_impl(
         reason_out: Optional list. When provided, on a `writeable=False` (readonly/json_mode)
                     call that collapses to an empty result, one of the following category
                     strings is appended: "gw_unreachable", "gw_not_serving", "request_failed",
-                    "no_choices", "grounding_failed", "budget_exhausted", "max_steps_exhausted",
+                    "rate_limited", "backend_unreachable", "request_timeout", "server_error"
+                    (the last four are per-step POST failure classes - see GW_REASON_* /
+                    GW_TRANSIENT_REASONS - that retry up to GW_STEP_MAX_RETRIES times within
+                    the per-step timeout envelope before landing here), "no_choices",
+                    "grounding_failed", "budget_exhausted", "max_steps_exhausted",
                     "interrupted". Left untouched on a genuinely successful (non-empty) result.
                     Stays empty/unpopulated for `writeable=True` calls regardless of cause. Pure
                     side channel - does not change the return type. When None (default), never
@@ -1298,36 +1472,35 @@ def _call_gw_agent_impl(
                 if _interrupted:
                     break
 
-            # Per-step timeout: leave headroom for the forced-conclusion model call.
-            # Never cap below 20s (a legitimate slow step on a loaded 122B can take minutes).
-            _per_step_timeout = max(20.0, _deadline - _now - _conclusion_reserve_s)
-
-            # POST to the backend (GW or swarm) with current message state.
-            try:
-                resp = requests.post(
-                    f"{backend_url}/v1/chat/completions",
-                    json={
-                        **({} if model is None else {"model": model}),
-                        "messages": messages,
-                        "tools": list(tools.values()),
-                        "tool_choice": "auto",
-                        "temperature": 0.7,
-                        **({} if _is_swarm else {"chat_template_kwargs": {"enable_thinking": think}}),
-                    },
-                    timeout=_per_step_timeout,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                if served_model_out is not None and "model" in data and data["model"] is not None:
-                    served_model_out.append(data["model"])
-            except Exception as e:
+            # Per-step timeout envelope: leave headroom for the forced-conclusion model
+            # call. Never cap below 20s (a legitimate slow step on a loaded 122B can
+            # take minutes). _post_step_with_bounded_retry recomputes this same
+            # (deadline - conclusion_reserve) bound before every attempt/sleep below.
+            #
+            # POST to the backend (GW or swarm) with current message state, with
+            # bounded retry for transient failure classes (D1/D2) - never exceeds the
+            # _per_step_timeout envelope above (recomputed per attempt/sleep inside).
+            _payload = {
+                **({} if model is None else {"model": model}),
+                "messages": messages,
+                "tools": list(tools.values()),
+                "tool_choice": "auto",
+                "temperature": 0.7,
+                **({} if _is_swarm else {"chat_template_kwargs": {"enable_thinking": think}}),
+            }
+            data, _post_fail_reason = _post_step_with_bounded_retry(
+                backend_url, _payload, _now, _deadline, _conclusion_reserve_s, log, step_num,
+            )
+            if data is None:
                 if log:
-                    log(f"[gw_agent] GW request failed: {e}")
+                    log(f"[gw_agent] GW request failed: {_post_fail_reason}")
                 # Return best-effort content accumulated so far
                 return _finalize_writeable_or_readonly(
                     messages, "", return_transcript, transcript, writeable, cwd, concluded=False,
-                    reason_out=reason_out, reason="request_failed",
+                    reason_out=reason_out, reason=_post_fail_reason,
                 )
+            if served_model_out is not None and "model" in data and data["model"] is not None:
+                served_model_out.append(data["model"])
 
             # Extract response.
             if "choices" not in data or not data["choices"]:
@@ -1335,7 +1508,7 @@ def _call_gw_agent_impl(
                     log(f"[gw_agent] GW returned no choices")
                 return _finalize_writeable_or_readonly(
                     messages, "", return_transcript, transcript, writeable, cwd, concluded=False,
-                    reason_out=reason_out, reason="no_choices",
+                    reason_out=reason_out, reason=GW_REASON_NO_CHOICES,
                 )
 
             choice = data["choices"][0]
