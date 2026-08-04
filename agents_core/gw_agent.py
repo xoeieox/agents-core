@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import sys
@@ -70,6 +71,126 @@ GW_TRANSIENT_REASONS: Final[frozenset] = frozenset({
 GW_STEP_MAX_RETRIES: Final[int] = 2
 GW_RETRY_AFTER_CAP_S: Final[float] = 30.0
 GW_RETRY_BACKOFF_BASE_S: Final[float] = 1.0
+
+
+# ---------------------------------------------------------------------------
+# Deferrable-acquire retry (agents-core-gw-agent-deferrable-acquire-retry-v0).
+#
+# The doorman's foreground-priority gate (gw-router-phase1-foreground-gate)
+# returns "pending_defer" immediately (unregistered, no lease) when a
+# `deferrable`-class acquire collides with an active `protected` lease. The
+# contract (doorman_client.py's acquire()/is_pending_defer() docstrings) is
+# that the caller retries the SAME work_id until it either clears or a
+# client-owned budget is exhausted.
+#
+# GW_DEFER_RETRY_BUDGET_SEC is deliberately NOT sized off
+# _defer_wait_timeout()/DOORMAN_MAX_HOLD_TIMEOUT_SEC (900s default): that
+# value bounds the *server's* wait-list hold, not how long a caller's worker
+# thread should block synchronously on one acquire. A short, separate,
+# client-owned ceiling is used instead so a caller that can't afford to sit
+# for 15 minutes still fails within a bounded, predictable window.
+# ---------------------------------------------------------------------------
+GW_DEFER_RETRY_BUDGET_SEC: Final[float] = float(
+    os.environ.get("GW_DEFER_RETRY_BUDGET_SEC", "45")
+)
+GW_DEFER_RETRY_INITIAL_SLEEP_S: Final[float] = 1.5
+GW_DEFER_RETRY_BACKOFF_MULT: Final[float] = 1.8
+GW_DEFER_RETRY_MAX_SLEEP_S: Final[float] = 9.0
+GW_DEFER_RETRY_JITTER_FRAC: Final[float] = 0.25
+
+# Additive to the reason_out vocabulary (see GW_REASON_* above and
+# call_gw_agent's reason_out docstring): distinguishable from
+# "gw_not_serving" so a defer-retry budget exhaustion is never confused with
+# a genuine same-call not-serving response.
+GW_REASON_DEFER_TIMEOUT: Final[str] = "gw_defer_timeout"
+
+
+def _compute_defer_retry_sleep_s(attempt: int, rand_fn: Callable[[], float] = random.random) -> float:
+    """Compute the jittered, capped-exponential sleep for defer-retry attempt N (1-indexed).
+
+    Shape (Council/Facets requirement, gate run 2026-08-04): bounded exponential
+    backoff with jitter, not a flat interval — a fixed interval risks every
+    deferred caller in a batch re-polling the doorman on the same tick.
+    """
+    base_sleep = min(
+        GW_DEFER_RETRY_INITIAL_SLEEP_S * (GW_DEFER_RETRY_BACKOFF_MULT ** max(0, attempt - 1)),
+        GW_DEFER_RETRY_MAX_SLEEP_S,
+    )
+    jitter = base_sleep * GW_DEFER_RETRY_JITTER_FRAC * (2.0 * rand_fn() - 1.0)
+    return max(0.0, base_sleep + jitter)
+
+
+def _acquire_with_defer_retry(
+    client: DoormanClient,
+    work_id: str,
+    *,
+    ttl_sec: float,
+    reason: str,
+    timeout: float,
+    principal: str | None,
+    lease_class: str | None,
+    budget_sec: float | None = None,
+    log: Callable[[str], None] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
+    rand_fn: Callable[[], float] = random.random,
+) -> tuple[dict, bool]:
+    """Retry a `deferrable`-class acquire on "pending_defer" up to a client-owned budget.
+
+    Isolated from the surrounding lease-acquisition flow (Council/Facets note,
+    gate run 2026-08-04): all retry/backoff state lives in this helper's own
+    locals, and a failure inside the sleep/retry cycle itself (e.g. sleep_fn
+    raising) is caught here and treated as a bounded timeout rather than
+    propagating in a way that could corrupt the caller's acquire state.
+
+    Only "pending_defer" responses are retried, per DoormanClient.is_pending_defer().
+    Any other status (including exceptions raised by client.acquire() itself,
+    e.g. DoormanUnreachable) is NOT retried here — it propagates/returns
+    immediately for the caller's existing on_wake_fail handling.
+
+    Returns (res, timed_out):
+      - timed_out is False and res["status"] == "serving" -> lease acquired.
+      - timed_out is False and res["status"] != "serving" -> genuine non-serving
+        status on the first check (or after a status other than pending_defer
+        was returned); caller falls into today's "gw_not_serving" handling.
+      - timed_out is True -> still "pending_defer" when the budget was
+        exhausted; res is the last pending_defer response seen. Caller should
+        use a reason distinguishable from "gw_not_serving" (GW_REASON_DEFER_TIMEOUT).
+    """
+    if budget_sec is None:
+        budget_sec = GW_DEFER_RETRY_BUDGET_SEC
+    if sleep_fn is None:
+        sleep_fn = time.sleep
+
+    start = time.monotonic()
+    attempt = 0
+    res = client.acquire(
+        "gravitywell", work_id, ttl_sec=ttl_sec, reason=reason, timeout=timeout,
+        principal=principal, lease_class=lease_class,
+    )
+    while DoormanClient.is_pending_defer(res):
+        elapsed = time.monotonic() - start
+        remaining = budget_sec - elapsed
+        if remaining <= 0:
+            return res, True
+        attempt += 1
+        sleep_s = min(_compute_defer_retry_sleep_s(attempt, rand_fn=rand_fn), remaining)
+        if log:
+            log(
+                f"[gw_agent] acquire pending_defer for work_id={work_id!r} "
+                f"(attempt {attempt}, {remaining:.1f}s of budget left) — "
+                f"retrying in {sleep_s:.2f}s"
+            )
+        try:
+            sleep_fn(sleep_s)
+        except Exception as e:  # defensive: a sleep_fn failure must not corrupt caller state
+            if log:
+                log(f"[gw_agent] defer-retry sleep failed: {e}")
+            return res, True
+        res = client.acquire(
+            "gravitywell", work_id, ttl_sec=ttl_sec, reason=reason, timeout=timeout,
+            principal=principal, lease_class=lease_class,
+        )
+    return res, False
 
 
 def _classify_response(resp: "requests.Response") -> tuple[str, float | None]:
@@ -1196,10 +1317,13 @@ def _call_gw_agent_impl(
                      None (default), never called.
         reason_out: Optional list. When provided, on a `writeable=False` (readonly/json_mode)
                     call that collapses to an empty result, one of the following category
-                    strings is appended: "gw_unreachable", "gw_not_serving", "request_failed",
-                    "rate_limited", "backend_unreachable", "request_timeout", "server_error"
-                    (the last four are per-step POST failure classes - see GW_REASON_* /
-                    GW_TRANSIENT_REASONS - that retry up to GW_STEP_MAX_RETRIES times within
+                    strings is appended: "gw_unreachable", "gw_not_serving", "gw_defer_timeout"
+                    (a `deferrable`-class acquire stayed "pending_defer" past
+                    GW_DEFER_RETRY_BUDGET_SEC - see _acquire_with_defer_retry - distinguishable
+                    from "gw_not_serving" which is a genuine same-call non-serving status),
+                    "request_failed", "rate_limited", "backend_unreachable", "request_timeout",
+                    "server_error" (the last four are per-step POST failure classes - see
+                    GW_REASON_* / GW_TRANSIENT_REASONS - that retry up to GW_STEP_MAX_RETRIES times within
                     the per-step timeout envelope before landing here), "no_choices",
                     "grounding_failed", "budget_exhausted", "max_steps_exhausted",
                     "interrupted". Left untouched on a genuinely successful (non-empty) result.
@@ -1341,14 +1465,15 @@ def _call_gw_agent_impl(
     try:
         if acquire_lease:
             try:
-                res = client.acquire(
-                    "gravitywell",
+                res, _defer_timed_out = _acquire_with_defer_retry(
+                    client,
                     work_id,
                     ttl_sec=timeout + 60,
                     reason="gw_agent",
                     timeout=_gw_acquire_timeout(),
                     principal=principal,
                     lease_class=lease_class,
+                    log=log,
                 )
             except DoormanUnreachable as e:
                 if log:
@@ -1361,6 +1486,30 @@ def _call_gw_agent_impl(
                     return (None, transcript) if return_transcript else None
                 elif on_wake_fail == "error":
                     raise
+                elif on_wake_fail == "claude":
+                    return _fallback_claude_cli(
+                        prompt, system, cwd, json_mode, log, return_transcript, transcript
+                    )
+                else:
+                    raise ValueError(f"unknown on_wake_fail: {on_wake_fail}")
+
+            if _defer_timed_out:
+                if log:
+                    log(
+                        f"[gw_agent] GW acquire still pending_defer after "
+                        f"{GW_DEFER_RETRY_BUDGET_SEC}s retry budget"
+                    )
+                if on_wake_fail == "skip":
+                    if writeable:
+                        return (_build_fixer_result(cwd, transcript, concluded=False), transcript)
+                    if reason_out is not None:
+                        reason_out.append(GW_REASON_DEFER_TIMEOUT)
+                    return (None, transcript) if return_transcript else None
+                elif on_wake_fail == "error":
+                    raise Exception(
+                        f"GW acquire still pending_defer after {GW_DEFER_RETRY_BUDGET_SEC}s "
+                        "retry budget"
+                    )
                 elif on_wake_fail == "claude":
                     return _fallback_claude_cli(
                         prompt, system, cwd, json_mode, log, return_transcript, transcript

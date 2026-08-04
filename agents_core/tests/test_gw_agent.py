@@ -1681,3 +1681,158 @@ class TestFirstStepBudgetGuard:
             assert mock_post.call_count >= 1
             assert result == "Real answer."
             assert "budget-forced" not in result
+
+
+class TestDeferrableAcquireRetry:
+    """agents-core-gw-agent-deferrable-acquire-retry-v0: bounded retry on
+    "pending_defer" acquire responses, using DoormanClient.is_pending_defer(),
+    with jittered exponential backoff bounded by GW_DEFER_RETRY_BUDGET_SEC
+    (NOT _defer_wait_timeout()/DOORMAN_MAX_HOLD_TIMEOUT_SEC)."""
+
+    def test_retries_pending_defer_then_succeeds(self):
+        """DoD 1: pending_defer twice then serving -> call ultimately succeeds and
+        the acquire was actually retried (not just eventually giving up)."""
+        import itertools
+
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("agents_core.gw_agent.time.monotonic", side_effect=itertools.count(0.0, 1.0)), \
+             patch("agents_core.gw_agent.time.sleep") as mock_sleep, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.side_effect = [
+                {"status": "pending_defer"},
+                {"status": "pending_defer"},
+                {"status": "serving"},
+            ]
+            mock_post.return_value.json.return_value = {
+                "choices": [{"message": {"content": "Done.", "tool_calls": []},
+                             "finish_reason": "stop"}],
+                "usage": {"total_tokens": 10},
+            }
+
+            result = call_gw_agent(prompt="Review this.", timeout=10)
+
+            assert result == "Done."
+            assert mock_doorman.acquire.call_count == 3
+            assert mock_sleep.call_count == 2
+            mock_doorman.release.assert_called_once()
+
+    def test_budget_bounded_by_client_constant_not_defer_wait_timeout(self):
+        """DoD 2: retry ceiling is GW_DEFER_RETRY_BUDGET_SEC, not
+        _defer_wait_timeout()/DOORMAN_MAX_HOLD_TIMEOUT_SEC — mocking the latter to a
+        huge value must not extend the loop."""
+        from agents_core.gw_agent import _acquire_with_defer_retry, GW_DEFER_RETRY_BUDGET_SEC
+
+        # Sanity: the module's own retry ceiling is short, nowhere near the server's
+        # 900s max-hold-timeout default.
+        assert GW_DEFER_RETRY_BUDGET_SEC <= 60
+
+        with patch("agents_core.doorman_client._defer_wait_timeout", return_value=99999.0), \
+             patch("agents_core.gw_agent.time.monotonic", side_effect=[0.0, 100.0]):
+            mock_client = MagicMock()
+            mock_client.acquire.return_value = {"status": "pending_defer"}
+
+            res, timed_out = _acquire_with_defer_retry(
+                mock_client, "work-1", ttl_sec=60, reason="gw_agent", timeout=5,
+                principal=None, lease_class="deferrable",
+                sleep_fn=lambda s: None,
+            )
+
+            assert timed_out is True
+            assert res["status"] == "pending_defer"
+            # Only the initial acquire — bailed at the first over-budget check.
+            assert mock_client.acquire.call_count == 1
+
+    def test_backoff_is_capped_exponential_with_jitter(self):
+        """DoD 3: per-attempt sleep is neither constant nor unbounded — capped
+        exponential growth, and repeated runs don't produce identical sequences."""
+        from agents_core.gw_agent import (
+            _compute_defer_retry_sleep_s,
+            GW_DEFER_RETRY_MAX_SLEEP_S,
+        )
+
+        # Deterministic (zero-jitter) sequence: strictly increasing, then capped.
+        no_jitter = [_compute_defer_retry_sleep_s(a, rand_fn=lambda: 0.5) for a in range(1, 8)]
+        assert all(s <= GW_DEFER_RETRY_MAX_SLEEP_S for s in no_jitter)
+        # Increasing while below the cap, flat once capped.
+        for i in range(1, len(no_jitter)):
+            assert no_jitter[i] >= no_jitter[i - 1] - 1e-9
+
+        # Jitter: two runs across the same attempts with real randomness differ.
+        run_a = [_compute_defer_retry_sleep_s(a) for a in range(1, 6)]
+        run_b = [_compute_defer_retry_sleep_s(a) for a in range(1, 6)]
+        assert run_a != run_b
+
+        # Not a flat interval: sub-cap attempts vary interval-to-interval.
+        assert len(set(round(s, 3) for s in no_jitter[:3])) > 1
+
+    def test_defer_timeout_reason_distinguishable_from_not_serving(self):
+        """DoD 4: a pending_defer that never clears within budget produces
+        "gw_defer_timeout", distinguishable from an immediate "gw_not_serving"."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("agents_core.gw_agent.time.monotonic", side_effect=[0.0, 100.0]):
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "pending_defer"}
+
+            reason_out = []
+            result = call_gw_agent(
+                prompt="Review this.",
+                on_wake_fail="skip",
+                reason_out=reason_out,
+            )
+
+            assert result is None
+            assert reason_out == ["gw_defer_timeout"]
+            assert "gw_not_serving" not in reason_out
+
+    def test_genuine_not_serving_on_first_check_fails_immediately(self):
+        """DoD 5 regression: a non-pending_defer, non-serving status on the first
+        check still fails immediately with "gw_not_serving", unchanged."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "wake_failed"}
+
+            reason_out = []
+            result = call_gw_agent(
+                prompt="Review this.",
+                on_wake_fail="skip",
+                reason_out=reason_out,
+            )
+
+            assert result is None
+            assert reason_out == ["gw_not_serving"]
+            mock_doorman.acquire.assert_called_once()
+
+    def test_defer_timeout_on_wake_fail_error_raises(self):
+        """DoD 6: on_wake_fail="error" routes the defer-timeout the same way as
+        today's not-serving case."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("agents_core.gw_agent.time.monotonic", side_effect=[0.0, 100.0]):
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "pending_defer"}
+
+            with pytest.raises(Exception, match="pending_defer"):
+                call_gw_agent(prompt="Review this.", on_wake_fail="error")
+
+            mock_doorman.release.assert_called_once()
+
+    def test_defer_timeout_on_wake_fail_claude_falls_back(self):
+        """DoD 6: on_wake_fail="claude" routes the defer-timeout the same way as
+        today's not-serving case."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("agents_core.gw_agent.time.monotonic", side_effect=[0.0, 100.0]), \
+             patch("agents_core.gw_agent._fallback_claude_cli") as mock_fallback:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "pending_defer"}
+            mock_fallback.return_value = "fallback result"
+
+            result = call_gw_agent(prompt="Review this.", on_wake_fail="claude")
+
+            assert result == "fallback result"
+            mock_fallback.assert_called_once()
+            mock_doorman.release.assert_called_once()
