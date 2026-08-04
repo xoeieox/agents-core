@@ -30,16 +30,21 @@ def test_call_operator_qwen_default_model_works():
 
 
 # ---------------------------------------------------------------------------
-# qwen: non-default model must raise ValueError with the directive message
+# qwen: the old single-fixed-model guard is gone (agents-core-local-llm-gw-repoint-v0).
+# The backend is GravityWell/vLLM now, not the retired llama.cpp box, and
+# OPERATOR_DEFAULTS["qwen"] is a name GW does not serve - asserting a caller's
+# model= against it would just be asserting against a dead constant. A
+# non-default model= no longer raises; it's simply not forwarded (the qwen
+# backend never sends a `model` field at all - AC4).
 # ---------------------------------------------------------------------------
 
-def test_call_operator_qwen_non_default_model_raises():
-    """Passing a non-default model to the qwen operator raises ValueError."""
-    with pytest.raises(ValueError) as exc_info:
-        call_operator("qwen", prompt="hi", model="qwen-other-7b")
-    assert "infrastructure operation" in str(exc_info.value)
-    assert "qwen-other-7b" in str(exc_info.value)
-    assert OPERATOR_DEFAULTS["qwen"] in str(exc_info.value)
+def test_call_operator_qwen_non_default_model_no_longer_raises():
+    """Passing a non-default model to the qwen operator no longer raises; it's ignored."""
+    with patch("agents_core.llm._call_qwen_backend", return_value="ok") as mock_qwen:
+        result = call_operator("qwen", prompt="hi", model="qwen-other-7b")
+    assert result == "ok"
+    # model= is not a _call_qwen_backend parameter, so it's dropped, not forwarded.
+    mock_qwen.assert_called_once_with(prompt="hi")
 
 
 # ---------------------------------------------------------------------------

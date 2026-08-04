@@ -30,8 +30,6 @@ import requests
 import yaml
 from requests.exceptions import Timeout, ConnectionError, HTTPError, ChunkedEncodingError
 
-TAILSCALE_IP = "203.0.113.12"
-LLAMACPP_URL = f"http://{TAILSCALE_IP}:8081"
 PACIFIC = ZoneInfo("America/Los_Angeles")
 
 GW_URL = os.environ.get("GW_URL", "http://203.0.113.11:8081")
@@ -39,6 +37,34 @@ GW_CREATIVE_URL = os.environ.get("GW_CREATIVE_URL", "http://203.0.113.11:8093")
 QUEST_URL = os.environ.get("QUEST_URL", "http://203.0.113.11:8080")
 SWARM_URL = os.environ.get("SWARM_URL", GW_URL)
 SWARM_MAX_CONCURRENT = int(os.environ.get("SWARM_MAX_CONCURRENT", "4"))
+
+
+def _llamacpp_url() -> str:
+    """Resolve the qwen-operator local-LLM endpoint.
+
+    Read at call time (not module load) so tests can monkeypatch.setenv - same
+    call-time-vs-import-time discipline as _gw_max_tokens_default(). Defaults to
+    GW_URL (GravityWell), which is itself env-overridable; LOCAL_LLM_URL wins when
+    set. StarHouse (the old bare-literal TAILSCALE_IP default) kernel-panicked
+    2026-08-03 and is being held off deliberately - see
+    agents-core-local-llm-gw-repoint-v0.
+    """
+    return os.environ.get("LOCAL_LLM_URL", GW_URL)
+
+
+LLAMACPP_URL = _llamacpp_url()
+
+
+def _local_llm_think_enabled() -> bool:
+    """Whether the qwen-operator path should preserve GW's reasoning trace.
+
+    Default off. Measured (finding 3/4, agents-core-local-llm-gw-repoint-v0): a
+    brief-shaped prompt with the trace on ran 28.0s wall-clock and blew
+    state_brief.py's 30s guard; suppressed via chat_template_kwargs it ran 5.4s -
+    a 5.2x reduction. Every current qwen-operator consumer is a summarizer under a
+    wall-clock guard, not a reasoner. Opt back in with LOCAL_LLM_THINK=1.
+    """
+    return os.environ.get("LOCAL_LLM_THINK", "0") == "1"
 
 # flip-controller — sole mode/units/in-flight-flip oracle (gw-serving-state-resolver-v0).
 FLIP_CONTROLLER_URL = os.environ.get("FLIP_CONTROLLER_URL", "http://203.0.113.10:8408")
@@ -455,32 +481,45 @@ def _call_qwen_backend(prompt: str, system: str = None, timeout: int = 600,
         "messages": messages,
         "temperature": temperature,
         "cache_prompt": True,
+        "chat_template_kwargs": {"enable_thinking": _local_llm_think_enabled()},
     }
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
     max_retries = 3
+    call_start = time.monotonic()
     for attempt in range(max_retries):
         try:
             resp = requests.post(
-                f"{LLAMACPP_URL}/v1/chat/completions",
+                f"{_llamacpp_url()}/v1/chat/completions",
                 json=payload, timeout=timeout)
             resp.raise_for_status()
             data = resp.json()
             msg = data["choices"][0]["message"]
-            text = msg.get("content") or msg.get("reasoning_content") or ""
+            text = msg.get("content") or msg.get("reasoning") or msg.get("reasoning_content") or ""
             return text if text.strip() else None
         except (requests.exceptions.HTTPError,
                 requests.exceptions.ConnectionError) as e:
             if attempt < max_retries - 1:
-                backoff = 10 * (2 ** attempt)
+                # Budget-aware backoff: never sleep past the caller's remaining
+                # `timeout` wall-clock budget (state_brief.py's 30s guard abandons
+                # the executor mid-first-backoff otherwise - finding 6,
+                # agents-core-local-llm-gw-repoint-v0). Control flow (which
+                # exceptions retry vs raise vs swallow) is unchanged.
+                remaining = timeout - (time.monotonic() - call_start)
+                backoff = min(10 * (2 ** attempt), max(0.0, remaining))
+                if backoff <= 0:
+                    if log:
+                        log(f"LLM call failed (attempt {attempt + 1}/{max_retries}), "
+                            f"no budget left for retry: {e}")
+                    raise OperatorUnreachableError(_llamacpp_url(), e)
                 if log:
                     log(f"LLM call failed (attempt {attempt + 1}/{max_retries}): {e}")
                 time.sleep(backoff)
             else:
                 if log:
                     log(f"LLM call failed after {max_retries} attempts: {e}")
-                raise OperatorUnreachableError(LLAMACPP_URL, e)
+                raise OperatorUnreachableError(_llamacpp_url(), e)
         except Exception as e:
             if log:
                 log(f"LLM call error: {e}")
@@ -1045,15 +1084,14 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
         )
 
     if operator_class == "qwen":
-        if model is not None and model != OPERATOR_DEFAULTS["qwen"]:
-            raise ValueError(
-                f"call_operator(operator_class='qwen', model={model!r}): "
-                "the local llama.cpp backend serves a single fixed model "
-                f"({OPERATOR_DEFAULTS['qwen']!r}); model swaps are an "
-                "infrastructure operation (stop / swap weights / restart), "
-                "not a per-call parameter. Either pass model=None to use the "
-                "default, or do the model swap out-of-band first."
-            )
+        # No single-fixed-model guard here (agents-core-local-llm-gw-repoint-v0):
+        # the backend is GravityWell/vLLM now, not the old llama.cpp box, and
+        # OPERATOR_DEFAULTS["qwen"] ("qwen3.6-35b-a3b") is a name GW does not
+        # serve (confirmed live: posting it 404s). _call_qwen_backend never sends
+        # a `model` field at all (finding 1: the unmodified llama.cpp-shaped
+        # payload works against vLLM unchanged, which omits `model`), so `model`
+        # is accepted for API compatibility and otherwise ignored rather than
+        # validated against a dead constant.
         return _call_qwen_backend(prompt=prompt, **_forward_supported_kwargs(_call_qwen_backend, kwargs))
 
     if operator_class == "quest":
@@ -1536,7 +1574,7 @@ _LOCALITY_COST_CLASS_BY_OPERATOR = {
 }
 
 _LOCALITY_HOST_BY_OPERATOR = {
-    "qwen": LLAMACPP_URL,
+    "qwen": _llamacpp_url(),
     "quest": QUEST_URL,
     "gravitywell": GW_URL,
     "gravitywell-creative": GW_CREATIVE_URL,
@@ -1717,7 +1755,7 @@ def call_llm_streaming(prompt: str, system: str = None, timeout: int = 600,
     }
 
     resp = requests.post(
-        f"{LLAMACPP_URL}/v1/chat/completions",
+        f"{_llamacpp_url()}/v1/chat/completions",
         json=payload, timeout=timeout, stream=True)
     resp.raise_for_status()
 
