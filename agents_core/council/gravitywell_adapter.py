@@ -54,12 +54,19 @@ class GravityWellAdapter:
     principal: when set, all voices in one council run share one GW admission
     group (ride-along). Distinct runs stay distinct. None = per-call group
     (legacy; adds admission latency under GW_ADMISSION_MODE=enforce).
+
+    max_tokens: when set, overrides GW_MAX_TOKENS_DEFAULT (4096) for every
+    call this adapter makes. Wave mode passes a cap around 500 — a long
+    seat statement is re-prefilled by every seat in every later round, so
+    an uncapped seat compounds cost across the whole run (council-wave-
+    mode-v0 D6). Deliberation/scene leave this unset (unchanged behavior).
     """
     temperature: float = 0.8
     timeout: int = 300
     on_wake_fail: str = "park"
     voicing_events: list = None
     principal: str | None = None
+    max_tokens: int | None = None
 
     def __post_init__(self):
         if self.voicing_events is None:
@@ -83,6 +90,9 @@ class GravityWellAdapter:
         """
         prompt = _flatten_messages(messages)
         provenance: list = []
+        call_kwargs = {}
+        if self.max_tokens is not None:
+            call_kwargs["max_tokens"] = self.max_tokens
         result = call_operator(
             "gravitywell", prompt,
             system=system,
@@ -92,6 +102,7 @@ class GravityWellAdapter:
             principal=self.principal,
             _provenance_out=provenance,
             lease_class="protected",
+            **call_kwargs,
         )
         # provenance is a list of (reason, operator) tuples.
         # Find the effective operator and the actual failure reason (if any).
