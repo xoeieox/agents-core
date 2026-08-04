@@ -256,6 +256,138 @@ def test_call_llm_delegates_to_call_operator():
 
 
 # ---------------------------------------------------------------------------
+# GW repoint (agents-core-local-llm-gw-repoint-v0): LLAMACPP_URL env-override,
+# enable_thinking suppression, reasoning-key fallback, no stale model field.
+# No network calls — all backends mocked, per AC1/AC2/AC3/AC4.
+# ---------------------------------------------------------------------------
+
+def test_llamacpp_url_defaults_to_gw_url(monkeypatch):
+    """AC1: with LOCAL_LLM_URL unset, the local-LLM endpoint resolves to GW_URL."""
+    from agents_core import llm as llm_mod
+
+    monkeypatch.delenv("LOCAL_LLM_URL", raising=False)
+    assert llm_mod._llamacpp_url() == llm_mod.GW_URL
+
+
+def test_llamacpp_url_honors_local_llm_url_override(monkeypatch):
+    """AC1: LOCAL_LLM_URL, when set, wins over GW_URL — read at call time."""
+    from agents_core import llm as llm_mod
+
+    monkeypatch.setenv("LOCAL_LLM_URL", "http://example-override:9999")
+    assert llm_mod._llamacpp_url() == "http://example-override:9999"
+
+    # Call-time, not import-time: unsetting again reverts on the next call.
+    monkeypatch.delenv("LOCAL_LLM_URL", raising=False)
+    assert llm_mod._llamacpp_url() == llm_mod.GW_URL
+
+
+def test_call_qwen_backend_payload_defaults_enable_thinking_false(monkeypatch):
+    """AC2: default payload carries chat_template_kwargs.enable_thinking = false."""
+    from agents_core.llm import call_llm
+
+    monkeypatch.delenv("LOCAL_LLM_THINK", raising=False)
+    resp = _make_llama_response("answer")
+
+    with patch("agents_core.llm.requests.post", return_value=resp) as mock_post:
+        call_llm(prompt="p", system="s")
+
+    payload = mock_post.call_args[1]["json"]
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_call_qwen_backend_payload_opts_into_thinking(monkeypatch):
+    """AC2: LOCAL_LLM_THINK=1 flips enable_thinking to true."""
+    from agents_core.llm import call_llm
+
+    monkeypatch.setenv("LOCAL_LLM_THINK", "1")
+    resp = _make_llama_response("answer")
+
+    with patch("agents_core.llm.requests.post", return_value=resp) as mock_post:
+        call_llm(prompt="p", system="s")
+
+    payload = mock_post.call_args[1]["json"]
+    assert payload["chat_template_kwargs"] == {"enable_thinking": True}
+
+
+@pytest.mark.parametrize("message,expected", [
+    ({"content": None, "reasoning": "trace", "reasoning_content": None}, "trace"),
+    ({"content": None, "reasoning": None, "reasoning_content": "legacy trace"}, "legacy trace"),
+    ({"content": "plain content", "reasoning": None, "reasoning_content": None}, "plain content"),
+])
+def test_call_qwen_backend_reasoning_key_fallback(message, expected):
+    """AC3: parser falls back content -> reasoning (vLLM) -> reasoning_content (llama.cpp)."""
+    from agents_core.llm import call_llm
+
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {"choices": [{"message": message}]}
+
+    with patch("agents_core.llm.requests.post", return_value=resp):
+        result = call_llm(prompt="p", system="s")
+
+    assert result == expected
+
+
+def test_call_qwen_backend_never_sends_model_field():
+    """AC4: the qwen-operator payload omits `model` entirely (GW serves one resident
+    model and 404s on a stale name — OPERATOR_DEFAULTS['qwen'] is not served)."""
+    from agents_core.llm import call_llm
+
+    resp = _make_llama_response("answer")
+
+    with patch("agents_core.llm.requests.post", return_value=resp) as mock_post:
+        call_llm(prompt="p", system="s")
+
+    payload = mock_post.call_args[1]["json"]
+    assert "model" not in payload
+
+
+def test_call_operator_qwen_never_forwards_operator_defaults_model():
+    """AC4 (dispatcher level): OPERATOR_DEFAULTS['qwen'] never reaches the wire even
+    when a caller explicitly passes it as model=."""
+    from agents_core.llm import call_operator, OPERATOR_DEFAULTS
+
+    resp = _make_llama_response("answer")
+
+    with patch("agents_core.llm.requests.post", return_value=resp) as mock_post:
+        call_operator("qwen", prompt="p", model=OPERATOR_DEFAULTS["qwen"])
+
+    payload = mock_post.call_args[1]["json"]
+    assert "model" not in payload
+
+
+def test_call_llm_backoff_bounded_by_remaining_timeout_budget(monkeypatch):
+    """Item 7: backoff never sleeps past the caller's remaining timeout budget —
+    control flow (retry/raise/swallow) is unchanged, only the sleep duration shrinks."""
+    import requests as req
+    from agents_core.llm import call_llm, OperatorUnreachableError
+
+    conn_err = req.exceptions.ConnectionError("down")
+    sleeps = []
+
+    def fake_sleep(secs):
+        sleeps.append(secs)
+
+    # timeout=5: even the first nominal 10s backoff must be clamped down to
+    # whatever budget remains (<=5s), never the full 10s/20s ladder.
+    with patch("agents_core.llm.requests.post", side_effect=conn_err), \
+         patch("agents_core.llm.time.sleep", side_effect=fake_sleep):
+        with pytest.raises(OperatorUnreachableError):
+            call_llm(prompt="p", system="s", timeout=5)
+
+    assert all(s <= 5 for s in sleeps)
+
+
+def test_locality_host_by_operator_qwen_reflects_gw(monkeypatch):
+    """Item 6: qwen's locality-ledger host attribution is the real (GW) host, not
+    the retired StarHouse literal."""
+    from agents_core import llm as llm_mod
+
+    monkeypatch.delenv("LOCAL_LLM_URL", raising=False)
+    assert llm_mod._LOCALITY_HOST_BY_OPERATOR["qwen"] != "http://203.0.113.12:8081"
+
+
+# ---------------------------------------------------------------------------
 # Voicing Provenance Tests (GravityWell effective-operator tracking)
 # ---------------------------------------------------------------------------
 
