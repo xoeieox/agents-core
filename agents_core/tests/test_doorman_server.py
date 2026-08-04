@@ -145,6 +145,28 @@ def _default_serve_mode_big(monkeypatch):
     monkeypatch.setattr("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "big")
 
 
+@pytest.fixture(autouse=True)
+def _no_declared_posture_by_default(monkeypatch):
+    """Pin the Part 2 declared-posture read (agents-core-doorman-wake-honors-
+    declared-posture-v0) to "unreadable" (None) for the whole suite by default.
+
+    Fixer/CI processes share a host filesystem with the real BRIX box this
+    code targets, so the module's real default GW_HOME_MODE_ENV_PATH
+    (/srv/agents/config/conductor.env) can resolve to a REAL, live file —
+    without this pin, every test in this suite would silently pick up
+    whatever posture is declared on the host running the tests, rather than
+    exercising DOORMAN_DEFAULT_SERVE_MODE as the suite's ~30 call sites
+    assume. Combined with the DOORMAN_DEFAULT_SERVE_MODE=big pin above, this
+    keeps the legacy suite's dispatch byte-identical (declared=None -> falls
+    through to the literal -> "big"). Posture-resolution tests override this
+    locally.
+    """
+    monkeypatch.setattr(
+        "agents_core.doorman_server._NodeState._read_declared_home_posture",
+        lambda self: None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # _NodeState unit tests
 # ---------------------------------------------------------------------------
