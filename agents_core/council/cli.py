@@ -82,8 +82,29 @@ DEFAULT_POOLS = ["personal", "historical", "fiction"]
 DEFAULT_TURNS = 8
 DEFAULT_VOICING = "gravitywell"
 DEFAULT_MODE = "deliberation"
-VALID_MODES = ("deliberation", "scene")
+VALID_MODES = ("deliberation", "scene", "wave")
 SCENE_N_RANGE = (2, 3)
+# WAVE_N_RANGE must equal lapis_engine.directors.WAVE_N_RANGE — two drifting
+# seat ranges is a latent bug (council-wave-mode-v0 D1.2). Kept as a local
+# literal rather than a module-load-time import so importing agents_core.
+# council doesn't force-load lapis-engine at queue startup (see the
+# function-local lapis_engine imports below); asserted equal in
+# tests/test_council_wave_mode.py.
+WAVE_N_RANGE = (5, 7)
+# Per-seat GW output cap for wave mode only (council-wave-mode-v0 D6). A long
+# seat statement is re-prefilled by every seat in every later round, so an
+# uncapped seat (GW_MAX_TOKENS_DEFAULT=4096) compounds cost across the whole
+# run. Deliberation/scene are unaffected — they never set adapter.max_tokens.
+WAVE_SEAT_MAX_TOKENS = 500
+# Per-seat GW timeout for wave mode only (H2). Seats queue behind each
+# other's chunked prefill under bounded concurrency, so the last seat in a
+# wide wave needs more headroom than the adapter's global default (300s).
+WAVE_SEAT_TIMEOUT_S = 600
+# gravitywell-122b is pinned to --parallel 1 upstream (2026-07-29
+# silent-truncation revert) — serial only. Wave mode must refuse rather than
+# silently serialize itself into the same failure the pin exists to prevent
+# (council-wave-mode-v0 D7).
+GW_122B_MODEL = "gravitywell-122b"
 RECENCY_LOOKBACK = 6
 # COUNCIL_STALL_S: poller fast-fail threshold and deliberation-hold lease TTL (seconds).
 # _poll_council declares worker dead when heartbeat_at is stale beyond this value.
@@ -1076,74 +1097,83 @@ def run_deliberation(run_id: str) -> None:
         from agents_core.council.narrator_entity import NarratorEntity
 
         try:
-            adapter = _build_adapter(run["voicing"], ClaudeAdapter, LlamaAdapter, run_id=run_id, gw_principal=run.get("gw_principal") or None)
-            entities = [
-                _build_entity(sel, adapter, CharacterEntity, NarratorEntity)
-                for sel in run["selected_entities"]
-            ]
-            director = _build_director(
-                mode=mode,
-                prompt=run["decision"],
-                turns=int(run["turns_cap"]),
-                DeliberationDirector=DeliberationDirector,
-                SceneDirector=SceneDirector,
-            )
-
-            def on_step(sd: "StepData") -> None:
-                event = sd.events[0] if sd.events else None
-                run["turns"].append(
-                    {
-                        "step": sd.step,
-                        "speaker": sd.acting_entity_id,
-                        "type": event.type if event else "unknown",
-                        "content": sd.response,
-                        "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    }
+            if mode == "wave":
+                _run_wave_deliberation(
+                    run=run, run_id=run_id, Engine=Engine,
+                    hold_active=_hold_active, doorman=_doorman,
+                    hold_work_id=_hold_work_id, hold_principal=_hold_principal,
+                    refresh_threads=_refresh_threads,
+                    CharacterEntity=CharacterEntity, NarratorEntity=NarratorEntity,
                 )
-                run["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
-                save_run(run)
-                # Heartbeat-coupled hold refresh: fire-and-forget thread so the engine
-                # turn loop is not blocked by doorman latency (5s timeout per call).
-                # Only refreshes while turns advance — stalled worker produces no refreshes
-                # and the lease expires after COUNCIL_STALL_S (zombie-hold guard).
-                if _hold_active and _doorman:
-                    def _refresh(_step=sd.step):
-                        try:
-                            _doorman.acquire(
-                                "gravitywell", _hold_work_id,
-                                ttl_sec=COUNCIL_STALL_S,
-                                reason="council-deliberation-heartbeat",
-                                timeout=5.0,
-                                principal=_hold_principal,
-                                lease_class="protected",
-                            )
-                        except Exception as _ref_err:
-                            print(
-                                f"[council] hold refresh failed step={_step}: {_ref_err}",
-                                flush=True,
-                            )
-                    _t = threading.Thread(target=_refresh, daemon=True)
-                    _refresh_threads.append(_t)
-                    _t.start()
-
-            Engine().run(director=director, entities=entities, on_step=on_step)
-
-            # Record effective voicing from adapter (gravitywell or fallback)
-            _apply_voicing_provenance(run, adapter)
-
-            # Emit in-stream voicing-degradation signal (Leg A of gw-voicing-stdout-signal-v0)
-            _emit_voicing_signal(run, adapter, run_id)
-
-            if mode == "scene":
-                run["status"] = "closed"
             else:
-                synth_content = run["turns"][-1]["content"] if run["turns"] else ""
-                run["synthesis"] = _parse_synthesis(synth_content)
-                # Common deliberation tail — runs in real mode.
-                _apply_position_cast_tail(
-                    run, entities=entities, adapter=adapter,
-                    kernel_version=kernel_version, cache=_cache,
+                adapter = _build_adapter(run["voicing"], ClaudeAdapter, LlamaAdapter, run_id=run_id, gw_principal=run.get("gw_principal") or None)
+                entities = [
+                    _build_entity(sel, adapter, CharacterEntity, NarratorEntity)
+                    for sel in run["selected_entities"]
+                ]
+                director = _build_director(
+                    mode=mode,
+                    prompt=run["decision"],
+                    turns=int(run["turns_cap"]),
+                    DeliberationDirector=DeliberationDirector,
+                    SceneDirector=SceneDirector,
                 )
+
+                def on_step(sd: "StepData") -> None:
+                    event = sd.events[0] if sd.events else None
+                    run["turns"].append(
+                        {
+                            "step": sd.step,
+                            "speaker": sd.acting_entity_id,
+                            "type": event.type if event else "unknown",
+                            "content": sd.response,
+                            "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        }
+                    )
+                    run["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
+                    save_run(run)
+                    # Heartbeat-coupled hold refresh: fire-and-forget thread so the engine
+                    # turn loop is not blocked by doorman latency (5s timeout per call).
+                    # Only refreshes while turns advance — stalled worker produces no refreshes
+                    # and the lease expires after COUNCIL_STALL_S (zombie-hold guard).
+                    if _hold_active and _doorman:
+                        def _refresh(_step=sd.step):
+                            try:
+                                _doorman.acquire(
+                                    "gravitywell", _hold_work_id,
+                                    ttl_sec=COUNCIL_STALL_S,
+                                    reason="council-deliberation-heartbeat",
+                                    timeout=5.0,
+                                    principal=_hold_principal,
+                                    lease_class="protected",
+                                )
+                            except Exception as _ref_err:
+                                print(
+                                    f"[council] hold refresh failed step={_step}: {_ref_err}",
+                                    flush=True,
+                                )
+                        _t = threading.Thread(target=_refresh, daemon=True)
+                        _refresh_threads.append(_t)
+                        _t.start()
+
+                Engine().run(director=director, entities=entities, on_step=on_step)
+
+                # Record effective voicing from adapter (gravitywell or fallback)
+                _apply_voicing_provenance(run, adapter)
+
+                # Emit in-stream voicing-degradation signal (Leg A of gw-voicing-stdout-signal-v0)
+                _emit_voicing_signal(run, adapter, run_id)
+
+                if mode == "scene":
+                    run["status"] = "closed"
+                else:
+                    synth_content = run["turns"][-1]["content"] if run["turns"] else ""
+                    run["synthesis"] = _parse_synthesis(synth_content)
+                    # Common deliberation tail — runs in real mode.
+                    _apply_position_cast_tail(
+                        run, entities=entities, adapter=adapter,
+                        kernel_version=kernel_version, cache=_cache,
+                    )
             run["completed_at"] = datetime.now().isoformat(timespec="seconds")
             run["paid_spend"] = _calculate_paid_spend(run)
             save_run(run)
@@ -1327,11 +1357,15 @@ def _build_entity(sel: dict, adapter, CharacterEntity, NarratorEntity):
 
 
 def _build_director(mode: str, prompt: str, turns: int,
-                    DeliberationDirector, SceneDirector):
+                    DeliberationDirector, SceneDirector, WaveDirector=None):
     if mode == "scene":
         return SceneDirector(id="council", scene=prompt, turns=turns)
     if mode == "deliberation":
         return DeliberationDirector(id="council", decision=prompt, turns=turns)
+    if mode == "wave":
+        if WaveDirector is None:
+            raise ValueError("wave mode requires WaveDirector to be passed in")
+        return WaveDirector(id="council", decision=prompt, rounds=turns)
     raise ValueError(f"Unknown mode: {mode!r}")
 
 
@@ -1349,6 +1383,296 @@ def _build_adapter(voicing: str, ClaudeAdapter, LlamaAdapter, run_id: str | None
             "(~10 cold sessions per deliberation run)."
         )
     raise ValueError(f"Unknown voicing: {voicing!r}")
+
+
+def _refuse_wave_against_122b(voicing: str) -> None:
+    """D7: refuse to run wave mode against gravitywell-122b.
+
+    122B is pinned to --parallel 1 upstream (2026-07-29 silent-truncation
+    revert) — serial only. Wave mode's whole reason for existing is
+    concurrent fan-out (D2); running it against a serial-pinned backend
+    would silently degrade every seat's concurrency into a queue behind the
+    same lock, which is strictly worse than just running deliberation mode.
+    Refuse loudly, naming the model and the reason, rather than let that
+    happen quietly.
+    """
+    if voicing != "gravitywell":
+        return
+    from agents_core.llm import _gw_default_model
+
+    resolved = _gw_default_model()
+    if resolved == GW_122B_MODEL:
+        raise ValueError(
+            f"wave mode refuses to run against {GW_122B_MODEL!r}: it is pinned to "
+            "--parallel 1 (serial only, per the 2026-07-29 silent-truncation revert). "
+            "Wave mode's concurrent fan-out (D2) would only queue behind that pin — "
+            "serial is better on 122B. Use deliberation or scene mode instead, or "
+            "wait for GravityWell to serve a parallel-capable model."
+        )
+
+
+def _apply_wave_voicing_provenance(run: dict, seat_adapters: list) -> None:
+    """Wave-mode counterpart to _apply_voicing_provenance.
+
+    Per-turn attribution is set directly in the wave on_step callback (each
+    seat has its own adapter — see _run_wave_deliberation — so there is no
+    shared, completion-ordered voicing_events list to slice by position;
+    that positional-slicing trap is exactly H1/D3). This function only
+    computes the run-level aggregate (effective_voicing / voicing_degraded),
+    mirroring _apply_voicing_provenance's aggregate logic across every
+    seat's adapter.
+    """
+    all_events = [e for adapter in seat_adapters for e in adapter.voicing_events]
+    if not all_events:
+        run["effective_voicing"] = "gravitywell"
+        run["voicing_degraded"] = False
+        return
+
+    operators = [e.get("effective_operator") for e in all_events]
+    reasons = [e.get("reason") for e in all_events]
+
+    if all(op == "gravitywell" for op in operators) and all(r == "success" for r in reasons):
+        run["effective_voicing"] = "gravitywell"
+        run["voicing_degraded"] = False
+        return
+
+    non_gw = [op for op in operators if op != "gravitywell"]
+    run["effective_voicing"] = non_gw[0] if non_gw else "gravitywell"
+    run["voicing_degraded"] = True
+    failure_reasons = []
+    for r in reasons:
+        if r not in failure_reasons and r != "success":
+            failure_reasons.append(r)
+    if "doorman_unreachable" in failure_reasons:
+        run["voicing_degraded_reason"] = "doorman_unreachable"
+    elif "serving_http_error" in failure_reasons:
+        run["voicing_degraded_reason"] = "serving_http_error"
+    elif "gw_not_serving" in failure_reasons:
+        run["voicing_degraded_reason"] = "gw_not_serving"
+    elif "stream_culled" in failure_reasons:
+        run["voicing_degraded_reason"] = "stream_culled"
+    else:
+        run["voicing_degraded_reason"] = failure_reasons[0] if failure_reasons else "unknown"
+
+
+def _run_wave_deliberation(
+    run: dict, run_id: str, Engine,
+    hold_active: bool, doorman, hold_work_id: str, hold_principal: str,
+    refresh_threads: list,
+    CharacterEntity, NarratorEntity,
+) -> None:
+    """Real (non-stub) wave-mode run path — the WaveDirector/run_waves
+    counterpart to the deliberation/scene Engine().run() path above.
+
+    Kept as its own function (rather than inlined into run_deliberation)
+    because wave mode's per-seat-adapter provenance fix (D3/H4), digest
+    wiring (D6), and lease-refresh cadence fix (H6/H6b) all need local
+    state that has no equivalent in the single-adapter deliberation/scene
+    path. Mutates `run` in place; returns None.
+    """
+    from lapis_engine.directors import WaveDirector
+    from lapis_engine.types import Event, RunContext
+
+    from agents_core.council.wave_digest import build_round_digest
+    from agents_core.council.wave_executor import concurrent_wave_executor
+
+    _refuse_wave_against_122b(run.get("voicing"))
+
+    # H4: one adapter per seat (D3's preferred-alternative route), but every
+    # seat MUST share one principal — splitting into per-seat adapters
+    # without threading the same principal through every one silently
+    # converts a 7-seat wave into 7 separate GW admission groups.
+    wave_principal = run.get("gw_principal") or f"council-delib-{run_id}"
+
+    entities = []
+    seat_adapters = []
+    for sel in run["selected_entities"]:
+        seat_adapter = GravityWellAdapter(
+            temperature=0.8,
+            principal=wave_principal,
+            timeout=WAVE_SEAT_TIMEOUT_S,  # H2: seats queue behind each other's prefill
+            max_tokens=WAVE_SEAT_MAX_TOKENS,  # D6: cap compounding re-prefill cost
+        )
+        entities.append(_build_entity(sel, seat_adapter, CharacterEntity, NarratorEntity))
+        seat_adapters.append(seat_adapter)
+    seat_adapter_by_id = {e.id: a for e, a in zip(entities, seat_adapters)}
+
+    director = _build_director(
+        mode="wave",
+        prompt=run["decision"],
+        turns=int(run["turns_cap"]),
+        DeliberationDirector=None,
+        SceneDirector=None,
+        WaveDirector=WaveDirector,
+    )
+
+    # D6: per-round digest state. WaveDirector has no built-in digest hook
+    # and lapis-engine must not import agents_core, so this monkeypatches
+    # this one director *instance*'s _render_transcript rather than
+    # reimplementing its rendering — the real lapis-engine renderer still
+    # does the formatting, just over a synthesized ctx where already-
+    # digested rounds collapse to one digest event each. Never discards the
+    # verbatim archive: turns[] (written in wave_on_step below) always gets
+    # every seat's full, uncondensed output — the digest governs only what
+    # later rounds / the synthesis speaker are *shown*, never what is
+    # *recorded* (the hard invariant D6 exists to protect).
+    digests: dict[int, str] = {}
+    _orig_render_transcript = director._render_transcript
+
+    def _digest_collapsed_ctx(ctx: "RunContext") -> "RunContext":
+        new_events = []
+        digested_rounds_emitted: set = set()
+        for e in ctx.events:
+            if e.type == "wave_turn":
+                r = e.metadata.get("round")
+                if r in digests:
+                    if r not in digested_rounds_emitted:
+                        new_events.append(Event(
+                            entity_id="wave-digest",
+                            type="wave_turn",
+                            content=digests[r],
+                            metadata={"round": r, "speaker": f"[digest of round {r}]"},
+                        ))
+                        digested_rounds_emitted.add(r)
+                    continue
+            new_events.append(e)
+        return RunContext(
+            step=ctx.step, entity_ids=ctx.entity_ids,
+            events=new_events, metadata=ctx.metadata,
+        )
+
+    def _digested_render_transcript(ctx: "RunContext") -> str:
+        return _orig_render_transcript(_digest_collapsed_ctx(ctx))
+
+    director._render_transcript = _digested_render_transcript
+
+    round_counter = {"n": 0}
+
+    def _wave_lease_refresh(reason: str) -> None:
+        if hold_active and doorman:
+            try:
+                doorman.acquire(
+                    "gravitywell", hold_work_id,
+                    ttl_sec=COUNCIL_STALL_S,
+                    reason=f"council-wave-heartbeat-{reason}",
+                    timeout=5.0,
+                    principal=hold_principal,
+                    lease_class="protected",
+                )
+            except Exception as _ref_err:
+                print(f"[council] wave hold refresh failed ({reason}): {_ref_err}", flush=True)
+
+    def _wave_executor(pairs, ctx):
+        round_idx = round_counter["n"]
+        round_counter["n"] += 1
+
+        # H6b: time-based refresh floor, independent of any seat completing.
+        # A seat may take up to WAVE_SEAT_TIMEOUT_S against a COUNCIL_STALL_S
+        # TTL, so on a cold/slow first round the hold can expire before any
+        # completion-coupled refresh has fired at all — the exact eviction
+        # H6 exists to prevent, merely moved earlier. Bound to a round that
+        # is actually in flight: stops the instant this round ends.
+        stop_floor = threading.Event()
+
+        def _floor_loop():
+            while not stop_floor.wait(COUNCIL_STALL_S / 2):
+                _wave_lease_refresh("floor")
+
+        floor_thread = threading.Thread(target=_floor_loop, daemon=True)
+        floor_started = bool(hold_active and doorman)
+        if floor_started:
+            floor_thread.start()
+
+        def _on_seat_complete(entity, _response) -> None:
+            # H6: refresh on each seat's actual completion, not once the
+            # whole round has drained — this executor call blocks on every
+            # seat before returning, so a refresh gated on that return would
+            # still collapse to once-per-round cadence.
+            def _refresh():
+                _wave_lease_refresh(f"seat-complete-{entity.id}")
+            _t = threading.Thread(target=_refresh, daemon=True)
+            refresh_threads.append(_t)
+            _t.start()
+
+        try:
+            results = concurrent_wave_executor(pairs, ctx, on_seat_complete=_on_seat_complete)
+        finally:
+            stop_floor.set()
+            if floor_started:
+                floor_thread.join(timeout=2.0)
+
+        # D6: one digest call per round, after all seats resolve, before the
+        # next round's prompts are built (next_wave()/make_prompt() for
+        # round_idx+1 only run after this executor call returns).
+        if round_idx < director.rounds:
+            seat_texts = [
+                (entity.id, r) for (entity, _prompt), r in zip(pairs, results)
+                if isinstance(r, str)
+            ]
+            digests[round_idx] = build_round_digest(
+                round_idx, seat_texts, principal=wave_principal,
+            )
+
+        return results
+
+    def wave_on_step(sd) -> None:
+        event = sd.events[0] if sd.events else None
+        etype = event.type if event else "unknown"
+        turn_entry = {
+            "step": sd.step,
+            "speaker": sd.acting_entity_id,
+            "content": sd.response,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        if etype == "wave_turn":
+            # D5: preserve the run-YAML shape every downstream consumer
+            # re-parses — consecutive turns[] entries, type ==
+            # "deliberation_turn", with a wave index in metadata.
+            turn_entry["type"] = "deliberation_turn"
+            turn_entry["wave_round"] = event.metadata.get("round") if event else None
+            seat_adapter = seat_adapter_by_id.get(sd.acting_entity_id)
+            if seat_adapter is not None and seat_adapter.voicing_events:
+                turn_entry["effective_voicing"] = seat_adapter.voicing_events[-1].get("effective_operator")
+        elif etype == "wave_seat_failure":
+            # Never "deliberation_turn" — a failed seat must surface as a
+            # failed seat, never as a silently short round, but it must
+            # also never pollute _render_transcript/turns_used, which
+            # filter strictly on type == "deliberation_turn".
+            turn_entry["type"] = "wave_seat_failure"
+            turn_entry["wave_round"] = event.metadata.get("round") if event else None
+            turn_entry["error_class"] = event.metadata.get("error_class") if event else None
+            turn_entry["error_message"] = event.metadata.get("message") if event else None
+        elif etype == "synthesis":
+            turn_entry["type"] = "synthesis"
+            seat_adapter = seat_adapter_by_id.get(sd.acting_entity_id)
+            if seat_adapter is not None and seat_adapter.voicing_events:
+                turn_entry["effective_voicing"] = seat_adapter.voicing_events[-1].get("effective_operator")
+        else:
+            turn_entry["type"] = etype
+
+        run["turns"].append(turn_entry)
+        run["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
+        save_run(run)
+
+    run_log = Engine().run_waves(
+        director=director, entities=entities,
+        executor=_wave_executor, on_step=wave_on_step,
+    )
+
+    _apply_wave_voicing_provenance(run, seat_adapters)
+    _emit_voicing_signal(run, seat_adapters[0] if seat_adapters else None, run_id)
+
+    # D6b: propagate the degraded-run flag. Distinct from voicing_degraded —
+    # voicing degradation (fell back off gravitywell) and seat failure
+    # (a seat's act() raised) are different faults and must not be
+    # conflated into one boolean. v1 scope: an audit trail only — no
+    # consumer changes behaviour on this flag in this unit.
+    run["seats_degraded"] = run_log.degraded
+    run["failed_seats"] = run_log.failed_seats
+
+    synth_content = run["turns"][-1]["content"] if run["turns"] else ""
+    run["synthesis"] = _parse_synthesis(synth_content)
+    run["status"] = _status_from_synthesis(run["synthesis"])
 
 
 def _parse_synthesis(text: str) -> dict:
@@ -1434,6 +1758,10 @@ def _validate_mode_n(
         raise ValueError("deliberation mode requires n in (2, 3)")
     if mode == "scene" and n not in SCENE_N_RANGE:
         raise ValueError(f"scene mode requires n in {SCENE_N_RANGE}, got {n}")
+    if mode == "wave" and not (WAVE_N_RANGE[0] <= n <= WAVE_N_RANGE[1]):
+        raise ValueError(
+            f"wave mode requires n in [{WAVE_N_RANGE[0]}, {WAVE_N_RANGE[1]}], got {n}"
+        )
     if narrator:
         if mode != "scene":
             raise ValueError("--narrator requires --mode=scene")
@@ -1460,6 +1788,11 @@ def _role_assignments(
             {"id": selected[0], "role": "first_voice"},
             {"id": selected[1], "role": "second_voice"},
         ]
+    if mode == "wave":
+        # No vocabulary for 5-7 seats beyond first/second/third_voice —
+        # follow the scene precedent (indexed roles) rather than inventing
+        # fourth_voice upward (council-wave-mode-v0 D1.3).
+        return [{"id": sid, "role": f"wave_slot_{i}"} for i, sid in enumerate(selected)]
     if narrator:
         if len(selected) != 2:
             raise ValueError(
@@ -1612,7 +1945,16 @@ def cmd_submit(args: argparse.Namespace) -> int:
     from agents_core.claude_queue import ClaudeQueue
     queue = ClaudeQueue()
 
-    timeout_seconds = 2400 if mode == "scene" else 1200
+    # H5: a wave run previously took the non-scene 1200s branch, which kills
+    # wide waves — seats queue behind each other's chunked prefill under
+    # bounded concurrency (D2/H2), so the whole-run budget needs its own
+    # entry rather than inheriting deliberation's.
+    if mode == "scene":
+        timeout_seconds = 2400
+    elif mode == "wave":
+        timeout_seconds = 3600
+    else:
+        timeout_seconds = 1200
     description = args.decision.replace("\n", " ").replace("\r", " ")
     if len(description) > 80:
         description = description[:80] + "\u2026"
