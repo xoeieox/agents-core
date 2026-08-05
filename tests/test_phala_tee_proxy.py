@@ -140,6 +140,50 @@ def test_unlisted_model_max_tokens_defaults_to_4096_if_absent():
     assert kwargs["extra_body"]["max_tokens"] == 4096
 
 
+def test_0731_max_tokens_defaults_to_ceiling_not_4096_if_absent():
+    mock_client = _make_client(mock_response={
+        "id": "r1", "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+    })
+    app = _app_with(mock_client)
+    resp = app.post("/v1/chat/completions", json={
+        "model": "deepseek/deepseek-v4-flash-0731",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert resp.status_code == 200
+    _, kwargs = mock_client.chat_completion.call_args
+    assert kwargs["extra_body"]["max_tokens"] == 131072
+
+
+def test_0731_max_tokens_over_ceiling_is_clamped_down():
+    mock_client = _make_client(mock_response={
+        "id": "r1", "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+    })
+    app = _app_with(mock_client)
+    resp = app.post("/v1/chat/completions", json={
+        "model": "deepseek/deepseek-v4-flash-0731",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 200000,
+    })
+    assert resp.status_code == 200
+    _, kwargs = mock_client.chat_completion.call_args
+    assert kwargs["extra_body"]["max_tokens"] == 131072
+
+
+def test_0731_max_tokens_under_ceiling_passes_through_unchanged():
+    mock_client = _make_client(mock_response={
+        "id": "r1", "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+    })
+    app = _app_with(mock_client)
+    resp = app.post("/v1/chat/completions", json={
+        "model": "deepseek/deepseek-v4-flash-0731",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1024,
+    })
+    assert resp.status_code == 200
+    _, kwargs = mock_client.chat_completion.call_args
+    assert kwargs["extra_body"]["max_tokens"] == 1024
+
+
 # ---------------------------------------------------------------------------
 # Non-streaming pass-through.
 # ---------------------------------------------------------------------------
@@ -247,7 +291,12 @@ def test_models_catalog_excludes_bad_includes_good():
     resp = app.get("/v1/models")
     assert resp.status_code == 200
     ids = {m["id"] for m in resp.json()["data"]}
-    assert {"deepseek/deepseek-v3.2", "deepseek/deepseek-v4-flash", "openai/gpt-oss-120b"} <= ids
+    assert {
+        "deepseek/deepseek-v3.2",
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-flash-0731",
+        "openai/gpt-oss-120b",
+    } <= ids
     assert "google/gemma-4-31b-it" not in ids
     assert "z-ai/glm-5.2" not in ids
     assert "moonshotai/kimi-k2.6" not in ids

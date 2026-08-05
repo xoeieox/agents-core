@@ -81,15 +81,42 @@ DEFAULT_MAX_TOKENS = 4096
 MAX_TOKENS_CEILING = {
     "deepseek/deepseek-v3.2": 8192,
     "deepseek/deepseek-v4-flash": 131072,
+    # Dated pin for the same backend the floating alias serves today. 131072
+    # is a safe *generation* budget, deliberately NOT the measured limit: the
+    # real constraint is a CONTEXT cap, prompt_tokens + max_tokens <= 2^20
+    # (bisected 2026-08-05, research/phala-0731-quality-bakeoff-2026-08-05).
+    # _clamp_max_tokens ASSIGNS this value when max_tokens is absent, so a
+    # context-sized entry here would 400 on any non-trivial prompt.
+    "deepseek/deepseek-v4-flash-0731": 131072,
 }
 
-# GOOD per research/phala-model-quality-vs-seal-2026-07-29 (mem). Excludes
+# GOOD per research/phala-model-quality-vs-seal-2026-07-29 and
+# research/phala-0731-quality-bakeoff-2026-08-05 (mem). Excludes
 # google/gemma-4-31b-it (corrupts ~25% of outputs), z-ai/glm-5.2 and
 # moonshotai/kimi-k2.6 (empty-answer trap) — those must never be offered
 # as a default catalog entry.
 MODEL_CATALOG = [
     {"id": "deepseek/deepseek-v3.2", "object": "model", "owned_by": "phala"},
     {"id": "deepseek/deepseek-v4-flash", "object": "model", "owned_by": "phala"},
+    {
+        "id": "deepseek/deepseek-v4-flash-0731",
+        "object": "model",
+        "owned_by": "phala",
+        # Same backend as deepseek/deepseek-v4-flash today. Measured clean 8/8
+        # on 2026-08-05. Sealing is UNAFFECTED: this id verifies and applies
+        # e2ee exactly like every other, same workload_keyset_digest.
+        # The flag records a LEGIBILITY gap only — unlike the floating alias,
+        # this id echoes the bare routing id in response.model instead of a
+        # served-model name, so there is no string to watch for drift. This
+        # is a deliberate trade-off, not a defect: the pin buys immutable
+        # weights at the cost of response-level auditability — do not "fix"
+        # it by dropping the pin.
+        # Do NOT read the alias's name as attested provenance either: Phala's
+        # attestation is gateway-scoped, identical across all models, and says
+        # nothing about which weights served the call
+        # (finding/phala-attestation-is-gateway-scoped-not-model-scoped-2026-08-05).
+        "served_model_unreported": True,
+    },
     {"id": "openai/gpt-oss-120b", "object": "model", "owned_by": "phala"},
     {
         "id": "qwen/qwen3.5-122b-a10b",
