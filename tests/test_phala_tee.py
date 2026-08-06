@@ -569,6 +569,92 @@ def test_open_response_raises_on_corrupted_reasoning_content():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# PhalaTeeClient timeout default + latency-warning signal
+# (agents-core-phala-gate-voicing-v0)
+# ---------------------------------------------------------------------------
+
+
+def test_phala_tee_client_default_timeout_matches_other_deliberation_adapters():
+    """Raised from 30.0 to 300.0 to match LlamaAdapter/GravityWellAdapter (both
+    300s) — a 30s ceiling shredded Council turns under live 2026-08-04 testing."""
+    client = phala_tee.PhalaTeeClient()
+    assert client._timeout == 300.0
+
+
+def test_phala_tee_client_timeout_remains_caller_overridable():
+    client = phala_tee.PhalaTeeClient(timeout=45.0)
+    assert client._timeout == 45.0
+
+
+def _stub_chat_completion_deps(monkeypatch, *, applied=True):
+    """Stub the attestation/e2ee machinery so chat_completion's HTTP+locality
+    path can be exercised without real crypto or network. Returns the mock
+    session whose .post the test controls."""
+    import unittest.mock as mock
+
+    fake_verification = mock.MagicMock(ok=True, workload_keyset_digest="deadbeef")
+    fake_channel = mock.MagicMock()
+    fake_channel.seal_messages.return_value = ([{"role": "user", "content": "sealed"}], {})
+    fake_channel.open_response.side_effect = lambda resp: resp
+
+    monkeypatch.setattr(phala_tee, "require_verified_report_binding",
+                         lambda report, nonce: fake_verification)
+    monkeypatch.setattr(phala_tee, "open_e2ee_channel",
+                         lambda report, verification: fake_channel)
+
+    session = mock.MagicMock()
+    resp = mock.MagicMock()
+    resp.raise_for_status = mock.MagicMock()
+    resp.headers = {"x-e2ee-applied": "true" if applied else "false"}
+    resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+    session.post.return_value = resp
+    session.get.return_value.raise_for_status = mock.MagicMock()
+    session.get.return_value.json.return_value = {"attestation": {}}
+    return session, resp
+
+
+def test_phala_tee_client_latency_warning_flagged_over_old_ceiling(monkeypatch):
+    """A call that would have failed under the retired 30s ceiling (>30000ms)
+    must carry extra.latency_warning=True — a distinct signal so a slow seat
+    stays discoverable rather than silently absorbed by the timeout raise."""
+    import unittest.mock as mock
+
+    session, _resp = _stub_chat_completion_deps(monkeypatch)
+    client = phala_tee.PhalaTeeClient(session=session)
+
+    times = iter([0.0, 45.0])  # start, end -> duration_ms = 45000
+    monkeypatch.setattr(phala_tee.time, "monotonic", lambda: next(times))
+
+    recorded = {}
+    monkeypatch.setattr(
+        phala_tee.locality, "record",
+        lambda **kw: recorded.update(kw),
+    )
+
+    client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m")
+
+    assert recorded["extra"]["latency_warning"] is True
+
+
+def test_phala_tee_client_no_latency_warning_under_old_ceiling(monkeypatch):
+    session, _resp = _stub_chat_completion_deps(monkeypatch)
+    client = phala_tee.PhalaTeeClient(session=session)
+
+    times = iter([0.0, 5.0])  # duration_ms = 5000, well under 30000
+    monkeypatch.setattr(phala_tee.time, "monotonic", lambda: next(times))
+
+    recorded = {}
+    monkeypatch.setattr(
+        phala_tee.locality, "record",
+        lambda **kw: recorded.update(kw),
+    )
+
+    client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m")
+
+    assert recorded["extra"]["latency_warning"] is False
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(
     not os.environ.get("PHALA_API_KEY"),

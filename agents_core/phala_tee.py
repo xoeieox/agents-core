@@ -606,13 +606,24 @@ class PhalaTeeClient:
     content-trust claim.
     """
 
+    # Old ceiling this default replaces (agents-core-phala-gate-voicing-v0). Live
+    # 2026-08-04 testing found deepseek/deepseek-v4-flash-0731 succeeding 1-of-3
+    # attempts, both failures our own 30s read timeout, not upstream error — a
+    # 30s ceiling shreds Council deliberation turns and presents as model
+    # unreliability. `_LEGACY_TIMEOUT_SECS` is kept as the threshold for the
+    # latency-warning signal below so a call that would have failed under the
+    # old ceiling stays discoverable rather than silently absorbed by the raise.
+    _LEGACY_TIMEOUT_SECS = 30.0
+
     def __init__(
         self,
         *,
         api_key: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         session: requests.Session | None = None,
-        timeout: float = 30.0,
+        # Raised from 30.0 to match the other deliberation adapters (LlamaAdapter
+        # 300s, GravityWellAdapter 300s) — caller-overridable, unchanged contract.
+        timeout: float = 300.0,
     ):
         self._api_key = api_key or os.environ.get("PHALA_API_KEY")
         self._base_url = base_url.rstrip("/")
@@ -693,6 +704,11 @@ class PhalaTeeClient:
                 "workload_keyset_digest": verification.workload_keyset_digest,
                 "e2ee_applied": applied,
                 "report_verified": verification.ok,
+                # Distinct signal (Facets `transmuter`, 2026-08-04) paired with the
+                # 30s→300s timeout raise above: a call that would have failed under
+                # the old ceiling must not simply succeed silently at 200s — flag it
+                # so a slow seat stays discoverable instead of absorbed.
+                "latency_warning": duration_ms > self._LEGACY_TIMEOUT_SECS * 1000,
             },
         )
 
