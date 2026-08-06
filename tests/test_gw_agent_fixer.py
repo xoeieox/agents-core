@@ -911,10 +911,63 @@ class TestToolSurfaceTruthBlock:
         assert "run_tests(target=" in content
         assert "pytest path" in content
 
-    def test_readonly_run_has_no_tool_block(self, tmp_path):
+    def test_readonly_run_has_tool_block(self, tmp_path):
         captured = self._run_and_capture(tmp_path, {"writeable": False})
         system_msg = next(m for m in captured[0]["messages"] if m["role"] == "system")
-        assert "## Your actual tools" not in system_msg["content"]
+        assert "## Your actual tools" in system_msg["content"]
+
+    def test_readonly_run_tool_block_lists_all_default_readonly_tools(self, tmp_path):
+        captured = self._run_and_capture(tmp_path, {"writeable": False})
+        system_msg = next(m for m in captured[0]["messages"] if m["role"] == "system")
+        content = system_msg["content"]
+        for tool_name in DEFAULT_READONLY_TOOLS:
+            assert tool_name in content
+
+    def test_readonly_run_tool_block_states_readonly_contract(self, tmp_path):
+        captured = self._run_and_capture(tmp_path, {"writeable": False})
+        system_msg = next(m for m in captured[0]["messages"] if m["role"] == "system")
+        content = system_msg["content"]
+        assert "READ-ONLY" in content
+        assert "does NOT apply to this run" in content
+        assert "zero successful tool calls" in content
+
+    def test_readonly_run_tool_block_disarms_fixer_preamble(self, tmp_path):
+        captured = self._run_and_capture(
+            tmp_path,
+            {
+                "system": (
+                    "You are editing code as a shaped agent subprocess. Branch, edit, "
+                    "test, commit, push, and open a PR."
+                ),
+                "writeable": False,
+            },
+        )
+        system_msg = next(m for m in captured[0]["messages"] if m["role"] == "system")
+        content = system_msg["content"]
+        assert content.index("shaped agent subprocess") < content.index("## Your actual tools")
+        assert "commits, branches, pushes, or opening a PR" in content
+
+    def test_writeable_run_system_message_unchanged_by_readonly_change(self, tmp_path):
+        """Regression: writeable path's assembled system message is unaffected."""
+        repo = _tmp_git_repo(tmp_path)
+        captured = self._run_and_capture(
+            repo,
+            {
+                "system": "You run as a claude -p subprocess with full Bash access.",
+                "writeable": True,
+            },
+        )
+        system_msg = next(m for m in captured[0]["messages"] if m["role"] == "system")
+        content = system_msg["content"]
+
+        assert content.index("claude -p subprocess") < content.index("## Your actual tools")
+        assert "FALSE CONTEXT" in content
+        assert "apply_edit(path, old_string, new_string)" in content
+        assert "write_file(path, content)" in content
+        assert "run_tests(target=" in content
+        assert "pytest path" in content
+        assert "READ-ONLY" not in content
+        assert "does NOT apply to this run" not in content
 
     def test_tool_block_reflects_live_tools_dict(self, tmp_path):
         """Adding a fake tool makes it appear; removing one makes it absent."""
