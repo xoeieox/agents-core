@@ -37,6 +37,10 @@ GW_CREATIVE_URL = os.environ.get("GW_CREATIVE_URL", "http://203.0.113.11:8093")
 QUEST_URL = os.environ.get("QUEST_URL", "http://203.0.113.11:8080")
 SWARM_URL = os.environ.get("SWARM_URL", GW_URL)
 SWARM_MAX_CONCURRENT = int(os.environ.get("SWARM_MAX_CONCURRENT", "4"))
+# Local phala-test-key.service (--user unit, 127.0.0.1:8413) — an
+# OpenAI-compatible loopback endpoint over agents_core.phala_tee.PhalaTeeClient.
+# Sealed, non-Anthropic, zero-local-watts inference seat (agents-core-phala-gate-voicing-v0).
+PHALA_URL = os.environ.get("PHALA_URL", "http://127.0.0.1:8413")
 
 
 def _llamacpp_url() -> str:
@@ -222,6 +226,26 @@ class CreativeOperatorUnavailable(Exception):
         super().__init__(f"Creative operator (Llama-70B) unreachable at {url}: {last_error}")
 
 
+class PhalaOperatorUnavailable(OperatorUnreachableError):
+    """Raised when the local phala-test-key (127.0.0.1:8413) cannot be reached.
+
+    There is nothing to wake — unlike gravitywell, phala is a single sealed
+    HTTP seat with no doorman, no lease, no cold-wake path — so unreachable
+    means fail-closed, structurally, not policy-configurable. Never falls
+    back to a paid Anthropic operator (agents-core-phala-gate-voicing-v0).
+    """
+
+    def __init__(self, url: str, last_error: Exception):
+        self.url = url
+        self.last_error = last_error
+        Exception.__init__(
+            self,
+            f"[phala] unavailable at {url} after retries — no paid fallback was "
+            f"attempted (phala has no wake path; fail-closed by design). "
+            f"last_error={last_error}",
+        )
+
+
 class GWParkedError(OperatorUnreachableError):
     """Raised when GW cannot be woken and on_wake_fail='park' (fail-closed default).
 
@@ -278,6 +302,7 @@ OPERATOR_DEFAULTS: dict[str, str] = {
     "haiku":                "claude-haiku-4-5-20251001",
     "gravitywell":          "gravitywell-122b",
     "gravitywell-creative": "gravitywell-llama-70b",
+    "phala":                "deepseek/deepseek-v4-flash-0731",
 }
 
 
@@ -1018,8 +1043,8 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                        **kwargs) -> str | None:
     """Route a completion request to the appropriate backend operator.
 
-    operator_class ∈ {"qwen", "quest", "sonnet", "opus", "haiku", "gravitywell", "gravitywell-creative"}.
-    Raises ValueError for unknown classes.
+    operator_class ∈ {"qwen", "quest", "sonnet", "opus", "haiku", "gravitywell",
+    "gravitywell-creative", "phala"}. Raises ValueError for unknown classes.
 
     Default models:
         qwen                 → "qwen3.6-35b-a3b"
@@ -1029,6 +1054,8 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
         haiku                → "claude-haiku-4-5-20251001"
         gravitywell          → "gravitywell-122b"   (122B reasoning, :8081, DoormanClient)
         gravitywell-creative → "gravitywell-llama-70b" (Llama-70B instruct, :8093, direct)
+        phala                → "deepseek/deepseek-v4-flash-0731" (sealed TEE seat,
+                                PHALA_URL :8413, OpenAI-compat, direct)
 
     qwen routes via the local llama-server (same path as call_llm()).
 
@@ -1065,6 +1092,15 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
     gravitywell-creative routes directly to the Llama-70B endpoint (:8093, GW_CREATIVE_URL).
     No DoormanClient, no admission control, no wake_fail fallback. Raises
     CreativeOperatorUnavailable on network failure — never silently falls back.
+
+    phala routes to the local phala-test-key.service (:8413, PHALA_URL) — a sealed,
+    non-Anthropic TEE inference seat over PhalaTeeClient. No DoormanClient, no lease,
+    no admission control, and (unlike gravitywell/quest) no wake-fail fallback of any
+    kind: there is nothing to wake, so unreachable is always fail-closed
+    (PhalaOperatorUnavailable, never a paid Anthropic escalation). Unlike quest/gravitywell,
+    `model=` overrides are accepted and passed through — Phala fronts a live swappable
+    model catalog, not a single pinned weight set, so refusing a swap here would fight
+    the seat's actual design (agents-core-phala-gate-voicing-v0).
 
     _provenance_out: optional list to append (reason, effective_operator) tuples
                      for tracking which operator actually answered. Used by adapters
@@ -1536,6 +1572,38 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
             _provenance_out.append(("success", "gravitywell-creative"))
         return result
 
+    if operator_class == "phala":
+        # No fixed-model guard (deliberate divergence from quest/gravitywell — see
+        # docstring above): Phala fronts a swappable catalog, so a model= override
+        # is accepted and falls back to the default when unset.
+        resolved_model = model or OPERATOR_DEFAULTS["phala"]
+        phala_kwargs = {
+            k: kwargs[k] for k in ("system", "timeout", "json_mode", "temperature", "log")
+            if k in kwargs
+        }
+        try:
+            result = _post_chat_completion(
+                base_url=PHALA_URL,
+                model=resolved_model,
+                messages=(
+                    ([{"role": "system", "content": phala_kwargs["system"]}]
+                     if phala_kwargs.get("system") else [])
+                    + [{"role": "user", "content": prompt}]
+                ),
+                timeout=int(phala_kwargs.get("timeout", 300)),
+                json_mode=bool(phala_kwargs.get("json_mode", False)),
+                temperature=float(phala_kwargs.get("temperature", 0.7)),
+                log=phala_kwargs.get("log"),
+                _no_thinking=True,
+            )
+        except OperatorUnreachableError as exc:
+            if _provenance_out is not None:
+                _provenance_out.append(("serving_http_error", "phala"))
+            raise PhalaOperatorUnavailable(PHALA_URL, exc) from exc
+        if _provenance_out is not None:
+            _provenance_out.append(("success", "phala"))
+        return result
+
     # Anthropic-family: route via ClaudeQueue → call_claude_cli.
     # No direct Anthropic-API code path (decision/no-anthropic-api-direct).
     resolved_model = model or OPERATOR_DEFAULTS[operator_class]
@@ -1571,6 +1639,7 @@ _LOCALITY_COST_CLASS_BY_OPERATOR = {
     "sonnet": "paid-anthropic",
     "opus": "paid-anthropic",
     "haiku": "paid-anthropic",
+    "phala": "paid-phala-tee",
 }
 
 _LOCALITY_HOST_BY_OPERATOR = {
@@ -1581,6 +1650,7 @@ _LOCALITY_HOST_BY_OPERATOR = {
     "sonnet": "claude-cli",
     "opus": "claude-cli",
     "haiku": "claude-cli",
+    "phala": PHALA_URL,
 }
 
 

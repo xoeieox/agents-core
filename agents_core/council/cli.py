@@ -58,9 +58,10 @@ from pathlib import Path
 
 import yaml
 
-from agents_core.llm import call_operator, _is_gw_result_degraded  # noqa: E402
+from agents_core.llm import call_operator, _is_gw_result_degraded, OPERATOR_DEFAULTS  # noqa: E402
 from agents_core.cards import cards_root, load_deck_cards
 from agents_core.council.gravitywell_adapter import GravityWellAdapter
+from agents_core.council.phala_adapter import PhalaAdapter
 from agents_core.room_paths import room_path
 
 COUNCIL_DIR = room_path("council")
@@ -1286,8 +1287,23 @@ def _apply_voicing_provenance(run: dict, adapter) -> None:
             # No voicing events recorded - shouldn't happen in real runs, assume success
             run["effective_voicing"] = "gravitywell"
             run["voicing_degraded"] = False
+    elif isinstance(adapter, PhalaAdapter):
+        # Explicit banner (ratified by Erah 2026-08-04): a Phala-voiced verdict must
+        # never read as a 122B one. PhalaAdapter never swallows an unreachable seat
+        # (call_operator("phala", ...) raises PhalaOperatorUnavailable straight
+        # through - no degraded/fallback shape to aggregate), so any voicing_events
+        # entry here is a clean success naming the model actually requested.
+        if adapter.voicing_events:
+            run["effective_voicing"] = adapter.voicing_events[-1]["effective_operator"]
+            run["voicing_degraded"] = False
+            for i, turn in enumerate(run.get("turns", [])):
+                if i < len(adapter.voicing_events):
+                    turn["effective_voicing"] = adapter.voicing_events[i]["effective_operator"]
+        else:
+            run["effective_voicing"] = f"phala:{adapter.model or OPERATOR_DEFAULTS['phala']}"
+            run["voicing_degraded"] = False
     elif adapter is not None:
-        # Non-GravityWell adapters: effective == requested
+        # Non-GravityWell, non-Phala adapters: effective == requested
         run["effective_voicing"] = requested_voicing
         run["voicing_degraded"] = False
     # If adapter is None, voicing provenance should already be set by caller (stub mode)
@@ -1375,6 +1391,8 @@ def _build_adapter(voicing: str, ClaudeAdapter, LlamaAdapter, run_id: str | None
     if voicing == "gravitywell":
         principal = gw_principal or (f"council-delib-{run_id}" if run_id else None)
         return GravityWellAdapter(temperature=0.8, principal=principal)
+    if voicing == "phala":
+        return PhalaAdapter(temperature=0.8)
     if voicing in ("haiku", "sonnet", "opus"):
         raise ValueError(
             f"Paid-model voicing {voicing!r} is not available via the council CLI. "
@@ -2088,10 +2106,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--n", type=int, default=None)
     sp.add_argument("--turns", type=int, default=DEFAULT_TURNS)
     sp.add_argument(
-        "--voicing", choices=["local", "gravitywell"],
+        "--voicing", choices=["local", "gravitywell", "phala"],
         default=DEFAULT_VOICING,
-        help="Voicing operator. Only gravitywell (default, GW queue) and local (LlamaAdapter) are available. "
-        "Paid-model voicing was removed to prevent the per-turn subprocess firehose.",
+        help="Voicing operator. gravitywell (default, GW queue), local (LlamaAdapter) and "
+        "phala (sealed TEE seat, PhalaAdapter) are available. Paid-model (Anthropic) "
+        "voicing was removed to prevent the per-turn subprocess firehose. phala voices "
+        "are always labeled by model id in effective_voicing - a sealed channel is a "
+        "privacy claim, not a content-trust claim, and must never read as the 122B.",
     )
     sp.add_argument("--with", dest="with_entity", default=None)
     sp.add_argument(
