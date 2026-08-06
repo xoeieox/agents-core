@@ -134,6 +134,8 @@ class DispatchResult:
     spec_path: str
     spec_id: str        # short uuid embedded in spec filename (used to find meta sidecar)
     output_path: str    # where the queue runner will write the result
+    joined_task_id: str | None = None  # set when submit() deduped: the id this
+                                        # dispatch generated before joining task_id
 
 
 class Shaper:
@@ -356,7 +358,8 @@ class Shaper:
             # competing worktree before the engine even starts.
             spec["worktree_required"] = agent.engine != "local-fixer"
             spec_path.write_text(json.dumps(spec, ensure_ascii=False))
-            queue.submit({
+            generated_task_id = task_id
+            task_id = queue.submit({
                 "task_type": "subprocess",
                 "priority": priority,
                 "timeout_seconds": agent.timeout_s + 60,
@@ -366,7 +369,8 @@ class Shaper:
                 "notify": agent.notify,
                 "notify_policy": agent.notify_policy,
                 "payload": {"command": cmd, "spec_path": str(spec_path)},
-            }, task_id=task_id)
+            }, task_id=generated_task_id)
+            joined_task_id = generated_task_id if task_id != generated_task_id else None
             output_path = str(room_path("claude_queue.completed") / f"{task_id}-output.md")
         else:
             spec_path.write_text(json.dumps(spec, ensure_ascii=False))
@@ -379,6 +383,7 @@ class Shaper:
                 "model": agent.model,
                 "payload": {"command": cmd},
             })
+            joined_task_id = None
             output_path = str(room_path("gpu_queue.completed") / f"{task_id}-output.md")
 
         # Open a project-slot on the blackboard for this dispatch. Best-effort:
@@ -400,4 +405,5 @@ class Shaper:
             spec_path=str(spec_path),
             spec_id=spec_id,
             output_path=output_path,
+            joined_task_id=joined_task_id,
         )

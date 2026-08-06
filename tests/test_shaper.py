@@ -59,7 +59,7 @@ def dispatch_mocks(tmp_path, monkeypatch):
 
     claude_q = MagicMock()
     claude_q._generate_id.return_value = "claude_task_id"
-    claude_q.submit.return_value = None
+    claude_q.submit.side_effect = lambda payload, task_id=None: task_id
     gpu_q = MagicMock()
     gpu_q.submit.return_value = "gpu_task_id"
 
