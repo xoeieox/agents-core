@@ -59,6 +59,145 @@ class TestFailureClass:
         assert runner_mod._failure_class(result) == "execution"
 
 
+class TestFailureClassReviewerReason:
+    """Tests for _failure_class's reviewer non-verdict reason table
+    (agents-core-reviewer-failure-notify-class-v0)."""
+
+    def test_infra_reason_gw_not_serving(self):
+        """gw_not_serving is a host-down reason → infra (pages)."""
+        result = "ERROR: local reviewer produced no verdict (reason=gw_not_serving)\nmore"
+        assert runner_mod._failure_class(result) == "infra"
+
+    def test_execution_reason_grounding_failed(self):
+        """grounding_failed is a model-quality outcome → execution (silenced)."""
+        result = "ERROR: local reviewer produced no verdict (reason=grounding_failed)\nmore"
+        assert runner_mod._failure_class(result) == "execution"
+
+    def test_contention_reason_gw_defer_timeout(self):
+        """gw_defer_timeout is transient GPU contention → contention (silenced)."""
+        result = "ERROR: local reviewer produced no verdict (reason=gw_defer_timeout)\nmore"
+        assert runner_mod._failure_class(result) == "contention"
+
+    def test_unknown_reason_fails_closed_to_infra(self):
+        """A well-formed reviewer line with a reason absent from the table
+        classifies as infra (fail closed) so a new outage class pages once."""
+        result = "ERROR: local reviewer produced no verdict (reason=some_new_reason)\nmore"
+        assert runner_mod._failure_class(result) == "infra"
+
+    def test_malformed_reviewer_line_falls_through_to_prefix_logic(self):
+        """A first line that does NOT match the reviewer non-verdict shape
+        (no reason= at all) is untouched by the reason table — it falls
+        through to today's prefix logic."""
+        result = "ERROR: local reviewer produced no verdict\nmore"
+        assert runner_mod._failure_class(result) == "infra"
+
+    def test_reviewer_failure_reason_extracts_token(self):
+        result = "ERROR: local reviewer produced no verdict (reason=grounding_failed)\nmore"
+        assert runner_mod._reviewer_failure_reason(result) == "grounding_failed"
+
+    def test_reviewer_failure_reason_none_for_non_reviewer_line(self):
+        result = "ERROR: worktree_setup: some error\nmore lines"
+        assert runner_mod._reviewer_failure_reason(result) is None
+
+    @pytest.mark.parametrize("first_line", [
+        "EXIT 1:",
+        "TIMEOUT: exceeded 300s",
+        "INTERRUPTED by signal 15:",
+        "ERROR: worktree_setup: something",
+    ])
+    def test_non_reviewer_prefixes_unchanged(self, first_line):
+        """Regression: fixer-seat first lines classify exactly as before —
+        the fixer seat's silencing depends on this being byte-identical."""
+        result = f"{first_line}\nsome trailing detail"
+        expected = "infra" if first_line.startswith(("ERROR:",)) else "execution"
+        assert runner_mod._failure_class(result) == expected
+
+
+class TestLogSilencedReason:
+    """Tests for _log_silenced carrying the extracted reviewer reason (C4)."""
+
+    def test_log_silenced_records_reason(self, tmp_path, monkeypatch):
+        log_path = tmp_path / "silenced.jsonl"
+        monkeypatch.setattr(runner_mod, "SILENCED_LOG", log_path)
+
+        task = {"id": "task_reason", "description": "reviewer:target_x"}
+        runner_mod._log_silenced(
+            "failure",
+            task,
+            failure_class="execution",
+            demoted_from="HIGH",
+            result="ERROR: local reviewer produced no verdict (reason=grounding_failed)\nmore",
+            reason="grounding_failed",
+        )
+
+        entry = json.loads(log_path.read_text())
+        assert entry["reason"] == "grounding_failed"
+
+    def test_log_silenced_reason_defaults_none(self, tmp_path, monkeypatch):
+        """Non-reviewer failures (fixer seat) omit reason → None."""
+        log_path = tmp_path / "silenced.jsonl"
+        monkeypatch.setattr(runner_mod, "SILENCED_LOG", log_path)
+
+        task = {"id": "task_no_reason", "description": "fixer:target_x"}
+        runner_mod._log_silenced(
+            "failure", task, failure_class="execution",
+            demoted_from="HIGH", result="EXIT 1:\nstderr",
+        )
+
+        entry = json.loads(log_path.read_text())
+        assert entry["reason"] is None
+
+
+class TestNotifyFailureReviewerReason:
+    """Tests for notify_failure end-to-end with reviewer non-verdict reasons."""
+
+    def test_infra_reason_pages_high(self, monkeypatch):
+        sent = []
+        monkeypatch.setattr(runner_mod, "send_notification",
+                            lambda *, message, title, priority: sent.append(priority))
+
+        task = {"notify": True, "notify_policy": "infra-only", "description": "reviewer:test"}
+        runner_mod.notify_failure(
+            task, "ERROR: local reviewer produced no verdict (reason=gw_not_serving)\nmore")
+
+        assert len(sent) == 1
+        assert sent[0].name == "HIGH"
+
+    def test_grounding_failed_demotes_with_reason(self, monkeypatch, tmp_path):
+        sent = []
+        monkeypatch.setattr(runner_mod, "send_notification",
+                            lambda *, message, title, priority: sent.append(priority))
+        log_path = tmp_path / "silenced.jsonl"
+        monkeypatch.setattr(runner_mod, "SILENCED_LOG", log_path)
+
+        task = {"notify": True, "notify_policy": "infra-only", "id": "t1",
+                "description": "reviewer:test"}
+        runner_mod.notify_failure(
+            task, "ERROR: local reviewer produced no verdict (reason=grounding_failed)\nmore")
+
+        assert len(sent) == 0
+        entry = json.loads(log_path.read_text())
+        assert entry["failure_class"] == "execution"
+        assert entry["reason"] == "grounding_failed"
+
+    def test_gw_defer_timeout_demotes_as_contention(self, monkeypatch, tmp_path):
+        sent = []
+        monkeypatch.setattr(runner_mod, "send_notification",
+                            lambda *, message, title, priority: sent.append(priority))
+        log_path = tmp_path / "silenced.jsonl"
+        monkeypatch.setattr(runner_mod, "SILENCED_LOG", log_path)
+
+        task = {"notify": True, "notify_policy": "infra-only", "id": "t2",
+                "description": "reviewer:test"}
+        runner_mod.notify_failure(
+            task, "ERROR: local reviewer produced no verdict (reason=gw_defer_timeout)\nmore")
+
+        assert len(sent) == 0
+        entry = json.loads(log_path.read_text())
+        assert entry["failure_class"] == "contention"
+        assert entry["reason"] == "gw_defer_timeout"
+
+
 class TestLogSilenced:
     """Tests for _log_silenced — silenced-event logging."""
 
