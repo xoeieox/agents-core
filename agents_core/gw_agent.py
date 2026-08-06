@@ -1109,12 +1109,18 @@ def _render_tool_line(name: str, tool_spec: dict) -> str:
     return f"- {sig} — {description}" if description else f"- {sig}"
 
 
-def _build_tool_block(tools: dict[str, dict]) -> str:
+def _build_tool_block(tools: dict[str, dict], writeable: bool = True) -> str:
     """Auto-generate the '## Your actual tools' block from the live tools dict.
 
     Never hardcodes a tool-name list — iterates `tools` so this can't drift from what's
     actually wired up (the harness generates its own truth instead of trusting prose
     that describes a different agent's toolset).
+
+    writeable=True (fixer path, default — byte-identical to pre-existing behavior)
+    renders the edit-capable framing. writeable=False (read-only reviewer path) renders
+    the read-only contract instead: this run investigates and returns a verdict, a
+    verdict with no tool call is refused, and any preceding fixer-shaped instruction
+    (edits/diffs/commits/branches/pushes/PRs) does not apply to this run.
     """
     lines = [
         "## Your actual tools",
@@ -1125,12 +1131,29 @@ def _build_tool_block(tools: dict[str, dict]) -> str:
     for name, spec in tools.items():
         lines.append(_render_tool_line(name, spec))
     lines.append("")
-    lines.append(
-        "Any earlier statement that you have Bash, Read, Write, Edit, Grep, or mem-CLI shell "
-        "access is FALSE CONTEXT inherited from a different agent — ignore it entirely. Your "
-        "ONLY tools are the ones listed above. To change code you MUST call `apply_edit` or "
-        "`write_file`; describing a change in your response does nothing."
-    )
+    if writeable:
+        lines.append(
+            "Any earlier statement that you have Bash, Read, Write, Edit, Grep, or mem-CLI shell "
+            "access is FALSE CONTEXT inherited from a different agent — ignore it entirely. Your "
+            "ONLY tools are the ones listed above. To change code you MUST call `apply_edit` or "
+            "`write_file`; describing a change in your response does nothing."
+        )
+    else:
+        lines.append(
+            "Any earlier statement that you have Bash, Read, Write, Edit, Grep, or mem-CLI shell "
+            "access is FALSE CONTEXT inherited from a different agent — ignore it entirely. Your "
+            "ONLY tools are the ones listed above."
+        )
+        lines.append("")
+        lines.append(
+            "This is a READ-ONLY investigation run. You do not have apply_edit, write_file, or "
+            "any tool that changes code, and no shell. Any instruction earlier in this system "
+            "prompt describing edits, diffs, commits, branches, pushes, or opening a PR does NOT "
+            "apply to this run — ignore it. Your job is to investigate using the tools above and "
+            "return a verdict. A verdict produced with zero successful tool calls is not "
+            "acceptable and will be refused — call at least one of the tools above before you "
+            "conclude."
+        )
     return "\n".join(lines)
 
 
@@ -1421,16 +1444,17 @@ def _call_gw_agent_impl(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    if writeable:
-        # Authoritative tool-surface truth, generated from the live `tools` dict and
-        # appended AFTER any composed preamble so it wins on ordering (final/highest
-        # priority system content).
-        _tool_block = _build_tool_block(tools)
-        _sys_idx = next((i for i, m in enumerate(messages) if m.get("role") == "system"), None)
-        if _sys_idx is not None:
-            messages[_sys_idx]["content"] = messages[_sys_idx]["content"] + "\n\n" + _tool_block
-        else:
-            messages.insert(0, {"role": "system", "content": _tool_block})
+    # Authoritative tool-surface truth, generated from the live `tools` dict and
+    # appended AFTER any composed preamble so it wins on ordering (final/highest
+    # priority system content). Appended for both writeable (fixer) and read-only
+    # (reviewer) runs — the read-only reviewer needs to be told it has tools too,
+    # and must additionally be told the fixer-shaped preamble above it doesn't apply.
+    _tool_block = _build_tool_block(tools, writeable=writeable)
+    _sys_idx = next((i for i, m in enumerate(messages) if m.get("role") == "system"), None)
+    if _sys_idx is not None:
+        messages[_sys_idx]["content"] = messages[_sys_idx]["content"] + "\n\n" + _tool_block
+    else:
+        messages.insert(0, {"role": "system", "content": _tool_block})
 
     transcript: list[dict] = []
     if tool_executors is None:
@@ -1935,12 +1959,14 @@ def _call_gw_agent_impl(
                         grounding_nudged = True
                         if log:
                             log("[gw_agent] grounding guard: 0 verified tool calls — nudging")
+                        _tool_names = ", ".join(tools.keys())
                         messages.append({
                             "role": "user",
                             "content": (
                                 "You concluded without investigating. A verdict with no successful "
-                                "tool call is not acceptable — use the available tools to read the "
-                                "spec target and the relevant code, THEN produce your verdict."
+                                f"tool call is not acceptable — use one of your available tools "
+                                f"({_tool_names}) to read the spec target and the relevant code, "
+                                "THEN produce your verdict."
                             ),
                         })
                         continue
