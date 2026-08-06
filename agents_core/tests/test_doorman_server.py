@@ -45,6 +45,7 @@ from agents_core.doorman_server import (
     _describe_stopped_units,
     _write_idle_log,
     create_app,
+    parse_vllm_capacity_gauges,
 )
 from agents_core.llm import GwServingState
 
@@ -4745,3 +4746,472 @@ class TestBackgroundSweepIntegration:
         # this tick's wait-list sweep must not touch gw-serve at all — no wake/stop
         # subprocess call should fire from a pure sweep-and-release tick.
         assert run_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Capacity shadow (agents-core-doorman-capacity-shadow-v0)
+# ---------------------------------------------------------------------------
+
+# The verbatim live exposition text quoted in the spec, GravityWell slot1, 2026-08-06.
+_LIVE_CAPACITY_EXPOSITION = (
+    'vllm:num_requests_running{engine="0",model_name="gravitywell-27b"} 0.0\n'
+    'vllm:num_requests_waiting{engine="0",model_name="gravitywell-27b"} 0.0\n'
+    'vllm:num_requests_waiting_by_reason{engine="0",model_name="gravitywell-27b",reason="capacity"} 0.0\n'
+    'vllm:num_requests_waiting_by_reason{engine="0",model_name="gravitywell-27b",reason="deferred"} 0.0\n'
+)
+
+
+class TestParseVllmCapacityGauges:
+    """DoD 2: value-preserving read of the four capacity gauges."""
+
+    def test_verbatim_live_exposition_text_parses(self):
+        gauges = parse_vllm_capacity_gauges(_LIVE_CAPACITY_EXPOSITION)
+        assert gauges == {
+            "num_requests_running": 0.0,
+            "num_requests_waiting": 0.0,
+            "capacity_wait": 0.0,
+            "deferred_wait": 0.0,
+        }
+
+    def test_nonzero_values_preserved_individually(self):
+        text = (
+            'vllm:num_requests_running{engine="0",model_name="gravitywell-27b"} 3.0\n'
+            'vllm:num_requests_waiting{engine="0",model_name="gravitywell-27b"} 2.0\n'
+            'vllm:num_requests_waiting_by_reason{engine="0",model_name="gravitywell-27b",reason="capacity"} 1.0\n'
+            'vllm:num_requests_waiting_by_reason{engine="0",model_name="gravitywell-27b",reason="deferred"} 5.0\n'
+        )
+        gauges = parse_vllm_capacity_gauges(text)
+        assert gauges["num_requests_running"] == 3.0
+        assert gauges["num_requests_waiting"] == 2.0
+        assert gauges["capacity_wait"] == 1.0
+        assert gauges["deferred_wait"] == 5.0
+
+    def test_gauges_missing_from_body_are_none_not_zero(self):
+        """DoD 5: a missing reading must be representable as missing."""
+        gauges = parse_vllm_capacity_gauges("llamacpp:requests_processing 0\n")
+        assert gauges == {
+            "num_requests_running": None,
+            "num_requests_waiting": None,
+            "capacity_wait": None,
+            "deferred_wait": None,
+        }
+
+    def test_does_not_filter_on_model_name_label(self):
+        """DoD 4: sums across label sets, never pinned to one model_name — a
+        topology flip must not make the parser go silently indeterminate."""
+        text = (
+            'vllm:num_requests_running{engine="0",model_name="gravitywell-somethingelse"} 4.0\n'
+            'vllm:num_requests_waiting_by_reason{engine="0",model_name="gravitywell-somethingelse",reason="capacity"} 2.0\n'
+        )
+        gauges = parse_vllm_capacity_gauges(text)
+        assert gauges["num_requests_running"] == 4.0
+        assert gauges["capacity_wait"] == 2.0
+
+    def test_sums_across_multiple_label_sets(self):
+        """Two engines reporting the same gauge — summed, not overwritten."""
+        text = (
+            'vllm:num_requests_running{engine="0",model_name="gravitywell-27b"} 1.0\n'
+            'vllm:num_requests_running{engine="1",model_name="gravitywell-27b"} 2.0\n'
+        )
+        gauges = parse_vllm_capacity_gauges(text)
+        assert gauges["num_requests_running"] == 3.0
+
+
+class TestCapacityGaugeDoesNotAlterActivityBoolean:
+    """DoD 3: the new value-preserving read must not change
+    _probe_vllm_metrics_activity's existing boolean result for the same input."""
+
+    def test_same_body_same_boolean_result(self):
+        state = _make_state()
+        for text, expected_bool in (
+            (_LIVE_CAPACITY_EXPOSITION, False),
+            (
+                'vllm:num_requests_running{engine="0",model_name="gravitywell-27b"} 2.0\n'
+                'vllm:num_requests_waiting{engine="0",model_name="gravitywell-27b"} 0.0\n',
+                True,
+            ),
+        ):
+            def mock_metrics(url, _text=text, **kwargs):
+                m = MagicMock(status_code=200)
+                m.text = _text
+                return m
+
+            with patch("agents_core.doorman_server.requests.get", side_effect=mock_metrics):
+                assert state._probe_vllm_metrics_activity(GW_URL_DEFAULT) is expected_bool
+            # The new parser reads the identical body independently, never
+            # touching _probe_vllm_metrics_activity's own match logic.
+            parse_vllm_capacity_gauges(text)
+
+
+class TestCapacityShadowProbeOutcome:
+    """DoD 5: probe_outcome distinguishes unreachable from gauge_absent, and
+    neither is ever recorded as capacity_wait: 0."""
+
+    def test_unreachable_on_connection_error(self):
+        state = _make_state()
+        import requests as req_lib
+
+        def mock_conn_error(url, **kwargs):
+            raise req_lib.exceptions.ConnectionError("connection refused")
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_conn_error):
+            result = state._fetch_capacity_gauges()
+        assert result["probe_outcome"] == "unreachable"
+        assert result["gauges"].get("capacity_wait") is None
+
+    def test_unreachable_on_non_200(self):
+        state = _make_state()
+
+        def mock_metrics(url, **kwargs):
+            return MagicMock(status_code=503)
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_metrics):
+            result = state._fetch_capacity_gauges()
+        assert result["probe_outcome"] == "unreachable"
+        assert result["gauges"].get("capacity_wait") is None
+
+    def test_gauge_absent_on_200_with_no_matching_gauges(self):
+        """200 but big mode — no vllm: gauges present at all."""
+        state = _make_state()
+
+        def mock_metrics(url, **kwargs):
+            m = MagicMock(status_code=200)
+            m.text = "llamacpp:requests_processing 0\n"
+            return m
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_metrics):
+            result = state._fetch_capacity_gauges()
+        assert result["probe_outcome"] == "gauge_absent"
+        assert result["gauges"]["capacity_wait"] is None
+        assert result["gauges"]["num_requests_running"] is None
+
+    def test_ok_outcome_with_live_exposition(self):
+        state = _make_state()
+
+        def mock_metrics(url, **kwargs):
+            m = MagicMock(status_code=200)
+            m.text = _LIVE_CAPACITY_EXPOSITION
+            return m
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_metrics):
+            result = state._fetch_capacity_gauges()
+        assert result["probe_outcome"] == "ok"
+        assert result["gauges"]["capacity_wait"] == 0.0
+
+
+class TestCapacityShadowScrapeOffLock:
+    """DoD 6: the scrape is called outside state.lock."""
+
+    def test_scrape_proceeds_while_state_lock_held(self):
+        state = _make_state()
+
+        def mock_metrics(url, **kwargs):
+            m = MagicMock(status_code=200)
+            m.text = _LIVE_CAPACITY_EXPOSITION
+            return m
+
+        release_event = threading.Event()
+
+        def hold_lock():
+            with state.lock:
+                release_event.wait(timeout=2.0)
+
+        holder = threading.Thread(target=hold_lock, daemon=True)
+        holder.start()
+        time.sleep(0.05)  # let the holder actually acquire state.lock first
+        try:
+            with patch("agents_core.doorman_server.requests.get", side_effect=mock_metrics):
+                start = time.time()
+                result = state.capacity_shadow_scrape()
+                elapsed = time.time() - start
+        finally:
+            release_event.set()
+            holder.join(timeout=2.0)
+
+        assert result["probe_outcome"] == "ok"
+        assert elapsed < 1.0, "scrape must not block on state.lock"
+
+
+class TestCapacityShadowNeverRaises:
+    """DoD 7: the scrape never raises and never blocks past its timeout — a
+    would-defer acquire against an unreachable /metrics still completes and
+    returns today's response."""
+
+    def test_unreachable_metrics_does_not_break_acquire(self):
+        with patch("agents_core.doorman_server._start_refresh_thread"):
+            app = create_app(gw_url=GW_URL_DEFAULT)
+        c = TestClient(app, raise_server_exceptions=True)
+
+        import requests as req_lib
+
+        def mock_conn_error(url, **kwargs):
+            raise req_lib.exceptions.ConnectionError("connection refused")
+
+        with patch("agents_core.doorman_server._NodeState._is_serving", return_value=True):
+            r = c.post("/lease/acquire", json={
+                "node": "gravitywell", "work_id": "pm-session", "ttl_sec": 300,
+                "reason": "interactive", "class": "protected",
+            })
+            assert r.status_code == 200
+            assert r.json()["status"] == "serving"
+
+            with patch("agents_core.doorman_server.requests.get", side_effect=mock_conn_error):
+                r2 = c.post("/lease/acquire", json={
+                    "node": "gravitywell", "work_id": "fixer-1", "ttl_sec": 120,
+                    "reason": "fixer work", "class": "deferrable",
+                })
+        assert r2.status_code == 200
+        assert r2.json()["status"] == "pending_defer"
+        assert r2.json()["work_id"] == "fixer-1"
+
+
+class TestCapacityShadowEvent:
+    """DoD 8: one shadow event per would-defer acquire, carrying the full
+    field set named in the spec."""
+
+    def test_shadow_event_field_set(self):
+        with patch("agents_core.doorman_server._start_refresh_thread"):
+            app = create_app(gw_url=GW_URL_DEFAULT)
+        c = TestClient(app, raise_server_exceptions=True)
+
+        def mock_metrics(url, **kwargs):
+            m = MagicMock(status_code=200)
+            m.text = _LIVE_CAPACITY_EXPOSITION
+            return m
+
+        write_calls = []
+
+        def fake_write(node, event, lease_count, **kwargs):
+            write_calls.append((event, kwargs))
+
+        with patch("agents_core.doorman_server._NodeState._is_serving", return_value=True):
+            r = c.post("/lease/acquire", json={
+                "node": "gravitywell", "work_id": "pm-session", "ttl_sec": 300,
+                "reason": "interactive", "class": "protected", "lease_kind": "coordination",
+            })
+            assert r.json()["status"] == "serving"
+
+            with patch("agents_core.doorman_server.requests.get", side_effect=mock_metrics), \
+                 patch("agents_core.doorman_server._write_idle_log", side_effect=fake_write):
+                r2 = c.post("/lease/acquire", json={
+                    "node": "gravitywell", "work_id": "fixer-1", "ttl_sec": 120,
+                    "reason": "fixer work", "class": "deferrable", "role": "worker",
+                    "principal": "P",
+                })
+        assert r2.json()["status"] == "pending_defer"
+
+        shadow_events = [kw for ev, kw in write_calls if ev == "capacity-shadow"]
+        assert len(shadow_events) == 1
+        event = shadow_events[0]
+        expected_fields = {
+            "work_id", "role", "reason", "principal", "lease_class",
+            "num_requests_running", "num_requests_waiting", "capacity_wait",
+            "deferred_wait", "probe_outcome", "probe_latency_ms", "sample_age_ms",
+            "predicted_defer", "actual_defer", "scrape_to_lock_ms",
+            "gating_lease_work_id", "gating_lease_kind", "gating_lease_principal",
+        }
+        assert expected_fields.issubset(event.keys())
+        assert event["work_id"] == "fixer-1"
+        assert event["predicted_defer"] is True
+        assert event["actual_defer"] is True
+        assert event["probe_outcome"] == "ok"
+        assert event["capacity_wait"] == 0.0
+        assert event["gating_lease_work_id"] == "pm-session"
+        assert event["gating_lease_kind"] == "coordination"
+
+
+class TestCapacityShadowKillSwitch:
+    """DoD 9: DOORMAN_CAPACITY_SHADOW=false restores the exact current code
+    path — no scrape call, no event."""
+
+    def test_disabled_skips_scrape_and_event(self):
+        with patch("agents_core.doorman_server._start_refresh_thread"):
+            app = create_app(gw_url=GW_URL_DEFAULT)
+        c = TestClient(app, raise_server_exceptions=True)
+
+        scrape_calls = []
+
+        def mock_metrics(url, **kwargs):
+            scrape_calls.append(url)
+            m = MagicMock(status_code=200)
+            m.text = _LIVE_CAPACITY_EXPOSITION
+            return m
+
+        write_calls = []
+
+        def fake_write(node, event, lease_count, **kwargs):
+            write_calls.append(event)
+
+        with patch("agents_core.doorman_server._NodeState._is_serving", return_value=True):
+            r = c.post("/lease/acquire", json={
+                "node": "gravitywell", "work_id": "pm-session", "ttl_sec": 300,
+                "reason": "interactive", "class": "protected",
+            })
+            assert r.json()["status"] == "serving"
+
+            with patch("agents_core.doorman_server.requests.get", side_effect=mock_metrics), \
+                 patch("agents_core.doorman_server._write_idle_log", side_effect=fake_write), \
+                 patch("agents_core.doorman_server.DOORMAN_CAPACITY_SHADOW", False):
+                r2 = c.post("/lease/acquire", json={
+                    "node": "gravitywell", "work_id": "fixer-1", "ttl_sec": 120,
+                    "reason": "fixer work", "class": "deferrable",
+                })
+        assert r2.json()["status"] == "pending_defer"
+        assert scrape_calls == [], "no /metrics scrape must fire when the kill switch is off"
+        assert "capacity-shadow" not in write_calls
+        assert "shadow-predicate-divergence" not in write_calls
+
+
+class TestCapacityShadowDivergence:
+    """DoD 13: predicted_defer vs actual_defer disagreement is counted, not
+    assumed — a lease expiring between the off-lock read and the locked call
+    fires a shadow-predicate-divergence event. Exercises the endpoint's own
+    sequence (predict off-lock -> scrape off-lock -> lock -> acquire_or_defer
+    -> finalize) one step at a time, forcing the lease to expire in the gap
+    exactly as the "lease can change between scrape and lock" scenario (C2)
+    describes."""
+
+    def test_lease_expiring_in_the_gap_fires_divergence_event(self):
+        state = _make_state()
+        state.leases["pm-session"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "interactive",
+            "role": "worker", "class": "protected",
+        }
+
+        write_calls = []
+
+        def fake_write(node, event, lease_count, **kwargs):
+            write_calls.append((event, kwargs))
+
+        with patch("agents_core.doorman_server._write_idle_log", side_effect=fake_write):
+            predicted_defer = state._capacity_shadow_predict_defer("fixer-1", None)
+            assert predicted_defer is True  # protected lease still present, off-lock
+
+            scrape = {
+                "probe_outcome": "ok", "gauges": parse_vllm_capacity_gauges(_LIVE_CAPACITY_EXPOSITION),
+                "probe_latency_ms": 1.0, "sample_age_ms": 0.0,
+            }
+
+            # The gap: the protected lease expires between the off-lock
+            # predict/scrape and the locked acquire_or_defer call.
+            state.leases.pop("pm-session")
+
+            with state.lock:
+                pending, release_info = state.acquire_or_defer(
+                    "fixer-1", "fixer work", "worker", "deferrable", None,
+                )
+                actual_defer = pending is not None
+                gating_lease = state._gating_protected_lease(None) if actual_defer else None
+                state._emit_capacity_shadow_event(
+                    work_id="fixer-1", role="worker", reason="fixer work",
+                    principal=None, lease_class="deferrable",
+                    scrape=scrape, predicted_defer=predicted_defer,
+                    actual_defer=actual_defer, scrape_to_lock_ms=1.0,
+                    gating_lease=gating_lease,
+                )
+
+        assert actual_defer is False  # lease expired before the locked call
+        divergence_events = [kw for ev, kw in write_calls if ev == "shadow-predicate-divergence"]
+        assert len(divergence_events) == 1
+        assert divergence_events[0]["predicted_defer"] is True
+        assert divergence_events[0]["actual_defer"] is False
+
+
+class TestCapacityShadowSingleFlight:
+    """DoD 14: N concurrent would-defer acquires perform exactly one scrape;
+    the rest are recorded as probe_outcome: coalesced with non-zero
+    sample_age_ms."""
+
+    def test_concurrent_scrapes_coalesce_to_one(self):
+        state = _make_state()
+        scrape_calls = []
+        call_lock = threading.Lock()
+
+        def mock_metrics(url, **kwargs):
+            with call_lock:
+                scrape_calls.append(url)
+            time.sleep(0.05)  # hold the single-flight lock long enough to overlap
+            m = MagicMock(status_code=200)
+            m.text = _LIVE_CAPACITY_EXPOSITION
+            return m
+
+        results = []
+        results_lock = threading.Lock()
+
+        def worker():
+            r = state.capacity_shadow_scrape()
+            with results_lock:
+                results.append(r)
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_metrics), \
+             patch("agents_core.doorman_server.DOORMAN_CAPACITY_SHADOW_MIN_INTERVAL_SEC", 5.0):
+            threads = [threading.Thread(target=worker) for _ in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5.0)
+
+        assert len(scrape_calls) == 1, "exactly one real /metrics scrape must fire"
+        assert len(results) == 5
+        coalesced = [r for r in results if r["probe_outcome"] == "coalesced"]
+        assert len(coalesced) == 4
+        for r in coalesced:
+            assert r["sample_age_ms"] >= 0.0
+        ok_results = [r for r in results if r["probe_outcome"] == "ok"]
+        assert len(ok_results) == 1
+
+
+class TestCapacityShadowNoSideEffects:
+    """DoD 15: the scrape has no side effects, including a failing one."""
+
+    def test_scrape_leaves_doorman_state_untouched(self):
+        state = _make_state()
+        state.leases["existing"] = {
+            "acquired_at": time.time(), "ttl_sec": 300, "reason": "r",
+            "role": "worker", "class": "protected",
+        }
+        state.wait_list["waiting-1"] = {"enqueued_at": time.time(), "reason": "r", "role": "worker"}
+        idle_before = state.idle_since
+        cached_serving_before = state._cached_serving
+
+        leases_snapshot = dict(state.leases)
+        wait_list_snapshot = dict(state.wait_list)
+
+        import requests as req_lib
+
+        def mock_conn_error(url, **kwargs):
+            raise req_lib.exceptions.ConnectionError("connection refused")
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_conn_error):
+            result = state.capacity_shadow_scrape()
+
+        assert result["probe_outcome"] == "unreachable"
+        assert state.leases == leases_snapshot
+        assert state.wait_list == wait_list_snapshot
+        assert state.idle_since == idle_before
+        assert state._cached_serving == cached_serving_before
+
+
+class TestCapacityShadowMinInterval:
+    """DoD 16: DOORMAN_CAPACITY_SHADOW_MIN_INTERVAL_SEC is honoured — two
+    would-defer acquires inside the floor produce one scrape."""
+
+    def test_two_scrapes_inside_floor_produce_one(self):
+        state = _make_state()
+        scrape_calls = []
+
+        def mock_metrics(url, **kwargs):
+            scrape_calls.append(url)
+            m = MagicMock(status_code=200)
+            m.text = _LIVE_CAPACITY_EXPOSITION
+            return m
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_metrics), \
+             patch("agents_core.doorman_server.DOORMAN_CAPACITY_SHADOW_MIN_INTERVAL_SEC", 2.0):
+            first = state.capacity_shadow_scrape()
+            second = state.capacity_shadow_scrape()
+
+        assert len(scrape_calls) == 1
+        assert first["probe_outcome"] == "ok"
+        assert second["probe_outcome"] == "coalesced"
+        assert second["sample_age_ms"] >= 0.0

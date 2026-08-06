@@ -211,6 +211,148 @@ DOORMAN_PROBE_LLAMA_ACTIVITY = os.environ.get(
 # as satisfied.
 _VLLM_ACTIVITY_METRICS = ("vllm:num_requests_running", "vllm:num_requests_waiting")
 
+# ---------------------------------------------------------------------------
+# Capacity shadow (agents-core-doorman-capacity-shadow-v0) — instrumentation
+# only. Takes a fresh capacity reading on every would-defer deferrable acquire
+# and records what was seen alongside what would have been decided.
+# Behaviour is byte-identical to today: no acquire that defers today is
+# admitted by this unit. Default ON; "false"/"0" restores the exact current
+# code path (no scrape, no event) — see DOORMAN_PROBE_LLAMA_ACTIVITY above
+# for the repo convention this follows.
+# ---------------------------------------------------------------------------
+DOORMAN_CAPACITY_SHADOW = os.environ.get(
+    "DOORMAN_CAPACITY_SHADOW", "true"
+).lower() not in ("0", "false")
+
+# Floor between real capacity scrapes per node — inside this window, a
+# would-defer acquire reuses the most recent sample and is marked
+# probe_outcome="coalesced" rather than triggering a second /metrics hit.
+# Anti-DoS: without this, N deferrable callers refused in a burst would
+# fire N concurrent 2.5s scrapes at /metrics (C3, spec 2026-08-06).
+DOORMAN_CAPACITY_SHADOW_MIN_INTERVAL_SEC = float(
+    os.environ.get("DOORMAN_CAPACITY_SHADOW_MIN_INTERVAL_SEC", "2.0")
+)
+
+# Value-preserving vLLM capacity gauge names, read from the same /metrics
+# exposition text as _VLLM_ACTIVITY_METRICS but parsed to individual numeric
+# values rather than folded into a single boolean (which is all
+# _probe_vllm_metrics_activity above can return). Verified live on
+# GravityWell slot1, 2026-08-06 — see spec for the raw exposition lines.
+# `vllm:num_requests_waiting_by_reason` carries a `reason` label
+# ("capacity" | "deferred"); its match test below requires "{" immediately
+# after the metric name, so it never collides with the plain
+# `vllm:num_requests_waiting{` prefix used for the bare gauge.
+_VLLM_CAPACITY_RUNNING_METRIC = "vllm:num_requests_running"
+_VLLM_CAPACITY_WAITING_METRIC = "vllm:num_requests_waiting"
+_VLLM_CAPACITY_WAITING_BY_REASON_METRIC = "vllm:num_requests_waiting_by_reason"
+
+
+def _extract_prom_value(line: str, metric: str) -> float | None:
+    """Extract a Prometheus plaintext-exposition gauge value from one line,
+    for an exact metric name (labels present or not). Mirrors the
+    brace-then-value parsing already used by _probe_vllm_metrics_activity —
+    duplicated rather than shared so neither parser's behaviour can shift
+    under the other's maintenance. Never raises."""
+    if line.startswith(metric + "{"):
+        brace_end = line.find("}")
+        if brace_end == -1:
+            return None
+        value_str = line[brace_end + 1:].strip().split()
+    elif line.startswith(metric + " "):
+        value_str = line[len(metric):].strip().split()
+    else:
+        return None
+    if not value_str:
+        return None
+    try:
+        return float(value_str[0])
+    except ValueError:
+        return None
+
+
+def _parse_prom_labels(label_str: str) -> dict[str, str]:
+    """Parse a Prometheus label-set body (the text between `{` and `}`,
+    already stripped of the braces) into a dict. Never raises."""
+    labels: dict[str, str] = {}
+    for part in label_str.split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        labels[k.strip()] = v.strip().strip('"')
+    return labels
+
+
+def parse_vllm_capacity_gauges(text: str) -> dict[str, float | None]:
+    """Value-preserving read of the capacity-shadow gauges from vLLM's
+    /metrics exposition text. Unlike _probe_vllm_metrics_activity (which
+    sums two gauges into a single `total > 0` boolean, unable to
+    distinguish "3 running, 0 waiting" from "0 running, 3 waiting"), this
+    returns each gauge's summed numeric value.
+
+    Sums across ALL label sets — deliberately does NOT filter on the
+    `model_name` label value. Slot 1 has been flipped across at least six
+    models and the label follows --served-model-name; a parser pinned to
+    one model name goes permanently indeterminate after any flip, silently.
+
+    A gauge that never appears in `text` maps to None (missing), never 0 —
+    a missing reading must be representable as missing, or a probe failure
+    silently poisons the capacity-shadow dataset as "0 capacity wait".
+
+    Never raises; unparsable lines are skipped.
+    """
+    running_total = 0.0
+    waiting_total = 0.0
+    capacity_wait_total = 0.0
+    deferred_wait_total = 0.0
+    found: set[str] = set()
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if line.startswith(_VLLM_CAPACITY_WAITING_BY_REASON_METRIC + "{"):
+            brace_end = line.find("}")
+            if brace_end == -1:
+                continue
+            label_str = line[len(_VLLM_CAPACITY_WAITING_BY_REASON_METRIC) + 1:brace_end]
+            value_str = line[brace_end + 1:].strip().split()
+            if not value_str:
+                continue
+            try:
+                val = float(value_str[0])
+            except ValueError:
+                continue
+            reason = _parse_prom_labels(label_str).get("reason")
+            if reason == "capacity":
+                capacity_wait_total += val
+                found.add("capacity_wait")
+            elif reason == "deferred":
+                deferred_wait_total += val
+                found.add("deferred_wait")
+            continue
+
+        val = _extract_prom_value(line, _VLLM_CAPACITY_RUNNING_METRIC)
+        if val is not None:
+            running_total += val
+            found.add("num_requests_running")
+            continue
+
+        val = _extract_prom_value(line, _VLLM_CAPACITY_WAITING_METRIC)
+        if val is not None:
+            waiting_total += val
+            found.add("num_requests_waiting")
+            continue
+
+    return {
+        "num_requests_running": running_total if "num_requests_running" in found else None,
+        "num_requests_waiting": waiting_total if "num_requests_waiting" in found else None,
+        "capacity_wait": capacity_wait_total if "capacity_wait" in found else None,
+        "deferred_wait": deferred_wait_total if "deferred_wait" in found else None,
+    }
+
+
 # Must match OPERATOR_DEFAULTS['gravitywell'] in agents_core.llm (verified: llm.py:58).
 GW_BIG_MODEL_ID = "gravitywell-122b"
 
@@ -408,6 +550,15 @@ class _NodeState:
         # bounded TTL so it auto-expires — never an indefinite freeze.
         self.brake_reason: str | None = None
         self.brake_expires_at: float | None = None
+        # Capacity shadow (agents-core-doorman-capacity-shadow-v0): dedicated
+        # lock so single-flight scraping never contends with self.lock — the
+        # scrape must be able to proceed while self.lock is held elsewhere.
+        # _capacity_shadow_last_sample/_last_scraped_at are touched ONLY by
+        # capacity_shadow_scrape() under _capacity_shadow_scrape_lock; never
+        # read/written under self.lock and never part of doorman state proper.
+        self._capacity_shadow_scrape_lock = threading.Lock()
+        self._capacity_shadow_last_sample: dict | None = None
+        self._capacity_shadow_last_scraped_at: float = 0.0
 
     # ------------------------------------------------------------------
     # Health poll (lock-free — read-only HTTP, safe to call outside lock)
@@ -526,6 +677,175 @@ class _NodeState:
         except Exception as exc:
             log.debug(f"[{self.node_name}] vllm metrics probe ({url}) inconclusive: {exc}")
             return None
+
+    # ------------------------------------------------------------------
+    # Capacity shadow (agents-core-doorman-capacity-shadow-v0)
+    # ------------------------------------------------------------------
+
+    def _fetch_capacity_gauges(self, timeout: float = 2.5) -> dict:
+        """One GET {self.gw_url}/metrics, parsed value-preserving.
+
+        Never raises, never blocks longer than `timeout`, and touches no
+        doorman state — pure read. Outside self.lock and outside
+        _capacity_shadow_scrape_lock's caller's expectations (this is the
+        function that lock wraps for single-flight, not a lock holder
+        itself).
+
+        Returns {"probe_outcome": "ok"|"unreachable"|"gauge_absent",
+                 "gauges": {...}, "probe_latency_ms": float}.
+        `gauge_absent` — 200 but none of the target gauges are present in
+        the body (e.g. big mode, where vLLM isn't serving at all).
+        `unreachable` — timeout, connection error, or non-200.
+        Neither outcome's gauges carry a fabricated 0 — see
+        parse_vllm_capacity_gauges.
+        """
+        start = time.time()
+        try:
+            resp = requests.get(f"{self.gw_url}/metrics", timeout=timeout)
+        except Exception as exc:
+            log.debug(f"[{self.node_name}] capacity shadow scrape failed: {exc}")
+            return {
+                "probe_outcome": "unreachable",
+                "gauges": {},
+                "probe_latency_ms": (time.time() - start) * 1000,
+            }
+        latency_ms = (time.time() - start) * 1000
+        if resp.status_code != 200:
+            return {"probe_outcome": "unreachable", "gauges": {}, "probe_latency_ms": latency_ms}
+        gauges = parse_vllm_capacity_gauges(resp.text)
+        if all(v is None for v in gauges.values()):
+            return {"probe_outcome": "gauge_absent", "gauges": gauges, "probe_latency_ms": latency_ms}
+        return {"probe_outcome": "ok", "gauges": gauges, "probe_latency_ms": latency_ms}
+
+    def capacity_shadow_scrape(self) -> dict:
+        """Single-flight, floor-respecting capacity scrape (C3, spec
+        2026-08-06). At most one real /metrics scrape in flight per node at
+        any time; a concurrent or too-soon caller reuses the most recent
+        sample, marked probe_outcome="coalesced" with sample_age_ms set to
+        how old that reused reading is. Never touches self.lock, self.leases,
+        self.wait_list, idle_since, or the serving cache — strict
+        no-side-effect contract (C3).
+
+        Must be called OUTSIDE self.lock (blocking HTTP, ~2.5s cap).
+        """
+        with self._capacity_shadow_scrape_lock:
+            now = time.time()
+            elapsed = now - self._capacity_shadow_last_scraped_at
+            if (
+                self._capacity_shadow_last_sample is not None
+                and elapsed < DOORMAN_CAPACITY_SHADOW_MIN_INTERVAL_SEC
+            ):
+                out = dict(self._capacity_shadow_last_sample)
+                out["probe_outcome"] = "coalesced"
+                out["sample_age_ms"] = elapsed * 1000
+                return out
+
+            result = self._fetch_capacity_gauges()
+            self._capacity_shadow_last_sample = result
+            self._capacity_shadow_last_scraped_at = time.time()
+            out = dict(result)
+            out["sample_age_ms"] = 0.0
+            return out
+
+    def _capacity_shadow_predict_defer(self, work_id: str, principal: str | None) -> bool:
+        """Cheap, off-lock approximation of acquire_or_defer's would-defer
+        decision — used only to decide whether this acquire is on the
+        would-defer path worth scraping for (agents-core-doorman-capacity-
+        shadow-v0). Deliberately racy: the real decision happens a moment
+        later under self.lock, and disagreement between the two is recorded
+        (predicted_defer/actual_defer, shadow-predicate-divergence), not
+        prevented. Mirrors _protected_lease_active + _brake_active without
+        taking self.lock."""
+        if work_id in self.wait_list:
+            return True
+        if self.brake_expires_at is not None and time.time() < self.brake_expires_at:
+            return True
+        now = time.time()
+        for _wid, info in self.leases.items():
+            if not (
+                info.get("class", DEFAULT_LEASE_CLASS) == "protected"
+                and now <= info["acquired_at"] + info["ttl_sec"]
+            ):
+                continue
+            if principal is not None:
+                p = info.get("principal", GHOST_PRINCIPAL)
+                if p != GHOST_PRINCIPAL and p == principal:
+                    continue
+            return True
+        return False
+
+    def _gating_protected_lease(self, exclude_principal: str | None = None) -> dict | None:
+        """Same matching logic as _protected_lease_active, but returns the
+        gating lease's identity (work_id, lease_kind, principal) instead of
+        a bool — capacity-shadow event enrichment only (agents-core-doorman-
+        capacity-shadow-v0), so the record distinguishes "deferred behind
+        real inference" from "deferred behind a coordination hold using no
+        GPU". Must be called under self.lock."""
+        now = time.time()
+        for wid, info in self.leases.items():
+            if not (
+                info.get("class", DEFAULT_LEASE_CLASS) == "protected"
+                and now <= info["acquired_at"] + info["ttl_sec"]
+            ):
+                continue
+            if exclude_principal is not None:
+                p = info.get("principal", GHOST_PRINCIPAL)
+                if p != GHOST_PRINCIPAL and p == exclude_principal:
+                    continue
+            return {
+                "work_id": wid,
+                "lease_kind": info.get("lease_kind"),
+                "principal": info.get("principal", GHOST_PRINCIPAL),
+            }
+        return None
+
+    def _emit_capacity_shadow_event(
+        self,
+        *,
+        work_id: str,
+        role: str,
+        reason: str,
+        principal: str | None,
+        lease_class: str,
+        scrape: dict,
+        predicted_defer: bool,
+        actual_defer: bool,
+        scrape_to_lock_ms: float,
+        gating_lease: dict | None,
+    ) -> None:
+        """One JSON line per would-defer decision, via the existing
+        _write_idle_log machinery (DOORMAN_IDLE_LOG) also used by
+        _emit_release_event. Must be called under self.lock — file I/O only,
+        same convention as _emit_release_event."""
+        gauges = scrape.get("gauges") or {}
+        _write_idle_log(
+            self.node_name, "capacity-shadow", len(self.leases),
+            work_id=work_id,
+            role=role,
+            reason=reason,
+            principal=principal if principal is not None else GHOST_PRINCIPAL,
+            lease_class=lease_class,
+            num_requests_running=gauges.get("num_requests_running"),
+            num_requests_waiting=gauges.get("num_requests_waiting"),
+            capacity_wait=gauges.get("capacity_wait"),
+            deferred_wait=gauges.get("deferred_wait"),
+            probe_outcome=scrape.get("probe_outcome"),
+            probe_latency_ms=round(scrape.get("probe_latency_ms", 0.0), 2),
+            sample_age_ms=round(scrape.get("sample_age_ms", 0.0), 2),
+            predicted_defer=predicted_defer,
+            actual_defer=actual_defer,
+            scrape_to_lock_ms=round(scrape_to_lock_ms, 2),
+            gating_lease_work_id=(gating_lease or {}).get("work_id"),
+            gating_lease_kind=(gating_lease or {}).get("lease_kind"),
+            gating_lease_principal=(gating_lease or {}).get("principal"),
+        )
+        if predicted_defer != actual_defer:
+            _write_idle_log(
+                self.node_name, "shadow-predicate-divergence", len(self.leases),
+                work_id=work_id,
+                predicted_defer=predicted_defer,
+                actual_defer=actual_defer,
+            )
 
     def _probe_slot_activity(self) -> bool | None:
         """Tri-state unmediated-caller activity probe across both signal sources
@@ -2227,6 +2547,17 @@ def create_app(gw_url: str | None = None) -> FastAPI:
 
         state = nodes[node]
 
+        # Capacity shadow (agents-core-doorman-capacity-shadow-v0): off-lock,
+        # would-defer-path-only instrumentation. Behaviour below this block
+        # is byte-identical to today regardless of the outcome here — nothing
+        # here feeds acquire_or_defer's decision. Kill switch restores the
+        # exact current code path.
+        _capacity_shadow_ctx = None
+        if lease_class == "deferrable" and DOORMAN_CAPACITY_SHADOW:
+            if state._capacity_shadow_predict_defer(work_id, principal):
+                _scrape = state.capacity_shadow_scrape()
+                _capacity_shadow_ctx = {"scrape": _scrape, "scrape_done_at": time.time()}
+
         # Dispatch-layer defer-check (gw-router-phase1-foreground-gate): a
         # `deferrable` acquire yields while a `protected` lease or the brake is
         # active. `protected` acquires always return (None, None) here (AC2 —
@@ -2235,6 +2566,22 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         with state.lock:
             state._gc_stale()
             pending_resp, release_info = state.acquire_or_defer(work_id, reason, role, lease_class, principal)
+            if _capacity_shadow_ctx is not None:
+                _lock_acquired_at = time.time()
+                _actual_defer = pending_resp is not None
+                _gating_lease = state._gating_protected_lease(principal) if _actual_defer else None
+                state._emit_capacity_shadow_event(
+                    work_id=work_id,
+                    role=role,
+                    reason=reason,
+                    principal=principal,
+                    lease_class=lease_class,
+                    scrape=_capacity_shadow_ctx["scrape"],
+                    predicted_defer=True,
+                    actual_defer=_actual_defer,
+                    scrape_to_lock_ms=(_lock_acquired_at - _capacity_shadow_ctx["scrape_done_at"]) * 1000,
+                    gating_lease=_gating_lease,
+                )
         if pending_resp is not None:
             return pending_resp
 
