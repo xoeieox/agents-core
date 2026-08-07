@@ -529,11 +529,47 @@ def _run_local_reviewer(spec: dict, base_cwd: str | None) -> str | None:
     is already a worktree checked out to existing_branch (verified against
     origin) or base_branch, not the raw shared clone.
     """
-    from agents_core.gw_agent import call_gw_agent
+    from agents_core.gw_agent import DEFAULT_READONLY_TOOLS, call_gw_agent, probe_seat_tool_call
 
     task_id = spec.get("task_id") or spec.get("slot_id") or "lr-unknown"
     cwd = base_cwd or "/srv/agents"
     model = spec.get("model")
+    backend_url = spec.get("backend_url")
+
+    # Probe the seat's tool-calling ability before dispatching the real review
+    # (agents-core-reviewer-seat-tool-call-probe-v0). The seat can be alive,
+    # serving, and correctly configured, yet emit zero tool_calls for every
+    # request — a fault that today only surfaces after a real review burns an
+    # attempt on reason=grounding_failed (2-4s exit, indistinguishable from a
+    # model that looked and declined to investigate). This uses the SAME
+    # model, backend_url and tool surface (DEFAULT_READONLY_TOOLS — the same
+    # default call_gw_agent applies below for writeable=False) the real call
+    # below will use (DoD 1, 4). Logged unconditionally, pass or fail (D7).
+    probe = probe_seat_tool_call(
+        backend_url=backend_url,
+        model=model,
+        tools=DEFAULT_READONLY_TOOLS,
+    )
+    print(
+        f"INFO: reviewer-seat-probe: outcome={probe['outcome']} "
+        f"served_model={probe['served_model']}",
+        file=sys.stderr,
+    )
+    if probe["outcome"] == "no_tool_call":
+        # D5 fail CLOSED: a clean response with zero tool_calls is a positive
+        # determination the seat is dead. Short-circuit — do not spend a real
+        # attempt on a seat that cannot possibly ground. New reason token
+        # (distinct from a real grounding_failed) so the caller can tell a
+        # dead seat apart from a live one that declined to investigate.
+        print(
+            "ERROR: local reviewer produced no verdict (reason=seat_no_tool_calls)",
+            file=sys.stderr,
+        )
+        return None
+    # probe["outcome"] in {"tool_call", "error"} both proceed to the real
+    # call: "tool_call" because the seat proved itself, "error" because probe
+    # health is unknown and a probe outage must never block a real review
+    # (D5 fail OPEN).
 
     reason: list[str] = []
     result = call_gw_agent(
@@ -548,7 +584,7 @@ def _run_local_reviewer(spec: dict, base_cwd: str | None) -> str | None:
         work_id=task_id,
         max_steps=int(spec.get("max_steps", 24)),
         model=model,
-        backend_url=spec.get("backend_url"),
+        backend_url=backend_url,
         acquire_lease=spec.get("acquire_lease", True),
         lease_class="deferrable",
         reason_out=reason,
