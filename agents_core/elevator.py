@@ -91,7 +91,8 @@ CREATE TABLE IF NOT EXISTS queue_items (
     slot_ref           TEXT,
     depends_on         TEXT,
     provenance         TEXT,
-    result             TEXT
+    result             TEXT,
+    failed_at          TEXT
 );
 
 CREATE INDEX IF NOT EXISTS queue_items_lane_status_created
@@ -141,6 +142,7 @@ class ElevatorStore:
         self._conn.executescript(SCHEMA)
         self._lock = threading.RLock()
         self._migrate_add_result_column()
+        self._migrate_add_failed_at_column()
         # Start reaper thread (master only).
         self._reaper_stop = threading.Event()
         self._reaper_thread = None
@@ -166,6 +168,17 @@ class ElevatorStore:
             columns = {row[1] for row in cursor.fetchall()}
             if "result" not in columns:
                 self._conn.execute("ALTER TABLE queue_items ADD COLUMN result TEXT")
+                self._conn.commit()
+
+    def _migrate_add_failed_at_column(self):
+        """Idempotent migration: add failed_at terminal-timestamp column if missing.
+
+        Additive schema change (Leg 4) — existing rows read back as NULL."""
+        with self._lock:
+            cursor = self._conn.execute("PRAGMA table_info(queue_items)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "failed_at" not in columns:
+                self._conn.execute("ALTER TABLE queue_items ADD COLUMN failed_at TEXT")
                 self._conn.commit()
 
     def close(self):
@@ -316,42 +329,69 @@ class ElevatorStore:
             self._conn.commit()
         return True
 
-    def requeue(self, item_id: str) -> bool:
+    def requeue(self, item_id: str, reason: str | None = None) -> bool:
         """Requeue a claimed item back to pending (retry). Increments attempts.
+
+        `reason` (Leg 4), when given, names the calling branch and is folded into
+        the item's provenance under `last_requeue_reason` — diagnosable-by-default
+        for the next incident, without disturbing terminal `provenance` writes.
 
         Returns True. Raises QueueNotFoundError if item does not exist."""
         self._check_writable()
         with self._lock:
             row = self._conn.execute(
-                "SELECT attempts FROM queue_items WHERE item_id=?", (item_id,)
+                "SELECT attempts, provenance FROM queue_items WHERE item_id=?", (item_id,)
             ).fetchone()
             if not row:
                 raise QueueNotFoundError(item_id)
 
             attempts = (row["attempts"] or 0) + 1
+            provenance_json = row["provenance"]
+            if reason is not None:
+                try:
+                    prov = json.loads(provenance_json) if provenance_json else {}
+                except Exception:
+                    prov = {}
+                prov["last_requeue_reason"] = reason
+                provenance_json = json.dumps(prov)
             self._conn.execute(
                 "UPDATE queue_items SET status='pending', attempts=?, "
-                "claimed_at=NULL, claim_owner=NULL, claim_ttl_sec=NULL "
+                "claimed_at=NULL, claim_owner=NULL, claim_ttl_sec=NULL, provenance=? "
                 "WHERE item_id=?",
-                (attempts, item_id),
+                (attempts, provenance_json, item_id),
             )
             self._conn.commit()
         return True
 
-    def fail(self, item_id: str) -> bool:
+    def fail(self, item_id: str, reason: str | None = None) -> bool:
         """Mark a claimed item as permanently failed (terminal).
+
+        `reason` (Leg 4), when given, names the calling branch and is folded into
+        the item's provenance under `reason`. Also stamps `failed_at` — the
+        terminal timestamp Leg 4 adds so claim-held duration is recoverable.
 
         Returns True. Raises QueueNotFoundError if item does not exist."""
         self._check_writable()
+        now = _now()
         with self._lock:
-            exists = self._conn.execute(
-                "SELECT 1 FROM queue_items WHERE item_id=?", (item_id,)
+            row = self._conn.execute(
+                "SELECT provenance FROM queue_items WHERE item_id=?", (item_id,)
             ).fetchone()
-            if not exists:
+            if row is None:
                 raise QueueNotFoundError(item_id)
 
+            provenance_json = row["provenance"]
+            if reason is not None:
+                try:
+                    prov = json.loads(provenance_json) if provenance_json else {}
+                except Exception:
+                    prov = {}
+                prov["reason"] = reason
+                provenance_json = json.dumps(prov)
             self._conn.execute(
-                "UPDATE queue_items SET status='failed' WHERE item_id=?", (item_id,)
+                "UPDATE queue_items SET status='failed', failed_at=?, provenance=? "
+                "WHERE item_id=?",
+                (now, provenance_json, item_id),
             )
             self._conn.commit()
         return True

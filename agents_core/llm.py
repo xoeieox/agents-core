@@ -1288,6 +1288,10 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                 _claim_ttl = timeout + 90
                 _poll = float(os.environ.get("GW_ADMISSION_POLL_INTERVAL_SEC", "1.5"))
                 _max_wf = int(os.environ.get("MAX_WAKE_FAIL_RETRIES", "5"))
+                # Leg 1: per-branch ceilings for the two branches that used to hold the
+                # claim across an unbounded sleep, modelled on AC8's wf_retries/_max_wf.
+                _max_ct = int(os.environ.get("GW_ADMISSION_MAX_CONTENDED_RETRIES", "5"))
+                _max_se = int(os.environ.get("GW_ADMISSION_MAX_SOFT_ERROR_RETRIES", "5"))
 
                 from pathlib import Path as _Path
                 _elev_db = _Path(os.environ.get("ELEVATOR_DB_PATH",
@@ -1303,9 +1307,30 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                 admitted = False
                 is_ride_along = False
                 wf_retries = 0
+                ct_retries = 0
+                se_retries = 0
                 _loop_ticket_settled = False
                 deadline = time.monotonic() + _max_wait
                 client = DoormanClient()
+
+                def _release_lease_swallow_unreachable(_work_id):
+                    # Leg 2: a failed release must never convert a retry into a crash —
+                    # the lease TTL + doorman _gc_stale remain the backstop. Catch only
+                    # the declared transport failure so a real logic fault still surfaces.
+                    try:
+                        client.release("gravitywell", _work_id)
+                    except DoormanUnreachable as _release_err:
+                        _log.warning(
+                            "[gw-admission] lease_release_failed work_id=%s: %s",
+                            _work_id, _release_err,
+                        )
+
+                if _provenance_out is not None and is_unique_work_id_principal:
+                    # Leg 4 / AC10: emit under enforce too, not just shadow.
+                    _provenance_out.append(
+                        ("admission_enforce:principal_group_collision_risk", "gravitywell")
+                    )
+
                 try:
                     while True:
                         if time.monotonic() >= deadline:
@@ -1315,7 +1340,7 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                             )
                             if _provenance_out is not None:
                                 _provenance_out.append(("slot_queued_timeout", "gravitywell"))
-                            elevator.fail(ticket)
+                            elevator.fail(ticket, reason="slot_queued_timeout")
                             _loop_ticket_settled = True
                             return _apply_wake_fail(
                                 on_wake_fail, operator_class, prompt,
@@ -1351,29 +1376,64 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                             # AC5b: transport failure — fail-ticket, not loud-proceed (would reopen race).
                             if _provenance_out is not None:
                                 _provenance_out.append(("doorman_unreachable", "gravitywell"))
-                            elevator.fail(ticket)
+                            elevator.fail(ticket, reason="doorman_unreachable")
                             _loop_ticket_settled = True
                             return _apply_wake_fail(
                                 on_wake_fail, operator_class, prompt,
                                 _provenance_out=_provenance_out, **wake_fail_kwargs,
                             )
                         except Exception as _acquire_err:
-                            # AC5b: soft-error (e.g. HTTP 5xx) — treat as not-drain-clear, retry.
+                            # Leg 1: acquire_soft_error (e.g. HTTP 5xx) was previously a bare
+                            # sleep-and-continue that held the claim indefinitely. Now mirrors
+                            # AC8's wake_failed pattern — release the claim before sleeping,
+                            # with its own retry counter and exponential backoff ceiling.
                             _log.warning(
                                 "[gw-admission] acquire_soft_error work_id=%s: %s",
                                 work_id, _acquire_err,
                             )
-                            time.sleep(_poll)
+                            if _provenance_out is not None:
+                                _provenance_out.append(("acquire_soft_error", "gravitywell"))
+                            if se_retries >= _max_se:
+                                elevator.fail(ticket, reason="acquire_soft_error_ceiling")
+                                _loop_ticket_settled = True
+                                return _apply_wake_fail(
+                                    on_wake_fail, operator_class, prompt,
+                                    _provenance_out=_provenance_out, **wake_fail_kwargs,
+                                )
+                            backoff = min(2 ** se_retries, 16)
+                            se_retries += 1
+                            elevator.requeue(ticket, reason="acquire_soft_error_retry")
+                            admitted = False
+                            is_ride_along = False
+                            time.sleep(backoff)
                             continue
 
                         if DoormanClient.is_contended(res):
-                            # Drain-gate: another group holds a worker lease. Retry within deadline.
-                            time.sleep(_poll)
+                            # Leg 1: drain-gate contended was previously a bare sleep-and-continue
+                            # that held the claim indefinitely (root cause of the two-principal
+                            # deadlock — see the spec). Now releases the claim before sleeping,
+                            # with its own retry counter and exponential backoff ceiling.
+                            if _provenance_out is not None:
+                                _provenance_out.append(("gw_contended", "gravitywell"))
+                            if ct_retries >= _max_ct:
+                                elevator.fail(ticket, reason="gw_contended_ceiling")
+                                _loop_ticket_settled = True
+                                return _apply_wake_fail(
+                                    on_wake_fail, operator_class, prompt,
+                                    _provenance_out=_provenance_out, **wake_fail_kwargs,
+                                )
+                            backoff = min(2 ** ct_retries, 16)
+                            ct_retries += 1
+                            elevator.requeue(ticket, reason="gw_contended_retry")
+                            admitted = False
+                            is_ride_along = False
+                            time.sleep(backoff)
                             continue
 
                         if DoormanClient.is_deferred(res):
-                            # AC6: requeue and continue waiting
-                            elevator.requeue(ticket)
+                            # AC6: requeue and continue waiting (unchanged except Leg 2's release).
+                            _release_lease_swallow_unreachable(work_id)
+                            elevator.requeue(ticket, reason="gw_deferred_swarm")
                             admitted = False
                             is_ride_along = False
                             if _provenance_out is not None:
@@ -1382,11 +1442,12 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                             continue
 
                         elif res.get("status") != "serving":
-                            # AC8: wake_failed - bounded backoff requeue
+                            # AC8: wake_failed - bounded backoff requeue (unchanged except Leg 2's release).
+                            _release_lease_swallow_unreachable(work_id)
                             if _provenance_out is not None:
                                 _provenance_out.append(("gw_not_serving", "gravitywell"))
                             if wf_retries >= _max_wf:
-                                elevator.fail(ticket)
+                                elevator.fail(ticket, reason="gw_not_serving_ceiling")
                                 _loop_ticket_settled = True
                                 return _apply_wake_fail(
                                     on_wake_fail, operator_class, prompt,
@@ -1394,7 +1455,7 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                                 )
                             backoff = min(2 ** wf_retries, 16)
                             wf_retries += 1
-                            elevator.requeue(ticket)
+                            elevator.requeue(ticket, reason="gw_not_serving_retry")
                             admitted = False
                             is_ride_along = False
                             time.sleep(backoff)
@@ -1413,6 +1474,26 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                                     _provenance_out.append(
                                         ("drain_count_unavailable", "gravitywell")
                                     )
+
+                            # Leg 3: re-validate the ticket before dispatch. A reaper may have
+                            # requeued it behind our back (elevator.py's stale-claim reclaim) between
+                            # try_admit and here; dispatching while holding no claim would silently
+                            # invert the admission invariant. Lost the race -> don't dispatch,
+                            # release the just-acquired doorman lease, and re-admit from the top.
+                            _current_ticket = elevator.get(ticket)
+                            if (
+                                _current_ticket is None
+                                or _current_ticket.get("status") != "claimed"
+                                or _current_ticket.get("claim_owner") != effective_principal
+                            ):
+                                if _provenance_out is not None:
+                                    _provenance_out.append(
+                                        ("gw_claim_lost_before_dispatch", "gravitywell")
+                                    )
+                                _release_lease_swallow_unreachable(work_id)
+                                admitted = False
+                                is_ride_along = False
+                                continue
 
                             # serving: run backend via thread watchdog (AC2)
                             # _call_gravitywell_backend is a GIL-releasing HTTP socket read.
@@ -1434,7 +1515,7 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                                     # the underlying request timeout will reap it eventually.
                                     if _provenance_out is not None:
                                         _provenance_out.append(("gw_member_deadline", "gravitywell"))
-                                    elevator.fail(ticket)
+                                    elevator.fail(ticket, reason="gw_member_deadline")
                                     ticket_settled = True
                                     _loop_ticket_settled = True
                                     client.release("gravitywell", work_id)
@@ -1446,7 +1527,7 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                                 except OperatorUnreachableError:
                                     if _provenance_out is not None:
                                         _provenance_out.append(("serving_http_error", "gravitywell"))
-                                    elevator.fail(ticket)
+                                    elevator.fail(ticket, reason="serving_http_error")
                                     ticket_settled = True
                                     _loop_ticket_settled = True
                                     return _apply_wake_fail(
@@ -1458,7 +1539,7 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                                     if _provenance_out is not None:
                                         _provenance_out.append(("gw_member_error", "gravitywell"))
                                     if not ticket_settled:
-                                        elevator.fail(ticket)
+                                        elevator.fail(ticket, reason="gw_member_error")
                                         ticket_settled = True
                                         _loop_ticket_settled = True
                                     raise
@@ -1492,7 +1573,7 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                                 _provenance_out.append(
                                     ("gw_admission_loop_aborted", "gravitywell")
                                 )
-                            elevator.fail(ticket)
+                            elevator.fail(ticket, reason="gw_admission_loop_aborted")
                         except Exception:
                             pass
                     client.close()
