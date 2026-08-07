@@ -299,6 +299,63 @@ PROBE_PROMPT: Final[str] = (
     "call the tool."
 )
 
+# Default number of perturbation attempts probe_seat_tool_call makes before
+# concluding the seat is genuinely dead (agents-core-reviewer-seat-prefix-
+# perturbation-retry-v0). See perturb_tool_order below for why this is a
+# deterministic rotation, not a synthetic-tool injection or random shuffle.
+PROBE_DEFAULT_ATTEMPTS: Final[int] = 3
+
+
+def perturb_tool_order(
+    tools: dict[str, dict[str, Any]], attempt: int
+) -> dict[str, dict[str, Any]]:
+    """Return a semantically-equivalent tool mapping, differently serialized.
+
+    Live-measured 2026-08-07 (see the reviewer-seat-prefix-perturbation-retry-v0
+    spec): the native serialization of DEFAULT_READONLY_TOOLS/DEFAULT_FIXER_TOOLS
+    emits zero tool_calls deterministically for a given vLLM-server-lifetime,
+    while any structurally-different serialization of the SAME tool set
+    recovers it. The fault is localized to the cached KV blocks for that exact
+    prefix, not to anything semantic about the tools.
+
+    The perturbation is a rotation of tool order, not injection of a synthetic
+    tool — a synthetic tool would enlarge the model's action space and could
+    itself be called. This never adds, removes, or renames a tool, and never
+    touches a tool's parameter schema; only the dict's key order (and hence
+    the serialized byte sequence downstream) changes.
+
+    Deterministic and stateless: derived from `attempt` alone via modulo
+    arithmetic over the tool count, so it is well-defined for any attempt
+    index, including 0 (returns `tools` unchanged — the native order),
+    an index equal to the tool count (shift wraps to 0, same as attempt 0),
+    and an index exceeding the tool count (`attempt % len(tools)` folds it
+    back into range). Randomized/salted perturbation is deliberately rejected
+    — a non-reproducible variant would make it impossible for the real review
+    call (Part 3) to send the exact variant the probe validated, and would
+    make post-hoc log analysis of which prefixes get poisoned impossible.
+    """
+    if not tools:
+        return tools
+    names = list(tools.keys())
+    shift = attempt % len(names)
+    if shift == 0:
+        return tools
+    rotated_names = names[shift:] + names[:shift]
+    return {name: tools[name] for name in rotated_names}
+
+
+def _tool_block_hash(tools: dict[str, dict[str, Any]] | list[dict]) -> str:
+    """Short, stable hash of a serialized tool block for dispatch-log correlation.
+
+    Used by probe_seat_tool_call's log line (Part 4) so a seat that needs
+    perturbation is traceable back to the exact refused prefix — makes
+    post-hoc analysis of which prefixes get poisoned, and how often,
+    possible. Deterministic: same tool mapping/order -> same hash, always.
+    """
+    _tools = list(tools.values()) if isinstance(tools, dict) else tools
+    blob = json.dumps(_tools, sort_keys=False, default=str).encode("utf-8", errors="replace")
+    return hashlib.sha256(blob).hexdigest()[:12]
+
 
 def probe_seat_tool_call(
     *,
@@ -306,60 +363,129 @@ def probe_seat_tool_call(
     model: str | None,
     tools: dict[str, dict[str, Any]],
     timeout: float = 15.0,
+    attempts: int = PROBE_DEFAULT_ATTEMPTS,
     log: Callable[[str], None] | None = None,
 ) -> dict:
     """Direct-POST probe: does this seat, with this tool surface, emit a
-    tool call at all? One request, no lease, no agent loop.
+    tool call at all? Bounded attempt loop (default 3) over perturbed
+    tool-order variants (see perturb_tool_order) — a single dead attempt at
+    the native prefix no longer condemns the seat, since the fault is a
+    per-server-lifetime cache-poisoning of one exact serialized prefix, not
+    a property of the tool set itself.
 
     Returns a dict:
       {"outcome": "tool_call" | "no_tool_call" | "error",
        "served_model": str | None,
-       "detail": str | None}
+       "detail": str | None,
+       "variant": dict — the tool mapping that produced this outcome (the
+         successful variant on "tool_call"; the caller should reuse this
+         EXACT variant for the real review — see Part 3 of the spec),
+       "attempt": int | None — 0-indexed attempt that succeeded, or None if
+         no attempt succeeded (outcome != "tool_call"),
+       "attempts_made": int — total attempts actually made,
+       "refused_prefix_hash": str — short stable hash of the native
+         (attempt-0) serialized tool block, for dispatch-log correlation}
 
-    "tool_call": the probe response carried >=1 tool_calls — seat is alive.
-    "no_tool_call": a clean response with zero tool_calls — seat is dead
-      (D5 fail CLOSED; caller should short-circuit with reason
+    "tool_call": some attempt (any of the `attempts`) carried >=1
+      tool_calls — seat is alive. Outcome semantics are NOT widened relative
+      to the pre-retry probe: this is still "the seat can tool-call", now
+      established across up to `attempts` differently-serialized variants
+      of the identical tool set instead of just the native one.
+    "no_tool_call": every attempt returned a clean zero-tool-call response —
+      seat is dead (D5 fail CLOSED; caller should short-circuit with reason
       "seat_no_tool_calls").
-    "error": transport failure, timeout, non-200, or a malformed body — seat
-      health is UNKNOWN (D5 fail OPEN; caller should proceed to the real
-      review, never treat this as a dead seat).
+    "error": transport failure, timeout, non-200, or a malformed body on ANY
+      attempt — seat health is UNKNOWN (D5 fail OPEN; caller should proceed
+      to the real review, never treat this as a dead seat). A transport
+      error terminates the attempt loop immediately rather than being
+      retried as if it were a clean refusal — it must never be converted
+      into a dead-seat ("no_tool_call") verdict.
     """
     _url = backend_url if backend_url is not None else GW_URL
     messages = [{"role": "user", "content": PROBE_PROMPT}]
-    payload = build_step_payload(
-        model=model,
-        messages=messages,
-        tools=tools,
-        is_swarm=False,
-        think=False,
-        temperature=0.0,
-        max_tokens=64,
-    )
-    try:
-        resp = requests.post(f"{_url}/v1/chat/completions", json=payload, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        if log:
-            log(f"[gw_agent] reviewer-seat-probe: request failed: {exc}")
-        return {"outcome": "error", "served_model": None, "detail": str(exc)}
+    native_hash = _tool_block_hash(tools)
+    _attempts = max(1, attempts)
 
-    served_model = data.get("model")
-    choices = data.get("choices") or []
-    if not choices:
-        if log:
-            log("[gw_agent] reviewer-seat-probe: response had no choices")
-        return {"outcome": "error", "served_model": served_model, "detail": "no_choices"}
+    served_model = None
+    for attempt in range(_attempts):
+        attempts_made = attempt + 1
+        variant = perturb_tool_order(tools, attempt)
+        payload = build_step_payload(
+            model=model,
+            messages=messages,
+            tools=variant,
+            is_swarm=False,
+            think=False,
+            temperature=0.0,
+            max_tokens=64,
+        )
+        try:
+            resp = requests.post(f"{_url}/v1/chat/completions", json=payload, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            if log:
+                log(f"[gw_agent] reviewer-seat-probe: request failed on attempt {attempt}: {exc}")
+            return {
+                "outcome": "error",
+                "served_model": None,
+                "detail": str(exc),
+                "variant": variant,
+                "attempt": None,
+                "attempts_made": attempts_made,
+                "refused_prefix_hash": native_hash,
+            }
 
-    message = choices[0].get("message") or {}
-    tool_calls = message.get("tool_calls") or []
-    outcome = "tool_call" if tool_calls else "no_tool_call"
+        served_model = data.get("model")
+        choices = data.get("choices") or []
+        if not choices:
+            if log:
+                log(f"[gw_agent] reviewer-seat-probe: response had no choices on attempt {attempt}")
+            return {
+                "outcome": "error",
+                "served_model": served_model,
+                "detail": "no_choices",
+                "variant": variant,
+                "attempt": None,
+                "attempts_made": attempts_made,
+                "refused_prefix_hash": native_hash,
+            }
+
+        message = choices[0].get("message") or {}
+        tool_calls = message.get("tool_calls") or []
+        if tool_calls:
+            if log:
+                log(
+                    f"[gw_agent] reviewer-seat-probe: outcome=tool_call "
+                    f"succeeded_attempt={attempt} attempts_made={attempts_made} "
+                    f"served_model={served_model}"
+                )
+            return {
+                "outcome": "tool_call",
+                "served_model": served_model,
+                "detail": None,
+                "variant": variant,
+                "attempt": attempt,
+                "attempts_made": attempts_made,
+                "refused_prefix_hash": native_hash,
+            }
+        # Clean zero-tool-call response on this attempt — try the next
+        # perturbation rather than concluding the seat is dead on one attempt.
+
     if log:
         log(
-            f"[gw_agent] reviewer-seat-probe: outcome={outcome} "
-            f"served_model={served_model}"
+            f"[gw_agent] reviewer-seat-probe: outcome=no_tool_call "
+            f"all {_attempts} perturbations refused served_model={served_model}"
         )
-    return {"outcome": outcome, "served_model": served_model, "detail": None}
+    return {
+        "outcome": "no_tool_call",
+        "served_model": served_model,
+        "detail": None,
+        "variant": tools,
+        "attempt": None,
+        "attempts_made": _attempts,
+        "refused_prefix_hash": native_hash,
+    }
 
 
 def _post_step_with_bounded_retry(

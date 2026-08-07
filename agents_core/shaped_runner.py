@@ -550,19 +550,31 @@ def _run_local_reviewer(spec: dict, base_cwd: str | None) -> str | None:
         model=model,
         tools=DEFAULT_READONLY_TOOLS,
     )
+    # Part 4 (agents-core-reviewer-seat-prefix-perturbation-retry-v0): the
+    # succeeding attempt index, total attempts made, and a short stable hash
+    # of the native (attempt-0) serialized tool block — a seat that needed
+    # perturbation is recovering from a real fault, and that must stay
+    # visible in the dispatch logs rather than being silently papered over.
     print(
         f"INFO: reviewer-seat-probe: outcome={probe['outcome']} "
-        f"served_model={probe['served_model']}",
+        f"served_model={probe['served_model']} "
+        f"succeeded_attempt={probe.get('attempt')} "
+        f"attempts_made={probe.get('attempts_made')} "
+        f"refused_prefix_hash={probe.get('refused_prefix_hash')}",
         file=sys.stderr,
     )
     if probe["outcome"] == "no_tool_call":
-        # D5 fail CLOSED: a clean response with zero tool_calls is a positive
-        # determination the seat is dead. Short-circuit — do not spend a real
-        # attempt on a seat that cannot possibly ground. New reason token
-        # (distinct from a real grounding_failed) so the caller can tell a
-        # dead seat apart from a live one that declined to investigate.
+        # D5 fail CLOSED: every perturbation attempt returned a clean
+        # zero-tool-call response — a positive determination the seat is
+        # dead. Short-circuit — do not spend a real attempt on a seat that
+        # cannot possibly ground. New reason token (distinct from a real
+        # grounding_failed) so the caller can tell a dead seat apart from a
+        # live one that declined to investigate. Logged explicitly so
+        # seat_no_tool_calls can never again be confused with a single
+        # unlucky request against one prefix.
         print(
-            "ERROR: local reviewer produced no verdict (reason=seat_no_tool_calls)",
+            "ERROR: local reviewer produced no verdict (reason=seat_no_tool_calls) "
+            f"all {probe.get('attempts_made')} perturbations refused",
             file=sys.stderr,
         )
         return None
@@ -571,11 +583,18 @@ def _run_local_reviewer(spec: dict, base_cwd: str | None) -> str | None:
     # health is unknown and a probe outage must never block a real review
     # (D5 fail OPEN).
 
+    # Part 3: carry the EXACT variant that succeeded (or the native tools on
+    # a fail-open "error" probe, where no variant was validated) into the
+    # real review — a probe that only proves *some* variant works while the
+    # real call still sends the poisoned native prefix fixes nothing.
+    reviewer_tools = probe.get("variant") or DEFAULT_READONLY_TOOLS
+
     reason: list[str] = []
     result = call_gw_agent(
         prompt=spec["prompt"],
         system=spec.get("system", ""),
         cwd=cwd,
+        tools=reviewer_tools,
         writeable=False,
         json_mode=True,
         timeout=int(spec.get("timeout_s", 900)),
