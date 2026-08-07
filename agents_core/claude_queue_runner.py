@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -119,17 +120,77 @@ def _extract_ops_primitives(task_id: str, task_type: str,
 # Failure classification and silenced-event logging
 # ---------------------------------------------------------------------------
 
+# shaped_runner._run_local_reviewer prints every non-verdict as
+# "ERROR: local reviewer produced no verdict (reason=<X>)" (shaped_runner.py:558),
+# where <X> is drawn from the closed vocabulary documented at gw_agent.py:1318-1332.
+# This regex isolates that shape from every other "ERROR:"-prefixed first line so
+# extraction and classification stay decoupled — a line that merely starts with
+# "ERROR:" must never enter the reason table (agents-core-reviewer-failure-notify-class-v0).
+_REVIEWER_NO_VERDICT_RE = re.compile(
+    r"^ERROR: local reviewer produced no verdict \(reason=(\w+)\)"
+)
+
+# Reason -> class, per agents-core-reviewer-failure-notify-class-v0 C2.
+# infra: a host is down or refusing — pages HIGH, a human can act on it.
+# execution: model-quality / lifecycle outcomes — no host to fix, silence to audit.
+# contention: transient GPU contention / per-step transport failures already
+# retried internally (GW_STEP_MAX_RETRIES) — the normal cost of a shared GPU,
+# must not page. Recorded distinctly from execution in the audit line (C2, C4).
+_REVIEWER_REASON_CLASS = {
+    "gw_unreachable": "infra",
+    "gw_not_serving": "infra",
+    "backend_unreachable": "infra",
+    "grounding_failed": "execution",
+    "max_steps_exhausted": "execution",
+    "budget_exhausted": "execution",
+    "no_choices": "execution",
+    "interrupted": "execution",
+    "gw_defer_timeout": "contention",
+    "rate_limited": "contention",
+    "request_timeout": "contention",
+    "server_error": "contention",
+    "request_failed": "contention",
+}
+
+
+def _reviewer_failure_reason(result: str) -> str | None:
+    """Extract the reason= token from a reviewer non-verdict first line.
+
+    Returns None when the first line does not match the reviewer non-verdict
+    shape at all — that "does not match" case must fall through to today's
+    prefix logic in _failure_class untouched (C3), never enter the reason
+    table below.
+    """
+    lines = result.splitlines()
+    first = lines[0] if lines else ""
+    m = _REVIEWER_NO_VERDICT_RE.match(first)
+    return m.group(1) if m else None
+
+
 def _failure_class(result: str) -> str:
-    """Classify a failure result string as 'infra' or 'execution'.
+    """Classify a failure result string as 'infra', 'execution', or 'contention'.
 
     Inspects only the **first line** of the formatted result string
     (e.g. "EXIT 1:\n…", "ERROR: worktree_setup:\n…"), not raw subprocess output.
     This is distinct from _classify_runner_failure which scans all lines.
 
-    Contract: use startswith (not substring 'in') to match prefixes.
+    Reviewer non-verdicts ("ERROR: local reviewer produced no verdict
+    (reason=<X>)") classify by <X> via _REVIEWER_REASON_CLASS rather than by
+    the uniform "ERROR:" prefix — see agents-core-reviewer-failure-notify-class-v0.
+    An unrecognised reason fails closed to 'infra' (page once, loudly, rather
+    than silently swallow an unanticipated outage class).
+
+    Every other first line — fixer EXIT/TIMEOUT/INTERRUPTED, and any other
+    "ERROR:"-prefixed string that isn't the reviewer non-verdict shape — keeps
+    the original prefix-only contract byte-identical (use startswith, not
+    substring 'in', to match prefixes).
     """
     lines = result.splitlines()
     first = lines[0] if lines else ""
+
+    reason = _reviewer_failure_reason(result)
+    if reason is not None:
+        return _REVIEWER_REASON_CLASS.get(reason, "infra")  # unknown reason → fail closed
 
     if first.startswith("ERROR:"):
         return "infra"
@@ -139,8 +200,13 @@ def _failure_class(result: str) -> str:
 
 
 def _log_silenced(event: str, task: dict, *, failure_class: str | None,
-                  demoted_from: str, result: str) -> None:
+                  demoted_from: str, result: str,
+                  reason: str | None = None) -> None:
     """Append one JSON line to SILENCED_LOG for a demoted notification.
+
+    `reason` is the extracted reviewer non-verdict reason (e.g.
+    "grounding_failed"), when applicable — so the audit line answers "what
+    stopped paging and why" without re-reading the queue (C4).
 
     Best-effort: wrap the whole body in try/except so a logging failure
     never raises and never causes a push.
@@ -158,6 +224,7 @@ def _log_silenced(event: str, task: dict, *, failure_class: str | None,
             "failure_class": failure_class,
             "demoted_from": demoted_from,
             "result_head": result_head,
+            "reason": reason,
         }
         with open(SILENCED_LOG, "a") as f:
             f.write(json.dumps(entry, separators=(",", ":")) + "\n")
@@ -240,8 +307,12 @@ def notify_failure(task: dict, result: str) -> None:
                 priority=PushoverPriority.HIGH,
             )
         else:
+            # 'execution' and 'contention' both demote to the audit log; the
+            # class distinction (and the extracted reviewer reason, if any)
+            # is preserved in the audit line rather than collapsed (C2, C4).
             _log_silenced("failure", task, failure_class=cls,
-                         demoted_from="HIGH", result=result)
+                         demoted_from="HIGH", result=result,
+                         reason=_reviewer_failure_reason(result))
         return
     summary = result.splitlines()[0][:300] if result else "(no output)"
     send_notification(
