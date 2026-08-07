@@ -233,6 +233,135 @@ def _classify_exception(exc: Exception) -> tuple[str, float | None]:
     return GW_REASON_REQUEST_FAILED, None
 
 
+def build_step_payload(
+    *,
+    model: str | None,
+    messages: list[dict],
+    tools: dict[str, dict[str, Any]] | list[dict],
+    is_swarm: bool = False,
+    think: bool = False,
+    temperature: float = 0.7,
+    max_tokens: int | None = None,
+) -> dict:
+    """Single construction path for a chat-completions step payload.
+
+    Used by both the real per-step POST inside `_call_gw_agent_impl`'s loop and
+    the reviewer-seat probe (agents-core-reviewer-seat-tool-call-probe-v0, D6/
+    5b) — the probe must send a structurally identical payload (same `model`,
+    `tools` shape, `chat_template_kwargs`/`response_format` handling) to the
+    real reviewer call, or it tests a different request shape and can report a
+    healthy seat while the real call fails. `tools` may be the OpenAI-format
+    dict keyed by name (as stored in DEFAULT_READONLY_TOOLS/DEFAULT_FIXER_TOOLS)
+    or an already-flattened list — dict is flattened via `.values()`.
+    """
+    _tools = list(tools.values()) if isinstance(tools, dict) else tools
+    return {
+        **({} if model is None else {"model": model}),
+        "messages": messages,
+        "tools": _tools,
+        "tool_choice": "auto",
+        "temperature": temperature,
+        **({} if is_swarm else {"chat_template_kwargs": {"enable_thinking": think}}),
+        **({} if max_tokens is None else {"max_tokens": max_tokens}),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Reviewer-seat tool-call probe (agents-core-reviewer-seat-tool-call-probe-v0)
+#
+# The local reviewer seat can be alive, serving, and correctly configured, and
+# still emit zero tool_calls for every request — a fault that is invisible
+# above this layer (a dead-seat reviewer exits in 2-4s with reason=
+# grounding_failed, indistinguishable from a real "model looked and declined
+# to investigate" outcome without this probe) and NOT stable across GW
+# restarts (established by live probe 2026-08-06, see
+# correction/reviewer-tool-set-rule-refuted-seat-is-epoch-fragile-2026-08-06).
+#
+# D6 (amended): this is a DIRECT HTTP POST, not a call_gw_agent run. Routing
+# through call_gw_agent would take a second doorman lease (acquire_lease
+# defaults True) or, if acquire_lease=False were passed to avoid that, would
+# silently flip _is_swarm (gw_agent.py _is_swarm = backend_url is not None and
+# not acquire_lease) and change the payload shape (drops chat_template_kwargs,
+# alters response_format handling) — testing a payload the real call never
+# sends. The probe therefore posts once, directly, with the exact payload
+# shape (build_step_payload above) the real call uses, takes no lease, and
+# cannot trip the swarm flag.
+#
+# D5: fail OPEN on probe error (transport/timeout/non-200 — seat health
+# unknown, never block a real review on a probe outage), fail CLOSED on probe
+# refusal (a clean response with zero tool_calls — a positive determination
+# the seat is dead).
+# ---------------------------------------------------------------------------
+
+PROBE_PROMPT: Final[str] = (
+    "Call the read_file tool on the path \"/tmp\" to confirm your tool "
+    "surface is working. This is a liveness probe — do not explain, just "
+    "call the tool."
+)
+
+
+def probe_seat_tool_call(
+    *,
+    backend_url: str | None,
+    model: str | None,
+    tools: dict[str, dict[str, Any]],
+    timeout: float = 15.0,
+    log: Callable[[str], None] | None = None,
+) -> dict:
+    """Direct-POST probe: does this seat, with this tool surface, emit a
+    tool call at all? One request, no lease, no agent loop.
+
+    Returns a dict:
+      {"outcome": "tool_call" | "no_tool_call" | "error",
+       "served_model": str | None,
+       "detail": str | None}
+
+    "tool_call": the probe response carried >=1 tool_calls — seat is alive.
+    "no_tool_call": a clean response with zero tool_calls — seat is dead
+      (D5 fail CLOSED; caller should short-circuit with reason
+      "seat_no_tool_calls").
+    "error": transport failure, timeout, non-200, or a malformed body — seat
+      health is UNKNOWN (D5 fail OPEN; caller should proceed to the real
+      review, never treat this as a dead seat).
+    """
+    _url = backend_url if backend_url is not None else GW_URL
+    messages = [{"role": "user", "content": PROBE_PROMPT}]
+    payload = build_step_payload(
+        model=model,
+        messages=messages,
+        tools=tools,
+        is_swarm=False,
+        think=False,
+        temperature=0.0,
+        max_tokens=64,
+    )
+    try:
+        resp = requests.post(f"{_url}/v1/chat/completions", json=payload, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        if log:
+            log(f"[gw_agent] reviewer-seat-probe: request failed: {exc}")
+        return {"outcome": "error", "served_model": None, "detail": str(exc)}
+
+    served_model = data.get("model")
+    choices = data.get("choices") or []
+    if not choices:
+        if log:
+            log("[gw_agent] reviewer-seat-probe: response had no choices")
+        return {"outcome": "error", "served_model": served_model, "detail": "no_choices"}
+
+    message = choices[0].get("message") or {}
+    tool_calls = message.get("tool_calls") or []
+    outcome = "tool_call" if tool_calls else "no_tool_call"
+    if log:
+        log(
+            f"[gw_agent] reviewer-seat-probe: outcome={outcome} "
+            f"served_model={served_model}"
+        )
+    return {"outcome": outcome, "served_model": served_model, "detail": None}
+
+
 def _post_step_with_bounded_retry(
     backend_url: str,
     payload: dict,
@@ -1653,14 +1782,13 @@ def _call_gw_agent_impl(
             # POST to the backend (GW or swarm) with current message state, with
             # bounded retry for transient failure classes (D1/D2) - never exceeds the
             # _per_step_timeout envelope above (recomputed per attempt/sleep inside).
-            _payload = {
-                **({} if model is None else {"model": model}),
-                "messages": messages,
-                "tools": list(tools.values()),
-                "tool_choice": "auto",
-                "temperature": 0.7,
-                **({} if _is_swarm else {"chat_template_kwargs": {"enable_thinking": think}}),
-            }
+            _payload = build_step_payload(
+                model=model,
+                messages=messages,
+                tools=tools,
+                is_swarm=_is_swarm,
+                think=think,
+            )
             data, _post_fail_reason = _post_step_with_bounded_retry(
                 backend_url, _payload, _now, _deadline, _conclusion_reserve_s, log, step_num,
             )

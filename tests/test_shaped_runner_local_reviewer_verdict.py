@@ -33,6 +33,9 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+_PROBE_OK = {"outcome": "tool_call", "served_model": "gravitywell-122b", "detail": None}
+
+
 def test_run_local_reviewer_returns_none_and_logs_reason(capsys):
     import agents_core.shaped_runner as sr
 
@@ -42,7 +45,10 @@ def test_run_local_reviewer_returns_none_and_logs_reason(capsys):
         kwargs["reason_out"].append("max_steps_exhausted")
         return None
 
-    with patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_call_gw_agent):
+    with (
+        patch("agents_core.gw_agent.probe_seat_tool_call", return_value=_PROBE_OK),
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_call_gw_agent),
+    ):
         result = sr._run_local_reviewer(spec, "/some/cwd")
 
     assert result is None, "must return None, not '' — '' silently becomes a fake success"
@@ -59,7 +65,10 @@ def test_run_local_reviewer_empty_reason_out_falls_back(capsys):
     def fake_call_gw_agent(**kwargs):
         return None  # reason_out left untouched
 
-    with patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_call_gw_agent):
+    with (
+        patch("agents_core.gw_agent.probe_seat_tool_call", return_value=_PROBE_OK),
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_call_gw_agent),
+    ):
         result = sr._run_local_reviewer(spec, "/some/cwd")
 
     assert result is None
@@ -77,7 +86,10 @@ def test_run_local_reviewer_happy_path_returns_verdict_text():
         assert "reason_out" in kwargs and kwargs["reason_out"] == []
         return '{"verdict": "clean"}'
 
-    with patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_call_gw_agent):
+    with (
+        patch("agents_core.gw_agent.probe_seat_tool_call", return_value=_PROBE_OK),
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_call_gw_agent),
+    ):
         result = sr._run_local_reviewer(spec, "/some/cwd")
 
     assert result == '{"verdict": "clean"}'
