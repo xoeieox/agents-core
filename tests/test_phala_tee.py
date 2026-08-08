@@ -13,6 +13,7 @@ integration test (skipped, not failed, when the credential is absent — same
 convention as tests/test_retrieval.py's `@pytest.mark.integration` real-
 backend test).
 """
+import json
 import os
 import time
 import unittest.mock as mock
@@ -253,17 +254,34 @@ def _build_aci1_report(*, e2ee_versions=None):
     return report, keyset_digest, service_priv
 
 
-def _passing_transcript(*, checks, keyset_digest=None, nonce=None, exit_code=0, verdict="VERIFIED"):
-    transcript = {
-        "verdict": verdict,
-        "checks": [{"id": cid, "status": status} for cid, status in checks],
-        "_exit_code": exit_code,
+def _transcript(*, checks, keyset_digest=None, nonce=None, exit_code=0, verified=True, failed=0):
+    """Build a transcript matching the REAL `aci --json` shape (Defect B):
+    exactly two top-level keys, `checks` and `verdict`. `verdict` carries
+    `workload_keyset_digest` (not top-level `keyset_digest`/
+    `workload_keyset_digest`), and there is no structured `nonce` field
+    anywhere — a `nonce` embeds into id-2's `detail` string instead, the
+    only place the real binary puts it
+    ('statement digest for nonce "<nonce>" matches report_data')."""
+    checks_list = []
+    for cid, status in checks:
+        detail = None
+        if cid == "id-2" and nonce is not None:
+            detail = f'statement digest for nonce "{nonce}" matches report_data'
+        checks_list.append({"id": cid, "status": status, "detail": detail})
+    verdict = {
+        "verified": verified,
+        "passed": sum(1 for _, s in checks if s == "pass"),
+        "failed": failed,
+        "skipped": sum(1 for _, s in checks if s == "skip"),
     }
     if keyset_digest is not None:
-        transcript["keyset_digest"] = keyset_digest
-    if nonce is not None:
-        transcript["nonce"] = nonce
-    return transcript
+        verdict["workload_keyset_digest"] = keyset_digest
+    return {"checks": checks_list, "verdict": verdict, "_exit_code": exit_code}
+
+
+# Old name kept as an alias so any external callers aren't broken by the
+# rename to `_transcript` (Defect B: the old name/shape encoded the bug).
+_passing_transcript = _transcript
 
 
 def _install_aci_cli_stub(monkeypatch, *, audit_transcript, verify_transcript):
@@ -288,13 +306,28 @@ def _install_aci_cli_stub(monkeypatch, *, audit_transcript, verify_transcript):
 
 
 def _default_transcripts(*, keyset_digest, nonce):
+    # exit_code=1 on the offline leg matches the REAL binary (Defect A):
+    # `aci audit` exits 1 whenever the verdict isn't VERIFIED, and an
+    # offline audit can never be VERIFIED (id-1/id-6 need online/live-TLS
+    # data an offline audit doesn't have — they're structurally always
+    # skipped here). Zero failed, all three required checks pass: this is
+    # the measured real-binary shape, and must still verify.
     audit = _passing_transcript(
-        checks=[("id-2", "pass"), ("id-3", "pass"), ("id-4", "pass")],
+        checks=[
+            ("id-1", "skip"), ("id-2", "pass"), ("id-3", "pass"),
+            ("id-4", "pass"), ("id-5", "skip"), ("id-6", "skip"),
+        ],
         keyset_digest=keyset_digest,
         nonce=nonce,
+        exit_code=1,
+        verified=False,
+        failed=0,
     )
     verify = _passing_transcript(
         checks=[("id-1", "pass"), ("id-5", "skip"), ("id-6", "pass")],
+        exit_code=0,
+        verified=False,  # id-5 skipped, not "pass" -> verdict.verified is False too
+        failed=0,
     )
     return audit, verify
 
@@ -419,20 +452,44 @@ def test_verify_report_binding_rejects_hostile_verifier_nonce_mismatch(monkeypat
     assert "aci_audit.nonce_binding" in failed
 
 
-def test_verify_report_binding_rejects_non_zero_exit_even_with_passing_checks(monkeypatch):
-    """DoD 3: a non-zero exit must raise, not pass, even if every declared
-    check in the transcript says pass — exit code is necessary, never
-    sufficient."""
+def test_verify_report_binding_accepts_non_zero_exit_when_required_checks_pass_and_none_failed(monkeypatch):
+    """Defect A: `aci audit` exits 1 whenever the verdict isn't VERIFIED,
+    and an offline audit can NEVER be VERIFIED (id-1/id-6 need online/
+    live-TLS data it structurally doesn't have). Gating must not use the
+    exit code — `_default_transcripts` already encodes exactly this shape
+    (audit exit=1, verdict.failed=0, id-2/3/4 pass), so this is really an
+    assertion that the happy path from `_default_transcripts` verifies,
+    named explicitly so the exit-code trap can't silently regress."""
     report, keyset_digest, _ = _build_aci1_report()
     nonce = "a" * 64
     audit, verify = _default_transcripts(keyset_digest=keyset_digest, nonce=nonce)
-    audit["_exit_code"] = 1
+    assert audit["_exit_code"] != 0  # sanity: this is the structurally-can't-pass leg
+    _install_aci_cli_stub(monkeypatch, audit_transcript=audit, verify_transcript=verify)
+
+    verification = phala_tee.verify_report_binding(report, nonce)
+    assert verification.ok is True
+
+
+@pytest.mark.parametrize("leg", ["audit", "verify"])
+def test_verify_report_binding_rejects_verdict_failed_nonzero_even_with_zero_exit(monkeypatch, leg):
+    """Defect A, the flip side: `verdict.failed > 0` must gate the result
+    even when the leg's own exit code is 0 — exit code is informational
+    only, never load-bearing in either direction."""
+    report, keyset_digest, _ = _build_aci1_report()
+    nonce = "a" * 64
+    audit, verify = _default_transcripts(keyset_digest=keyset_digest, nonce=nonce)
+    if leg == "audit":
+        audit["_exit_code"] = 0
+        audit["verdict"]["failed"] = 1
+    else:
+        verify["_exit_code"] = 0
+        verify["verdict"]["failed"] = 1
     _install_aci_cli_stub(monkeypatch, audit_transcript=audit, verify_transcript=verify)
 
     verification = phala_tee.verify_report_binding(report, nonce)
     assert verification.ok is False
     failed = {c.name for c in verification.checks if not c.ok}
-    assert "aci_audit.exit_code" in failed
+    assert f"aci_{leg}.no_failed_checks" in failed
 
 
 def test_require_verified_report_binding_raises_on_failure(monkeypatch):
@@ -479,6 +536,26 @@ def test_verify_report_binding_never_caches_the_nonce_bound_audit_leg(monkeypatc
     assert v2.ok is False
     failed = {c.name for c in v2.checks if not c.ok}
     assert "aci_audit.nonce_binding" in failed
+
+
+@pytest.mark.parametrize("loopback_url", ["http://127.0.0.1:4180", "http://localhost:4180", "http://[::1]:4180"])
+def test_verify_report_binding_refuses_loopback_verification_target(monkeypatch, loopback_url):
+    """Defect C: a verification target resolving to loopback must be
+    refused fail-closed, naming both settings — verifying the local
+    traffic-routing hop instead of the real upstream is the exact
+    misconfiguration that made id-6 fail to bind (plain HTTP, no TLS
+    handshake to bind to)."""
+    report, keyset_digest, _ = _build_aci1_report()
+    nonce = "a" * 64
+    audit, verify = _default_transcripts(keyset_digest=keyset_digest, nonce=nonce)
+    calls = _install_aci_cli_stub(monkeypatch, audit_transcript=audit, verify_transcript=verify)
+
+    with pytest.raises(phala_tee.LoopbackVerificationTargetError) as excinfo:
+        phala_tee.verify_report_binding(report, nonce, base_url=loopback_url)
+    assert "PHALA_BASE_URL" in str(excinfo.value)
+    assert phala_tee.PHALA_VERIFY_TARGET_ENV in str(excinfo.value)
+    # Must fail before ever shelling out to either leg.
+    assert calls == {"audit": 0, "verify": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +697,62 @@ def test_real_binary_rejects_the_old_broken_stdin_audit_argv(tmp_path):
     assert _is_clap_usage_error(proc.returncode, stderr_text), (
         f"expected the old stdin-form argv to fail clap argument parsing, "
         f"got exit {proc.returncode}, stderr: {stderr_text!r}"
+    )
+
+
+def test_real_binary_audit_transcript_shape_matches_what_module_reads(tmp_path):
+    """Defect D: the argv contract tests above prove the CLI *accepts* our
+    arguments; they say nothing about the *shape* of what it hands back.
+    That gap is exactly what shipped Defect B (this module read
+    `keyset_digest`/`workload_keyset_digest`/`nonce` at the top level and a
+    structured nonce field that never existed). Capture a REAL transcript
+    from the real binary — never a hand-written fixture asserting our own
+    assumptions, which would just reproduce the bug this test exists to
+    catch — and assert every field `verify_report_binding` actually reads
+    is present where it reads it."""
+    binary = _resolve_real_aci_binary()
+    report, _keyset_digest, _ = _build_aci1_report()
+    nonce = "a" * 64
+    report_path = tmp_path / "report.json"
+    report_path.write_text(json.dumps(report))
+
+    proc = _subprocess_mod.run(
+        [binary, "audit", "--report", str(report_path), "--nonce", nonce, "--json"],
+        capture_output=True, timeout=30.0,
+    )
+    stderr_text = proc.stderr.decode("utf-8", errors="replace")
+    assert not _is_clap_usage_error(proc.returncode, stderr_text), (
+        f"real `aci audit` argv rejected as a usage error (exit "
+        f"{proc.returncode}): {stderr_text!r}"
+    )
+    transcript = json.loads(proc.stdout.decode("utf-8"))
+
+    # Top-level shape: exactly what the code destructures.
+    assert set(transcript.keys()) == {"checks", "verdict"}, (
+        f"real transcript top-level keys {sorted(transcript.keys())} != "
+        f"{{'checks', 'verdict'}} — this module's field reads must be updated"
+    )
+
+    verdict = transcript["verdict"]
+    assert isinstance(verdict, dict)
+    assert "failed" in verdict, "verdict.failed is what gating reads (Defect A)"
+    assert isinstance(verdict["failed"], int)
+    assert "workload_keyset_digest" in verdict, (
+        "verdict.workload_keyset_digest is what the digest-binding check reads (Defect B)"
+    )
+
+    checks = transcript["checks"]
+    assert isinstance(checks, list) and checks
+    for entry in checks:
+        assert "id" in entry and "status" in entry and "detail" in entry, (
+            f"check entry missing id/status/detail: {entry!r}"
+        )
+
+    id2 = next((c for c in checks if c.get("id") == "id-2"), None)
+    assert id2 is not None, "id-2 (nonce binding statement) must be present in the audit transcript"
+    assert isinstance(id2.get("detail"), str) and nonce in id2["detail"], (
+        f"expected nonce {nonce!r} inside id-2's detail, got {id2.get('detail')!r} — "
+        f"this is the only place the audited nonce is exposed (Defect B)"
     )
 
 
@@ -800,6 +933,53 @@ def test_phala_tee_client_default_timeout_matches_other_deliberation_adapters():
 def test_phala_tee_client_timeout_remains_caller_overridable():
     client = phala_tee.PhalaTeeClient(timeout=45.0)
     assert client._timeout == 45.0
+
+
+# ---------------------------------------------------------------------------
+# PhalaTeeClient verify_target / PHALA_BASE_URL split (Defect C).
+# ---------------------------------------------------------------------------
+
+
+def test_phala_tee_client_verify_target_defaults_to_default_base_url():
+    """The verification target must default to the real upstream, distinct
+    from base_url, even when base_url is pinned to the loopback hop."""
+    client = phala_tee.PhalaTeeClient(base_url="http://127.0.0.1:4180")
+    assert client._base_url == "http://127.0.0.1:4180"
+    assert client._verify_target == phala_tee.DEFAULT_BASE_URL
+
+
+def test_phala_tee_client_verify_target_env_fallback(monkeypatch):
+    monkeypatch.setenv(phala_tee.PHALA_VERIFY_TARGET_ENV, "https://verify.example.com")
+    client = phala_tee.PhalaTeeClient()
+    assert client._verify_target == "https://verify.example.com"
+
+
+def test_phala_tee_client_verify_target_explicit_arg_wins_over_env(monkeypatch):
+    monkeypatch.setenv(phala_tee.PHALA_VERIFY_TARGET_ENV, "https://from-env.example.com")
+    client = phala_tee.PhalaTeeClient(verify_target="https://from-arg.example.com")
+    assert client._verify_target == "https://from-arg.example.com"
+
+
+def test_chat_completion_passes_verify_target_not_base_url_to_report_binding(monkeypatch):
+    """The online verify leg must audit the verification target, never the
+    loopback traffic route — this is the exact split Defect C fixes."""
+    session, _resp = _stub_chat_completion_deps(
+        monkeypatch, capabilities={"supported_e2ee_versions": [], "serving": "aggregator"}
+    )
+    client = phala_tee.PhalaTeeClient(
+        session=session, base_url="http://127.0.0.1:4180", verify_target="https://real.example.com",
+    )
+
+    captured = {}
+
+    def spy_require_verified(report, nonce, base_url=None):
+        captured["base_url"] = base_url
+        return mock.MagicMock(ok=True, workload_keyset_digest="deadbeef", custody_skipped=True)
+
+    monkeypatch.setattr(phala_tee, "require_verified_report_binding", spy_require_verified)
+
+    client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m")
+    assert captured["base_url"] == "https://real.example.com"
 
 
 def test_phala_tee_client_default_nonce_is_64_hex_chars(monkeypatch):

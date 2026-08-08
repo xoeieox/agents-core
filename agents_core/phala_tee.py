@@ -99,6 +99,14 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from agents_core import locality
 
 DEFAULT_BASE_URL = "https://inference.phala.com"
+# The traffic route (PHALA_BASE_URL) and the verification target
+# (PHALA_VERIFY_TARGET) are different concepts and must never be confused —
+# see PlaintextChannelNotLoopbackError vs LoopbackVerificationTargetError.
+# PHALA_BASE_URL points client traffic at the loopback aci-serve verifying
+# hop; PHALA_VERIFY_TARGET is what the online `aci verify` leg audits, and
+# defaults to the real upstream so the online leg verifies Phala's actual
+# TLS-terminating service, not the hop.
+PHALA_VERIFY_TARGET_ENV = "PHALA_VERIFY_TARGET"
 E2EE_ALGO = "x25519-aes-256-gcm-hkdf-sha256"
 _HKDF_INFO = b"aci.e2ee.v2.x25519"
 # The e2ee version string this module's sealing code implements, matched
@@ -235,6 +243,28 @@ class PlaintextChannelNotLoopbackError(AciError):
     a local, attestation-verifying hop (see ``systemd/aci-serve.service``) —
     this is the invariant that keeps the seat honest under aci/1's
     channel-binding confidentiality model."""
+
+
+class LoopbackVerificationTargetError(AciError):
+    """Raised when the online `aci verify` leg's target resolves to
+    loopback. ``PHALA_BASE_URL`` (the traffic route) and the verification
+    target are different concepts that must never be confused: traffic is
+    meant to flow through the loopback verifying hop, but the thing that
+    gets *verified* must be the real upstream, or the online leg ends up
+    checking the hop's own plain-HTTP loopback listener instead of Phala's
+    TLS-terminating service (id-6 can never bind over plain HTTP). Fail
+    closed here rather than let that surface as a confusing id-6 failure."""
+
+    def __init__(self, verify_target: str):
+        super().__init__(
+            f"verification target {verify_target!r} resolves to loopback — "
+            f"refusing to verify the local traffic hop instead of the real "
+            f"upstream. PHALA_BASE_URL routes traffic through the loopback "
+            f"verifying hop (correct, leave it); {PHALA_VERIFY_TARGET_ENV} "
+            f"(default {DEFAULT_BASE_URL!r}) is what gets verified and must "
+            f"point at the real service."
+        )
+        self.verify_target = verify_target
 
 
 class ReasoningContentDecryptionError(AciError):
@@ -495,6 +525,45 @@ def _is_loopback_url(url: str) -> bool:
     return hostname in ("127.0.0.1", "::1", "localhost")
 
 
+def _normalize_keyset_digest(value: str | None) -> str | None:
+    """Strip an optional ``sha256:`` prefix so the transcript's claimed
+    digest and our independently recomputed one (``compute_keyset_digest``,
+    always ``sha256:``-prefixed) compare on the same representation
+    regardless of whether the transcript's value carries the prefix."""
+    if value is None:
+        return None
+    prefix = "sha256:"
+    return value[len(prefix):] if value.startswith(prefix) else value
+
+
+def _verdict_failed_count(transcript: dict) -> int | None:
+    """`verdict.failed` from a transcript's top-level `verdict` object, or
+    None if the transcript doesn't have the shape we expect — treated as
+    "not zero" (fails closed) by the caller, never as a pass."""
+    verdict = transcript.get("verdict")
+    if not isinstance(verdict, dict):
+        return None
+    return verdict.get("failed")
+
+
+def _nonce_in_id2_detail(audit_transcript: dict, nonce: str) -> bool:
+    """The transcript exposes no structured nonce field — the only place the
+    audited nonce appears is inside id-2's `detail` string ('statement
+    digest for nonce "<nonce>" matches report_data'). String-level because
+    the transcript exposes no structured field; a future verifier build
+    that adds one is an obvious upgrade over this, not a rediscovery of the
+    check. Absence (missing id-2, missing detail, or nonce not present) is
+    False — a failure, never a pass-by-default."""
+    checks_list = audit_transcript.get("checks")
+    if not isinstance(checks_list, list):
+        return False
+    for entry in checks_list:
+        if isinstance(entry, dict) and entry.get("id") == "id-2":
+            detail = entry.get("detail")
+            return isinstance(detail, str) and nonce in detail
+    return False
+
+
 def verify_report_binding(
     report: dict, nonce: str, *, now: int | None = None, base_url: str = DEFAULT_BASE_URL
 ) -> ReportVerification:
@@ -503,8 +572,21 @@ def verify_report_binding(
     for why this module no longer hand-rolls TDX quote parsing or reads the
     fields aci/1 dropped.
 
+    `base_url` means "the thing to verify" — pass the verification target
+    (e.g. `PhalaTeeClient`'s `PHALA_VERIFY_TARGET`, default
+    `https://inference.phala.com`), never the traffic route
+    (`PHALA_BASE_URL`, which stays pinned to the loopback verifying hop). A
+    `base_url` that resolves to loopback is refused outright
+    (`LoopbackVerificationTargetError`) — verifying the local hop instead of
+    the real upstream is exactly the misconfiguration that made id-6 fail
+    to bind.
+
     Two legs, both fail-closed, both gated on PER-CHECK transcript status
-    (never on the exit code alone):
+    and `verdict.failed == 0` (never on the exit code alone — an offline
+    `aci audit` exits 1 whenever the verdict isn't VERIFIED, which is
+    *every* offline audit, since id-1/id-6 are structurally always skipped
+    without a live/online channel; exit code is kept as informational-only
+    detail, never used to gate):
 
     - offline `aci audit` over the exact report bytes + fresh `nonce`, run
       on EVERY call, never cached (nonce-bound). Required: id-2 (binding
@@ -515,25 +597,31 @@ def verify_report_binding(
       root), id-6 (channel binding to the attested keyset).
 
     Beyond the per-check status, this also independently recomputes
-    `workload_keyset_digest` and compares it — plus the nonce — against what
-    the verifier transcript itself claims to have audited. A verifier that
-    reports VERIFIED/exit-0/all-required-pass but audited a different digest
-    or nonce than what was actually asked for is refused: the malicious/
-    hostile-verifier case this defends against (Facets `trickster`,
-    2026-08-08).
+    `workload_keyset_digest` and compares it (normalizing the `sha256:`
+    prefix explicitly) against `verdict.workload_keyset_digest` — plus
+    asserts `nonce` appears in id-2's `detail` string, the only place the
+    audited nonce is exposed — against what the verifier transcript itself
+    claims to have audited. A verifier that reports VERIFIED/all-required-
+    pass/zero-failed but audited a different digest or nonce than what was
+    actually asked for is refused: the malicious/hostile-verifier case this
+    defends against (Facets `trickster`, 2026-08-08).
 
     id-5 (private-key custody) is the sole permitted skip against the
     current vendored verifier build — never required, never silently
     absorbed; see `ReportVerification.custody_skipped`.
 
-    Raises `AciVerifierNotFoundError` / `AciVerifierTimeoutError` /
-    `AciVerifierProtocolError` for toolchain faults ("the verifier didn't
+    Raises `LoopbackVerificationTargetError` if `base_url` resolves to
+    loopback. Raises `AciVerifierNotFoundError` / `AciVerifierTimeoutError`
+    / `AciVerifierProtocolError` for toolchain faults ("the verifier didn't
     run") — distinguishable from a report that ran through it and failed
     (reported as `ok=False` in the returned `Check`s here; use
     `require_verified_report_binding` to raise `ReportVerificationError` on
     that). Never degrades to an unverified pass for any of these.
     """
     del now  # kept for call-site compatibility; freshness is the verifier's job (id-3).
+
+    if _is_loopback_url(base_url):
+        raise LoopbackVerificationTargetError(base_url)
 
     attestation = report["attestation"]
     keyset = attestation["workload_keyset"]
@@ -544,14 +632,44 @@ def verify_report_binding(
     # --- offline leg: aci audit — nonce-bound, run fresh every call, never cached.
     audit_transcript = _run_aci_audit(report, nonce)
     audit_statuses = _check_statuses(audit_transcript, leg="audit")
-    checks.append(Check("aci_audit.exit_code", audit_transcript.get("_exit_code") == 0,
-                         f"exit={audit_transcript.get('_exit_code')}"))
 
-    transcript_digest = (
-        audit_transcript.get("keyset_digest") or audit_transcript.get("workload_keyset_digest")
-    )
-    checks.append(_check_equal("aci_audit.keyset_digest_binding", transcript_digest, workload_keyset_digest))
-    checks.append(_check_equal("aci_audit.nonce_binding", audit_transcript.get("nonce"), nonce))
+    # Structural gate: no check failed outright, on this leg. An offline
+    # audit's exit code cannot be used for this — `aci audit` exits 1
+    # whenever the verdict is not VERIFIED, and an offline audit can never
+    # be VERIFIED (id-1/id-6 need online/live-TLS data it doesn't have, so
+    # they're always skipped here). The exit code is kept visible in the
+    # detail string as informational only; it never gates.
+    audit_failed = _verdict_failed_count(audit_transcript)
+    checks.append(Check(
+        "aci_audit.no_failed_checks",
+        audit_failed == 0,
+        f"verdict.failed={audit_failed!r} (aci audit exit={audit_transcript.get('_exit_code')}, informational)",
+    ))
+
+    # Hostile-verifier defence (Facets `trickster`, 2026-08-08): a verifier
+    # reporting all-required-pass while having audited a *different* digest
+    # or nonce than the one asked for must be refused. Read from
+    # verdict.workload_keyset_digest (top-level keyset_digest/
+    # workload_keyset_digest do not exist in the real transcript shape).
+    # The transcript's digest and our recomputed one are both
+    # sha256:-prefixed; normalize explicitly rather than substring-matching.
+    audit_verdict = audit_transcript.get("verdict")
+    raw_digest = audit_verdict.get("workload_keyset_digest") if isinstance(audit_verdict, dict) else None
+    checks.append(_check_equal(
+        "aci_audit.keyset_digest_binding",
+        _normalize_keyset_digest(raw_digest),
+        _normalize_keyset_digest(workload_keyset_digest),
+    ))
+
+    # There is no structured nonce field in the transcript — the audited
+    # nonce only appears inside id-2's `detail` string. String-level
+    # because the transcript exposes no structured field (see
+    # _nonce_in_id2_detail); absence is a failure, never a pass-by-default.
+    nonce_present = _nonce_in_id2_detail(audit_transcript, nonce)
+    checks.append(Check(
+        "aci_audit.nonce_binding", nonce_present,
+        None if nonce_present else f"nonce {nonce!r} not found in id-2 detail",
+    ))
 
     for check_id in _AUDIT_REQUIRED_CHECKS:
         status = audit_statuses.get(check_id)
@@ -560,8 +678,15 @@ def verify_report_binding(
     # --- online leg: aci verify — nonce-independent, cached per keyset digest.
     verify_transcript = _run_aci_verify_online(base_url, workload_keyset_digest=workload_keyset_digest)
     verify_statuses = _check_statuses(verify_transcript, leg="verify")
-    checks.append(Check("aci_verify.exit_code", verify_transcript.get("_exit_code") == 0,
-                         f"exit={verify_transcript.get('_exit_code')}"))
+
+    # Same structural gate as the offline leg: no check failed outright.
+    # Exit code stays visible in the detail string, informational only.
+    verify_failed = _verdict_failed_count(verify_transcript)
+    checks.append(Check(
+        "aci_verify.no_failed_checks",
+        verify_failed == 0,
+        f"verdict.failed={verify_failed!r} (aci verify exit={verify_transcript.get('_exit_code')}, informational)",
+    ))
 
     for check_id in _VERIFY_REQUIRED_CHECKS:
         status = verify_statuses.get(check_id)
@@ -830,6 +955,7 @@ class PhalaTeeClient:
         *,
         api_key: str | None = None,
         base_url: str | None = None,
+        verify_target: str | None = None,
         session: requests.Session | None = None,
         # Raised from 30.0 to match the other deliberation adapters (LlamaAdapter
         # 300s, GravityWellAdapter 300s) — caller-overridable, unchanged contract.
@@ -837,10 +963,20 @@ class PhalaTeeClient:
     ):
         self._api_key = api_key or os.environ.get("PHALA_API_KEY")
         # PHALA_BASE_URL (Piece 3b, agents-core-phala-aci1-restoration-v0):
-        # points this client at the loopback aci-serve verifying hop instead
-        # of directly at inference.phala.com — same os.environ fallback
-        # pattern as PHALA_API_KEY above, explicit arg always wins.
+        # points this client's TRAFFIC at the loopback aci-serve verifying
+        # hop instead of directly at inference.phala.com — same os.environ
+        # fallback pattern as PHALA_API_KEY above, explicit arg always wins.
         self._base_url = (base_url or os.environ.get("PHALA_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
+        # PHALA_VERIFY_TARGET is a distinct concept from PHALA_BASE_URL: what
+        # the online `aci verify` leg audits, NOT where traffic is routed.
+        # Defaults to the real upstream (Erah 2026-08-08: "split the config
+        # — verify the upstream, route through the hop"), so the online leg
+        # verifies Phala's actual TLS-terminating service rather than the
+        # loopback hop it can never TLS-handshake with. Same env-fallback
+        # pattern, explicit arg always wins.
+        self._verify_target = (
+            verify_target or os.environ.get(PHALA_VERIFY_TARGET_ENV) or DEFAULT_BASE_URL
+        ).rstrip("/")
         self._session = session or requests.Session()
         self._timeout = timeout
 
@@ -884,7 +1020,11 @@ class PhalaTeeClient:
             nonce = os.urandom(32).hex()  # aci/1 requires 64 hex chars (32 bytes).
 
         report = self.fetch_attestation(nonce=nonce)
-        verification = require_verified_report_binding(report, nonce, base_url=self._base_url)
+        # verify_report_binding's base_url means "the thing to verify" —
+        # pass the verification target, not the traffic route: self._base_url
+        # is pinned to the loopback aci-serve hop and can never TLS-handshake
+        # (id-6 needs a live TLS channel to the real service).
+        verification = require_verified_report_binding(report, nonce, base_url=self._verify_target)
 
         capabilities = report.get("service_capabilities") or {}
         supported_versions = capabilities.get("supported_e2ee_versions") or []
