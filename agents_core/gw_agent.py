@@ -1534,6 +1534,7 @@ def _call_gw_agent_impl(
     handler_hook: Callable[[dict], dict] | None = None,
     handler_objective: str = "",
     handler_max_interventions: int = 2,
+    skip_probe: bool = False,
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Run a multi-step read-only tool-loop on GravityWell.
 
@@ -1604,8 +1605,14 @@ def _call_gw_agent_impl(
                     GW_REASON_* / GW_TRANSIENT_REASONS - that retry up to GW_STEP_MAX_RETRIES times within
                     the per-step timeout envelope before landing here), "no_choices",
                     "grounding_failed", "budget_exhausted", "max_steps_exhausted",
-                    "interrupted". Left untouched on a genuinely successful (non-empty) result.
-                    Stays empty/unpopulated for `writeable=True` calls regardless of cause. Pure
+                    "interrupted". Left untouched on a genuinely successful (non-empty) result,
+                    with one deliberate exception: "grounded_after_perturbation" is appended
+                    on a successful (non-empty) result that only grounded after the grounding
+                    guard's tool-order perturbation retry engaged (agents-core-gw-agent-
+                    grounding-retry-parity-v0, skip_probe=False) - a caller counting on
+                    "untouched reason_out == no retry happened" needs this one visible, since
+                    a silent recovery here is exactly the invisibility this remedy exists to
+                    fix. Stays empty/unpopulated for `writeable=True` calls regardless of cause. Pure
                     side channel - does not change the return type. When None (default), never
                     touched.
         served_model_out: Optional list. When provided, the top-level "model" field echoed by
@@ -1653,6 +1660,20 @@ def _call_gw_agent_impl(
                                    path and the existing hard-abort stands - the Handler
                                    can never create an infinite supervision loop. Ignored
                                    when handler_hook is None.
+        skip_probe: If True, the grounding guard's second-ungrounded-stop retry (below)
+                    stands down and returns "grounding_failed" immediately, exactly like
+                    before this parameter existed (agents-core-gw-agent-grounding-retry-
+                    parity-v0, DoD-5). Set this when the caller already probed the seat's
+                    tool-calling ability itself (shaped_runner.py's _run_local_reviewer
+                    calls probe_seat_tool_call before this function) — engaging both would
+                    double the model calls on the hottest dispatch route in the system.
+                    When False (default), a run that reaches the second ungrounded stop
+                    (json_mode, not writeable, zero verified tool calls) retries with a
+                    perturbed tool order via perturb_tool_order() instead of giving up,
+                    capped at PROBE_DEFAULT_ATTEMPTS total tool-order variants — the same
+                    remedy shaped_runner already applies externally via probe_seat_tool_
+                    call, now reachable by every other call_gw_agent consumer. A run whose
+                    first step makes a tool call never engages this path (lazy, not eager).
 
     Returns:
         - str or None (or (str|None, list) when return_transcript=True).
@@ -1732,6 +1753,12 @@ def _call_gw_agent_impl(
     # Grounding guard state (json_mode review runs): track verified (error-free) tool calls.
     grounding_count = 0  # tool calls with error is None
     grounding_nudged = False  # True after the first 0-tool-call stop nudge
+    # Grounding-retry-parity state (agents-core-gw-agent-grounding-retry-parity-v0):
+    # 0 = still on the native tool order; > 0 = this many perturb_tool_order() variants
+    # tried so far. _restart_for_perturbation signals the step loop below to re-enter
+    # with a fresh conversation and the next variant instead of returning grounding_failed.
+    _grounding_perturb_attempt = 0
+    _restart_for_perturbation = False
     # Interrupt state: set by cancel_check or before_tool stop.
     _interrupted = False
     _interrupt_reason = ""
@@ -1821,498 +1848,564 @@ def _call_gw_agent_impl(
         _avg_step_s = 18.0  # seed before any step completes (typical 122B latency)
         _step_times: list[float] = []
         _step_start: float | None = None
+        # Base tool set for grounding-retry perturbation (agents-core-gw-agent-grounding-
+        # retry-parity-v0) — `tools` itself is reassigned to a perturbed variant on retry,
+        # so the native mapping must be captured once, up front, to perturb from.
+        _original_tools = tools
 
-        for step_num in range(max_steps):
-            # Update rolling avg using the wall-clock of the just-completed step (if any).
-            _now = time.monotonic()
-            if _step_start is not None:
-                _step_times.append(_now - _step_start)
-                _avg_step_s = sum(_step_times) / len(_step_times)
-            _step_start = _now
+        while True:
+            for step_num in range(max_steps):
+                # Update rolling avg using the wall-clock of the just-completed step (if any).
+                _now = time.monotonic()
+                if _step_start is not None:
+                    _step_times.append(_now - _step_start)
+                    _avg_step_s = sum(_step_times) / len(_step_times)
+                _step_start = _now
 
-            # Pre-step budget check: stop exploring if too close to the deadline to
-            # fit another step AND still have time for a forced-conclusion call.
-            #
-            # First-step guarantee: at step_num == 0 no real step has run yet, so
-            # _avg_step_s is only a seed (18s). The seeded 2*_avg_step_s reserve term
-            # can spuriously exceed a modest timeout (e.g. 36s > a 10s timeout),
-            # force-concluding at step 0 with ZERO real work — a conclusion from the
-            # prompt alone. So at step 0 we use only the real proportional reserve
-            # (0.20*timeout) and ignore the unvalidated seed term; steps >= 1 use the
-            # full reserve once _avg_step_s reflects measured latency. A genuine
-            # deadline breach at step 0 (little/no wall-clock left) still force-
-            # concludes below, salvaging a partial via the 20s-floored conclusion call.
-            _conclusion_reserve_s = max(2.0 * _avg_step_s, 0.20 * timeout)
-            _effective_reserve_s = (
-                0.20 * timeout if step_num == 0 else _conclusion_reserve_s
-            )
-            if _deadline - _now <= _effective_reserve_s:
-                if log:
-                    log(
-                        f"[gw_agent] budget deadline approaching at step {step_num + 1}: "
-                        f"{_deadline - _now:.1f}s remaining, reserve={_effective_reserve_s:.1f}s — "
-                        "forcing conclusion"
+                # Pre-step budget check: stop exploring if too close to the deadline to
+                # fit another step AND still have time for a forced-conclusion call.
+                #
+                # First-step guarantee: at step_num == 0 no real step has run yet, so
+                # _avg_step_s is only a seed (18s). The seeded 2*_avg_step_s reserve term
+                # can spuriously exceed a modest timeout (e.g. 36s > a 10s timeout),
+                # force-concluding at step 0 with ZERO real work — a conclusion from the
+                # prompt alone. So at step 0 we use only the real proportional reserve
+                # (0.20*timeout) and ignore the unvalidated seed term; steps >= 1 use the
+                # full reserve once _avg_step_s reflects measured latency. A genuine
+                # deadline breach at step 0 (little/no wall-clock left) still force-
+                # concludes below, salvaging a partial via the 20s-floored conclusion call.
+                _conclusion_reserve_s = max(2.0 * _avg_step_s, 0.20 * timeout)
+                _effective_reserve_s = (
+                    0.20 * timeout if step_num == 0 else _conclusion_reserve_s
+                )
+                if _deadline - _now <= _effective_reserve_s:
+                    if log:
+                        log(
+                            f"[gw_agent] budget deadline approaching at step {step_num + 1}: "
+                            f"{_deadline - _now:.1f}s remaining, reserve={_effective_reserve_s:.1f}s — "
+                            "forcing conclusion"
+                        )
+                    _elapsed = _now - _loop_start
+                    _budget_suffix = (
+                        f"[gw_agent: budget-forced conclusion at step {step_num + 1}/"
+                        f"elapsed {_elapsed:.0f}s]"
                     )
-                _elapsed = _now - _loop_start
-                _budget_suffix = (
-                    f"[gw_agent: budget-forced conclusion at step {step_num + 1}/"
-                    f"elapsed {_elapsed:.0f}s]"
-                )
-                _fc_timeout = max(20.0, _deadline - _now)
-                _forced_content = _force_conclusion(
-                    messages, backend_url, timeout, json_mode, log, _is_swarm,
-                    call_timeout=_fc_timeout, partial=True,
-                    served_model_out=served_model_out,
-                    model=model,
-                )
-                if _forced_content:
+                    _fc_timeout = max(20.0, _deadline - _now)
+                    _forced_content = _force_conclusion(
+                        messages, backend_url, timeout, json_mode, log, _is_swarm,
+                        call_timeout=_fc_timeout, partial=True,
+                        served_model_out=served_model_out,
+                        model=model,
+                    )
+                    if _forced_content:
+                        return _finalize_writeable_or_readonly(
+                            messages, _forced_content, return_transcript, transcript,
+                            writeable, cwd, concluded=False,
+                            budget_forced=True,
+                            budget_forced_suffix=_budget_suffix,
+                            reason_out=reason_out,
+                        )
                     return _finalize_writeable_or_readonly(
-                        messages, _forced_content, return_transcript, transcript,
+                        messages, "", return_transcript, transcript,
                         writeable, cwd, concluded=False,
                         budget_forced=True,
                         budget_forced_suffix=_budget_suffix,
                         reason_out=reason_out,
                     )
-                return _finalize_writeable_or_readonly(
-                    messages, "", return_transcript, transcript,
-                    writeable, cwd, concluded=False,
-                    budget_forced=True,
-                    budget_forced_suffix=_budget_suffix,
-                    reason_out=reason_out,
-                )
 
-            if log:
-                log(f"[gw_agent] step {step_num + 1}/{max_steps}")
-            step_made_progress = False
-
-            # Step-top cancel check (fail-safe: raising halts the loop)
-            if cancel_check is not None:
-                try:
-                    if cancel_check():
-                        _interrupted = True
-                        _interrupt_reason = "user_cancel"
-                        _interrupted_step = step_num + 1
-                except Exception as _cc_exc:
-                    logger.error(f"[gw_agent] cancel_check raised at step top: {_cc_exc}")
-                    _interrupted = True
-                    _interrupt_reason = "cancel_check_failed"
-                    _interrupted_step = step_num + 1
-                if _interrupted:
-                    break
-
-            # Per-step timeout envelope: leave headroom for the forced-conclusion model
-            # call. Never cap below 20s (a legitimate slow step on a loaded 122B can
-            # take minutes). _post_step_with_bounded_retry recomputes this same
-            # (deadline - conclusion_reserve) bound before every attempt/sleep below.
-            #
-            # POST to the backend (GW or swarm) with current message state, with
-            # bounded retry for transient failure classes (D1/D2) - never exceeds the
-            # _per_step_timeout envelope above (recomputed per attempt/sleep inside).
-            _payload = build_step_payload(
-                model=model,
-                messages=messages,
-                tools=tools,
-                is_swarm=_is_swarm,
-                think=think,
-            )
-            data, _post_fail_reason = _post_step_with_bounded_retry(
-                backend_url, _payload, _now, _deadline, _conclusion_reserve_s, log, step_num,
-            )
-            if data is None:
                 if log:
-                    log(f"[gw_agent] GW request failed: {_post_fail_reason}")
-                # Return best-effort content accumulated so far
-                return _finalize_writeable_or_readonly(
-                    messages, "", return_transcript, transcript, writeable, cwd, concluded=False,
-                    reason_out=reason_out, reason=_post_fail_reason,
-                )
-            if served_model_out is not None and "model" in data and data["model"] is not None:
-                served_model_out.append(data["model"])
+                    log(f"[gw_agent] step {step_num + 1}/{max_steps}")
+                step_made_progress = False
 
-            # Extract response.
-            if "choices" not in data or not data["choices"]:
-                if log:
-                    log(f"[gw_agent] GW returned no choices")
-                return _finalize_writeable_or_readonly(
-                    messages, "", return_transcript, transcript, writeable, cwd, concluded=False,
-                    reason_out=reason_out, reason=GW_REASON_NO_CHOICES,
-                )
-
-            choice = data["choices"][0]
-            assistant_message = choice.get("message", {})
-            content = assistant_message.get("content") or ""
-            tool_calls_list = assistant_message.get("tool_calls") or []
-            finish_reason = choice.get("finish_reason", "")
-
-            # Update context token count.
-            if "usage" in data:
-                ctx_tokens = data["usage"].get("total_tokens", ctx_tokens)
-            else:
-                ctx_tokens = len(json.dumps(messages)) // 4
-
-            # Append assistant message (with content + tool_calls reference).
-            messages.append({"role": "assistant", "content": content, "tool_calls": tool_calls_list})
-
-            # Precedence: tool_calls > content.
-            if tool_calls_list:
-                for tool_call in tool_calls_list:
-                    tool_call_id = tool_call.get("id", f"call_{step_num}_{len(transcript)}")
-                    tool_name = tool_call.get("function", {}).get("name", "")
-                    tool_args_str = tool_call.get("function", {}).get("arguments", "{}")
-
-                    # Parse tool arguments.
+                # Step-top cancel check (fail-safe: raising halts the loop)
+                if cancel_check is not None:
                     try:
-                        if isinstance(tool_args_str, str):
-                            tool_args = json.loads(tool_args_str)
-                        else:
-                            tool_args = tool_args_str
-                    except json.JSONDecodeError:
-                        tool_args = {}
+                        if cancel_check():
+                            _interrupted = True
+                            _interrupt_reason = "user_cancel"
+                            _interrupted_step = step_num + 1
+                    except Exception as _cc_exc:
+                        logger.error(f"[gw_agent] cancel_check raised at step top: {_cc_exc}")
+                        _interrupted = True
+                        _interrupt_reason = "cancel_check_failed"
+                        _interrupted_step = step_num + 1
+                    if _interrupted:
+                        break
 
-                    # Check for repeated calls (no-progress detection).
-                    call_sig = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
-                    repeated_calls[call_sig] = repeated_calls.get(call_sig, 0) + 1
+                # Per-step timeout envelope: leave headroom for the forced-conclusion model
+                # call. Never cap below 20s (a legitimate slow step on a loaded 122B can
+                # take minutes). _post_step_with_bounded_retry recomputes this same
+                # (deadline - conclusion_reserve) bound before every attempt/sleep below.
+                #
+                # POST to the backend (GW or swarm) with current message state, with
+                # bounded retry for transient failure classes (D1/D2) - never exceeds the
+                # _per_step_timeout envelope above (recomputed per attempt/sleep inside).
+                _payload = build_step_payload(
+                    model=model,
+                    messages=messages,
+                    tools=tools,
+                    is_swarm=_is_swarm,
+                    think=think,
+                )
+                data, _post_fail_reason = _post_step_with_bounded_retry(
+                    backend_url, _payload, _now, _deadline, _conclusion_reserve_s, log, step_num,
+                )
+                if data is None:
+                    if log:
+                        log(f"[gw_agent] GW request failed: {_post_fail_reason}")
+                    # Return best-effort content accumulated so far
+                    return _finalize_writeable_or_readonly(
+                        messages, "", return_transcript, transcript, writeable, cwd, concluded=False,
+                        reason_out=reason_out, reason=_post_fail_reason,
+                    )
+                if served_model_out is not None and "model" in data and data["model"] is not None:
+                    served_model_out.append(data["model"])
 
-                    if repeated_calls[call_sig] == 3:
-                        # Nudge once.
-                        if log:
-                            log(f"[gw_agent] repeated call detected (3x): {tool_name}")
-                        nudge_msg = f"You already ran '{tool_name}' with those arguments. Conclude or try something else."
-                        messages.append({"role": "user", "content": nudge_msg})
-                    elif repeated_calls[call_sig] >= 4:
-                        # Break after 4th repeat (after nudge); try forced conclusion.
-                        if log:
-                            log(f"[gw_agent] breaking due to repeated call (4x): {tool_name}")
-                        forced_content = _force_conclusion(
-                            messages, backend_url, timeout, json_mode, log, _is_swarm,
-                            served_model_out=served_model_out,
-                            model=model,
-                        )
-                        if forced_content:
+                # Extract response.
+                if "choices" not in data or not data["choices"]:
+                    if log:
+                        log(f"[gw_agent] GW returned no choices")
+                    return _finalize_writeable_or_readonly(
+                        messages, "", return_transcript, transcript, writeable, cwd, concluded=False,
+                        reason_out=reason_out, reason=GW_REASON_NO_CHOICES,
+                    )
+
+                choice = data["choices"][0]
+                assistant_message = choice.get("message", {})
+                content = assistant_message.get("content") or ""
+                tool_calls_list = assistant_message.get("tool_calls") or []
+                finish_reason = choice.get("finish_reason", "")
+
+                # Update context token count.
+                if "usage" in data:
+                    ctx_tokens = data["usage"].get("total_tokens", ctx_tokens)
+                else:
+                    ctx_tokens = len(json.dumps(messages)) // 4
+
+                # Append assistant message (with content + tool_calls reference).
+                messages.append({"role": "assistant", "content": content, "tool_calls": tool_calls_list})
+
+                # Precedence: tool_calls > content.
+                if tool_calls_list:
+                    for tool_call in tool_calls_list:
+                        tool_call_id = tool_call.get("id", f"call_{step_num}_{len(transcript)}")
+                        tool_name = tool_call.get("function", {}).get("name", "")
+                        tool_args_str = tool_call.get("function", {}).get("arguments", "{}")
+
+                        # Parse tool arguments.
+                        try:
+                            if isinstance(tool_args_str, str):
+                                tool_args = json.loads(tool_args_str)
+                            else:
+                                tool_args = tool_args_str
+                        except json.JSONDecodeError:
+                            tool_args = {}
+
+                        # Check for repeated calls (no-progress detection).
+                        call_sig = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
+                        repeated_calls[call_sig] = repeated_calls.get(call_sig, 0) + 1
+
+                        if repeated_calls[call_sig] == 3:
+                            # Nudge once.
+                            if log:
+                                log(f"[gw_agent] repeated call detected (3x): {tool_name}")
+                            nudge_msg = f"You already ran '{tool_name}' with those arguments. Conclude or try something else."
+                            messages.append({"role": "user", "content": nudge_msg})
+                        elif repeated_calls[call_sig] >= 4:
+                            # Break after 4th repeat (after nudge); try forced conclusion.
+                            if log:
+                                log(f"[gw_agent] breaking due to repeated call (4x): {tool_name}")
+                            forced_content = _force_conclusion(
+                                messages, backend_url, timeout, json_mode, log, _is_swarm,
+                                served_model_out=served_model_out,
+                                model=model,
+                            )
+                            if forced_content:
+                                return _finalize_writeable_or_readonly(
+                                    messages, forced_content, return_transcript, transcript,
+                                    writeable, cwd, concluded=True,
+                                    reason_out=reason_out,
+                                )
+                            # Forced conclusion failed; fall back to exhaustion marker.
                             return _finalize_writeable_or_readonly(
-                                messages, forced_content, return_transcript, transcript,
-                                writeable, cwd, concluded=True,
+                                messages, content, return_transcript, transcript,
+                                writeable, cwd, concluded=False, max_steps_reached=True,
                                 reason_out=reason_out,
                             )
-                        # Forced conclusion failed; fall back to exhaustion marker.
-                        return _finalize_writeable_or_readonly(
-                            messages, content, return_transcript, transcript,
-                            writeable, cwd, concluded=False, max_steps_reached=True,
-                            reason_out=reason_out,
+
+                        # Pre-tool cancel check (fail-safe: raising halts the loop)
+                        if cancel_check is not None:
+                            try:
+                                if cancel_check():
+                                    _interrupted = True
+                                    _interrupt_reason = "user_cancel"
+                                    _interrupted_step = step_num + 1
+                            except Exception as _cc_exc:
+                                logger.error(f"[gw_agent] cancel_check raised pre-tool: {_cc_exc}")
+                                _interrupted = True
+                                _interrupt_reason = "cancel_check_failed"
+                                _interrupted_step = step_num + 1
+                        if _interrupted:
+                            break
+
+                        # Before-tool gate (fail-closed: raising rejects this tool, loop continues)
+                        _gate_override: dict | None = None
+                        if before_tool is not None:
+                            try:
+                                _gate = before_tool(tool_name, tool_args)
+                                _decision = _gate.get("decision", "proceed") if isinstance(_gate, dict) else "proceed"
+                                if _decision == "stop":
+                                    _interrupted = True
+                                    _interrupt_reason = "user_cancel"
+                                    _interrupted_step = step_num + 1
+                                elif _decision == "reject":
+                                    _reason_text = _gate.get("reason", "gate rejected") if isinstance(_gate, dict) else "gate rejected"
+                                    _gate_override = {"error": f"rejected: {_reason_text}"}
+                            except Exception as _bt_exc:
+                                logger.warning(f"[gw_agent] before_tool raised: {_bt_exc}")
+                                _gate_override = {"error": f"gate_failure: {_bt_exc}"}
+                        if _interrupted:
+                            break
+
+                        # Execute tool (or use gate override for reject/gate_failure)
+                        if _gate_override is not None:
+                            tool_result = _gate_override
+                        elif tool_name in tool_executors:
+                            try:
+                                tool_result = tool_executors[tool_name].execute(tool_args)
+                            except Exception as e:
+                                tool_result = {"error": f"tool execution exception: {e}"}
+                        else:
+                            tool_result = {"error": f"unknown tool: {tool_name}"}
+
+                        # Convert result to string.
+                        if isinstance(tool_result, dict):
+                            result_str = json.dumps(tool_result)
+                        else:
+                            result_str = str(tool_result)
+
+                        # Record transcript.
+                        # error field: None if tool succeeded, error message string if it failed
+                        error_value = None
+                        if isinstance(tool_result, dict) and "error" in tool_result:
+                            error_value = tool_result["error"]
+
+                        transcript.append(
+                            {
+                                "step": step_num + 1,
+                                "tool_name": tool_name,
+                                "tool_call_id": tool_call_id,
+                                "arguments": tool_args,
+                                "result": result_str,
+                                "error": error_value,
+                            }
                         )
 
-                    # Pre-tool cancel check (fail-safe: raising halts the loop)
-                    if cancel_check is not None:
-                        try:
-                            if cancel_check():
-                                _interrupted = True
-                                _interrupt_reason = "user_cancel"
-                                _interrupted_step = step_num + 1
-                        except Exception as _cc_exc:
-                            logger.error(f"[gw_agent] cancel_check raised pre-tool: {_cc_exc}")
-                            _interrupted = True
-                            _interrupt_reason = "cancel_check_failed"
-                            _interrupted_step = step_num + 1
-                    if _interrupted:
-                        break
-
-                    # Before-tool gate (fail-closed: raising rejects this tool, loop continues)
-                    _gate_override: dict | None = None
-                    if before_tool is not None:
-                        try:
-                            _gate = before_tool(tool_name, tool_args)
-                            _decision = _gate.get("decision", "proceed") if isinstance(_gate, dict) else "proceed"
-                            if _decision == "stop":
-                                _interrupted = True
-                                _interrupt_reason = "user_cancel"
-                                _interrupted_step = step_num + 1
-                            elif _decision == "reject":
-                                _reason_text = _gate.get("reason", "gate rejected") if isinstance(_gate, dict) else "gate rejected"
-                                _gate_override = {"error": f"rejected: {_reason_text}"}
-                        except Exception as _bt_exc:
-                            logger.warning(f"[gw_agent] before_tool raised: {_bt_exc}")
-                            _gate_override = {"error": f"gate_failure: {_bt_exc}"}
-                    if _interrupted:
-                        break
-
-                    # Execute tool (or use gate override for reject/gate_failure)
-                    if _gate_override is not None:
-                        tool_result = _gate_override
-                    elif tool_name in tool_executors:
-                        try:
-                            tool_result = tool_executors[tool_name].execute(tool_args)
-                        except Exception as e:
-                            tool_result = {"error": f"tool execution exception: {e}"}
-                    else:
-                        tool_result = {"error": f"unknown tool: {tool_name}"}
-
-                    # Convert result to string.
-                    if isinstance(tool_result, dict):
-                        result_str = json.dumps(tool_result)
-                    else:
-                        result_str = str(tool_result)
-
-                    # Record transcript.
-                    # error field: None if tool succeeded, error message string if it failed
-                    error_value = None
-                    if isinstance(tool_result, dict) and "error" in tool_result:
-                        error_value = tool_result["error"]
-
-                    transcript.append(
-                        {
-                            "step": step_num + 1,
-                            "tool_name": tool_name,
-                            "tool_call_id": tool_call_id,
-                            "arguments": tool_args,
-                            "result": result_str,
-                            "error": error_value,
-                        }
-                    )
-
-                    # Track grounding: count error-free tool calls (verified, not merely attempted).
-                    if error_value is None:
-                        grounding_count += 1
-
-                    # Append tool result message.
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "content": result_str,
-                        }
-                    )
-
-                    # Semantic-progress tracking for no-progress guard (writeable only).
-                    # Novelty accounting: a repeated non-novel action (re-reading an
-                    # already-read path, an unchanged grep/mem/test) does NOT reset the
-                    # guard — it counts toward exhaustion via _explore_steps instead.
-                    if writeable and no_progress_steps > 0:
-                        if tool_name in ("apply_edit", "write_file"):
-                            if not (isinstance(tool_result, dict) and "error" in tool_result):
-                                step_made_progress = True
-                        else:
-                            _explore_steps += 1
-                            if tool_name == "run_tests":
-                                if isinstance(tool_result, dict) and "error" not in tool_result:
-                                    tc = (
-                                        int(tool_result.get("passed") or 0),
-                                        int(tool_result.get("failed") or 0),
-                                        int(tool_result.get("errors") or 0),
+                        # Track grounding: count error-free tool calls (verified, not merely attempted).
+                        if error_value is None:
+                            grounding_count += 1
+                            # First verified tool call of a perturbation-retry variant: the
+                            # seat that refused the native order just grounded on a
+                            # differently-serialized one. Distinguishable from a plain,
+                            # never-retried success (reason_out untouched there) and from
+                            # a final grounding_failed (DoD-4).
+                            if grounding_count == 1 and _grounding_perturb_attempt > 0:
+                                if reason_out is not None:
+                                    reason_out.append("grounded_after_perturbation")
+                                if log:
+                                    log(
+                                        "[gw_agent] grounding guard: recovered via perturbed "
+                                        f"tool order on attempt {_grounding_perturb_attempt}"
                                     )
-                                    if tc != last_test_counts:
-                                        step_made_progress = True
-                                        last_test_counts = tc
-                            elif tool_name == "read_file":
-                                # Novelty keyed on path only — a path already read this run
-                                # is never novel again, even if its bytes changed (defeats
-                                # a live-timestamp-in-file state-flip loop).
-                                _path_key = tool_args.get("path")
-                                if _path_key is not None:
-                                    if _path_key not in _seen_read_paths:
-                                        step_made_progress = True
-                                    _seen_read_paths.add(_path_key)
-                            elif tool_name in ("grep", "mem"):
-                                _rhash = _novelty_hash(tool_name, tool_args, result_str)
-                                if _rhash not in _seen_result_hashes:
+
+                        # Append tool result message.
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": result_str,
+                            }
+                        )
+
+                        # Semantic-progress tracking for no-progress guard (writeable only).
+                        # Novelty accounting: a repeated non-novel action (re-reading an
+                        # already-read path, an unchanged grep/mem/test) does NOT reset the
+                        # guard — it counts toward exhaustion via _explore_steps instead.
+                        if writeable and no_progress_steps > 0:
+                            if tool_name in ("apply_edit", "write_file"):
+                                if not (isinstance(tool_result, dict) and "error" in tool_result):
                                     step_made_progress = True
-                                _seen_result_hashes.add(_rhash)
+                            else:
+                                _explore_steps += 1
+                                if tool_name == "run_tests":
+                                    if isinstance(tool_result, dict) and "error" not in tool_result:
+                                        tc = (
+                                            int(tool_result.get("passed") or 0),
+                                            int(tool_result.get("failed") or 0),
+                                            int(tool_result.get("errors") or 0),
+                                        )
+                                        if tc != last_test_counts:
+                                            step_made_progress = True
+                                            last_test_counts = tc
+                                elif tool_name == "read_file":
+                                    # Novelty keyed on path only — a path already read this run
+                                    # is never novel again, even if its bytes changed (defeats
+                                    # a live-timestamp-in-file state-flip loop).
+                                    _path_key = tool_args.get("path")
+                                    if _path_key is not None:
+                                        if _path_key not in _seen_read_paths:
+                                            step_made_progress = True
+                                        _seen_read_paths.add(_path_key)
+                                elif tool_name in ("grep", "mem"):
+                                    _rhash = _novelty_hash(tool_name, tool_args, result_str)
+                                    if _rhash not in _seen_result_hashes:
+                                        step_made_progress = True
+                                    _seen_result_hashes.add(_rhash)
 
-                if _interrupted:
-                    break
+                    if _interrupted:
+                        break
 
-                # No-progress guard: abort if K consecutive steps made no semantic progress,
-                # OR if total exploration steps exceed the hard ceiling (grace can never
-                # mask an infinite loop of "novel" reads).
-                if writeable and no_progress_steps > 0:
-                    if step_made_progress:
-                        consecutive_no_progress = 0
-                    else:
-                        consecutive_no_progress += 1
+                    # No-progress guard: abort if K consecutive steps made no semantic progress,
+                    # OR if total exploration steps exceed the hard ceiling (grace can never
+                    # mask an infinite loop of "novel" reads).
+                    if writeable and no_progress_steps > 0:
+                        if step_made_progress:
+                            consecutive_no_progress = 0
+                        else:
+                            consecutive_no_progress += 1
 
-                    _nudge_threshold = max(no_progress_steps - 2, 1)
-                    _explore_nudge_threshold = max(_max_explore_steps - 2, 1)
-                    if (
-                        consecutive_no_progress >= _nudge_threshold
-                        or _explore_steps >= _explore_nudge_threshold
-                    ):
-                        _handler_acted = False
-                        if handler_hook is not None and _handler_interventions_used < handler_max_interventions:
-                            try:
-                                _handler_ctx = _build_handler_context(
-                                    transcript, messages, handler_objective,
-                                    consecutive_no_progress, step_num + 1, _explore_steps,
-                                )
-                                _verdict = handler_hook(_handler_ctx)
-                            except Exception as _hh_exc:
-                                logger.warning(f"[gw_agent] handler_hook raised: {_hh_exc}")
-                                _verdict = None
+                        _nudge_threshold = max(no_progress_steps - 2, 1)
+                        _explore_nudge_threshold = max(_max_explore_steps - 2, 1)
+                        if (
+                            consecutive_no_progress >= _nudge_threshold
+                            or _explore_steps >= _explore_nudge_threshold
+                        ):
+                            _handler_acted = False
+                            if handler_hook is not None and _handler_interventions_used < handler_max_interventions:
+                                try:
+                                    _handler_ctx = _build_handler_context(
+                                        transcript, messages, handler_objective,
+                                        consecutive_no_progress, step_num + 1, _explore_steps,
+                                    )
+                                    _verdict = handler_hook(_handler_ctx)
+                                except Exception as _hh_exc:
+                                    logger.warning(f"[gw_agent] handler_hook raised: {_hh_exc}")
+                                    _verdict = None
 
-                            _decision = _verdict.get("decision") if isinstance(_verdict, dict) else None
-                            if _decision == "redirect":
-                                _redirect_raw = _verdict.get("redirect")
-                                _redirect_text = _redirect_raw.strip() if isinstance(_redirect_raw, str) else ""
-                                if _redirect_text:
-                                    messages.append({"role": "user", "content": _redirect_text})
+                                _decision = _verdict.get("decision") if isinstance(_verdict, dict) else None
+                                if _decision == "redirect":
+                                    _redirect_raw = _verdict.get("redirect")
+                                    _redirect_text = _redirect_raw.strip() if isinstance(_redirect_raw, str) else ""
+                                    if _redirect_text:
+                                        messages.append({"role": "user", "content": _redirect_text})
+                                        consecutive_no_progress = 0
+                                        _handler_interventions_used += 1
+                                        _handler_acted = True
+                                elif _decision == "continue":
+                                    # Strategic pause: Handler vouches the Operative is legitimately
+                                    # still gathering context. Extend the budget, append nothing -
+                                    # the Operative is judged on-track, don't pressure it.
                                     consecutive_no_progress = 0
                                     _handler_interventions_used += 1
                                     _handler_acted = True
-                            elif _decision == "continue":
-                                # Strategic pause: Handler vouches the Operative is legitimately
-                                # still gathering context. Extend the budget, append nothing -
-                                # the Operative is judged on-track, don't pressure it.
-                                consecutive_no_progress = 0
-                                _handler_interventions_used += 1
-                                _handler_acted = True
-                            # else: malformed/absent/unrecognized decision (incl. a stray "stop" -
-                            # v0 is redirect-only, run-halting is deferred) or empty/null redirect
-                            # falls through to the static nudge below, uncounted against budget.
+                                # else: malformed/absent/unrecognized decision (incl. a stray "stop" -
+                                # v0 is redirect-only, run-halting is deferred) or empty/null redirect
+                                # falls through to the static nudge below, uncounted against budget.
 
-                        if not _handler_acted and not _nudge_fired:
-                            _nudge_fired = True
+                            if not _handler_acted and not _nudge_fired:
+                                _nudge_fired = True
+                                messages.append({
+                                    "role": "user",
+                                    "content": (
+                                        "You now have enough context to act. Make your first "
+                                        "`apply_edit`/`write_file` now - continued reading without "
+                                        "an edit will end this run without a result."
+                                    ),
+                                })
+
+                        if consecutive_no_progress >= no_progress_steps or _explore_steps >= _max_explore_steps:
+                            if log:
+                                log(
+                                    f"[gw_agent] no-progress guard: {consecutive_no_progress} "
+                                    f"consecutive steps with no semantic progress "
+                                    f"({_explore_steps} total exploration steps) - aborting"
+                                )
+                            return _finalize_writeable_or_readonly(
+                                messages, "", return_transcript, transcript, writeable, cwd,
+                                concluded=False, no_progress=True,
+                            )
+
+                    # Context-growth guard: truncate oldest tool-result messages if needed.
+                    if ctx_tokens > GW_AGENT_CTX_CAP:
+                        if log:
+                            log(f"[gw_agent] context cap exceeded ({ctx_tokens} > {GW_AGENT_CTX_CAP}); truncating")
+                        messages = _truncate_messages(messages)
+
+                elif finish_reason == "stop" or finish_reason not in ("tool_calls", "stop"):
+                    # Agent concluded voluntarily (finish_reason == "stop", or unknown treated as stop).
+                    if finish_reason != "stop" and log:
+                        log(
+                            f"[gw_agent] agent ended with finish_reason={finish_reason} "
+                            f"(expected stop or tool_calls)"
+                        )
+                    if log and finish_reason == "stop":
+                        log(f"[gw_agent] agent concluded at step {step_num + 1}")
+
+                    # §1c: Grounding guard — json_mode review runs only, not writeable fixer runs.
+                    if json_mode and not writeable and grounding_count == 0:
+                        if not grounding_nudged:
+                            # First ungrounded stop: nudge and continue the loop.
+                            grounding_nudged = True
+                            if log:
+                                log("[gw_agent] grounding guard: 0 verified tool calls — nudging")
+                            _tool_names = ", ".join(tools.keys())
                             messages.append({
                                 "role": "user",
                                 "content": (
-                                    "You now have enough context to act. Make your first "
-                                    "`apply_edit`/`write_file` now - continued reading without "
-                                    "an edit will end this run without a result."
+                                    "You concluded without investigating. A verdict with no successful "
+                                    f"tool call is not acceptable — use one of your available tools "
+                                    f"({_tool_names}) to read the spec target and the relevant code, "
+                                    "THEN produce your verdict."
                                 ),
                             })
+                            continue
+                        else:
+                            # Second ungrounded stop at this tool-order variant. Before
+                            # ruling UNFOUNDED, retry with a perturbed tool order
+                            # (agents-core-gw-agent-grounding-retry-parity-v0) — the
+                            # reviewer-seat-prefix-perturbation-retry-v0 arc established
+                            # that native tool-list order alone can suppress tool_calls
+                            # deterministically, and a differently-serialized SAME tool set
+                            # recovers it. skip_probe stands this down for a caller
+                            # (shaped_runner) that already probed the seat externally, so
+                            # the two remedies never stack (DoD-5).
+                            if (
+                                not skip_probe
+                                and _grounding_perturb_attempt + 1 < PROBE_DEFAULT_ATTEMPTS
+                            ):
+                                _grounding_perturb_attempt += 1
+                                if log:
+                                    log(
+                                        "[gw_agent] grounding guard: second ungrounded stop — "
+                                        f"perturbing tool order (attempt "
+                                        f"{_grounding_perturb_attempt}/{PROBE_DEFAULT_ATTEMPTS - 1}) "
+                                        "and retrying"
+                                    )
+                                tools = perturb_tool_order(_original_tools, _grounding_perturb_attempt)
+                                _tool_block = _build_tool_block(tools, writeable=writeable)
+                                messages = [
+                                    {"role": "system", "content": system + "\n\n" + _tool_block},
+                                    {"role": "user", "content": prompt},
+                                ]
+                                grounding_nudged = False
+                                grounding_count = 0
+                                _restart_for_perturbation = True
+                                break
 
-                    if consecutive_no_progress >= no_progress_steps or _explore_steps >= _max_explore_steps:
-                        if log:
-                            log(
-                                f"[gw_agent] no-progress guard: {consecutive_no_progress} "
-                                f"consecutive steps with no semantic progress "
-                                f"({_explore_steps} total exploration steps) - aborting"
+                            # Every perturbation variant (or skip_probe) refused — UNFOUNDED.
+                            if log:
+                                if _grounding_perturb_attempt:
+                                    log(
+                                        "[gw_agent] grounding guard: grounding_failed after "
+                                        f"{_grounding_perturb_attempt} perturbation attempt(s) "
+                                        "— all refused"
+                                    )
+                                else:
+                                    log("[gw_agent] grounding guard: second ungrounded stop — UNFOUNDED")
+                            return _finalize_writeable_or_readonly(
+                                messages, "", return_transcript, transcript, writeable, cwd,
+                                concluded=False,
+                                reason_out=reason_out, reason="grounding_failed",
                             )
-                        return _finalize_writeable_or_readonly(
-                            messages, "", return_transcript, transcript, writeable, cwd,
-                            concluded=False, no_progress=True,
+
+                    # §1b: Validate JSON on voluntary stop for json_mode runs.
+                    if json_mode and not writeable:
+                        _stripped = re.sub(
+                            r"^```(?:json)?\s*\n?(.+?)\n?```$", r"\1", content.strip(), flags=re.DOTALL
                         )
+                        try:
+                            json.loads(_stripped)
+                            # Already valid JSON — finalize directly, no extra turn.
+                            return _finalize_writeable_or_readonly(
+                                messages, _stripped, return_transcript, transcript, writeable, cwd,
+                                concluded=True,
+                                reason_out=reason_out,
+                            )
+                        except (json.JSONDecodeError, ValueError):
+                            # Not valid JSON — re-emit under grammar constraint.
+                            if log:
+                                log("[gw_agent] voluntary stop: content not parseable JSON — re-emitting")
+                            _re_emitted = _force_conclusion(
+                                messages, backend_url, timeout, json_mode, log, _is_swarm,
+                                verdict_schema=verdict_schema,
+                                served_model_out=served_model_out,
+                                model=model,
+                                reason=(
+                                    "You stopped without emitting a valid JSON verdict. "
+                                    "Based only on what you have already gathered, produce "
+                                    "your final answer now as valid JSON only."
+                                ),
+                            )
+                            return _finalize_writeable_or_readonly(
+                                messages, _re_emitted if _re_emitted else content,
+                                return_transcript, transcript, writeable, cwd, concluded=True,
+                                reason_out=reason_out, reason="no_choices",
+                            )
 
-                # Context-growth guard: truncate oldest tool-result messages if needed.
-                if ctx_tokens > GW_AGENT_CTX_CAP:
-                    if log:
-                        log(f"[gw_agent] context cap exceeded ({ctx_tokens} > {GW_AGENT_CTX_CAP}); truncating")
-                    messages = _truncate_messages(messages)
-
-            elif finish_reason == "stop" or finish_reason not in ("tool_calls", "stop"):
-                # Agent concluded voluntarily (finish_reason == "stop", or unknown treated as stop).
-                if finish_reason != "stop" and log:
-                    log(
-                        f"[gw_agent] agent ended with finish_reason={finish_reason} "
-                        f"(expected stop or tool_calls)"
+                    # Non-json_mode or writeable: byte-identical to previous behavior.
+                    # reason="no_choices" reuses the closest existing category for a voluntary
+                    # stop whose content came back empty (mirrors the json_mode re-emit fallback
+                    # above, which reuses the same category for its analogous empty-content case).
+                    return _finalize_writeable_or_readonly(
+                        messages, content, return_transcript, transcript, writeable, cwd, concluded=True,
+                        reason_out=reason_out, reason="no_choices",
                     )
-                if log and finish_reason == "stop":
-                    log(f"[gw_agent] agent concluded at step {step_num + 1}")
 
-                # §1c: Grounding guard — json_mode review runs only, not writeable fixer runs.
-                if json_mode and not writeable and grounding_count == 0:
-                    if not grounding_nudged:
-                        # First ungrounded stop: nudge and continue the loop.
-                        grounding_nudged = True
-                        if log:
-                            log("[gw_agent] grounding guard: 0 verified tool calls — nudging")
-                        _tool_names = ", ".join(tools.keys())
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                "You concluded without investigating. A verdict with no successful "
-                                f"tool call is not acceptable — use one of your available tools "
-                                f"({_tool_names}) to read the spec target and the relevant code, "
-                                "THEN produce your verdict."
-                            ),
-                        })
-                        continue
-                    else:
-                        # Second ungrounded stop: UNFOUNDED — do not accept as a verdict.
-                        if log:
-                            log("[gw_agent] grounding guard: second ungrounded stop — UNFOUNDED")
-                        return _finalize_writeable_or_readonly(
-                            messages, "", return_transcript, transcript, writeable, cwd,
-                            concluded=False,
-                            reason_out=reason_out, reason="grounding_failed",
-                        )
+            # Grounding-retry-parity: the guard below armed a perturbed-tool-order retry and
+            # broke out of the step loop above to get here — re-enter with the fresh
+            # conversation/tool order it already installed, consuming another full max_steps
+            # budget rather than falling through to the interrupted/max_steps handling below,
+            # which would misreport this as either.
+            if _restart_for_perturbation:
+                _restart_for_perturbation = False
+                continue
 
-                # §1b: Validate JSON on voluntary stop for json_mode runs.
-                if json_mode and not writeable:
-                    _stripped = re.sub(
-                        r"^```(?:json)?\s*\n?(.+?)\n?```$", r"\1", content.strip(), flags=re.DOTALL
-                    )
-                    try:
-                        json.loads(_stripped)
-                        # Already valid JSON — finalize directly, no extra turn.
-                        return _finalize_writeable_or_readonly(
-                            messages, _stripped, return_transcript, transcript, writeable, cwd,
-                            concluded=True,
-                            reason_out=reason_out,
-                        )
-                    except (json.JSONDecodeError, ValueError):
-                        # Not valid JSON — re-emit under grammar constraint.
-                        if log:
-                            log("[gw_agent] voluntary stop: content not parseable JSON — re-emitting")
-                        _re_emitted = _force_conclusion(
-                            messages, backend_url, timeout, json_mode, log, _is_swarm,
-                            verdict_schema=verdict_schema,
-                            served_model_out=served_model_out,
-                            model=model,
-                            reason=(
-                                "You stopped without emitting a valid JSON verdict. "
-                                "Based only on what you have already gathered, produce "
-                                "your final answer now as valid JSON only."
-                            ),
-                        )
-                        return _finalize_writeable_or_readonly(
-                            messages, _re_emitted if _re_emitted else content,
-                            return_transcript, transcript, writeable, cwd, concluded=True,
-                            reason_out=reason_out, reason="no_choices",
-                        )
-
-                # Non-json_mode or writeable: byte-identical to previous behavior.
-                # reason="no_choices" reuses the closest existing category for a voluntary
-                # stop whose content came back empty (mirrors the json_mode re-emit fallback
-                # above, which reuses the same category for its analogous empty-content case).
+            # Interrupted: cancel_check or before_tool stop halted the loop.
+            if _interrupted:
+                if log:
+                    log(f"[gw_agent] interrupted at step {_interrupted_step} reason={_interrupt_reason}")
                 return _finalize_writeable_or_readonly(
-                    messages, content, return_transcript, transcript, writeable, cwd, concluded=True,
-                    reason_out=reason_out, reason="no_choices",
+                    messages, "", return_transcript, transcript, writeable, cwd, concluded=False,
+                    interrupted=True, interrupt_reason=_interrupt_reason,
+                    interrupted_step=_interrupted_step,
+                    reason_out=reason_out,
                 )
 
-        # Interrupted: cancel_check or before_tool stop halted the loop.
-        if _interrupted:
+            # Exhausted max_steps without conclusion; try forced conclusion.
             if log:
-                log(f"[gw_agent] interrupted at step {_interrupted_step} reason={_interrupt_reason}")
+                log(f"[gw_agent] max_steps ({max_steps}) reached without conclusion")
+            # Get the last actual content before calling _force_conclusion (which mutates messages)
+            last_content = ""
+            for msg in reversed(messages):
+                if msg.get("role") == "assistant" and msg.get("content"):
+                    last_content = msg.get("content", "")
+                    break
+            forced_content = _force_conclusion(
+                messages, backend_url, timeout, json_mode, log, _is_swarm,
+                served_model_out=served_model_out,
+                model=model,
+            )
+            if forced_content:
+                return _finalize_writeable_or_readonly(
+                    messages, forced_content, return_transcript, transcript, writeable, cwd, concluded=False,
+                    reason_out=reason_out,
+                )
+            # Forced conclusion failed; fall back to exhaustion marker.
             return _finalize_writeable_or_readonly(
-                messages, "", return_transcript, transcript, writeable, cwd, concluded=False,
-                interrupted=True, interrupt_reason=_interrupt_reason,
-                interrupted_step=_interrupted_step,
+                messages, last_content, return_transcript, transcript,
+                writeable, cwd, concluded=False, max_steps_reached=True,
                 reason_out=reason_out,
             )
-
-        # Exhausted max_steps without conclusion; try forced conclusion.
-        if log:
-            log(f"[gw_agent] max_steps ({max_steps}) reached without conclusion")
-        # Get the last actual content before calling _force_conclusion (which mutates messages)
-        last_content = ""
-        for msg in reversed(messages):
-            if msg.get("role") == "assistant" and msg.get("content"):
-                last_content = msg.get("content", "")
-                break
-        forced_content = _force_conclusion(
-            messages, backend_url, timeout, json_mode, log, _is_swarm,
-            served_model_out=served_model_out,
-            model=model,
-        )
-        if forced_content:
-            return _finalize_writeable_or_readonly(
-                messages, forced_content, return_transcript, transcript, writeable, cwd, concluded=False,
-                reason_out=reason_out,
-            )
-        # Forced conclusion failed; fall back to exhaustion marker.
-        return _finalize_writeable_or_readonly(
-            messages, last_content, return_transcript, transcript,
-            writeable, cwd, concluded=False, max_steps_reached=True,
-            reason_out=reason_out,
-        )
 
     finally:
         if acquire_lease:
@@ -2404,6 +2497,7 @@ def call_gw_agent(
     handler_hook: Callable[[dict], dict] | None = None,
     handler_objective: str = "",
     handler_max_interventions: int = 2,
+    skip_probe: bool = False,
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Locality-ledger side-write wrapper around _call_gw_agent_impl().
 
@@ -2435,7 +2529,7 @@ def call_gw_agent(
             cancel_check=cancel_check, before_tool=before_tool,
             reason_out=reason_out, served_model_out=_locality_served,
             model=model, handler_hook=handler_hook, handler_objective=handler_objective,
-            handler_max_interventions=handler_max_interventions,
+            handler_max_interventions=handler_max_interventions, skip_probe=skip_probe,
         )
         return _locality_result
     except Exception:

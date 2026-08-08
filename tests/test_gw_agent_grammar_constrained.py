@@ -79,12 +79,17 @@ def _mock_resp(data: dict) -> MagicMock:
 
 
 def _run_swarm(tmp_path, post_responses, json_mode=False, writeable=False,
-               max_steps=10, timeout=300, verdict_schema=None):
+               max_steps=10, timeout=300, verdict_schema=None, skip_probe=False,
+               reason_out=None):
     """Swarm path: _is_swarm=True (acquire_lease=False + backend_url set).
     No response_format added in this mode."""
     repo = _tmp_git_repo(tmp_path)
     posts = []
-    monotonic_values = [float(i) for i in range(max_steps + 20)]
+    # +40 (not +20) headroom: a grounding-guard perturbation retry re-enters the step
+    # loop for another attempt without resetting the wall-clock budget, so a test
+    # exercising multiple perturbation attempts burns more time.monotonic() calls than
+    # a single-attempt run of the same max_steps.
+    monotonic_values = [float(i) for i in range(max_steps + 40)]
 
     def fake_post(url, json=None, timeout=None):
         posts.append({"url": url, "body": json, "timeout": timeout})
@@ -104,6 +109,8 @@ def _run_swarm(tmp_path, post_responses, json_mode=False, writeable=False,
             timeout=timeout,
             json_mode=json_mode,
             verdict_schema=verdict_schema,
+            skip_probe=skip_probe,
+            reason_out=reason_out,
         )
     return result, posts
 
@@ -408,21 +415,72 @@ class TestGroundingGuard:
         assert parsed.get("verdict") == "clean"
 
     def test_second_ungrounded_stop_returns_unfounded_error(self, tmp_path):
-        """0 grounding + two consecutive stops → UNFOUNDED (None / not-concluded)."""
+        """0 grounding across every perturbed tool-order attempt → UNFOUNDED
+        (agents-core-gw-agent-grounding-retry-parity-v0): the second ungrounded
+        stop at the native order no longer fails immediately, it retries with a
+        perturbed tool order (PROBE_DEFAULT_ATTEMPTS=3 total variants); only
+        once every variant also stops ungrounded twice does this return None."""
+        ungrounded = lambda: _mock_resp(_make_stop_response("no tools used"))
+
+        result, posts = _run_swarm(
+            tmp_path,
+            [ungrounded() for _ in range(6)],
+            json_mode=True,
+            max_steps=10,
+        )
+
+        # 6 POSTs: 2 native-order stops (nudge + UNFOUNDED) x 3 tool-order variants
+        # (native + 2 perturbations) before the guard gives up.
+        assert len(posts) == 6
+        # Result is None (UNFOUNDED / not-concluded).
+        assert result is None
+
+    def test_second_ungrounded_stop_retries_perturbed_order_and_recovers(self, tmp_path):
+        """Native order stops ungrounded twice; the retry's perturbed tool order
+        gets a real tool call and a valid verdict — the exact remedy shaped_runner
+        already gets externally via probe_seat_tool_call, now reachable inline."""
+        ungrounded_stop1 = _mock_resp(_make_stop_response("no tools used first"))
+        ungrounded_stop2 = _mock_resp(_make_stop_response("no tools used second"))
+        tool_step = _mock_resp(_make_tool_call_response("read_file", {"path": "README.md"}, "c1"))
+        grounded_json_stop = _mock_resp(_make_stop_response('{"verdict": "clean"}'))
+        reason: list[str] = []
+
+        result, posts = _run_swarm(
+            tmp_path,
+            [ungrounded_stop1, ungrounded_stop2, tool_step, grounded_json_stop],
+            json_mode=True,
+            max_steps=10,
+            reason_out=reason,
+        )
+
+        # 4 POSTs: native nudge + native UNFOUNDED-stop (now a retry trigger) +
+        # perturbed-order tool call + perturbed-order final verdict.
+        assert len(posts) == 4
+        assert result is not None
+        assert json.loads(result).get("verdict") == "clean"
+        # DoD-4: a silent recovery is a defect — reason_out must say so.
+        assert reason == ["grounded_after_perturbation"]
+
+    def test_second_ungrounded_stop_skip_probe_disables_retry(self, tmp_path):
+        """skip_probe=True (shaped_runner's case, DoD-5) preserves the exact
+        pre-existing behavior: no perturbation retry, immediate UNFOUNDED."""
         ungrounded_stop1 = _mock_resp(_make_stop_response("no tools used first"))
         ungrounded_stop2 = _mock_resp(_make_stop_response('{"verdict": "clean"}'))
+        reason: list[str] = []
 
         result, posts = _run_swarm(
             tmp_path,
             [ungrounded_stop1, ungrounded_stop2],
             json_mode=True,
             max_steps=10,
+            skip_probe=True,
+            reason_out=reason,
         )
 
-        # 2 POSTs: first stop (nudge) + second stop (UNFOUNDED).
+        # 2 POSTs: first stop (nudge) + second stop (UNFOUNDED) — no retry engaged.
         assert len(posts) == 2
-        # Result is None (UNFOUNDED / not-concluded).
         assert result is None
+        assert reason == ["grounding_failed"]
 
     def test_errored_tool_call_counts_as_zero_grounding(self, tmp_path):
         """Tool call that returns an error counts as 0 grounding; grounding guard fires."""
