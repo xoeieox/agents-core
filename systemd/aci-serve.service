@@ -1,0 +1,32 @@
+[Unit]
+Description=aci serve — vendored aci/1 reference verifier, verifying proxy on loopback (port 4180, control 4181)
+After=network.target
+# Don't let a tight crash-loop trip the start limit and wedge the service.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# The `aci` binary (Piece 1, agents-core-phala-aci1-restoration-v0) is built
+# and installed by host ops, outside this repo — see spec Piece 1. This unit
+# only wires it up; it does not build it and does not assume a path beyond
+# the documented default (ACI_VERIFIER_BIN_ENV in agents_core/phala_tee.py).
+# Default build location on BRIX per the host lane:
+#   /srv/fast/aci-build/private-ai-gateway/target/release/aci
+# Override ExecStart (via a drop-in) if the binary lands somewhere else.
+ExecStart=/srv/fast/aci-build/private-ai-gateway/target/release/aci serve \
+    --listen 127.0.0.1:4180 \
+    --control 127.0.0.1:4181 \
+    --upstream https://inference.phala.com
+Restart=on-failure
+RestartSec=5
+# `aci serve` refuses to start unless the upstream verifies and pins every
+# hop to the attested TLS key — see spec Piece 3b. That is the binary's own
+# behavior, not something this unit enforces; a crash-loop here means the
+# upstream did not verify, and Restart=on-failure keeps retrying rather than
+# silently giving up (phala-test-key's PHALA_BASE_URL points at this
+# service, so a down aci-serve must surface as connection-refused upstream,
+# never as a silent fallback to a direct, unverified inference.phala.com hop).
+EnvironmentFile=-/srv/agents/config/phala.env
+
+[Install]
+WantedBy=default.target
