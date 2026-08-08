@@ -10,13 +10,15 @@ Type=simple
 # and installed by host ops, outside this repo — see spec Piece 1. This unit
 # only wires it up; it does not build it and does not assume a path beyond
 # the documented default (ACI_VERIFIER_BIN_ENV in agents_core/phala_tee.py).
-# Default build location on BRIX per the host lane:
-#   /srv/fast/aci-build/private-ai-gateway/target/release/aci
-# Override ExecStart (via a drop-in) if the binary lands somewhere else.
+# The build location depends on where `CARGO_TARGET_DIR` was pointed at
+# build time — it is NOT reliably the path below. Override ExecStart (via a
+# drop-in) with an `ACI_VERIFIER_BIN`-consistent path if the binary lands
+# somewhere else; a drop-in doing exactly this is already in use on BRIX.
+# `aci serve` takes its base URL as a positional argument, not `--upstream`.
 ExecStart=/srv/fast/aci-build/private-ai-gateway/target/release/aci serve \
     --listen 127.0.0.1:4180 \
     --control 127.0.0.1:4181 \
-    --upstream https://inference.phala.com
+    https://inference.phala.com
 Restart=on-failure
 RestartSec=5
 # `aci serve` refuses to start unless the upstream verifies and pins every

@@ -77,6 +77,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -451,9 +452,22 @@ def _check_statuses(transcript: dict, *, leg: str) -> dict[str, str]:
 
 def _run_aci_audit(report: dict, nonce: str, *, timeout: float = 30.0) -> dict:
     """Offline `aci audit` leg over the exact report bytes + fresh `nonce` —
-    id-2/id-3/id-4. Nonce-bound: run on EVERY call, NEVER cached."""
+    id-2/id-3/id-4. Nonce-bound: run on EVERY call, NEVER cached.
+
+    `aci audit` takes the report as a `--report <FILE>` path, not stdin —
+    there is no positional/stdin form. Serialize the report exactly once
+    (same `json.dumps` shape as ever — no `sort_keys`, no canonicalization;
+    the nonce binding is computed over these exact bytes) and write that
+    single object to a 0600 temp file, removed on every exit path."""
     report_bytes = json.dumps(report).encode("utf-8")
-    return _run_aci_json(["audit", "-", "--nonce", nonce], input_bytes=report_bytes, timeout=timeout)
+    fd, path = tempfile.mkstemp(prefix="aci-audit-report-", suffix=".json")
+    try:
+        os.chmod(path, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(report_bytes)
+        return _run_aci_json(["audit", "--report", path, "--nonce", nonce], timeout=timeout)
+    finally:
+        os.remove(path)
 
 
 def _run_aci_verify_online(

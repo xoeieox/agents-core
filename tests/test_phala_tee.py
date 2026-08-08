@@ -535,6 +535,95 @@ def test_aci_verifier_exception_types_are_distinguishable_and_all_refuse():
 
 
 # ---------------------------------------------------------------------------
+# Contract test against the REAL `aci` binary (agents-core-aci-audit-cli-
+# interface-fix-v0, leg 3). Every other test above mocks at the
+# `_run_aci_json` boundary, which is correct for logic tests but structurally
+# cannot catch an interface mismatch between the argv this module builds and
+# the argv the real binary accepts — that gap is exactly what shipped the
+# stdin-form `aci audit` defect this unit fixes. This test asserts argv
+# *parses*, never a verification verdict: reaching report-schema validation
+# on a stub report is a PASS (it proves the args were accepted), and a clap
+# usage error (exit 2, "unexpected argument" / "For more information, try
+# '--help'") is a FAIL.
+# ---------------------------------------------------------------------------
+
+import subprocess as _subprocess_mod  # noqa: E402 (test-local, avoid clash with mocked module)
+
+
+def _resolve_real_aci_binary():
+    binary = os.environ.get(phala_tee.ACI_VERIFIER_BIN_ENV) or phala_tee.DEFAULT_ACI_VERIFIER_BIN
+    if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+        pytest.skip(
+            f"real `aci` binary not found at {binary!r} — set "
+            f"{phala_tee.ACI_VERIFIER_BIN_ENV} to a built `aci` binary to run this contract test"
+        )
+    return binary
+
+
+def _is_clap_usage_error(returncode, stderr_text):
+    if returncode != 2:
+        return False
+    return "unexpected argument" in stderr_text or (
+        "error:" in stderr_text and "For more information, try '--help'" in stderr_text
+    )
+
+
+def test_real_binary_accepts_audit_report_flag_argv(tmp_path):
+    """The argv this module now builds — `audit --report <FILE> --nonce
+    <NONCE> --json` — must be accepted (not a clap usage error) by the real
+    binary. A stub report failing schema validation is the expected,
+    PASSING outcome here; it proves the args parsed."""
+    binary = _resolve_real_aci_binary()
+    report_path = tmp_path / "report.json"
+    report_path.write_bytes(b"{}")
+
+    proc = _subprocess_mod.run(
+        [binary, "audit", "--report", str(report_path), "--nonce", "a" * 64, "--json"],
+        capture_output=True, timeout=30.0,
+    )
+    stderr_text = proc.stderr.decode("utf-8", errors="replace")
+    assert not _is_clap_usage_error(proc.returncode, stderr_text), (
+        f"real `aci audit --report ...` argv was rejected as a usage error "
+        f"(exit {proc.returncode}): {stderr_text!r}"
+    )
+
+
+def test_real_binary_accepts_verify_argv():
+    """The `verify <BASE_URL>` leg is already correct; this is what keeps it
+    that way. `--upstream` unreachable is fine (network/connect failure, not
+    a usage error); a clap usage error is not."""
+    binary = _resolve_real_aci_binary()
+
+    proc = _subprocess_mod.run(
+        [binary, "verify", "http://127.0.0.1:1", "--json"],
+        capture_output=True, timeout=30.0,
+    )
+    stderr_text = proc.stderr.decode("utf-8", errors="replace")
+    assert not _is_clap_usage_error(proc.returncode, stderr_text), (
+        f"real `aci verify <BASE_URL>` argv was rejected as a usage error "
+        f"(exit {proc.returncode}): {stderr_text!r}"
+    )
+
+
+def test_real_binary_rejects_the_old_broken_stdin_audit_argv(tmp_path):
+    """Negative case (DoD 8): the OLD, broken form — a positional `-` and no
+    `--report` — must actually fail argument parsing against the real
+    binary, so this contract test is proven to discriminate rather than
+    passing vacuously."""
+    binary = _resolve_real_aci_binary()
+
+    proc = _subprocess_mod.run(
+        [binary, "audit", "-", "--nonce", "a" * 64, "--json"],
+        input=b"{}", capture_output=True, timeout=30.0,
+    )
+    stderr_text = proc.stderr.decode("utf-8", errors="replace")
+    assert _is_clap_usage_error(proc.returncode, stderr_text), (
+        f"expected the old stdin-form argv to fail clap argument parsing, "
+        f"got exit {proc.returncode}, stderr: {stderr_text!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # open_e2ee_channel / E2eeChannel full seal-open flow against a verified
 # aci/1 report (still no network — the "gateway" side is simulated locally
 # with the service's own X25519 private key).
