@@ -1867,3 +1867,478 @@ def test_gravitywell_acquire_lease_false_is_a_trust_contract_not_enforced():
     assert result == "ok"
     mock_backend.assert_called_once()
     dc.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# gw-admission-claim-doorman-lock-ordering-v0: Leg 1 — release the claim before
+# retrying the doorman on the two previously-defective branches.
+# ---------------------------------------------------------------------------
+
+def test_leg1_contended_requeues_and_resets_admitted_before_sleep(tmp_path, monkeypatch):
+    """AC1: a contended acquire requeues the ticket to pending and resets `admitted`
+    before sleeping — proven by observing ticket status='pending' between retries."""
+    monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+
+    dc = MagicMock()
+    instance = MagicMock()
+    instance.acquire.side_effect = [
+        {"ok": False, "contended": True},
+        {"status": "serving", "drain_cleared": True},
+    ]
+    dc.return_value = instance
+    dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
+
+    from agents_core.elevator import ElevatorStore
+    observed_statuses = []
+
+    def _sleep_hook(_seconds):
+        store = ElevatorStore(tmp_path / "q.db")
+        with store._lock:
+            rows = store._conn.execute(
+                "SELECT status FROM queue_items WHERE principal='ct-test'"
+            ).fetchall()
+        observed_statuses.extend(row["status"] for row in rows)
+        store.close()
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="ok"), \
+         patch("agents_core.llm.time.sleep", side_effect=_sleep_hook):
+        prov = []
+        result = call_operator("gravitywell", prompt="test", _provenance_out=prov,
+                                principal="ct-test")
+
+    assert result == "ok"
+    assert "pending" in observed_statuses
+    assert any(r == "gw_contended" for r, _ in prov)
+
+
+def test_leg1_acquire_soft_error_requeues_and_resets_admitted_before_sleep(tmp_path, monkeypatch):
+    """AC2: an acquire soft error (e.g. HTTP 5xx) requeues the ticket to pending and
+    resets `admitted` before sleeping — same invariant as the contended branch."""
+    monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+
+    dc = MagicMock()
+    instance = MagicMock()
+    instance.acquire.side_effect = [
+        RuntimeError("HTTP 503"),
+        {"status": "serving", "drain_cleared": True},
+    ]
+    dc.return_value = instance
+    dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
+
+    from agents_core.elevator import ElevatorStore
+    observed_statuses = []
+
+    def _sleep_hook(_seconds):
+        store = ElevatorStore(tmp_path / "q.db")
+        with store._lock:
+            rows = store._conn.execute(
+                "SELECT status FROM queue_items WHERE principal='se-test'"
+            ).fetchall()
+        observed_statuses.extend(row["status"] for row in rows)
+        store.close()
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="ok"), \
+         patch("agents_core.llm.time.sleep", side_effect=_sleep_hook):
+        prov = []
+        result = call_operator("gravitywell", prompt="test", _provenance_out=prov,
+                                principal="se-test")
+
+    assert result == "ok"
+    assert "pending" in observed_statuses
+    assert any(r == "acquire_soft_error" for r, _ in prov)
+
+
+def test_leg1_contended_ceiling_terminates_without_max_wait_deadline(tmp_path, monkeypatch):
+    """AC3: a persistently-contended cell fails at its own retry ceiling rather than
+    polling to the 900s _max_wait deadline."""
+    monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+    monkeypatch.setenv("GW_ADMISSION_MAX_CONTENDED_RETRIES", "2")
+    monkeypatch.setenv("GW_ADMISSION_MAX_WAIT_SEC", "900")  # would never fire within a test
+
+    dc = MagicMock()
+    instance = MagicMock()
+    instance.acquire.return_value = {"ok": False, "contended": True}
+    dc.return_value = instance
+    dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm.time.sleep"):
+        prov = []
+        result = call_operator("gravitywell", prompt="test", _provenance_out=prov,
+                                on_wake_fail="skip", principal="ct-ceiling")
+
+    assert result is None
+    # 3 acquire calls: retries at ct_retries=0,1 then ceiling hit at ct_retries=2.
+    assert instance.acquire.call_count == 3
+    assert [r for r, _ in prov].count("gw_contended") == 3
+
+
+def test_leg1_soft_error_ceiling_terminates_without_max_wait_deadline(tmp_path, monkeypatch):
+    """AC3: same ceiling behaviour for the acquire_soft_error branch."""
+    monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+    monkeypatch.setenv("GW_ADMISSION_MAX_SOFT_ERROR_RETRIES", "2")
+    monkeypatch.setenv("GW_ADMISSION_MAX_WAIT_SEC", "900")
+
+    dc = MagicMock()
+    instance = MagicMock()
+    instance.acquire.side_effect = RuntimeError("HTTP 503")
+    dc.return_value = instance
+    dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm.time.sleep"):
+        prov = []
+        result = call_operator("gravitywell", prompt="test", _provenance_out=prov,
+                                on_wake_fail="skip", principal="se-ceiling")
+
+    assert result is None
+    assert instance.acquire.call_count == 3
+    assert [r for r, _ in prov].count("acquire_soft_error") == 3
+
+
+def test_leg1_deferred_and_not_serving_admitted_handling_unchanged(tmp_path, monkeypatch):
+    """AC4: the deferred and not-serving branches keep their existing admitted/
+    is_ride_along reset behaviour — Leg 1 does not touch them beyond Leg 2's release."""
+    monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+
+    dc = MagicMock()
+    instance = MagicMock()
+    instance.acquire.side_effect = [
+        {"status": "deferred"},
+        {"status": "serving", "drain_cleared": True},
+    ]
+    dc.return_value = instance
+    dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="ok"), \
+         patch("agents_core.llm.time.sleep"):
+        prov = []
+        result = call_operator("gravitywell", prompt="test", _provenance_out=prov,
+                                principal="deferred-unchanged")
+
+    assert result == "ok"
+    assert ("gw_deferred_swarm", "gravitywell") in prov
+    assert ("success", "gravitywell") in prov
+
+
+def test_leg1_no_sleep_holds_a_claimed_ticket(tmp_path, monkeypatch):
+    """AC5: invariant — no code path sleeps while holding a `claimed` gw-admission
+    ticket. Checked across contended, soft-error, deferred, and wake_failed."""
+    monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+
+    dc = MagicMock()
+    instance = MagicMock()
+    instance.acquire.side_effect = [
+        {"ok": False, "contended": True},
+        RuntimeError("HTTP 503"),
+        {"status": "deferred"},
+        {"status": "wake_failed"},
+        {"status": "serving", "drain_cleared": True},
+    ]
+    dc.return_value = instance
+    dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
+
+    from agents_core.elevator import ElevatorStore
+    violations = []
+
+    def _sleep_hook(_seconds):
+        store = ElevatorStore(tmp_path / "q.db")
+        with store._lock:
+            rows = store._conn.execute(
+                "SELECT status FROM queue_items WHERE principal='invariant-test'"
+            ).fetchall()
+        store.close()
+        if any(row["status"] == "claimed" for row in rows):
+            violations.append(True)
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="ok"), \
+         patch("agents_core.llm.time.sleep", side_effect=_sleep_hook):
+        result = call_operator("gravitywell", prompt="test", principal="invariant-test")
+
+    assert result == "ok"
+    assert violations == []
+
+
+# ---------------------------------------------------------------------------
+# Leg 2 — release the doorman lease on every exit that is not a dispatch.
+# ---------------------------------------------------------------------------
+
+def test_leg2_release_swallows_doorman_unreachable_and_retries(tmp_path, monkeypatch):
+    """AC6: wake_failed's release call swallows DoormanUnreachable (bounded catch)
+    and the retry still proceeds to a successful dispatch."""
+    from agents_core.doorman_client import DoormanUnreachable
+    monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+
+    dc = MagicMock()
+    instance = MagicMock()
+    instance.acquire.side_effect = [
+        {"status": "wake_failed"},
+        {"status": "serving", "drain_cleared": True},
+    ]
+    instance.release.side_effect = [DoormanUnreachable("doorman down"), None]
+    dc.return_value = instance
+    dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="ok"), \
+         patch("agents_core.llm.time.sleep"):
+        prov = []
+        result = call_operator("gravitywell", prompt="test", _provenance_out=prov,
+                                principal="release-unreachable")
+
+    assert result == "ok"
+    assert instance.release.call_count >= 1
+
+
+def test_leg2_release_non_transport_error_propagates(tmp_path, monkeypatch):
+    """AC6: a non-transport error from release() is NOT masked by the bounded
+    DoormanUnreachable catch — it propagates rather than being swallowed."""
+    monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+
+    dc = MagicMock()
+    instance = MagicMock()
+    instance.acquire.return_value = {"status": "wake_failed"}
+    instance.release.side_effect = RuntimeError("logic bug in release path")
+    dc.return_value = instance
+    dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm.time.sleep"):
+        with pytest.raises(RuntimeError, match="logic bug in release path"):
+            call_operator("gravitywell", prompt="test", on_wake_fail="skip",
+                          principal="release-logic-bug")
+
+
+def test_leg2_deferred_calls_release_before_retry(tmp_path, monkeypatch):
+    """AC6: the deferred branch also releases the lease before requeueing."""
+    monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+
+    dc = MagicMock()
+    instance = MagicMock()
+    instance.acquire.side_effect = [
+        {"status": "deferred"},
+        {"status": "serving", "drain_cleared": True},
+    ]
+    dc.return_value = instance
+    dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="ok"), \
+         patch("agents_core.llm.time.sleep"):
+        result = call_operator("gravitywell", prompt="test", principal="deferred-release")
+
+    assert result == "ok"
+    # release must have fired at least twice: once on the deferred retry (Leg 2),
+    # once on the successful dispatch's finally block.
+    assert instance.release.call_count >= 2
+
+
+# ---------------------------------------------------------------------------
+# AC7 — the two-principal deadlock (the 2026-06-26 incident) does not reproduce.
+# ---------------------------------------------------------------------------
+
+def test_ac7_two_principal_deadlock_does_not_reproduce(tmp_path, monkeypatch):
+    """A leaks a lease on a failed wake; B then hits the drain gate. On current
+    main this wedges until a deadline. With Leg 1 + Leg 2 landed, both make
+    progress: A's failed wake releases its lease, and B terminates at its own
+    contended-retry ceiling rather than polling to the 900s _max_wait deadline."""
+    monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+    monkeypatch.setenv("GW_ADMISSION_MAX_CONTENDED_RETRIES", "2")
+    monkeypatch.setenv("GW_ADMISSION_MAX_WAIT_SEC", "900")
+
+    dc = MagicMock()
+    instance = MagicMock()
+    dc.return_value = instance
+    dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
+
+    # --- Principal A: wake fails; must not leak the doorman lease (Leg 2). ---
+    instance.acquire.return_value = {"status": "wake_failed"}
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm.time.sleep"):
+        result_a = call_operator("gravitywell", prompt="A", on_wake_fail="skip",
+                                  principal="principal-A")
+    assert result_a is None
+    assert instance.release.called, "Leg 2: A's failed wake must release its lease"
+
+    # --- Principal B: worst case, still observes contention on the drain gate
+    # (e.g. the reap window hasn't closed yet). Must terminate at its own
+    # ceiling rather than wedge (Leg 1) — this is what breaks the deadlock. ---
+    instance.acquire.reset_mock(side_effect=True, return_value=True)
+    instance.acquire.return_value = {"ok": False, "contended": True}
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm.time.sleep"):
+        result_b = call_operator("gravitywell", prompt="B", on_wake_fail="skip",
+                                  principal="principal-B")
+
+    assert result_b is None
+    # 3 acquire calls total for B: retries at ct_retries=0,1 then ceiling at 2 —
+    # bounded, not the ~600 polls a 900s/1.5s wedge would produce.
+    assert instance.acquire.call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# Leg 3 — re-validate the ticket before dispatch.
+# ---------------------------------------------------------------------------
+
+def test_leg3_ticket_lost_behind_back_does_not_dispatch_reindmits(tmp_path, monkeypatch):
+    """AC8: a ticket requeued behind the cell's back (simulating a reaper) is not
+    dispatched to; the cell re-admits and dispatches only on the re-admitted pass."""
+    monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+
+    from agents_core.elevator import ElevatorStore
+
+    call_count = {"n": 0}
+    backend_calls = []
+
+    def _acquire_side_effect(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Simulate a reaper requeuing this ticket between try_admit and dispatch.
+            store = ElevatorStore(tmp_path / "q.db")
+            with store._lock:
+                store._conn.execute(
+                    "UPDATE queue_items SET status='pending', claim_owner=NULL, "
+                    "claimed_at=NULL, claim_ttl_sec=NULL WHERE principal='leg3-test'"
+                )
+                store._conn.commit()
+            store.close()
+        return {"status": "serving", "drain_cleared": True}
+
+    dc = MagicMock()
+    instance = MagicMock()
+    instance.acquire.side_effect = _acquire_side_effect
+    dc.return_value = instance
+    dc.is_deferred = lambda resp: resp.get("status") == "deferred"
+    dc.is_contended = lambda resp: bool(resp.get("contended"))
+
+    def _fake_backend(**kwargs):
+        backend_calls.append(1)
+        return "dispatched"
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", side_effect=_fake_backend), \
+         patch("agents_core.llm.time.sleep"):
+        prov = []
+        result = call_operator("gravitywell", prompt="test", _provenance_out=prov,
+                                principal="leg3-test")
+
+    assert result == "dispatched"
+    assert backend_calls == [1]
+    assert any(r == "gw_claim_lost_before_dispatch" for r, _ in prov)
+
+
+# ---------------------------------------------------------------------------
+# Leg 4 — provenance reason, terminal timestamp, collision risk under enforce.
+# ---------------------------------------------------------------------------
+
+def test_leg4_fail_records_reason_and_terminal_timestamp(tmp_path, monkeypatch):
+    """AC9: a caller-failed ticket has non-NULL provenance reason and a non-NULL
+    terminal timestamp (failed_at)."""
+    import json as _json
+    monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+    monkeypatch.setenv("GW_ADMISSION_MAX_WAIT_SEC", "0")  # instant timeout
+
+    from agents_core.elevator import ElevatorStore
+    blocker = ElevatorStore(tmp_path / "q.db")
+    blocker.enqueue(lane="deliberation", kind="gw-admission", payload={},
+                    principal="blocker", latency_class="batch")
+    blocker.claim(lanes=["deliberation"], owner="other", claim_ttl_sec=999)
+    blocker.close()
+
+    dc, mock_client = _gw_dc(status="serving")
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm.time.sleep"):
+        result = call_operator("gravitywell", prompt="test", on_wake_fail="skip",
+                                principal="leg4-timeout")
+
+    assert result is None
+
+    store = ElevatorStore(tmp_path / "q.db")
+    with store._lock:
+        row = store._conn.execute(
+            "SELECT status, provenance, failed_at FROM queue_items WHERE principal='leg4-timeout'"
+        ).fetchone()
+    store.close()
+
+    assert row["status"] == "failed"
+    assert row["failed_at"] is not None
+    prov = _json.loads(row["provenance"])
+    assert prov.get("reason") == "slot_queued_timeout"
+
+
+def test_leg4_collision_risk_emitted_under_enforce(tmp_path, monkeypatch):
+    """AC10: principal_group_collision_risk fires under enforce too — previously
+    shadow-mode only."""
+    monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+
+    dc, mock_client = _gw_dc(status="serving")
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="ok"):
+        prov = []
+        # principal=None -> effective_principal = work_id -> unique-work_id principal.
+        result = call_operator("gravitywell", prompt="test", _provenance_out=prov)
+
+    assert result == "ok"
+    assert any("principal_group_collision_risk" in r for r, _ in prov)
+
+
+def test_leg4_no_collision_risk_on_shared_principal_under_enforce(tmp_path, monkeypatch):
+    """AC10 counterpart: an explicit shared principal does not trigger the
+    collision-risk signal under enforce (mirrors the shadow-mode behaviour)."""
+    monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+
+    dc, mock_client = _gw_dc(status="serving")
+
+    with patch("agents_core.elevator.IS_MASTER", True), \
+         patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("agents_core.llm._call_gravitywell_backend", return_value="ok"):
+        prov = []
+        result = call_operator("gravitywell", prompt="test", _provenance_out=prov,
+                                principal="shared-explicit-principal")
+
+    assert result == "ok"
+    assert not any("principal_group_collision_risk" in r for r, _ in prov)
