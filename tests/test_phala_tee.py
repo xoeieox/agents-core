@@ -26,6 +26,11 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 from agents_core import phala_tee
 
+# conftest.py's autouse `_locality_ledger_isolated` fixture already points
+# LOCALITY_LEDGER_ROOT at a per-test tmp_path — chat_completion's new spend-
+# cap check (agents-core-phala-spend-cap-v0) reads that same isolated root,
+# so no additional isolation is needed here.
+
 
 # ---------------------------------------------------------------------------
 # JCS / AAD / HKDF fixed vectors — no network.
@@ -1143,6 +1148,225 @@ def test_chat_completion_raises_e2ee_not_applied_when_capability_advertised_but_
 
     with pytest.raises(phala_tee.E2eeNotAppliedError):
         client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m")
+
+
+# ---------------------------------------------------------------------------
+# Spend cap (Leg 2) + reconciliation (Leg 3) — agents-core-phala-spend-cap-v0.
+# ---------------------------------------------------------------------------
+
+
+def _seed_ledger_cost(cost_usd, *, cost_class="paid-phala-tee"):
+    """Write one locality ledger row directly (bypassing chat_completion) so
+    cap/reconciliation tests can pre-load today's recorded spend."""
+    phala_tee.locality.record(
+        requested_operator="phala-tee",
+        served_model="m",
+        host="phala",
+        cost_class=cost_class,
+        seam="phala_tee",
+        cost_usd=cost_usd,
+        ok=True,
+    )
+
+
+def test_chat_completion_threads_usage_cost_and_token_counts_into_ledger(monkeypatch):
+    """Leg 1: usage.cost -> cost_usd, plus prompt/completion/total/reasoning
+    token counts into extra — the response's own meter, not an estimate."""
+    session, resp = _stub_chat_completion_deps(
+        monkeypatch, capabilities={"supported_e2ee_versions": [], "serving": "aggregator"}, applied=False
+    )
+    resp.json.return_value = {
+        "choices": [{"message": {"content": "ok"}}],
+        "usage": {
+            "prompt_tokens": 7,
+            "completion_tokens": 10,
+            "total_tokens": 17,
+            "reasoning_tokens": 0,
+            "cost": 5.4e-06,
+        },
+    }
+    client = phala_tee.PhalaTeeClient(session=session, base_url="http://127.0.0.1:4180")
+
+    recorded = {}
+    monkeypatch.setattr(phala_tee.locality, "record", lambda **kw: recorded.update(kw))
+
+    client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m")
+
+    assert recorded["cost_usd"] == 5.4e-06
+    assert recorded["extra"]["prompt_tokens"] == 7
+    assert recorded["extra"]["completion_tokens"] == 10
+    assert recorded["extra"]["total_tokens"] == 17
+    assert recorded["extra"]["reasoning_tokens"] == 0
+    assert recorded["extra"]["cost_unpriced"] is False
+
+
+def test_chat_completion_records_none_cost_and_marker_when_usage_absent(monkeypatch):
+    """DoD 2: no usage at all -> cost_usd=None, distinct marker, never a
+    silent zero."""
+    session, _resp = _stub_chat_completion_deps(
+        monkeypatch, capabilities={"supported_e2ee_versions": [], "serving": "aggregator"}, applied=False
+    )
+    client = phala_tee.PhalaTeeClient(session=session, base_url="http://127.0.0.1:4180")
+
+    recorded = {}
+    monkeypatch.setattr(phala_tee.locality, "record", lambda **kw: recorded.update(kw))
+
+    client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m")
+
+    assert recorded["cost_usd"] is None
+    assert recorded["extra"]["cost_unpriced"] is True
+    assert recorded["ok"] is True  # other fields unchanged
+
+
+def test_chat_completion_records_none_cost_when_cost_field_missing_but_tokens_present(monkeypatch):
+    """usage present without `cost` (e.g. a non-metered path some day) must
+    still record cost_usd=None + marker, never fabricate a cost."""
+    session, resp = _stub_chat_completion_deps(
+        monkeypatch, capabilities={"supported_e2ee_versions": [], "serving": "aggregator"}, applied=False
+    )
+    resp.json.return_value = {
+        "choices": [{"message": {"content": "ok"}}],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
+    }
+    client = phala_tee.PhalaTeeClient(session=session, base_url="http://127.0.0.1:4180")
+
+    recorded = {}
+    monkeypatch.setattr(phala_tee.locality, "record", lambda **kw: recorded.update(kw))
+
+    client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m")
+
+    assert recorded["cost_usd"] is None
+    assert recorded["extra"]["cost_unpriced"] is True
+    assert recorded["extra"]["prompt_tokens"] == 3
+
+
+def test_spend_cap_boundary_exactly_at_cap_refuses(monkeypatch):
+    """DoD 11 boundary case: recorded total == cap must refuse (any further
+    call would exceed it)."""
+    monkeypatch.setenv("PHALA_DAILY_SPEND_CAP_USD", "2.00")
+    _seed_ledger_cost(2.00)
+
+    session, _resp = _stub_chat_completion_deps(
+        monkeypatch, capabilities={"supported_e2ee_versions": [], "serving": "aggregator"}
+    )
+    client = phala_tee.PhalaTeeClient(session=session, base_url="http://127.0.0.1:4180")
+
+    with pytest.raises(phala_tee.PhalaSpendCapExceededError):
+        client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m")
+    session.get.assert_not_called()  # refused before any network I/O, including attestation
+    session.post.assert_not_called()
+
+
+def test_spend_cap_under_cap_allows_call(monkeypatch):
+    monkeypatch.setenv("PHALA_DAILY_SPEND_CAP_USD", "2.00")
+    _seed_ledger_cost(1.00)
+
+    session, _resp = _stub_chat_completion_deps(
+        monkeypatch, capabilities={"supported_e2ee_versions": [], "serving": "aggregator"}, applied=False
+    )
+    client = phala_tee.PhalaTeeClient(session=session, base_url="http://127.0.0.1:4180")
+
+    client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m")
+    session.post.assert_called_once()
+
+
+def test_spend_cap_above_cap_refuses_with_distinct_named_exception(monkeypatch):
+    """DoD 6: a distinct exception, not a generic/timeout error, and no
+    silent fallback to another operator (the caller never gets a response)."""
+    monkeypatch.setenv("PHALA_DAILY_SPEND_CAP_USD", "2.00")
+    _seed_ledger_cost(3.00)
+
+    session, _resp = _stub_chat_completion_deps(
+        monkeypatch, capabilities={"supported_e2ee_versions": [], "serving": "aggregator"}
+    )
+    client = phala_tee.PhalaTeeClient(session=session, base_url="http://127.0.0.1:4180")
+
+    with pytest.raises(phala_tee.PhalaSpendCapExceededError) as excinfo:
+        client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m")
+    assert excinfo.value.spent_usd == 3.00
+    assert excinfo.value.cap_usd == 2.00
+    assert not issubclass(phala_tee.PhalaSpendCapExceededError, TimeoutError)
+    session.post.assert_not_called()
+
+
+def test_spend_cap_refusal_notifies_pushover_once_per_day(monkeypatch):
+    """DoD 7: at most one Pushover per day, not one per blocked call."""
+    monkeypatch.setenv("PHALA_DAILY_SPEND_CAP_USD", "2.00")
+    _seed_ledger_cost(3.00)
+
+    session, _resp = _stub_chat_completion_deps(
+        monkeypatch, capabilities={"supported_e2ee_versions": [], "serving": "aggregator"}
+    )
+    client = phala_tee.PhalaTeeClient(session=session, base_url="http://127.0.0.1:4180")
+
+    calls = []
+    monkeypatch.setattr(
+        "agents_core.notify.send_notification",
+        lambda *a, **kw: calls.append((a, kw)) or True,
+    )
+
+    for _ in range(3):
+        with pytest.raises(phala_tee.PhalaSpendCapExceededError):
+            client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m")
+
+    assert len(calls) == 1
+
+
+def test_spend_cap_refusal_surfaces_unknown_total_when_unpriced_rows_present(monkeypatch):
+    """DoD 8: unpriced rows in the window are surfaced as unknown, in both
+    the raised exception and the notification — never folded into a
+    falsely confident total."""
+    monkeypatch.setenv("PHALA_DAILY_SPEND_CAP_USD", "2.00")
+    _seed_ledger_cost(3.00)
+    _seed_ledger_cost(None)  # unpriced row
+
+    session, _resp = _stub_chat_completion_deps(
+        monkeypatch, capabilities={"supported_e2ee_versions": [], "serving": "aggregator"}
+    )
+    client = phala_tee.PhalaTeeClient(session=session, base_url="http://127.0.0.1:4180")
+
+    calls = []
+    monkeypatch.setattr(
+        "agents_core.notify.send_notification",
+        lambda *a, **kw: calls.append((a, kw)) or True,
+    )
+
+    with pytest.raises(phala_tee.PhalaSpendCapExceededError) as excinfo:
+        client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m")
+
+    assert excinfo.value.unpriced_count == 1
+    assert "unpriced" in str(excinfo.value).lower()
+    assert calls and "unpriced" in calls[0][0][0].lower()
+
+
+def test_spend_cap_default_is_two_dollars_overridable_by_env(monkeypatch):
+    monkeypatch.delenv("PHALA_DAILY_SPEND_CAP_USD", raising=False)
+    assert phala_tee._phala_daily_spend_cap_usd() == 2.00
+    monkeypatch.setenv("PHALA_DAILY_SPEND_CAP_USD", "0.05")
+    assert phala_tee._phala_daily_spend_cap_usd() == 0.05
+
+
+def test_reconcile_daily_spend_reports_material_divergence_without_gating(monkeypatch):
+    """Leg 3 must report, never gate — no exception, no refusal."""
+    _seed_ledger_cost(1.00)
+    result = phala_tee.reconcile_daily_spend(2.50)
+    assert result["ledger_total_usd"] == 1.00
+    assert result["divergence_usd"] == pytest.approx(-1.50)
+    assert result["material_divergence"] is True
+
+
+def test_reconcile_daily_spend_no_divergence_when_matching(monkeypatch):
+    _seed_ledger_cost(1.00)
+    result = phala_tee.reconcile_daily_spend(1.00)
+    assert result["material_divergence"] is False
+
+
+def test_reconcile_daily_spend_unknown_provider_value_still_reports_ledger_total(monkeypatch):
+    _seed_ledger_cost(1.00)
+    result = phala_tee.reconcile_daily_spend(None)
+    assert result["ledger_total_usd"] == 1.00
+    assert result["divergence_usd"] is None
+    assert result["material_divergence"] is False
 
 
 @pytest.mark.integration

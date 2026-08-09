@@ -75,13 +75,16 @@ into it) — this module surfaces that as an explicit, visible allowance
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 from cryptography.exceptions import InvalidSignature, InvalidTag
@@ -97,6 +100,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from agents_core import locality
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://inference.phala.com"
 # The traffic route (PHALA_BASE_URL) and the verification target
@@ -114,6 +119,28 @@ _HKDF_INFO = b"aci.e2ee.v2.x25519"
 _SUPPORTED_E2EE_VERSION = "2"
 # secp256k1 group order — canonicality bound for raw r||s signatures.
 SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+# ---------------------------------------------------------------------------
+# Spend cap (agents-core-phala-spend-cap-v0, 2026-08-08 ratification). The
+# gateway returns an authoritative per-call `usage.cost` from the metered
+# provider synchronously, in the response body — this is not an estimate
+# and not Phala's usage panel (Erah's caveat: "either the panel is slow or
+# something's + or - here" — the panel must never be what enforces this).
+# Leg 1 threads that cost into the locality ledger below; Leg 2 (below) sums
+# today's already-recorded ledger rows and refuses BEFORE sending a call
+# that would push the Pacific day over cap. Never a price table, never a
+# poll.
+# ---------------------------------------------------------------------------
+PHALA_COST_CLASS = "paid-phala-tee"
+PHALA_DAILY_SPEND_CAP_ENV = "PHALA_DAILY_SPEND_CAP_USD"
+# Q2a-1 ratification: $2/day, ~5x Erah's observed 2026-08-08 usage ($0.36
+# for 3.6M tokens at $0.20/M input, $0.40/M output).
+DEFAULT_PHALA_DAILY_SPEND_CAP_USD = 2.00
+_PACIFIC = ZoneInfo("America/Los_Angeles")
+# Reconciliation (Leg 3) divergence threshold — informational only, never
+# gates a call. Env-overridable like the cap for the same testing reasons.
+PHALA_RECONCILE_DIVERGENCE_ENV = "PHALA_RECONCILE_DIVERGENCE_USD"
+DEFAULT_PHALA_RECONCILE_DIVERGENCE_USD = 0.50
 
 # ---------------------------------------------------------------------------
 # Vendored reference verifier (`aci` CLI) delegation — Piece 1 (the binary
@@ -265,6 +292,35 @@ class LoopbackVerificationTargetError(AciError):
             f"point at the real service."
         )
         self.verify_target = verify_target
+
+
+class PhalaSpendCapExceededError(AciError):
+    """Raised when today's recorded Phala spend (Pacific day, cost_class
+    ``paid-phala-tee``, summed from OUR OWN locality ledger — never Phala's
+    usage panel) is at or over the daily cap. Refused BEFORE the call is
+    sent — fail closed (Q2a-2, 2026-08-08 ratification: "a spend guard that
+    keeps spending is not a guard"). Distinct from every other AciError in
+    this module on purpose: those mean a broken/unverifiable seat, this
+    means "we chose not to spend" — a caller must be able to tell the two
+    apart. Never degrades to another operator; the caller must handle this
+    explicitly (e.g. skip the call, fall back to a non-metered seat by its
+    own choice, or surface it upstream)."""
+
+    def __init__(self, spent_usd: float, cap_usd: float, unpriced_count: int):
+        self.spent_usd = spent_usd
+        self.cap_usd = cap_usd
+        self.unpriced_count = unpriced_count
+        msg = (
+            f"Phala daily spend cap reached: ${spent_usd:.4f} recorded today "
+            f"(America/Los_Angeles day) against a ${cap_usd:.2f}/day cap"
+        )
+        if unpriced_count:
+            msg += (
+                f" — {unpriced_count} unpriced call(s) also recorded today; "
+                f"true spend may be higher than the total above (unknown, not zero)"
+            )
+        msg += ". Refusing this call rather than risk exceeding the cap."
+        super().__init__(msg)
 
 
 class ReasoningContentDecryptionError(AciError):
@@ -923,6 +979,133 @@ def open_e2ee_channel(report: dict, verification: ReportVerification) -> E2eeCha
 
 
 # ---------------------------------------------------------------------------
+# Spend cap (Leg 2) + reconciliation (Leg 3) — agents-core-phala-spend-cap-v0.
+# ---------------------------------------------------------------------------
+
+
+def _phala_daily_spend_cap_usd() -> float:
+    """Read at call time (not module load) so tests/ops can override via env
+    without a process restart — same pattern as locality._max_bytes()."""
+    raw = os.environ.get(PHALA_DAILY_SPEND_CAP_ENV)
+    if raw is None:
+        return DEFAULT_PHALA_DAILY_SPEND_CAP_USD
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_PHALA_DAILY_SPEND_CAP_USD
+
+
+def _phala_reconcile_divergence_usd() -> float:
+    raw = os.environ.get(PHALA_RECONCILE_DIVERGENCE_ENV)
+    if raw is None:
+        return DEFAULT_PHALA_RECONCILE_DIVERGENCE_USD
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_PHALA_RECONCILE_DIVERGENCE_USD
+
+
+def _pacific_day_bounds(day: date | None = None, *, now_utc: datetime | None = None):
+    """Return (start_utc, end_utc) for one America/Los_Angeles calendar day,
+    matching how TOU windows and the night DAG reckon their day boundary.
+    `day=None` means "today" (Pacific), and end_utc is then `now_utc` rather
+    than midnight, so a same-day window never looks into the future."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    now_pacific_date = now_utc.astimezone(_PACIFIC).date()
+    if day is None:
+        day = now_pacific_date
+    start_pacific = datetime(day.year, day.month, day.day, tzinfo=_PACIFIC)
+    start_utc = start_pacific.astimezone(timezone.utc)
+    if day == now_pacific_date:
+        end_utc = now_utc
+    else:
+        end_utc = (start_pacific + timedelta(days=1)).astimezone(timezone.utc)
+    return start_utc, end_utc
+
+
+def _notify_spend_cap_once(spent_usd: float, cap_usd: float, unpriced_count: int) -> None:
+    """Pushover the spend-cap refusal, at most once per Pacific day (Q2a-2:
+    a cap that pages on every blocked call is alert fatigue by construction).
+    Best-effort: never raises, never blocks the caller's refusal."""
+    try:
+        day = datetime.now(_PACIFIC).strftime("%Y-%m-%d")
+        marker = locality.root() / f".phala_spend_cap_notified.{day}"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+        except FileExistsError:
+            return  # already notified today
+
+        message = (
+            f"Phala daily spend cap (${cap_usd:.2f}) reached: "
+            f"${spent_usd:.4f} recorded today."
+        )
+        if unpriced_count:
+            message += (
+                f" {unpriced_count} unpriced call(s) also recorded today — "
+                f"true spend may be higher (unknown, not zero)."
+            )
+
+        from agents_core.notify import Priority, send_notification
+
+        send_notification(
+            message,
+            title="Phala spend cap reached",
+            priority=Priority.HIGH,
+            source="phala_tee",
+        )
+    except Exception as e:
+        logger.warning("[phala_tee] spend-cap notification failed: %s", e)
+
+
+def _check_phala_spend_cap() -> None:
+    """Sum today's OWN-LEDGER cost for cost_class paid-phala-tee (never
+    Phala's usage panel) and refuse before a call is sent if the Pacific
+    day is already at or over the cap — fail closed. Called at the top of
+    `PhalaTeeClient.chat_completion`, before any network I/O."""
+    cap = _phala_daily_spend_cap_usd()
+    since, until = _pacific_day_bounds()
+    summary = locality.cost_class_window_summary(PHALA_COST_CLASS, since=since, until=until)
+    spent = summary["total_cost_usd"]
+    if spent >= cap:
+        _notify_spend_cap_once(spent, cap, summary["unpriced_count"])
+        raise PhalaSpendCapExceededError(spent, cap, summary["unpriced_count"])
+
+
+def reconcile_daily_spend(provider_reported_usd: float | None, *, day: date | None = None) -> dict:
+    """Leg 3 — compare our ledger's daily total against the provider's own
+    reported usage for the same Pacific day. Reports a divergence; NEVER
+    gates a call (that's Leg 2, and Leg 2 never reads the provider panel —
+    Erah's caveat "either the panel is slow or something's + or - here" is
+    exactly why this leg is a slow, informational cross-check and not the
+    enforcement path).
+
+    `provider_reported_usd` is supplied by the caller (e.g. read off Phala's
+    usage panel or API out of band) — this function does not fetch it, so
+    it never becomes a second polling path into the panel.
+    """
+    since, until = _pacific_day_bounds(day)
+    summary = locality.cost_class_window_summary(PHALA_COST_CLASS, since=since, until=until)
+    ledger_total = summary["total_cost_usd"]
+
+    divergence_usd = None
+    material_divergence = False
+    if provider_reported_usd is not None:
+        divergence_usd = ledger_total - provider_reported_usd
+        material_divergence = abs(divergence_usd) >= _phala_reconcile_divergence_usd()
+
+    return {
+        "ledger_total_usd": ledger_total,
+        "provider_reported_usd": provider_reported_usd,
+        "divergence_usd": divergence_usd,
+        "material_divergence": material_divergence,
+        "unpriced_count": summary["unpriced_count"],
+        "window": {"since": since.isoformat(), "until": until.isoformat()},
+    }
+
+
+# ---------------------------------------------------------------------------
 # High-level client
 # ---------------------------------------------------------------------------
 
@@ -1015,7 +1198,12 @@ class PhalaTeeClient:
         `x-e2ee-applied: true`; `PlaintextChannelNotLoopbackError` if the
         gateway does NOT advertise e2ee and `base_url` is not loopback —
         never silently falls back to an unverified/unsealed call over a
-        non-local hop."""
+        non-local hop; `PhalaSpendCapExceededError` if today's own-ledger
+        spend for this cost class is already at or over the daily cap —
+        refused before any network I/O, fail closed
+        (agents-core-phala-spend-cap-v0)."""
+        _check_phala_spend_cap()
+
         if nonce is None:
             nonce = os.urandom(32).hex()  # aci/1 requires 64 hex chars (32 bytes).
 
@@ -1070,6 +1258,27 @@ class PhalaTeeClient:
 
         e2ee_applied = bool(seal and applied)
 
+        # Leg 1 (agents-core-phala-spend-cap-v0): the gateway returns an
+        # authoritative per-call `usage.cost` from the metered provider,
+        # synchronously, in the response body — not an estimate, not the
+        # (untrusted-fresh) usage panel. Thread it into the ledger row so
+        # Leg 2's cap can sum OUR OWN recorded spend instead of polling
+        # anything. If usage or cost is absent, record cost_usd=None with a
+        # distinct marker — never substitute an estimate or a silent zero,
+        # which would make the cap under-count.
+        usage = response_json.get("usage") if isinstance(response_json, dict) else None
+        cost_usd = None
+        usage_extra: dict[str, Any] = {}
+        if isinstance(usage, dict):
+            for field_name in ("prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens"):
+                value = usage.get(field_name)
+                if isinstance(value, (int, float)):
+                    usage_extra[field_name] = value
+            raw_cost = usage.get("cost")
+            if isinstance(raw_cost, (int, float)):
+                cost_usd = raw_cost
+        usage_extra["cost_unpriced"] = cost_usd is None
+
         locality.record(
             requested_operator="phala-tee",
             served_model=model,
@@ -1077,6 +1286,7 @@ class PhalaTeeClient:
             cost_class="paid-phala-tee",
             seam="phala_tee",
             duration_ms=duration_ms,
+            cost_usd=cost_usd,
             # `ok` is the call-completed claim only (HTTP succeeded above) —
             # it must never be collapsed with the e2ee_applied claim (module
             # docstring, Piece 3 of agents-core-phala-aci1-restoration-v0).
@@ -1095,6 +1305,7 @@ class PhalaTeeClient:
                 # the old ceiling must not simply succeed silently at 200s — flag it
                 # so a slow seat stays discoverable instead of absorbed.
                 "latency_warning": duration_ms > self._LEGACY_TIMEOUT_SECS * 1000,
+                **usage_extra,
             },
         )
 
