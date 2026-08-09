@@ -607,6 +607,13 @@ def _run_local_reviewer(spec: dict, base_cwd: str | None) -> str | None:
         acquire_lease=spec.get("acquire_lease", True),
         lease_class="deferrable",
         reason_out=reason,
+        # This function already probed the seat's tool-calling ability above
+        # (probe_seat_tool_call) and carried the exact validated variant into
+        # `reviewer_tools`. Stand call_gw_agent's own grounding-guard retry
+        # down so the two remedies never stack on this, the hottest dispatch
+        # route in the system (agents-core-gw-agent-grounding-retry-parity-v0,
+        # DoD-5).
+        skip_probe=True,
     )
     if result is None:
         why = reason[0] if reason else "no_content_no_reason"
