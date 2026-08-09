@@ -672,10 +672,14 @@ def test_daemon_worker_acquires_council_sem_before_self_sem():
     )
 
 
-@pytest.mark.asyncio
-async def test_council_concurrency_cap_one_at_a_time():
-    """At most one council task runs at a time under _COUNCIL_SEM."""
+async def _run_council_concurrency_probe(monkeypatch, cap: int) -> int:
+    """Drive N=3 simulated council tasks under a _COUNCIL_SEM of the given
+    cap and return the observed concurrency peak. Shared by the cap=1
+    (historical hardcoded behavior) and cap=N (configurable, this unit)
+    cases below — same mechanism, different cap."""
     import agents_core.claude_queue_runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "_COUNCIL_SEM", asyncio.Semaphore(cap))
 
     concurrent_peak = [0]
     current_running = [0]
@@ -686,27 +690,37 @@ async def test_council_concurrency_cap_one_at_a_time():
         await asyncio.sleep(0.05)
         current_running[0] -= 1
 
-    orig = runner_mod._run_council_task
-    runner_mod._run_council_task = _slow_council
-    try:
-        sem = asyncio.Semaphore(4)  # plenty of general capacity
+    monkeypatch.setattr(runner_mod, "_run_council_task", _slow_council)
+    sem = asyncio.Semaphore(4)  # plenty of general capacity
 
-        async def _worker_sim(task):
-            async with runner_mod._COUNCIL_SEM:
-                async with sem:
-                    await runner_mod._run_task(MagicMock(), task)
+    async def _worker_sim(task):
+        async with runner_mod._COUNCIL_SEM:
+            async with sem:
+                await runner_mod._run_task(MagicMock(), task)
 
-        tasks = [
-            asyncio.create_task(_worker_sim(_make_task(task_type="council.run", task_id=f"c{i}")))
-            for i in range(3)
-        ]
-        await asyncio.gather(*tasks)
-    finally:
-        runner_mod._run_council_task = orig
+    tasks = [
+        asyncio.create_task(_worker_sim(_make_task(task_type="council.run", task_id=f"c{i}")))
+        for i in range(3)
+    ]
+    await asyncio.gather(*tasks)
+    return concurrent_peak[0]
 
-    assert concurrent_peak[0] == 1, (
-        f"Expected at most 1 concurrent council task, got peak={concurrent_peak[0]}"
-    )
+
+@pytest.mark.asyncio
+async def test_council_concurrency_cap_one_at_a_time(monkeypatch):
+    """At most one council task runs at a time under a _COUNCIL_SEM of 1
+    (COUNCIL_MAX_CONCURRENT=1 fallback / A/B surface — the historical
+    behavior, still reachable via explicit cap)."""
+    peak = await _run_council_concurrency_probe(monkeypatch, cap=1)
+    assert peak == 1, f"Expected at most 1 concurrent council task, got peak={peak}"
+
+
+@pytest.mark.asyncio
+async def test_council_concurrency_cap_honours_configured_value(monkeypatch):
+    """COUNCIL_MAX_CONCURRENT is a real cap, not just a literal-1 relabel —
+    raising it to 2 must let 2 council tasks run concurrently."""
+    peak = await _run_council_concurrency_probe(monkeypatch, cap=2)
+    assert peak == 2, f"Expected exactly 2 concurrent council tasks under cap=2, got peak={peak}"
 
 
 # ---------------------------------------------------------------------------
