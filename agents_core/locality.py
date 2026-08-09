@@ -302,6 +302,34 @@ def summarize(*, since=None, until=None) -> dict:
     }
 
 
+def cost_class_window_summary(cost_class: str, *, since=None, until=None) -> dict:
+    """Sum `cost_usd` for one `cost_class` within [since, until], keeping
+    unpriced rows (a call that completed but carries `cost_usd=None`)
+    distinct from priced ones instead of silently folding them into the
+    total as $0 — a spend cap reading this must be able to say "unknown",
+    not report a falsely confident number (agents-core-phala-spend-cap-v0).
+    """
+    entries = _read_entries(since=since, until=until)
+    total = 0.0
+    priced = 0
+    unpriced = 0
+    for entry in entries:
+        if entry.get("cost_class") != cost_class:
+            continue
+        cost_usd = entry.get("cost_usd")
+        if isinstance(cost_usd, (int, float)):
+            total += cost_usd
+            priced += 1
+        else:
+            unpriced += 1
+    return {
+        "total_cost_usd": total,
+        "priced_count": priced,
+        "unpriced_count": unpriced,
+        "count": priced + unpriced,
+    }
+
+
 def is_ledger_healthy(*, max_silence_hours: float = 24.0) -> tuple[bool, str]:
     """Return (False, reason) when no record has been written in
     max_silence_hours. An empty/stale ledger reads identically to a perfect

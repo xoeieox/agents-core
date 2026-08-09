@@ -225,6 +225,34 @@ def test_summarize_since_until_window_filters_entries(tmp_path, monkeypatch):
     assert past_result["total"] == 1
 
 
+def test_cost_class_window_summary_sums_only_priced_rows_of_the_requested_class(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALITY_LEDGER_ROOT", str(tmp_path))
+    locality.record(requested_operator="phala-tee", served_model="m", host="phala",
+                     cost_class="paid-phala-tee", seam="phala_tee", cost_usd=1.5)
+    locality.record(requested_operator="phala-tee", served_model="m", host="phala",
+                     cost_class="paid-phala-tee", seam="phala_tee", cost_usd=0.5)
+    # unpriced row of the same class — must count toward unpriced_count, not total.
+    locality.record(requested_operator="phala-tee", served_model="m", host="phala",
+                     cost_class="paid-phala-tee", seam="phala_tee")
+    # a different cost class — must not leak into the total.
+    locality.record(requested_operator="claude-cli", served_model="m", host="claude-cli",
+                     cost_class="paid-anthropic", seam="call_claude_cli", cost_usd=100.0)
+
+    result = locality.cost_class_window_summary("paid-phala-tee")
+    assert result["total_cost_usd"] == 2.0
+    assert result["priced_count"] == 2
+    assert result["unpriced_count"] == 1
+    assert result["count"] == 3
+
+
+def test_cost_class_window_summary_empty_ledger_reports_zero_not_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALITY_LEDGER_ROOT", str(tmp_path))
+    result = locality.cost_class_window_summary("paid-phala-tee")
+    assert result["total_cost_usd"] == 0.0
+    assert result["priced_count"] == 0
+    assert result["unpriced_count"] == 0
+
+
 def test_is_ledger_healthy_false_when_no_records(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALITY_LEDGER_ROOT", str(tmp_path))
     healthy, reason = locality.is_ledger_healthy()
