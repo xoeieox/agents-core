@@ -8,7 +8,7 @@ Environment variables:
   SHARED_DELIBERATION_BIND_HOST      — uvicorn bind host (default 127.0.0.1)
   SHARED_DELIBERATION_BIND_PORT      — uvicorn bind port (default 8409)
   SHARED_DELIBERATION_BEARER_TOKEN   — optional shared bearer token
-  SHARED_DELIBERATION_MAX_CONCURRENT — max concurrent Facets subprocesses (default 2)
+  SHARED_DELIBERATION_MAX_CONCURRENT — max concurrent Facets subprocesses (default 4)
   SHARED_DELIBERATION_COUNCIL_TIMEOUT_S — council poll timeout in seconds (default 1800)
   SHARED_DELIBERATION_FACETS_STUB    — set to 1 to stub Facets (testing)
   SHARED_DELIBERATION_COUNCIL_STUB   — set to 1 to stub Council (testing)
@@ -32,7 +32,7 @@ log = logging.getLogger("shared-deliberation-server")
 BIND_HOST = os.environ.get("SHARED_DELIBERATION_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("SHARED_DELIBERATION_BIND_PORT", "8409"))
 BEARER_TOKEN = os.environ.get("SHARED_DELIBERATION_BEARER_TOKEN")
-MAX_CONCURRENT = int(os.environ.get("SHARED_DELIBERATION_MAX_CONCURRENT", "2"))
+MAX_CONCURRENT = int(os.environ.get("SHARED_DELIBERATION_MAX_CONCURRENT", "4"))
 
 
 def _error(code: str, message: str) -> dict:

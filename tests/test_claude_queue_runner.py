@@ -635,3 +635,97 @@ def test_startup_sweep_clears_ghost_in_flight_entry(tmp_path, monkeypatch):
     import json
     persisted = json.loads(queue.state_path.read_text())
     assert "ghost-id" not in persisted["in_flight"]
+
+
+# ---------------------------------------------------------------------------
+# Council concurrency cap — _parse_concurrency_cap / COUNCIL_MAX_CONCURRENT
+# (council-concurrent-voicing-and-governor-caps-v0)
+# ---------------------------------------------------------------------------
+
+def test_parse_concurrency_cap_missing_env_uses_default(monkeypatch):
+    monkeypatch.delenv("SOME_TEST_CAP_VAR", raising=False)
+    assert runner_mod._parse_concurrency_cap("SOME_TEST_CAP_VAR", 2) == 2
+
+
+def test_parse_concurrency_cap_valid_value_used(monkeypatch):
+    monkeypatch.setenv("SOME_TEST_CAP_VAR", "5")
+    assert runner_mod._parse_concurrency_cap("SOME_TEST_CAP_VAR", 2) == 5
+
+
+def test_parse_concurrency_cap_invalid_falls_back_to_1_and_warns(monkeypatch, caplog):
+    monkeypatch.setenv("SOME_TEST_CAP_VAR", "not-a-number")
+    with caplog.at_level("WARNING", logger="claude-queue-runner"):
+        cap = runner_mod._parse_concurrency_cap("SOME_TEST_CAP_VAR", 2)
+    assert cap == 1
+    assert any(
+        record.levelname == "WARNING" and "SOME_TEST_CAP_VAR" in record.message
+        for record in caplog.records
+    )
+
+
+def test_parse_concurrency_cap_zero_falls_back_to_1_and_warns(monkeypatch, caplog):
+    monkeypatch.setenv("SOME_TEST_CAP_VAR", "0")
+    with caplog.at_level("WARNING", logger="claude-queue-runner"):
+        cap = runner_mod._parse_concurrency_cap("SOME_TEST_CAP_VAR", 2)
+    assert cap == 1
+    assert any(record.levelname == "WARNING" for record in caplog.records)
+
+
+def test_parse_concurrency_cap_negative_falls_back_to_1_and_warns(monkeypatch, caplog):
+    monkeypatch.setenv("SOME_TEST_CAP_VAR", "-3")
+    with caplog.at_level("WARNING", logger="claude-queue-runner"):
+        cap = runner_mod._parse_concurrency_cap("SOME_TEST_CAP_VAR", 2)
+    assert cap == 1
+    assert any(record.levelname == "WARNING" for record in caplog.records)
+
+
+def test_council_max_concurrent_default_wiring():
+    """COUNCIL_MAX_CONCURRENT and _COUNCIL_SEM are module-level, parsed once
+    at import. In this process (no COUNCIL_MAX_CONCURRENT set) the default
+    is 2 — proving the literal-1 semaphore has genuinely been replaced by
+    the configurable cap, not hardcoded."""
+    assert runner_mod.COUNCIL_MAX_CONCURRENT == 2
+    assert runner_mod._COUNCIL_SEM._value == 2
+
+
+def _import_time_council_cap(env_value: str | None) -> tuple[int, int]:
+    """Import claude_queue_runner fresh in a subprocess under a controlled
+    COUNCIL_MAX_CONCURRENT env, and report (COUNCIL_MAX_CONCURRENT,
+    _COUNCIL_SEM._value). Subprocess isolation (rather than importlib.reload
+    in-process) avoids leaving a second Daemon/Semaphore class generation
+    behind for every other test module that imported this one at collection
+    time."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    if env_value is None:
+        env.pop("COUNCIL_MAX_CONCURRENT", None)
+    else:
+        env["COUNCIL_MAX_CONCURRENT"] = env_value
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json, agents_core.claude_queue_runner as m; "
+            "print(json.dumps([m.COUNCIL_MAX_CONCURRENT, m._COUNCIL_SEM._value]))",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return tuple(json.loads(proc.stdout.strip().splitlines()[-1]))
+
+
+def test_council_max_concurrent_honours_env_override():
+    cap, sem_value = _import_time_council_cap("5")
+    assert (cap, sem_value) == (5, 5)
+
+
+def test_council_max_concurrent_invalid_env_falls_back_to_1():
+    cap, sem_value = _import_time_council_cap("garbage")
+    assert (cap, sem_value) == (1, 1)

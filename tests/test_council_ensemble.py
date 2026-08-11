@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -118,6 +119,41 @@ def _wire_fixture_reviewer_deck(tmp_path: Path, monkeypatch) -> Path:
     return root
 
 
+def _wire_n_fixture_reviewer_cards(tmp_path: Path, monkeypatch, n: int) -> list[str]:
+    """Portable cards root with `n` minimal fixture reviewer cards
+    (fixture-reviewer-a, -b, -c, ... — alphabetical == deck order, since
+    load_deck_cards sorts by filename). Returns the slugs in deck order."""
+    root = tmp_path / "cards"
+    primitives_dir = root / "primitives"
+    primitives_dir.mkdir(parents=True)
+    reviewer_dir = root / "decks" / "reviewer"
+    reviewer_dir.mkdir(parents=True)
+
+    slugs = []
+    for i in range(n):
+        letter = chr(ord("a") + i)
+        slug = f"fixture-reviewer-{letter}"
+        slugs.append(slug)
+        prim_id = f"{letter}-primitive"
+        card = {
+            "slug": slug,
+            "composition": {"primitives": {prim_id: 1.0}},
+            "voice_exemplars": [
+                f"{letter} exemplar one.",
+                f"{letter} exemplar two.",
+                f"{letter} exemplar three.",
+            ],
+            "domains": [f"{letter}-domain"],
+            "kernel_invariants": ["Truth integrity"],
+        }
+        (reviewer_dir / f"{slug}.yaml").write_text(yaml.safe_dump(card))
+        (primitives_dir / f"{prim_id}.yaml").write_text(f"id: {prim_id}\n")
+
+    monkeypatch.setenv("ARCHETYPAL_CARDS_PATH", str(root))
+    monkeypatch.setattr(ensemble, "DECKS_ROOT", root / "decks")
+    return slugs
+
+
 # ---------------------------------------------------------------------------
 # run_ensemble — real seeded deck (1 card)
 # ---------------------------------------------------------------------------
@@ -208,6 +244,250 @@ def test_run_ensemble_shares_one_principal_across_voices(tmp_path, monkeypatch):
 
     assert len(captured_principals) == 2
     assert captured_principals[0] == captured_principals[1] == "shared-principal-x"
+
+
+# ---------------------------------------------------------------------------
+# run_ensemble — concurrent voicing (council-concurrent-voicing-and-governor-caps-v0)
+# ---------------------------------------------------------------------------
+
+def test_run_ensemble_provenance_isolated_under_concurrent_interleaving(tmp_path, monkeypatch):
+    """Deliberately interleave completion order (later-deck-index cards finish
+    first) and assert every VoiceEntry carries exactly its own event — no
+    cross-voice bleed from concurrent-append on a shared adapter."""
+    slugs = _wire_n_fixture_reviewer_cards(tmp_path, monkeypatch, 4)
+    monkeypatch.setenv("COUNCIL_VOICING_MAX_CONCURRENT", "4")
+
+    def fake_call_operator(operator_class, prompt, **kwargs):
+        system = kwargs.get("system", "")
+        matched = next(s for s in slugs if s in system)
+        # Reverse-order sleep: the LAST deck card finishes FIRST, forcing
+        # real out-of-order completion under the thread pool.
+        idx = slugs.index(matched)
+        time.sleep(0.03 * (len(slugs) - idx))
+        provenance_out = kwargs.get("_provenance_out")
+        if provenance_out is not None:
+            provenance_out.append(("success", matched))
+        return f"voiced by {matched}"
+
+    with patch(
+        "agents_core.council.gravitywell_adapter.call_operator",
+        side_effect=fake_call_operator,
+    ):
+        result = ensemble.run_ensemble("Review this diff.", deck="reviewer")
+
+    assert len(result.roster) == 4
+    for entry in result.roster:
+        assert len(entry.voicing_provenance) == 1
+        assert entry.voicing_provenance[0]["effective_operator"] == entry.slug
+        assert entry.output == f"voiced by {entry.slug}"
+
+
+def test_run_ensemble_roster_order_is_deck_order_despite_completion_order(tmp_path, monkeypatch):
+    slugs = _wire_n_fixture_reviewer_cards(tmp_path, monkeypatch, 4)
+    monkeypatch.setenv("COUNCIL_VOICING_MAX_CONCURRENT", "4")
+
+    def fake_call_operator(operator_class, prompt, **kwargs):
+        system = kwargs.get("system", "")
+        matched = next(s for s in slugs if s in system)
+        idx = slugs.index(matched)
+        time.sleep(0.03 * (len(slugs) - idx))  # first card finishes LAST
+        return f"voiced by {matched}"
+
+    with patch(
+        "agents_core.council.gravitywell_adapter.call_operator",
+        side_effect=fake_call_operator,
+    ):
+        result = ensemble.run_ensemble("Review this diff.", deck="reviewer")
+
+    assert [entry.slug for entry in result.roster] == slugs
+
+
+def test_run_ensemble_voicing_cap_1_matches_sequential_behavior(tmp_path, monkeypatch):
+    """COUNCIL_VOICING_MAX_CONCURRENT=1 must reproduce today's sequential
+    behavior exactly — one call in flight at a time, in deck order."""
+    slugs = _wire_n_fixture_reviewer_cards(tmp_path, monkeypatch, 3)
+    monkeypatch.setenv("COUNCIL_VOICING_MAX_CONCURRENT", "1")
+
+    call_order = []
+    in_flight = []
+    max_in_flight = [0]
+
+    def fake_call_operator(operator_class, prompt, **kwargs):
+        system = kwargs.get("system", "")
+        matched = next(s for s in slugs if s in system)
+        in_flight.append(matched)
+        max_in_flight[0] = max(max_in_flight[0], len(in_flight))
+        call_order.append(matched)
+        time.sleep(0.01)
+        in_flight.remove(matched)
+        return f"voiced by {matched}"
+
+    with patch(
+        "agents_core.council.gravitywell_adapter.call_operator",
+        side_effect=fake_call_operator,
+    ):
+        result = ensemble.run_ensemble("Review this diff.", deck="reviewer")
+
+    assert max_in_flight[0] == 1  # never more than one call in flight
+    assert call_order == slugs   # and it happened in deck order
+    assert [entry.slug for entry in result.roster] == slugs
+
+
+def test_council_voicing_cap_invalid_env_falls_back_to_1_and_warns(monkeypatch, caplog):
+    monkeypatch.setenv("COUNCIL_VOICING_MAX_CONCURRENT", "not-a-number")
+    with caplog.at_level("WARNING", logger="agents_core.council.ensemble"):
+        cap = ensemble._council_voicing_cap()
+    assert cap == 1
+    assert any(
+        record.levelname == "WARNING" and "COUNCIL_VOICING_MAX_CONCURRENT" in record.message
+        for record in caplog.records
+    )
+
+
+def test_council_voicing_cap_zero_falls_back_to_1_and_warns(monkeypatch, caplog):
+    monkeypatch.setenv("COUNCIL_VOICING_MAX_CONCURRENT", "0")
+    with caplog.at_level("WARNING", logger="agents_core.council.ensemble"):
+        cap = ensemble._council_voicing_cap()
+    assert cap == 1
+    assert any(record.levelname == "WARNING" for record in caplog.records)
+
+
+def test_council_voicing_cap_default_is_4(monkeypatch):
+    monkeypatch.delenv("COUNCIL_VOICING_MAX_CONCURRENT", raising=False)
+    assert ensemble._council_voicing_cap() == 4
+
+
+def test_run_ensemble_partial_failure_yields_error_entry_others_succeed(tmp_path, monkeypatch):
+    slugs = _wire_n_fixture_reviewer_cards(tmp_path, monkeypatch, 3)
+    failing_slug = slugs[1]
+
+    def fake_call_operator(operator_class, prompt, **kwargs):
+        system = kwargs.get("system", "")
+        matched = next(s for s in slugs if s in system)
+        if matched == failing_slug:
+            raise RuntimeError("simulated voice failure")
+        provenance_out = kwargs.get("_provenance_out")
+        if provenance_out is not None:
+            provenance_out.append(("success", matched))
+        return f"voiced by {matched}"
+
+    with patch(
+        "agents_core.council.gravitywell_adapter.call_operator",
+        side_effect=fake_call_operator,
+    ):
+        result = ensemble.run_ensemble("Review this diff.", deck="reviewer")
+
+    assert [entry.slug for entry in result.roster] == slugs  # position preserved
+    failed = result.roster[1]
+    assert failed.error is not None
+    assert failed.output == ""
+    assert failed.voicing_provenance == []
+    for i in (0, 2):
+        assert result.roster[i].error is None
+        assert result.roster[i].output == f"voiced by {slugs[i]}"
+
+
+def test_run_ensemble_all_voices_fail_raises(tmp_path, monkeypatch):
+    slugs = _wire_n_fixture_reviewer_cards(tmp_path, monkeypatch, 2)
+
+    def fake_call_operator(operator_class, prompt, **kwargs):
+        raise RuntimeError("simulated total outage")
+
+    with patch(
+        "agents_core.council.gravitywell_adapter.call_operator",
+        side_effect=fake_call_operator,
+    ):
+        with pytest.raises(RuntimeError):
+            ensemble.run_ensemble("Review this diff.", deck="reviewer")
+
+
+# ---------------------------------------------------------------------------
+# run_ensemble — roster rotation seam
+# ---------------------------------------------------------------------------
+
+def test_run_ensemble_rotation_same_key_same_subset(tmp_path, monkeypatch):
+    slugs = _wire_n_fixture_reviewer_cards(tmp_path, monkeypatch, 6)
+
+    def fake_call_operator(operator_class, prompt, **kwargs):
+        system = kwargs.get("system", "")
+        matched = next(s for s in slugs if s in system)
+        return f"voiced by {matched}"
+
+    with patch(
+        "agents_core.council.gravitywell_adapter.call_operator",
+        side_effect=fake_call_operator,
+    ):
+        result_a = ensemble.run_ensemble(
+            "Review this diff.", deck="reviewer", voices=3, rotation_key="spec-a"
+        )
+        result_b = ensemble.run_ensemble(
+            "Review this diff.", deck="reviewer", voices=3, rotation_key="spec-a"
+        )
+
+    assert len(result_a.roster) == 3
+    assert [e.slug for e in result_a.roster] == [e.slug for e in result_b.roster]
+
+
+def test_run_ensemble_rotation_different_key_different_subset(tmp_path, monkeypatch):
+    slugs = _wire_n_fixture_reviewer_cards(tmp_path, monkeypatch, 6)
+
+    def fake_call_operator(operator_class, prompt, **kwargs):
+        system = kwargs.get("system", "")
+        matched = next(s for s in slugs if s in system)
+        return f"voiced by {matched}"
+
+    with patch(
+        "agents_core.council.gravitywell_adapter.call_operator",
+        side_effect=fake_call_operator,
+    ):
+        result_a = ensemble.run_ensemble(
+            "Review this diff.", deck="reviewer", voices=3, rotation_key="spec-a"
+        )
+        result_b = ensemble.run_ensemble(
+            "Review this diff.", deck="reviewer", voices=3, rotation_key="spec-b"
+        )
+
+    slugs_a = {e.slug for e in result_a.roster}
+    slugs_b = {e.slug for e in result_b.roster}
+    assert slugs_a != slugs_b
+
+
+def test_run_ensemble_rotation_selection_preserves_deck_order(tmp_path, monkeypatch):
+    slugs = _wire_n_fixture_reviewer_cards(tmp_path, monkeypatch, 6)
+
+    def fake_call_operator(operator_class, prompt, **kwargs):
+        system = kwargs.get("system", "")
+        matched = next(s for s in slugs if s in system)
+        return f"voiced by {matched}"
+
+    with patch(
+        "agents_core.council.gravitywell_adapter.call_operator",
+        side_effect=fake_call_operator,
+    ):
+        result = ensemble.run_ensemble(
+            "Review this diff.", deck="reviewer", voices=3, rotation_key="spec-order-check"
+        )
+
+    result_slugs = [e.slug for e in result.roster]
+    # Selected subset must appear in deck (alphabetical) order, not rotation-key order.
+    assert result_slugs == sorted(result_slugs)
+
+
+def test_run_ensemble_voices_none_is_full_deck_unchanged(tmp_path, monkeypatch):
+    slugs = _wire_n_fixture_reviewer_cards(tmp_path, monkeypatch, 3)
+
+    def fake_call_operator(operator_class, prompt, **kwargs):
+        system = kwargs.get("system", "")
+        matched = next(s for s in slugs if s in system)
+        return f"voiced by {matched}"
+
+    with patch(
+        "agents_core.council.gravitywell_adapter.call_operator",
+        side_effect=fake_call_operator,
+    ):
+        result = ensemble.run_ensemble("Review this diff.", deck="reviewer")
+
+    assert [e.slug for e in result.roster] == slugs
 
 
 # ---------------------------------------------------------------------------

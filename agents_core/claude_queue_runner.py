@@ -54,20 +54,8 @@ _CLAIM_LOOP_CRASH_EXIT_CODE = 3
 
 # Council concurrency control — module-level, NOT on Daemon (see docstring).
 # asyncio.Semaphore is safe to create at module level in Python 3.10+.
-_COUNCIL_SEM = asyncio.Semaphore(1)
-"""Hard cap: at most one council subprocess at a time.
-
-NOT placed on Daemon because the existing dispatch pattern is
-  Daemon._worker → module-level _run_task(queue, task)
-with no Daemon handle threaded through.  Putting it on Daemon would require
-reworking every call site.
-
-Acquisition order in Daemon._worker is load-bearing: _COUNCIL_SEM is
-acquired BEFORE self.sem.  Reversed order causes the second queued council
-task to idle-hold a worker slot while waiting — dropping fixer/reviewer
-throughput to zero.  With the outer-first ordering, the second council task
-blocks without holding a worker slot.
-"""
+# Constructed below (after `log` and COUNCIL_MAX_CONCURRENT are defined) —
+# see _COUNCIL_SEM assignment further down this module.
 
 _COUNCIL_DIR = room_path("council")
 _COUNCIL_LOG_DIR = room_path("council.logs")
@@ -80,6 +68,47 @@ _DELIBERATION_TERMINAL = frozenset({"resolved", "open", "laid-down"})
 _SCENE_TERMINAL = frozenset({"closed"})
 
 log = logging.getLogger("claude-queue-runner")
+
+
+def _parse_concurrency_cap(env_var: str, default: int) -> int:
+    """Parse a positive-int concurrency cap from an env var.
+
+    Invalid or <1 values fall back to 1 and log a WARNING (never crash the
+    daemon on a bad env var). Missing env var uses `default` silently.
+    """
+    raw = os.environ.get(env_var)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+        if value < 1:
+            raise ValueError(f"{env_var}={raw!r} must be >= 1")
+        return value
+    except ValueError:
+        log.warning(
+            f"{env_var}={raw!r} is invalid — falling back to 1"
+        )
+        return 1
+
+
+COUNCIL_MAX_CONCURRENT = _parse_concurrency_cap("COUNCIL_MAX_CONCURRENT", 2)
+
+_COUNCIL_SEM = asyncio.Semaphore(COUNCIL_MAX_CONCURRENT)
+"""Cap: at most COUNCIL_MAX_CONCURRENT council subprocesses at a time
+(env COUNCIL_MAX_CONCURRENT, default 2; invalid/<1 falls back to 1 with a
+WARNING log — see _parse_concurrency_cap).
+
+NOT placed on Daemon because the existing dispatch pattern is
+  Daemon._worker → module-level _run_task(queue, task)
+with no Daemon handle threaded through.  Putting it on Daemon would require
+reworking every call site.
+
+Acquisition order in Daemon._worker is load-bearing: _COUNCIL_SEM is
+acquired BEFORE self.sem.  Reversed order causes the second queued council
+task to idle-hold a worker slot while waiting — dropping fixer/reviewer
+throughput to zero.  With the outer-first ordering, the second council task
+blocks without holding a worker slot.
+"""
 
 
 # ---------------------------------------------------------------------------
