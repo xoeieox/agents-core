@@ -328,20 +328,42 @@ def _gw_explicit_backend() -> str | None:
     return val
 
 
-def _gw_backend(discovered_model: str | None = None) -> str:
+def _gw_backend(discovered_model: str | None = None, owned_by: str | None = None) -> str:
     """Resolve the llama.cpp-vs-vLLM payload dialect.
 
-    Explicit GW_BACKEND always wins (set-but-unrecognized raises ValueError - a
-    misconfigured switch must force a deliberate fix, never silently normalize).
-    Otherwise, when auto-detecting, `discovered_model` (the model _gw_discover_serving()
-    found being served) decides: "llamacpp" iff it equals OPERATOR_DEFAULTS["gravitywell"]
-    ("gravitywell-122b", the only llama.cpp-served model name in this ecosystem today),
-    else "vllm". With no explicit backend and no discovered_model (e.g. called standalone
-    with no call context), falls back to "llamacpp".
+    Precedence:
+    1. Explicit GW_BACKEND always wins (set-but-unrecognized raises ValueError - a
+       misconfigured switch must force a deliberate fix, never silently normalize).
+    2. `owned_by` - the `owned_by` field the discovery probe's /v1/models response
+       carries alongside the served model id - decides directly when recognized:
+       "llamacpp" -> "llamacpp", "vllm" -> "vllm". The server names its own engine, so
+       this is correct for every current and future llama.cpp/vLLM seat (today
+       gravitywell-122b and gravitywell-v4flash both serve llama.cpp under different
+       names) without a model-name allowlist to keep in sync.
+    3. An unrecognized `owned_by` (a future engine string, or a garbled value) falls
+       through to the literal comparison below and logs one WARNING naming the value -
+       resolution must never raise here, this runs inside every GW call. Absent
+       `owned_by` (older servers, or no discovery context) is not an anomaly and logs
+       nothing; it falls to the same literal comparison: `discovered_model` equals
+       OPERATOR_DEFAULTS["gravitywell"] ("gravitywell-122b") -> "llamacpp", else "vllm".
+       This literal fallback is known-stale for any second/future llama.cpp seat that
+       omits or garbles `owned_by` - it exists only as a safety net for those servers.
+    4. With no explicit backend, no owned_by, and no discovered_model (e.g. called
+       standalone with no call context), falls back to "llamacpp".
     """
     explicit = _gw_explicit_backend()
     if explicit is not None:
         return explicit
+    if owned_by is not None:
+        if owned_by == "llamacpp":
+            return "llamacpp"
+        if owned_by == "vllm":
+            return "vllm"
+        _log.warning(
+            "[gravitywell] unrecognized owned_by=%r reported for model=%r; falling back "
+            "to literal model-name comparison for backend dialect resolution",
+            owned_by, discovered_model,
+        )
     if discovered_model is not None:
         return "llamacpp" if discovered_model == OPERATOR_DEFAULTS["gravitywell"] else "vllm"
     return "llamacpp"
@@ -355,20 +377,33 @@ _gw_handshake_cache: dict[tuple[str, str], bool] = {}
 _gw_handshake_lock = threading.Lock()
 
 
-def _gw_probe_served_model(url: str, timeout: int = 10, log=None) -> str | None:
+def _gw_probe_served_model(
+    url: str, timeout: int = 10, log=None, _owned_by_out: list | None = None
+) -> str | None:
     """Pure transport: GET {url}/v1/models and return the served model id, or None on
     any failure (connect error, timeout, malformed response, empty data). No caching, no
     assertion - callers own both. Shared by _gw_verify_serving_mode (explicit-mode,
     process-lifetime cache, hard-fail-on-drift) and _gw_discover_serving (auto-detect,
     TTL-bounded cache, no assertion) so the two only differ in caching/assertion
     semantics, not in how they talk to GW.
+
+    _owned_by_out: optional list to append the response entry's `owned_by` field to (the
+    same response this already fetches, no second request) - agents-core-gw-backend-
+    owned-by-resolver-v0 D1. None is appended when the field is absent, the entry is
+    missing, or the probe fails, so a caller can distinguish "no owned_by" from "didn't
+    ask". Omitted by default so existing callers are unaffected.
     """
     try:
         resp = requests.get(f"{url}/v1/models", timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
-        return data["data"][0].get("id") if data.get("data") else None
+        entry = data["data"][0] if data.get("data") else None
+        if _owned_by_out is not None:
+            _owned_by_out.append(entry.get("owned_by") if entry else None)
+        return entry.get("id") if entry else None
     except Exception as e:
+        if _owned_by_out is not None:
+            _owned_by_out.append(None)
         if log:
             log(f"[gravitywell] /v1/models probe unreachable (treated as availability, "
                 f"not drift): {e}")
@@ -403,11 +438,11 @@ def _gw_verify_serving_mode(url: str, model: str, log=None) -> None:
         _gw_handshake_cache[cache_key] = True
 
 
-# TTL-bounded discovery cache (auto-detect case): url -> (served_model, discovered_at).
+# TTL-bounded discovery cache (auto-detect case): url -> (served_model, owned_by, discovered_at).
 # Deliberately NOT a process-lifetime cache like _gw_handshake_cache above - a long-lived
 # process (claude-queue-runner above all) must still notice a genuine mode flip within a
 # bounded window. See _gw_discover_serving() for the full rationale.
-_gw_discovery_cache: dict[str, tuple[str, float]] = {}
+_gw_discovery_cache: dict[str, tuple[str, str | None, float]] = {}
 GW_DISCOVERY_TTL_S_DEFAULT = 30.0
 
 
@@ -418,7 +453,7 @@ def _gw_discovery_ttl_s() -> float:
     return float(os.environ.get("GW_DISCOVERY_TTL_S", str(GW_DISCOVERY_TTL_S_DEFAULT)))
 
 
-def _gw_discover_serving(url: str, log=None) -> str | None:
+def _gw_discover_serving(url: str, log=None, _owned_by_out: list | None = None) -> str | None:
     """Auto-detect (unset GW_MODEL and GW_BACKEND): return what `url` is currently
     serving, probing at most once per _gw_discovery_ttl_s() seconds per url.
 
@@ -438,20 +473,30 @@ def _gw_discover_serving(url: str, log=None) -> str | None:
     redundant concurrent probes are idempotent and harmless (the /v1/models GET is
     read-only), and holding the lock across the network call would serialize every
     concurrent GW probe process-wide (both functions share _gw_handshake_lock).
+
+    _owned_by_out: optional list to append the discovered `owned_by` value to (cached
+    alongside the model id, so a TTL-hit reuses it too - no extra HTTP request either way;
+    agents-core-gw-backend-owned-by-resolver-v0 D1).
     """
     now = time.monotonic()
     with _gw_handshake_lock:
         cached = _gw_discovery_cache.get(url)
-        if cached is not None and (now - cached[1]) < _gw_discovery_ttl_s():
+        if cached is not None and (now - cached[2]) < _gw_discovery_ttl_s():
+            if _owned_by_out is not None:
+                _owned_by_out.append(cached[1])
             return cached[0]
-    served = _gw_probe_served_model(url, log=log)
+    probe_owned_by: list = []
+    served = _gw_probe_served_model(url, log=log, _owned_by_out=probe_owned_by)
+    owned_by = probe_owned_by[0] if probe_owned_by else None
     if served is not None:
         with _gw_handshake_lock:
-            _gw_discovery_cache[url] = (served, now)
+            _gw_discovery_cache[url] = (served, owned_by, now)
+    if _owned_by_out is not None:
+        _owned_by_out.append(owned_by if served is not None else None)
     return served
 
 
-def _gw_default_model(url: str = None, log=None) -> str:
+def _gw_default_model(url: str = None, log=None, _owned_by_out: list | None = None) -> str:
     """Resolve the default gravitywell model name, read at call time (not module-load).
 
     Explicit GW_MODEL always wins. Otherwise, explicit GW_BACKEND=vllm -> "gravitywell-27b",
@@ -461,6 +506,12 @@ def _gw_default_model(url: str = None, log=None) -> str:
     immune to the boot-default posture changing again without a code edit. Falls back to
     OPERATOR_DEFAULTS["gravitywell"] if the discovery probe fails (GW unreachable); the
     subsequent real call then fails to connect too, surfacing as OperatorUnreachableError.
+
+    _owned_by_out: optional list to append the discovered `owned_by` value to (only
+    populated on the auto-detect path; empty when GW_MODEL/GW_BACKEND are explicit, since
+    no discovery ran) - _call_gravitywell_backend threads this into _gw_backend() so the
+    backend dialect resolves from the server's own self-report, not a model-name literal
+    (agents-core-gw-backend-owned-by-resolver-v0 D1).
     """
     explicit_model = _gw_explicit_model()
     if explicit_model:
@@ -468,7 +519,7 @@ def _gw_default_model(url: str = None, log=None) -> str:
     explicit_backend = _gw_explicit_backend()
     if explicit_backend is not None:
         return "gravitywell-27b" if explicit_backend == "vllm" else OPERATOR_DEFAULTS["gravitywell"]
-    discovered = _gw_discover_serving(url or GW_URL, log=log)
+    discovered = _gw_discover_serving(url or GW_URL, log=log, _owned_by_out=_owned_by_out)
     return discovered if discovered is not None else OPERATOR_DEFAULTS["gravitywell"]
 
 
@@ -816,8 +867,11 @@ def _call_gravitywell_backend(
 
     The default GW path (_url is None and _model is None) only:
     - Payload dialect gates on GW_BACKEND when explicit ("llamacpp" byte-identical to
-      today; "vllm" omits the llama.cpp-only cache_prompt field), or on the auto-detected
-      model when GW_BACKEND/GW_MODEL are both unset - see _gw_backend().
+      today; "vllm" omits the llama.cpp-only cache_prompt field), or - when GW_BACKEND/
+      GW_MODEL are both unset - on the `owned_by` field the discovery probe's response
+      already carried alongside the auto-detected model (falling back to a literal
+      model-name comparison only if `owned_by` is absent or unrecognized) - see
+      _gw_backend().
     - Runs the pre-flight serving-mode handshake (cached) when GW_BACKEND/GW_MODEL are
       explicit - skipped when auto-detecting, since the discovery probe already
       established what's served - and always runs the per-call response-echo assertion,
@@ -858,12 +912,21 @@ def _call_gravitywell_backend(
     is_auto_detecting = (
         is_default_gw_path and _gw_explicit_model() is None and _gw_explicit_backend() is None
     )
-    model = _model if _model is not None else _gw_default_model(url=url, log=log)
+    if _model is not None:
+        model = _model
+        discovered_owned_by = None
+    else:
+        _owned_by_out: list = []
+        model = _gw_default_model(url=url, log=log, _owned_by_out=_owned_by_out)
+        discovered_owned_by = _owned_by_out[0] if _owned_by_out else None
 
     if is_default_gw_path:
         if not is_auto_detecting:
             _gw_verify_serving_mode(url, model, log=log)
-        backend = _gw_backend(discovered_model=model if is_auto_detecting else None)
+        backend = _gw_backend(
+            discovered_model=model if is_auto_detecting else None,
+            owned_by=discovered_owned_by if is_auto_detecting else None,
+        )
     else:
         backend = "llamacpp"
 

@@ -33,7 +33,7 @@ def _gw_handshake_precached():
         llm_mod._gw_handshake_cache.clear()
         llm_mod._gw_handshake_cache[(llm_mod.GW_URL, legacy_model)] = True
         llm_mod._gw_discovery_cache.clear()
-        llm_mod._gw_discovery_cache[llm_mod.GW_URL] = (legacy_model, time.monotonic())
+        llm_mod._gw_discovery_cache[llm_mod.GW_URL] = (legacy_model, None, time.monotonic())
     yield
     with llm_mod._gw_handshake_lock:
         llm_mod._gw_handshake_cache.clear()
