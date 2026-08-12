@@ -22,6 +22,8 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agents_core import mem_exhaust
+
 # --- Configuration ---
 
 DB_DIR = Path("/data/memory")
@@ -85,7 +87,7 @@ END;
 class MemoryStore:
     """SQLite-backed memory store with FTS5 full-text search."""
 
-    def __init__(self, db_path: Path = DB_PATH):
+    def __init__(self, db_path: Path = DB_PATH, exhaust_db_path: Path | None = None):
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
@@ -98,13 +100,42 @@ class MemoryStore:
         # simultaneous calls from different threads — this lock does. RLock because
         # stats() calls all_tags() internally.
         self._lock = threading.RLock()
+        # Sibling exhaust store (agents-core-mem-exhaust-sibling-store-v0) —
+        # opened lazily on first routed write or fall-through read, so the vast
+        # majority of MemoryStore() instances that never touch a routed prefix
+        # never create exhaust.db as a side effect. Defaults to a file next to
+        # `db_path` (see default_exhaust_path()), which is what keeps every
+        # test that points MemoryStore at a tmp_path automatically isolated
+        # from the real /data/memory/exhaust.db.
+        self._exhaust_db_path = exhaust_db_path or mem_exhaust.default_exhaust_path(self.db_path)
+        self._exhaust: mem_exhaust.ExhaustStore | None = None
+
+    def _exhaust_store(self) -> "mem_exhaust.ExhaustStore":
+        if self._exhaust is None:
+            with self._lock:
+                if self._exhaust is None:
+                    self._exhaust = mem_exhaust.ExhaustStore(db_path=self._exhaust_db_path)
+        return self._exhaust
 
     def close(self):
         self._conn.close()
+        if self._exhaust is not None:
+            self._exhaust.close()
 
     def set(self, key: str, content: str, tags: list[str] | None = None,
             source: str = "") -> bool:
-        """Upsert a memory. Returns True if created, False if updated."""
+        """Upsert a memory. Returns True if created, False if updated.
+
+        Keys matching a tier-1 exhaust prefix (agents-core-mem-exhaust-sibling-
+        store-v0; see mem_exhaust.EXHAUST_PREFIXES) route to the sibling
+        exhaust store instead of mem.db. This is the sole write chokepoint —
+        every exhaust writer (elevator_scheduler, ops_primitives, lapis-pm's
+        spec_review via the mem CLI) already funnels through here, so no
+        caller needs to change.
+        """
+        if mem_exhaust.route_to_exhaust(key):
+            return self._exhaust_store().set(key, content, tags=tags, source=source)
+
         now = datetime.now(timezone.utc).isoformat()
         tag_str = ",".join(sorted(tags)) if tags else ""
         source = source or HOSTNAME
@@ -129,12 +160,24 @@ class MemoryStore:
         return not existing
 
     def get(self, key: str) -> dict | None:
-        """Exact key lookup."""
+        """Exact key lookup.
+
+        Falls through to the sibling exhaust store on a miss so reads never
+        develop a hole for a routed key (agents-core-mem-exhaust-sibling-
+        store-v0). A fall-through hit logs exactly one cold-path-access event
+        — see mem_exhaust.log_cold_path_access().
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM memories WHERE key = ?", (key,)
             ).fetchone()
-        return self._row_to_dict(row) if row else None
+        if row:
+            return self._row_to_dict(row)
+
+        exhaust_row = self._exhaust_store().get(key)
+        if exhaust_row is not None:
+            mem_exhaust.log_cold_path_access(key)
+        return exhaust_row
 
     def search(self, query: str, tag: str = "", limit: int = 20) -> list[dict]:
         """FTS5 ranked search. Returns results sorted by relevance."""
@@ -210,7 +253,30 @@ class MemoryStore:
                 "SELECT * FROM memories WHERE key LIKE ? ESCAPE '\\' ORDER BY key LIMIT ?",
                 (pattern, limit),
             ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
+        results = [self._row_to_dict(row) for row in rows]
+
+        # Fall through to the sibling exhaust store (agents-core-mem-exhaust-
+        # sibling-store-v0) whenever `prefix` could possibly select a routed
+        # key — always merged, not gated on mem.db returning zero rows.
+        # During the leg-3 observation window mem.db still holds the
+        # pre-migration rows for a routed prefix while new writes for that
+        # same prefix land only in exhaust.db; gating on "mem.db was empty"
+        # would silently hide those new rows from any caller — the exact
+        # hole this fall-through exists to prevent. Cheap for every other
+        # prefix: could_overlap_exhaust() is a pure string check, so the
+        # sibling store is never even opened for an unrelated prefix.
+        if mem_exhaust.could_overlap_exhaust(prefix):
+            seen_keys = {row["key"] for row in results}
+            for erow in self._exhaust_store().list_by_prefix(prefix, limit=limit):
+                if erow["key"] in seen_keys:
+                    continue
+                results.append(erow)
+                seen_keys.add(erow["key"])
+                mem_exhaust.log_cold_path_access(erow["key"])
+            results.sort(key=lambda r: r["key"])
+            results = results[:limit]
+
+        return results
 
     def delete(self, key: str) -> bool:
         """Delete a memory by key. Returns True if deleted."""
@@ -276,9 +342,35 @@ class MemoryStore:
         return "\n".join(lines)
 
     def checkpoint_wal(self):
-        """Force WAL checkpoint for clean sync copy."""
+        """Force WAL checkpoint for clean sync copy.
+
+        Also checkpoints the sibling exhaust store in the same pass
+        (agents-core-mem-exhaust-sibling-store-v0, leg 4) — two
+        independently-scheduled checkpoints could leave the pair diverged at
+        the moment Syncthing or the nightly backup reads them.
+
+        Gated on whether the sibling file exists ON DISK, not on whether
+        *this* instance ever opened it (`self._exhaust is not None`). The
+        latter was tried in PR #224 and is inert in production: the real
+        checkpoint mechanism, mem-checkpoint.service, constructs a fresh
+        MemoryStore() every 5 minutes (confirmed via journalctl — new PID
+        each firing) with no MEM_SERVER env set, so it always takes the
+        direct `store = MemoryStore(); store.checkpoint_wal()` path on an
+        instance that has never called set()/get()/list_by_prefix() — the
+        per-instance gate is never true there, so the sibling WAL is never
+        truncated by the mechanism this leg exists to fix (CORRECTION
+        2026-08-11 on agents-core-mem-exhaust-sibling-store-v0's Leg 4).
+        Checking the file's existence instead means any process that
+        happens to run the checkpoint still covers the sibling as long as
+        *some* process has ever routed a write there — while a store that
+        has never been written anywhere still has no exhaust.db and nothing
+        to truncate, so this still doesn't conjure an empty file as a side
+        effect.
+        """
         with self._lock:
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        if self._exhaust is not None or self._exhaust_db_path.exists():
+            self._exhaust_store().checkpoint_wal()
 
     @staticmethod
     def _row_to_dict(row: sqlite3.Row) -> dict:
