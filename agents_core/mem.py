@@ -345,20 +345,32 @@ class MemoryStore:
         """Force WAL checkpoint for clean sync copy.
 
         Also checkpoints the sibling exhaust store in the same pass
-        (agents-core-mem-exhaust-sibling-store-v0, leg 4) if it has been
-        opened in this process — two independently-scheduled checkpoints
-        could leave the pair diverged at the moment Syncthing or the nightly
-        backup reads them. Gated on `self._exhaust is not None` rather than
-        always opening it here: mem-server is the sole long-lived writer for
-        both files, so by the time a checkpoint has anything to truncate on
-        exhaust.db, that same process will already have opened it via a
-        routed set()/get() — this just avoids conjuring an empty exhaust.db
-        (and touching production paths from tests that never route a key).
+        (agents-core-mem-exhaust-sibling-store-v0, leg 4) — two
+        independently-scheduled checkpoints could leave the pair diverged at
+        the moment Syncthing or the nightly backup reads them.
+
+        Gated on whether the sibling file exists ON DISK, not on whether
+        *this* instance ever opened it (`self._exhaust is not None`). The
+        latter was tried in PR #224 and is inert in production: the real
+        checkpoint mechanism, mem-checkpoint.service, constructs a fresh
+        MemoryStore() every 5 minutes (confirmed via journalctl — new PID
+        each firing) with no MEM_SERVER env set, so it always takes the
+        direct `store = MemoryStore(); store.checkpoint_wal()` path on an
+        instance that has never called set()/get()/list_by_prefix() — the
+        per-instance gate is never true there, so the sibling WAL is never
+        truncated by the mechanism this leg exists to fix (CORRECTION
+        2026-08-11 on agents-core-mem-exhaust-sibling-store-v0's Leg 4).
+        Checking the file's existence instead means any process that
+        happens to run the checkpoint still covers the sibling as long as
+        *some* process has ever routed a write there — while a store that
+        has never been written anywhere still has no exhaust.db and nothing
+        to truncate, so this still doesn't conjure an empty file as a side
+        effect.
         """
         with self._lock:
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        if self._exhaust is not None:
-            self._exhaust.checkpoint_wal()
+        if self._exhaust is not None or self._exhaust_db_path.exists():
+            self._exhaust_store().checkpoint_wal()
 
     @staticmethod
     def _row_to_dict(row: sqlite3.Row) -> dict:

@@ -235,6 +235,50 @@ def test_checkpoint_wal_covers_sibling_once_opened(tmp_path):
     store.close()
 
 
+def test_checkpoint_wal_covers_sibling_from_a_second_never_routed_instance(tmp_path):
+    """This is the case that actually matters in production and that
+    `test_checkpoint_wal_covers_sibling_once_opened` above does NOT cover:
+    mem-checkpoint.service constructs a brand-new MemoryStore() every 5
+    minutes and calls checkpoint_wal() on it directly, without ever routing
+    a set()/get()/list_by_prefix() through that instance first. Gating the
+    sibling checkpoint on `self._exhaust is not None` (PR #224) passes the
+    single-instance test above but is never true on that real process, so
+    the sibling WAL is never truncated in production (CORRECTION 2026-08-11
+    on agents-core-mem-exhaust-sibling-store-v0's Leg 4). Assert against the
+    actual observable effect — the WAL file shrinking — not just "does not
+    raise", since a no-op checkpoint also does not raise.
+    """
+    mem_db = tmp_path / "mem.db"
+    exhaust_db = tmp_path / "exhaust.db"
+
+    # First instance routes a batch of writes, creating exhaust.db + its WAL
+    # and growing the WAL enough for a checkpoint to have something to do.
+    writer = MemoryStore(db_path=mem_db)
+    for i in range(50):
+        writer.set(f"weather/2026-08-11/task-{i}", "x" * 2000)
+    writer_wal = exhaust_db.with_name(exhaust_db.name + "-wal")
+    assert exhaust_db.exists()
+    assert writer_wal.exists()
+    size_before = writer_wal.stat().st_size
+    assert size_before > 0
+    writer.close()
+
+    # Second instance, pointed at the same paths, with nothing routed
+    # through it — exactly what mem-checkpoint.service is, every 5 minutes.
+    checker = MemoryStore(db_path=mem_db)
+    assert checker._exhaust is None  # never opened via a routed call
+
+    checker.checkpoint_wal()
+
+    size_after = writer_wal.stat().st_size
+    assert size_after < size_before, (
+        "sibling WAL did not shrink from a second, never-routed instance's "
+        "checkpoint_wal() call — this is exactly what mem-checkpoint.service "
+        "does in production"
+    )
+    checker.close()
+
+
 def test_default_exhaust_path_is_sibling_of_db_path(tmp_path, monkeypatch):
     monkeypatch.delenv("MEM_EXHAUST_DB_PATH", raising=False)
     db_path = tmp_path / "somewhere" / "mem.db"
