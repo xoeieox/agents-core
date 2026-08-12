@@ -1211,12 +1211,18 @@ def _gw_clear_auto_detect_caches():
         _gw_discovery_cache.clear()
 
 
-def _fake_gw_models_get(served_model):
-    """A requests.get side_effect returning `served_model` from /v1/models."""
+def _fake_gw_models_get(served_model, owned_by=None):
+    """A requests.get side_effect returning `served_model` from /v1/models. Pass
+    owned_by to also include that field in the response entry (agents-core-gw-backend-
+    owned-by-resolver-v0) - omitted (None) reproduces the older-server shape that has no
+    owned_by field at all."""
     def fake_get(url, timeout=None):
+        entry = {"id": served_model}
+        if owned_by is not None:
+            entry["owned_by"] = owned_by
         resp = MagicMock()
         resp.raise_for_status = MagicMock()
-        resp.json.return_value = {"data": [{"id": served_model}]}
+        resp.json.return_value = {"data": [entry]}
         return resp
     return fake_get
 
@@ -1669,6 +1675,124 @@ def test_ac7_gw_backend_unrecognized_raises_value_error(monkeypatch):
     monkeypatch.setenv("GW_BACKEND", "vllm2")
     with pytest.raises(ValueError, match="Unknown GW_BACKEND"):
         _gw_backend()
+
+
+# --- agents-core-gw-backend-owned-by-resolver-v0: resolve dialect from owned_by --------
+
+def test_owned_by_llamacpp_resolves_llamacpp_for_non_122b_id(monkeypatch):
+    """The defect, fixed: a llama.cpp seat that isn't the 122B (e.g. gravitywell-v4flash)
+    used to misresolve to "vllm" via the stale literal comparison. owned_by=llamacpp now
+    decides directly regardless of the model name."""
+    from agents_core.llm import _gw_backend
+
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    assert _gw_backend(discovered_model="gravitywell-v4flash", owned_by="llamacpp") == "llamacpp"
+
+
+def test_owned_by_vllm_resolves_vllm_regression_pin(monkeypatch):
+    """Live posture pin: owned_by=vllm resolves to "vllm" (unaffected by this change,
+    guards against a future edit flipping the precedence)."""
+    from agents_core.llm import _gw_backend
+
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    assert _gw_backend(discovered_model="gravitywell-27b", owned_by="vllm") == "vllm"
+
+
+def test_owned_by_absent_falls_back_to_literal_comparison(monkeypatch):
+    """Older servers that omit owned_by entirely (owned_by=None) keep resolving via the
+    legacy literal model-name comparison - fallback preserved."""
+    from agents_core.llm import _gw_backend
+
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    assert _gw_backend(discovered_model="gravitywell-122b", owned_by=None) == "llamacpp"
+
+
+def test_owned_by_unrecognized_falls_through_with_warning(monkeypatch, caplog):
+    """D2: an unrecognized owned_by value never raises - it falls through to the literal
+    comparison fallback, and logs exactly one WARNING naming the unrecognized value and
+    the model id."""
+    import logging
+    from agents_core.llm import _gw_backend
+
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    with caplog.at_level(logging.WARNING, logger="agents_core.llm"):
+        result = _gw_backend(discovered_model="gravitywell-27b", owned_by="triton")
+
+    assert result == "vllm"  # literal fallback: not the 122b name -> vllm
+    warnings_logged = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings_logged) == 1
+    assert "triton" in warnings_logged[0].getMessage()
+    assert "gravitywell-27b" in warnings_logged[0].getMessage()
+
+
+def test_owned_by_absent_logs_no_warning(monkeypatch, caplog):
+    """Absent owned_by (older servers) is not an anomaly - no warning is logged, unlike
+    the unrecognized-value case above."""
+    import logging
+    from agents_core.llm import _gw_backend
+
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    with caplog.at_level(logging.WARNING, logger="agents_core.llm"):
+        result = _gw_backend(discovered_model="gravitywell-122b", owned_by=None)
+
+    assert result == "llamacpp"
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def test_gw_backend_env_wins_over_owned_by(monkeypatch):
+    """Explicit GW_BACKEND still takes precedence over owned_by - the resolver's top
+    precedence rung is unchanged by this fix."""
+    from agents_core.llm import _gw_backend
+
+    monkeypatch.setenv("GW_BACKEND", "vllm")
+    assert _gw_backend(discovered_model="gravitywell-122b", owned_by="llamacpp") == "vllm"
+
+
+# --- Integration-shaped: _call_gravitywell_backend payload reflects owned_by -----------
+
+def test_integration_v4flash_owned_by_llamacpp_gets_cache_prompt_and_repeat_penalty(monkeypatch):
+    """A second llama.cpp seat (gravitywell-v4flash, owned_by=llamacpp) auto-detected via
+    discovery produces a payload carrying cache_prompt=True and repeat_penalty - the
+    consumer at the payload-assembly site now resolves correctly for a non-122B llama.cpp
+    seat. Probe economy: resolving the backend costs zero extra requests.get calls beyond
+    today's single discovery probe."""
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    _gw_clear_auto_detect_caches()
+
+    captured = {}
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.get",
+               side_effect=_fake_gw_models_get("gravitywell-v4flash", owned_by="llamacpp")) as mock_get, \
+         patch("requests.post", side_effect=_make_gw_sse_resp("ok", captured)):
+        result = call_operator("gravitywell", prompt="hi")
+
+    assert result == "ok"
+    assert captured["payload"]["cache_prompt"] is True
+    assert "repeat_penalty" in captured["payload"]
+    assert mock_get.call_count == 1
+
+
+def test_integration_27b_owned_by_vllm_omits_llamacpp_fields(monkeypatch):
+    """The vLLM seat (gravitywell-27b, owned_by=vllm) carries neither cache_prompt nor
+    repeat_penalty - regression pin for the live posture, and same probe-economy check."""
+    monkeypatch.delenv("GW_BACKEND", raising=False)
+    monkeypatch.delenv("GW_MODEL", raising=False)
+    _gw_clear_auto_detect_caches()
+
+    captured = {}
+    dc, _mock_client = _gw_dc()
+    with patch("agents_core.doorman_client.DoormanClient", dc), \
+         patch("requests.get",
+               side_effect=_fake_gw_models_get("gravitywell-27b", owned_by="vllm")) as mock_get, \
+         patch("requests.post", side_effect=_make_gw_sse_resp("ok", captured)):
+        result = call_operator("gravitywell", prompt="hi")
+
+    assert result == "ok"
+    assert "cache_prompt" not in captured["payload"]
+    assert "repeat_penalty" not in captured["payload"]
+    assert mock_get.call_count == 1
 
 
 # --- AC8: creative-path isolation (scope guard) -----------------------------
