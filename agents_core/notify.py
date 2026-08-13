@@ -76,12 +76,40 @@ def send_notification(
     url_title: str = "",
     source: str = "unknown",
 ) -> bool:
-    """Send a Pushover notification. Returns True on success."""
+    """Send a Pushover notification. Returns True on success.
+
+    Delivery is suppressed while a test is running. pytest sets
+    PYTEST_CURRENT_TEST in os.environ for the duration of each test (and
+    unsets it afterwards) — process-level, so it's visible in threads a
+    test spawns too. Its presence means this call originated from a test
+    run, not production; on that path no HTTP POST is made, this returns
+    False, and the audit line is still written (extra={"suppressed":
+    "pytest"}) so a suppressed page stays visible to triage rather than
+    vanishing silently.
+
+    Trust boundary: PYTEST_CURRENT_TEST is a test-environment signal, not
+    a security control. Anything that can set it can already read the
+    Pushover credentials sitting next to it in the same environment. This
+    guard prevents accidental self-paging from test runs; it does not
+    defend against hostile manipulation.
+    """
     # Truncate to Pushover limits
     if len(message) > MAX_MESSAGE_LENGTH:
         message = message[: MAX_MESSAGE_LENGTH - 3] + "..."
     if len(title) > MAX_TITLE_LENGTH:
         title = title[: MAX_TITLE_LENGTH - 3] + "..."
+
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        delivered = False
+        _capture_event(
+            source=source,
+            message=message,
+            title=title,
+            priority=priority,
+            delivered=delivered,
+            extra={"suppressed": "pytest"},
+        )
+        return delivered
 
     user_key = os.environ.get("PUSHOVER_USER_KEY", "")
     app_token = os.environ.get("PUSHOVER_APP_TOKEN", "")
