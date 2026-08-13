@@ -190,6 +190,41 @@ def test_single_122b_serving(mock_get, monkeypatch):
     assert state.source_freshness["slot2"]["status"] == "unreachable"
 
 
+FLIP_STATUS_BIG_V4FLASH = {
+    "node": "gravitywell",
+    "mode": "big",
+    "model_label": "deepseek-v4-flash",
+    "healthy": True,
+    "units": {"llama-server": "active"},
+    "in_flight_flip": False,
+}
+
+
+@patch("agents_core.llm.requests.get")
+def test_v4flash_serving_resolves_as_big_not_unknown(mock_get, monkeypatch):
+    """agents-core-doorman-big-seat-membership-v0 (DoD 9): gravitywell-v4flash
+    is a registered big-seat member (gw_models.yaml mode_alias: big) — the
+    resolver must not degrade it to unknown_model, and mode_inferred must
+    read 'big' via the registry the same way the stock 122B does."""
+    monkeypatch.delenv("GW_SLOT2_URL", raising=False)
+    mock_get.side_effect = _mock_get({
+        "/health": _resp(200),
+        "/v0/status": _resp(200, FLIP_STATUS_BIG_V4FLASH),
+        "8082/v1/models": ConnectionErrorStub("slot2 down"),
+        "/v1/models": _resp(200, {"data": [{"id": "gravitywell-v4flash"}]}),
+    })
+
+    state = gw_serving_state(endpoint="http://gw:8081")
+
+    assert state.serving is True
+    assert state.served_id == "gravitywell-v4flash"
+    assert state.canonical is not None
+    assert state.canonical.canonical_id == "gravitywell-v4flash"
+    assert state.unknown_model is False
+    assert state.mode == "big"
+    assert state.mode_inferred == "big"
+
+
 @patch("agents_core.llm.requests.get")
 def test_flip_controller_unreachable_sets_authority_gap(mock_get, monkeypatch):
     monkeypatch.delenv("GW_SLOT2_URL", raising=False)

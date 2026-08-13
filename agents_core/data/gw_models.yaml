@@ -18,6 +18,17 @@ models:
     display_label: qwen3.5-122b-a10b
     weights_hint: "Qwen3.5-122B-A10B"
 
+  # Second "big" seat member (agents-core-doorman-big-seat-membership-v0):
+  # the big seat is a registry-declared mode_alias, not a single model's
+  # identity — this row is what lets the doorman recognise V4-Flash as a
+  # valid big-seat occupant without a code change. gravitywell-122b remains
+  # the stock/default member (see GW_BIG_MODEL_ID in doorman_server.py).
+  - canonical_id: gravitywell-v4flash
+    mode_alias: big
+    operator_alias: gravitywell
+    display_label: deepseek-v4-flash
+    weights_hint: "DeepSeek-V4-Flash"
+
   # dual-coder topology (ratified 2026-07-30 as GravityWell's home posture,
   # agents-core-doorman-serving-mode-topology-truthful-v0) — slot1 :8081 nvfp4,
   # slot2 :8082 coder. Both imply mode_alias "dual"; a lookup keyed on either
