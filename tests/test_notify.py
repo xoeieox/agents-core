@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import Mock
 
 import pytest
 
@@ -81,6 +82,7 @@ class TestSendNotificationCapture:
     def test_delivered_true_on_success(self, tmp_path, monkeypatch):
         log_path = tmp_path / "captured.jsonl"
         monkeypatch.setattr(notify_mod, "CAPTURE_LOG", log_path)
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
         monkeypatch.setenv("PUSHOVER_USER_KEY", "u")
         monkeypatch.setenv("PUSHOVER_APP_TOKEN", "t")
 
@@ -112,6 +114,7 @@ class TestSendNotificationCapture:
     def test_delivered_false_on_request_exception(self, tmp_path, monkeypatch):
         log_path = tmp_path / "captured.jsonl"
         monkeypatch.setattr(notify_mod, "CAPTURE_LOG", log_path)
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
         monkeypatch.setenv("PUSHOVER_USER_KEY", "u")
         monkeypatch.setenv("PUSHOVER_APP_TOKEN", "t")
 
@@ -154,6 +157,7 @@ class TestSendNotificationCapture:
         bad_path = tmp_path / "is_a_directory"
         bad_path.mkdir()
         monkeypatch.setattr(notify_mod, "CAPTURE_LOG", bad_path)
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
         monkeypatch.setenv("PUSHOVER_USER_KEY", "u")
         monkeypatch.setenv("PUSHOVER_APP_TOKEN", "t")
 
@@ -177,3 +181,84 @@ class TestSendNotificationCapture:
 
         entry = json.loads(log_path.read_text())
         assert entry["message_head"] == ("M" * (notify_mod.MAX_MESSAGE_LENGTH - 3) + "...")[:300]
+
+
+class TestPytestDeliveryGuard:
+    """Guard: send_notification must never deliver a real page from inside a
+    pytest run, and the suppression must be visible in the audit log.
+
+    Covers all four combinations of (PYTEST_CURRENT_TEST present/absent) x
+    (credentials present/absent). requests.post is always patched with a
+    Mock so the suite can assert whether it was called at all, and never
+    reaches the network either way.
+    """
+
+    def test_pytest_present_creds_present_suppresses_post(self, tmp_path, monkeypatch):
+        log_path = tmp_path / "captured.jsonl"
+        monkeypatch.setattr(notify_mod, "CAPTURE_LOG", log_path)
+        monkeypatch.setenv("PYTEST_CURRENT_TEST", "tests/test_notify.py::fake")
+        monkeypatch.setenv("PUSHOVER_USER_KEY", "u")
+        monkeypatch.setenv("PUSHOVER_APP_TOKEN", "t")
+        post = Mock()
+        monkeypatch.setattr(notify_mod.requests, "post", post)
+
+        result = notify_mod.send_notification("hello", source="my_source")
+
+        assert result is False
+        post.assert_not_called()
+        entry = json.loads(log_path.read_text())
+        assert entry["delivered"] is False
+        assert entry["extra"] == {"suppressed": "pytest"}
+
+    def test_pytest_present_creds_absent_suppresses_post(self, tmp_path, monkeypatch):
+        log_path = tmp_path / "captured.jsonl"
+        monkeypatch.setattr(notify_mod, "CAPTURE_LOG", log_path)
+        monkeypatch.setenv("PYTEST_CURRENT_TEST", "tests/test_notify.py::fake")
+        monkeypatch.delenv("PUSHOVER_USER_KEY", raising=False)
+        monkeypatch.delenv("PUSHOVER_APP_TOKEN", raising=False)
+        post = Mock()
+        monkeypatch.setattr(notify_mod.requests, "post", post)
+
+        result = notify_mod.send_notification("hello")
+
+        assert result is False
+        post.assert_not_called()
+        entry = json.loads(log_path.read_text())
+        assert entry["delivered"] is False
+        assert entry["extra"] == {"suppressed": "pytest"}
+
+    def test_pytest_absent_creds_present_posts_as_before(self, tmp_path, monkeypatch):
+        log_path = tmp_path / "captured.jsonl"
+        monkeypatch.setattr(notify_mod, "CAPTURE_LOG", log_path)
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        monkeypatch.setenv("PUSHOVER_USER_KEY", "u")
+        monkeypatch.setenv("PUSHOVER_APP_TOKEN", "t")
+        post = Mock(return_value=Mock(status_code=200))
+        monkeypatch.setattr(notify_mod.requests, "post", post)
+
+        result = notify_mod.send_notification("hello", source="my_source")
+
+        assert result is True
+        post.assert_called_once()
+        entry = json.loads(log_path.read_text())
+        assert entry["delivered"] is True
+        assert entry["extra"] == {}
+
+    def test_pytest_absent_creds_absent_unchanged(self, tmp_path, monkeypatch):
+        log_path = tmp_path / "captured.jsonl"
+        monkeypatch.setattr(notify_mod, "CAPTURE_LOG", log_path)
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        monkeypatch.delenv("PUSHOVER_USER_KEY", raising=False)
+        monkeypatch.delenv("PUSHOVER_APP_TOKEN", raising=False)
+        post = Mock()
+        monkeypatch.setattr(notify_mod.requests, "post", post)
+
+        result = notify_mod.send_notification("hello")
+
+        assert result is False
+        post.assert_not_called()
+        lines = log_path.read_text().strip().split("\n")
+        assert len(lines) == 1
+        entry = json.loads(lines[0])
+        assert entry["delivered"] is False
+        assert entry["extra"] == {}
