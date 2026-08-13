@@ -112,6 +112,7 @@ import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+import agents_core.llm as _llm
 from agents_core.llm import gw_serving_state
 
 log = logging.getLogger("doorman-server")
@@ -353,8 +354,35 @@ def parse_vllm_capacity_gauges(text: str) -> dict[str, float | None]:
     }
 
 
-# Must match OPERATOR_DEFAULTS['gravitywell'] in agents_core.llm (verified: llm.py:58).
+# The "big" seat's STOCK/DEFAULT member — what the base llama-server.service
+# ExecStart falls back to, and the rollback target if a later occupant needs
+# reverting (mirrors conductor/scripts/gw_topology.py's STOCK_BIG_MODEL_ID).
+# It is NOT the definition of "big": that membership is registry-declared
+# (gw_big_seat_members(), below) — a served model other than this one can
+# still be a full big-seat member. Must match OPERATOR_DEFAULTS['gravitywell']
+# in agents_core.llm (verified: llm.py:58).
 GW_BIG_MODEL_ID = "gravitywell-122b"
+
+
+def gw_big_seat_members() -> frozenset[str]:
+    """The registry-declared membership of the "big" seat: every canonical_id
+    in gw_models.yaml whose row declares mode_alias == "big"
+    (agents-core-doorman-big-seat-membership-v0).
+
+    Reads agents_core.llm's already-loaded registry live on every call — not
+    a second parse of gw_models.yaml, not a cached snapshot, not a hardcoded
+    list — so a new big-seat occupant is a one-row gw_models.yaml edit with
+    no change here. Both comparison sites that used to key on the single
+    GW_BIG_MODEL_ID identity (_refresh_serving_cache's big-probe and
+    _resolve_live_posture) consult this set instead; council/cli.py's wave
+    guard reads the same set for the same reason.
+    """
+    return frozenset(
+        entry.canonical_id
+        for entry in _llm._GW_MODEL_REGISTRY
+        if entry.mode_alias == "big"
+    )
+
 
 HOLD_NAME = "doorman"
 DOORMAN_IDLE_LOG = os.environ.get("DOORMAN_IDLE_LOG", "/var/log/doorman-idle.jsonl")
@@ -925,12 +953,18 @@ class _NodeState:
                 self._cached_topology_state = topology_state
                 controller_owns = self._controller_lease_active()
 
-                # big_probe_state (Council open question 2): "refuted" = the models
-                # endpoint answered and the 122B canonical id is absent — we looked
-                # and it is not there. "unknown" = the resolution itself failed
-                # (authority_gap, or the models endpoint never answered, or the
-                # resolver call raised/returned None) — we could not look.
-                # mode_inferred is never read here.
+                # big_probe_state (Council open question 2; membership set added
+                # by agents-core-doorman-big-seat-membership-v0): "confirmed" = a
+                # served id is a registry-declared big-seat member. "refuted" =
+                # the models endpoint answered and none of the served ids is a
+                # big-seat member, AND the served id is itself registered — we
+                # looked and it is definitively not big. "unknown" = either the
+                # resolution itself failed (authority_gap, the models endpoint
+                # never answered, or the resolver call raised/returned None), or
+                # the served id has no gw_models.yaml row at all — we could not
+                # classify it (DoD 4a gate amendment: an unregistered served
+                # model must never read as the stronger "refuted"). mode_inferred
+                # is never read here.
                 if topology_state is None:
                     models_answered = False
                 else:
@@ -940,13 +974,15 @@ class _NodeState:
                     )
                 if topology_state is None or topology_state.authority_gap or not models_answered:
                     self._big_probe_state = "unknown"
-                elif GW_BIG_MODEL_ID in topology_state.served_ids:
+                elif set(topology_state.served_ids) & gw_big_seat_members():
                     self._big_probe_state = "confirmed"
+                elif topology_state.unknown_model:
+                    self._big_probe_state = "unknown"
                 else:
                     self._big_probe_state = "refuted"
 
                 if self._big_probe_state == "refuted":
-                    # We looked and the 122B is definitively absent.
+                    # We looked and no served id is a big-seat member.
                     self._serving_is_big = False
                 elif self._big_probe_state == "confirmed":
                     # Controller win takes precedence over probe confirmation (AC6-D)
@@ -1044,8 +1080,8 @@ class _NodeState:
             )
             if not models_answered:
                 return "unknown"
-            if GW_BIG_MODEL_ID not in state.served_ids:
-                # We looked and the 122B is definitively absent — split-brain,
+            if not (set(state.served_ids) & gw_big_seat_members()):
+                # We looked and no served id is a big-seat member — split-brain,
                 # not a confident "big" (mirrors _refresh_serving_cache's
                 # big_probe_state="refuted" branch).
                 return "unknown"

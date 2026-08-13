@@ -1467,7 +1467,15 @@ class TestModeBearingAcquire:
              patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
              patch.object(state, "_wake_dual", side_effect=fake_wake_dual), \
              patch.object(state, "_wake_big") as mock_big, \
+             patch.object(state, "_resolve_live_posture", return_value="unknown"), \
              patch("agents_core.doorman_server.DOORMAN_DEFER_TO_CONTROLLER", True):
+            # _resolve_live_posture is mocked here because this test is only
+            # about wake_lock serialization, not topology resolution — it must
+            # not depend on live network reachability to the real GravityWell
+            # box (self.gw_url is a real Tailscale address; an unmocked call
+            # would make this test's outcome depend on GW's actual live
+            # serving state, which is exactly what agents-core-doorman-big-
+            # seat-membership-v0 changes the resolution of).
 
             results = []
 
@@ -2294,9 +2302,10 @@ class TestTopologyServingMode:
 
     def test_dod3_big_and_refuted_never_co_occur(self):
         """DoD 3: flip-controller claims 'big' but the SAME resolution's models
-        probe refutes the 122B (real split-brain) -> serving_mode='unknown', not 'big'."""
+        probe refutes membership (a registered non-member is served — real
+        split-brain) -> serving_mode='unknown', not 'big'."""
         state = _make_state()
-        topology = _make_topology_state(mode="big", served_ids=["some-other-model"])
+        topology = _make_topology_state(mode="big", served_ids=["gravitywell-a3b-nvfp4"])
         snapshot = self._snapshot_with_topology(state, topology)
         assert snapshot["big_probe_state"] == "refuted"
         assert snapshot["serving_mode"] != "big"
@@ -2448,9 +2457,59 @@ class TestModeAwareBigPredicate:
     """Tests for the /v1/models three-state probe and serving_is_big predicate."""
 
     def test_ac7_gw_big_model_id_value(self):
-        """AC7: GW_BIG_MODEL_ID must equal 'gravitywell-122b' (matches OPERATOR_DEFAULTS)."""
+        """AC7: GW_BIG_MODEL_ID must equal 'gravitywell-122b' — the seat's
+        STOCK/default member, deliberately retained (matches
+        OPERATOR_DEFAULTS), not the definition of seat membership. Membership
+        itself is asserted separately below."""
         import agents_core.doorman_server as ds
         assert ds.GW_BIG_MODEL_ID == "gravitywell-122b"
+
+    def test_gw_big_seat_members_derived_from_registry(self):
+        """DoD 6/registry-driven membership: gw_big_seat_members() returns
+        every canonical_id whose gw_models.yaml row declares mode_alias:
+        big — today that's the stock 122B plus the V4-Flash seat this unit
+        registers — and excludes the dual-mode rows."""
+        import agents_core.doorman_server as ds
+        members = ds.gw_big_seat_members()
+        assert members == frozenset({"gravitywell-122b", "gravitywell-v4flash"})
+        assert "gravitywell-a3b-nvfp4" not in members
+        assert "gravitywell-a3b-coder" not in members
+
+    def test_dod5_fourth_big_model_needs_only_a_registry_row(self):
+        """DoD 5: membership is registry-driven end to end — adding a
+        hypothetical fourth big model requires editing only gw_models.yaml
+        (simulated here via a fixture registry), with NO change to
+        doorman_server.py. gw_big_seat_members() must pick it up live."""
+        import agents_core.doorman_server as ds
+        from agents_core.llm import ModelEntry
+
+        fixture_registry = [
+            ModelEntry(
+                canonical_id="gravitywell-122b", mode_alias="big",
+                operator_alias="gravitywell", display_label="qwen3.5-122b-a10b",
+                weights_hint="Qwen3.5-122B-A10B",
+            ),
+            ModelEntry(
+                canonical_id="gravitywell-hypothetical-fourth", mode_alias="big",
+                operator_alias="gravitywell", display_label="hypothetical-fourth",
+                weights_hint="hypothetical",
+            ),
+        ]
+        with patch("agents_core.llm._GW_MODEL_REGISTRY", fixture_registry):
+            members = ds.gw_big_seat_members()
+            assert "gravitywell-hypothetical-fourth" in members
+
+            state = _make_state()
+            topology = _make_topology_state(
+                mode="big", served_ids=["gravitywell-hypothetical-fourth"],
+            )
+            with patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
+                 patch.object(state, "_is_serving", return_value=True), \
+                 patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+                state._refresh_serving_cache()
+
+        assert state._big_probe_state == "confirmed"
+        assert state._serving_is_big is True
 
     def test_ac6a_confirmed_probe_serving_is_big_true(self):
         """AC6(A): resolution confirmed, no controller lease, serving True -> serving_is_big=True."""
@@ -2467,10 +2526,14 @@ class TestModeAwareBigPredicate:
         assert state._cached_topology_state is topology
 
     def test_ac6b_refuted_probe_serving_is_big_false(self):
-        """AC6(B): resolution's models endpoint answered with a non-122B id ->
-        serving_is_big=False, big_probe_state='refuted' — we looked and it's absent."""
+        """AC6(B): resolution's models endpoint answered with a REGISTERED
+        non-member id (gravitywell-a3b-nvfp4, mode_alias: dual) ->
+        serving_is_big=False, big_probe_state='refuted' — we looked, the id
+        is known, and it's not a big-seat member. (Not to be confused with
+        an unregistered served id, which must read 'unknown' — see
+        test_ac6b2_unregistered_model_is_unknown_not_refuted.)"""
         state = _make_state()
-        topology = _make_topology_state(mode="big", served_ids=["swarm-coder-7b"])
+        topology = _make_topology_state(mode="big", served_ids=["gravitywell-a3b-nvfp4"])
         calls = []
 
         def fake_gw_serving_state(endpoint=None, **kwargs):
@@ -2486,6 +2549,29 @@ class TestModeAwareBigPredicate:
         assert state._big_probe_state == "refuted"
         # Single resolution: gw_serving_state was called once, against this node's endpoint.
         assert calls == [GW_URL_DEFAULT]
+
+    def test_ac6b2_unregistered_model_is_unknown_not_refuted(self):
+        """DoD 4a (gate amendment, unanimous Facets + Council,
+        2026-08-12-214706-ac3633/-da5dbc): a served id with NO gw_models.yaml
+        row at all (e.g. gravitywell-27b — absent from the registry today)
+        must read big_probe_state='unknown' and serving_is_big=None, never
+        'refuted'/False. 'refuted' means the registry was consulted and the
+        served id is a KNOWN non-member; 'unknown' means the served id could
+        not be classified at all. Pinned separately from
+        test_ac6b_refuted_probe_serving_is_big_false so a single "non-member"
+        test can't pass for the wrong reason."""
+        state = _make_state()
+        topology = _make_topology_state(
+            mode="big", served_ids=["gravitywell-27b"], unknown_model=True,
+        )
+
+        with patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+            state._refresh_serving_cache()
+
+        assert state._big_probe_state == "unknown"
+        assert state._serving_is_big is None
 
     def test_ac6c_unknown_resolution_serving_is_big_none_no_raise(self):
         """AC6(C): resolution failed (models endpoint never answered) -> serving_is_big=None

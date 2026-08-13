@@ -442,6 +442,17 @@ def test_refuse_wave_against_122b_raises():
             _refuse_wave_against_122b("gravitywell")
 
 
+def test_refuse_wave_against_v4flash_raises():
+    """agents-core-doorman-big-seat-membership-v0 DoD 8: the guard covers the
+    whole registry-declared big seat, not only the 122B by name — V4-Flash
+    (gw_models.yaml mode_alias: big) must refuse identically."""
+    from agents_core.council.cli import _refuse_wave_against_122b
+
+    with patch("agents_core.llm._gw_default_model", return_value="gravitywell-v4flash"):
+        with pytest.raises(ValueError, match="gravitywell-v4flash"):
+            _refuse_wave_against_122b("gravitywell")
+
+
 def test_refuse_wave_against_non_122b_model_allows():
     from agents_core.council.cli import _refuse_wave_against_122b
 

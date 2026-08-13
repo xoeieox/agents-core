@@ -1404,7 +1404,9 @@ def _build_adapter(voicing: str, ClaudeAdapter, LlamaAdapter, run_id: str | None
 
 
 def _refuse_wave_against_122b(voicing: str) -> None:
-    """D7: refuse to run wave mode against gravitywell-122b.
+    """D7 (extended by agents-core-doorman-big-seat-membership-v0): refuse to
+    run wave mode against any registry-declared member of the doorman's
+    "big" seat — not only gravitywell-122b by name.
 
     122B is pinned to --parallel 1 upstream (2026-07-29 silent-truncation
     revert) — serial only. Wave mode's whole reason for existing is
@@ -1413,19 +1415,27 @@ def _refuse_wave_against_122b(voicing: str) -> None:
     same lock, which is strictly worse than just running deliberation mode.
     Refuse loudly, naming the model and the reason, rather than let that
     happen quietly.
+
+    Big-seat membership is a PROXY for "this seat is pinned to --parallel 1",
+    not the honest key — the honest key is the seat's actual `parallel`
+    value (conductor's gw-topology.yaml), which this guard does not read.
+    That is a follow-up, not fixed by this unit; keying on membership only
+    restores the guard's original 122B-only coverage across the whole seat.
     """
     if voicing != "gravitywell":
         return
+    from agents_core.doorman_server import gw_big_seat_members
     from agents_core.llm import _gw_default_model
 
     resolved = _gw_default_model()
-    if resolved == GW_122B_MODEL:
+    if resolved in gw_big_seat_members():
         raise ValueError(
-            f"wave mode refuses to run against {GW_122B_MODEL!r}: it is pinned to "
-            "--parallel 1 (serial only, per the 2026-07-29 silent-truncation revert). "
-            "Wave mode's concurrent fan-out (D2) would only queue behind that pin — "
-            "serial is better on 122B. Use deliberation or scene mode instead, or "
-            "wait for GravityWell to serve a parallel-capable model."
+            f"wave mode refuses to run against {resolved!r}: it is a member of the "
+            "doorman's big seat, pinned to --parallel 1 (serial only, per the "
+            "2026-07-29 silent-truncation revert). Wave mode's concurrent fan-out "
+            "(D2) would only queue behind that pin — serial is better on this seat. "
+            "Use deliberation or scene mode instead, or wait for GravityWell to "
+            "serve a parallel-capable model."
         )
 
 
