@@ -10,7 +10,12 @@ from unittest import mock
 import httpx
 import pytest
 
-from agents_core.doorman_client import DoormanClient, DoormanUnreachable, _gw_acquire_timeout
+from agents_core.doorman_client import (
+    DoormanClient,
+    DoormanUnreachable,
+    _force_stop_timeout,
+    _gw_acquire_timeout,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -693,3 +698,86 @@ def test_force_stop_returns_blocked_response():
     result = c.force_stop("gravitywell", exclude_principal="cockpit")
     assert result["status"] == "blocked"
     assert result["active_leases"] == [{"work_id": "w1", "principal": "other-consumer"}]
+
+
+def test_force_stop_returns_stop_in_progress_response():
+    """R6: force_stop() must pass through the new stop_in_progress status
+    and its waited_seconds field unchanged."""
+    c = _client_with([(200, {
+        "status": "stop_in_progress", "node": "gravitywell", "waited_seconds": 12.5,
+    })])
+    result = c.force_stop("gravitywell")
+    assert result["status"] == "stop_in_progress"
+    assert result["waited_seconds"] == 12.5
+
+
+# ---------------------------------------------------------------------------
+# _force_stop_timeout / force_stop() default timeout (R4)
+# ---------------------------------------------------------------------------
+
+def test_force_stop_timeout_default():
+    """_force_stop_timeout() must derive from GW_SERVE_STOP_TIMEOUT_SEC (120)
+    + GW_ACQUIRE_MARGIN_SEC (30) = 150s by default."""
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("GW_SERVE_STOP_TIMEOUT_SEC", None)
+        os.environ.pop("GW_ACQUIRE_MARGIN_SEC", None)
+        assert _force_stop_timeout() == 150.0
+
+
+def test_force_stop_timeout_custom():
+    """_force_stop_timeout() must respect custom GW_SERVE_STOP_TIMEOUT_SEC and
+    GW_ACQUIRE_MARGIN_SEC."""
+    with mock.patch.dict(
+        os.environ,
+        {"GW_SERVE_STOP_TIMEOUT_SEC": "45", "GW_ACQUIRE_MARGIN_SEC": "10"},
+        clear=False,
+    ):
+        assert _force_stop_timeout() == 55.0
+
+
+def test_force_stop_uses_derived_default_not_short_client_timeout():
+    """force_stop() must not give up before the server's own
+    GW_SERVE_STOP_TIMEOUT_SEC budget — a slow-but-normal unload that the
+    generic 30s DOORMAN_CLIENT_TIMEOUT would misread as DoormanUnreachable
+    must succeed under the derived default."""
+    class _SlowTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            import time
+            time.sleep(1.5)  # > old 1s ceiling, < new derived timeout
+            return httpx.Response(200, json={"status": "stopped", "node": "gravitywell"})
+
+    with mock.patch.dict(
+        os.environ,
+        {
+            "GW_SERVE_STOP_TIMEOUT_SEC": "2",
+            "GW_ACQUIRE_MARGIN_SEC": "1",
+            "DOORMAN_CLIENT_TIMEOUT": "1",  # old ceiling, scaled down for the test
+        },
+        clear=False,
+    ):
+        c = DoormanClient(base_url="http://doorman.test")
+        c._client = httpx.Client(base_url="http://doorman.test", transport=_SlowTransport())
+
+        # No explicit timeout= passed — must use the derived default (3s),
+        # not the short client default (1s), or this raises DoormanUnreachable.
+        result = c.force_stop("gravitywell")
+        assert result["status"] == "stopped"
+
+
+def test_force_stop_explicit_timeout_wins_over_derived_default():
+    """An explicit caller-supplied timeout must still win over the derived
+    default."""
+    captured = {}
+
+    class _CaptureTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            captured["timeout_ext"] = request.extensions.get("timeout")
+            return httpx.Response(200, json={"status": "stopped", "node": "gravitywell"})
+
+    c = DoormanClient(base_url="http://doorman.test")
+    c._client = httpx.Client(base_url="http://doorman.test", transport=_CaptureTransport())
+    result = c.force_stop("gravitywell", timeout=5.0)
+    assert result["status"] == "stopped"
+    # httpx surfaces a per-request timeout override via request.extensions.
+    if captured["timeout_ext"] is not None:
+        assert captured["timeout_ext"]["read"] == 5.0

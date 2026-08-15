@@ -26,6 +26,7 @@ Covers:
 
 from __future__ import annotations
 
+import subprocess
 import threading
 import time
 from unittest.mock import MagicMock, call, patch
@@ -35,6 +36,8 @@ from fastapi.testclient import TestClient
 
 from agents_core.doorman_server import (
     GW_URL_DEFAULT,
+    GW_SERVE_STOP_TIMEOUT_SEC,
+    GW_SERVE_STOP_GIVEUP_SEC,
     HOLD_NAME,
     DEFERRED,
     DOORMAN_DEFER_TO_CONTROLLER,
@@ -892,6 +895,88 @@ class TestDeferredStop:
             t.join(timeout=2.0)
 
         assert len(stop_calls) == 0
+
+    def test_timeout_then_still_serving_defers_without_marking_failed(self):
+        """agents-core-doorman-force-stop-timeout-truthfulness-v0 (R5): a
+        deferred stop that times out while GW is still shutting down must
+        not write a stop_failed idle-log row, and must not be re-issued on
+        the very next tick — the two stop paths share one writer
+        (_stop_in_flight)."""
+        from agents_core.doorman_server import _start_refresh_thread
+
+        nodes, state = self._make_nodes_idle(idle_secs=700)
+
+        stop_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "gw-serve" in str(cmd) and "stop" in str(cmd):
+                stop_calls.append(cmd)
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=GW_SERVE_STOP_TIMEOUT_SEC)
+            return MagicMock(returncode=0, stderr="")
+
+        idle_events = []
+
+        def fake_write(node, event, lease_count, **kwargs):
+            idle_events.append(event)
+
+        tick_count = {"n": 0}
+
+        def fake_sleep(s):
+            tick_count["n"] += 1
+            if tick_count["n"] >= 2:
+                state.idle_since = None  # end the loop cleanly
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("time.sleep", side_effect=fake_sleep), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch("agents_core.doorman_server.DOORMAN_PROBE_LLAMA_ACTIVITY", False), \
+             patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0), \
+             patch("agents_core.doorman_server.GW_STOP_GRACE_SEC", 600), \
+             patch("agents_core.doorman_server._write_idle_log", side_effect=fake_write):
+            t = _start_refresh_thread(nodes)
+            t.join(timeout=2.0)
+
+        assert len(stop_calls) == 1, "the deferred stop must not be re-issued while in flight"
+        assert "stop_failed" not in idle_events
+        assert state.service_stopped is False
+        assert state._stop_in_flight is True
+
+    def test_manual_force_stop_in_flight_skips_automatic_stop(self):
+        """R5: the background loop must respect _stop_in_flight — if a
+        manual force-stop already owns the single writer, the loop skips
+        issuing its own gw-serve stop for that tick."""
+        from agents_core.doorman_server import _start_refresh_thread
+
+        nodes, state = self._make_nodes_idle(idle_secs=700)
+        state._stop_epoch += 1
+        state._stop_in_flight = True
+        state._stop_in_flight_since = time.time()
+
+        stop_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "gw-serve" in str(cmd) and "stop" in str(cmd):
+                stop_calls.append(cmd)
+            return MagicMock(returncode=0, stderr="")
+
+        tick_count = {"n": 0}
+
+        def fake_sleep(s):
+            tick_count["n"] += 1
+            if tick_count["n"] >= 2:
+                state.idle_since = None  # end the loop cleanly
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("time.sleep", side_effect=fake_sleep), \
+             patch("agents_core.doorman_server.DOORMAN_PROBE_LLAMA_ACTIVITY", False), \
+             patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0), \
+             patch("agents_core.doorman_server.GW_STOP_GRACE_SEC", 600), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            t = _start_refresh_thread(nodes)
+            t.join(timeout=2.0)
+
+        assert len(stop_calls) == 0
+        assert state.service_stopped is False
 
 
 # ---------------------------------------------------------------------------
@@ -4801,6 +4886,355 @@ class TestForceStopLeaseGuard:
 
         assert r.status_code == 200
         assert r.json()["status"] == "stopped"
+
+
+class TestForceStopTimeoutTruthfulness:
+    """agents-core-doorman-force-stop-timeout-truthfulness-v0: a `gw-serve stop`
+    that times out locally is resolved by observation, not reported as a hard
+    error for an unload that is in fact succeeding. Single-writer
+    _stop_in_flight (R1), lease re-check after the subprocess returns (R7),
+    bounded stop_in_progress via the background reconciler (R8), and the
+    epoch ownership token that closes the reconciler-vs-late-thread race
+    (R8a)."""
+
+    # -- AC1/AC2/AC3: timeout resolved by observation -------------------
+
+    def test_timeout_then_confirmed_down_reports_stopped(self):
+        """AC1: TimeoutExpired + service subsequently observed down ->
+        status == 'stopped', service_stopped is True."""
+        state = _make_state()
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="gw-serve stop", timeout=GW_SERVE_STOP_TIMEOUT_SEC),
+        ), patch.object(state, "_is_serving", return_value=False), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            result = state._force_stop()
+
+        assert result["status"] == "stopped"
+        assert state.service_stopped is True
+        assert state._stop_in_flight is False
+
+    def test_timeout_then_still_serving_reports_stop_in_progress(self):
+        """AC2: TimeoutExpired + service still serving -> status ==
+        'stop_in_progress', service_stopped unchanged."""
+        state = _make_state()
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="gw-serve stop", timeout=GW_SERVE_STOP_TIMEOUT_SEC),
+        ), patch.object(state, "_is_serving", return_value=True):
+            result = state._force_stop()
+
+        assert result["status"] == "stop_in_progress"
+        assert "waited_seconds" in result
+        assert state.service_stopped is False
+        # Genuinely still in flight — not cleared, so a duplicate request
+        # doesn't launch a second subprocess.
+        assert state._stop_in_flight is True
+
+    def test_timeout_then_still_serving_endpoint_returns_http_200(self):
+        """AC2: the HTTP route must answer 200, not 500, for stop_in_progress."""
+        c = _client_no_auth()
+        from agents_core.doorman_server import _NodeState as NS
+
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="gw-serve stop", timeout=GW_SERVE_STOP_TIMEOUT_SEC),
+        ), patch.object(NS, "_is_serving", return_value=True):
+            r = c.post("/v0/force-stop", json={"node": "gravitywell"})
+
+        assert r.status_code == 200
+        assert r.json()["status"] == "stop_in_progress"
+
+    def test_genuine_failure_still_reports_error(self):
+        """AC3: rc != 0 while the service remains up is still a real
+        failure — today's behavior is preserved."""
+        state = _make_state()
+        with patch("subprocess.run", return_value=MagicMock(returncode=1, stderr="boom")), \
+             patch.object(state, "_is_serving", return_value=True):
+            result = state._force_stop()
+
+        assert result["status"] == "error"
+        assert state.service_stopped is False
+        assert state._stop_in_flight is False
+
+    # -- AC4: lock not held across the subprocess (R1) -------------------
+
+    def test_status_not_blocked_during_force_stop_subprocess(self):
+        """AC4: /status must be served while a _force_stop subprocess is
+        blocked, proving state.lock is not held across it."""
+        subprocess_started = threading.Event()
+        release_subprocess = threading.Event()
+
+        def blocking_run(cmd, **kwargs):
+            subprocess_started.set()
+            assert release_subprocess.wait(timeout=5), "release never signaled"
+            return MagicMock(returncode=0, stderr="")
+
+        with patch("agents_core.doorman_server._start_refresh_thread"):
+            app = create_app(gw_url=GW_URL_DEFAULT)
+        c = TestClient(app, raise_server_exceptions=True)
+
+        with patch("subprocess.run", side_effect=blocking_run), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            t = threading.Thread(
+                target=c.post, args=("/v0/force-stop",),
+                kwargs={"json": {"node": "gravitywell"}},
+            )
+            t.start()
+            assert subprocess_started.wait(timeout=2), "subprocess never started"
+
+            start = time.time()
+            r = c.get("/status")
+            elapsed = time.time() - start
+
+            release_subprocess.set()
+            t.join(timeout=5)
+
+        assert not t.is_alive()
+        assert r.status_code == 200
+        assert elapsed < 1.0, f"/status blocked {elapsed:.2f}s during in-flight force-stop"
+
+    # -- AC6: GW_SERVE_STOP_TIMEOUT_SEC is env-overridable ---------------
+
+    def test_gw_serve_stop_timeout_default(self):
+        """AC6: default of 120s applied when the env var is unset."""
+        assert GW_SERVE_STOP_TIMEOUT_SEC == 120
+
+    def test_gw_serve_stop_timeout_honored_by_subprocess_call(self):
+        """AC6: the constant (as read from the environment at import time)
+        is the exact timeout passed to the ssh subprocess."""
+        state = _make_state()
+        with patch("agents_core.doorman_server.GW_SERVE_STOP_TIMEOUT_SEC", 45), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as mock_sub, \
+             patch("agents_core.doorman_server._write_idle_log"):
+            state._force_stop()
+
+        assert mock_sub.call_args.kwargs["timeout"] == 45
+
+    # -- AC7: post-subprocess lease re-check (R1 + R7) -------------------
+
+    def test_lease_acquired_mid_stop_blocks_post_subprocess(self):
+        """AC7: a worker lease acquired while the subprocess is in flight —
+        invisible to the pre-check — must be honoured by the post-subprocess
+        re-check. service_stopped must not be set."""
+        state = _make_state()
+        subprocess_started = threading.Event()
+        proceed = threading.Event()
+
+        def blocking_run(cmd, **kwargs):
+            subprocess_started.set()
+            assert proceed.wait(timeout=5), "proceed never signaled"
+            return MagicMock(returncode=0, stderr="")
+
+        result_holder = {}
+
+        def run_force_stop():
+            result_holder["result"] = state._force_stop()
+
+        with patch("subprocess.run", side_effect=blocking_run), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            t = threading.Thread(target=run_force_stop)
+            t.start()
+            assert subprocess_started.wait(timeout=2), "subprocess never started"
+
+            with state.lock:
+                state.leases["w-mid"] = {
+                    "acquired_at": time.time(), "ttl_sec": 300, "reason": "t",
+                    "role": "worker", "principal": "late-consumer",
+                }
+
+            proceed.set()
+            t.join(timeout=5)
+
+        assert not t.is_alive()
+        result = result_holder["result"]
+        assert result["status"] == "blocked"
+        assert result["active_leases"] == [{"work_id": "w-mid", "principal": "late-consumer"}]
+        assert state.service_stopped is False
+        assert state._stop_in_flight is False
+
+    # -- AC8: single-writer (R1) -----------------------------------------
+
+    def test_second_concurrent_force_stop_returns_stop_in_progress(self):
+        """AC8: a second POST while a first is in flight returns
+        stop_in_progress, and only one gw-serve stop subprocess is ever
+        launched."""
+        state = _make_state()
+        subprocess_started = threading.Event()
+        proceed = threading.Event()
+        call_lock = threading.Lock()
+        call_count = {"n": 0}
+
+        def blocking_run(cmd, **kwargs):
+            with call_lock:
+                call_count["n"] += 1
+            subprocess_started.set()
+            assert proceed.wait(timeout=5), "proceed never signaled"
+            return MagicMock(returncode=0, stderr="")
+
+        results = {}
+
+        def first():
+            results["first"] = state._force_stop()
+
+        with patch("subprocess.run", side_effect=blocking_run), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            t1 = threading.Thread(target=first)
+            t1.start()
+            assert subprocess_started.wait(timeout=2), "subprocess never started"
+
+            results["second"] = state._force_stop()
+
+            proceed.set()
+            t1.join(timeout=5)
+
+        assert not t1.is_alive()
+        assert results["second"]["status"] == "stop_in_progress"
+        assert "waited_seconds" in results["second"]
+        assert results["first"]["status"] == "stopped"
+        assert call_count["n"] == 1
+
+    # -- AC9: boundedness via the background reconciler (R8) -------------
+
+    def test_reconciler_gives_up_on_wedged_stop(self):
+        """AC9: an in-flight stop exceeding GW_SERVE_STOP_GIVEUP_SEC
+        transitions to a visible failure and clears _stop_in_flight, rather
+        than reporting stop_in_progress indefinitely."""
+        state = _make_state()
+        with state.lock:
+            state._stop_epoch += 1
+            state._stop_in_flight = True
+            state._stop_in_flight_since = time.time() - (GW_SERVE_STOP_GIVEUP_SEC + 5)
+
+        nodes = {"gravitywell": state}
+        with patch("subprocess.run") as mock_sub, \
+             patch("time.sleep", side_effect=_StopRefreshLoop), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("agents_core.doorman_server.DOORMAN_PROBE_LLAMA_ACTIVITY", False), \
+             patch("agents_core.doorman_server._write_idle_log") as mock_idle_log:
+            _run_refresh_thread_one_tick(nodes)
+
+        assert state._stop_in_flight is False
+        assert state._stop_in_flight_since is None
+        assert state.last_error is not None
+        assert "giving up" in state.last_error
+        mock_idle_log.assert_any_call("gravitywell", "stop_failed", 0)
+        # The reconciler's give-up is bookkeeping only — it must never issue
+        # a subprocess of its own.
+        mock_sub.assert_not_called()
+
+    # -- AC10: flag hygiene (R1) ------------------------------------------
+
+    def test_subprocess_exception_clears_stop_in_flight(self):
+        """AC10: an unexpected exception from the subprocess call clears
+        _stop_in_flight, so a single failure cannot wedge the endpoint."""
+        state = _make_state()
+        with patch("subprocess.run", side_effect=RuntimeError("ssh binary missing")):
+            result = state._force_stop()
+
+        assert result["status"] == "error"
+        assert state._stop_in_flight is False
+        assert state._stop_in_flight_since is None
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            result2 = state._force_stop()
+        assert result2["status"] == "stopped"
+
+    # -- AC11: ownership token closes the reconciler-vs-late-thread race (R8a) --
+
+    def test_late_stop_thread_does_not_overwrite_reconciler_giveup(self):
+        """AC11: the reconciler times out an in-flight stop; the subprocess
+        thread then returns late. The late thread must mutate nothing."""
+        state = _make_state()
+        subprocess_started = threading.Event()
+        proceed = threading.Event()
+
+        def blocking_run(cmd, **kwargs):
+            subprocess_started.set()
+            assert proceed.wait(timeout=5), "proceed never signaled"
+            return MagicMock(returncode=0, stderr="")
+
+        result_holder = {}
+
+        def run_force_stop():
+            result_holder["result"] = state._force_stop()
+
+        giveup_error = "gw-serve stop unresolved after 999s (budget 900s) — giving up"
+
+        with patch("subprocess.run", side_effect=blocking_run), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            t = threading.Thread(target=run_force_stop)
+            t.start()
+            assert subprocess_started.wait(timeout=2), "subprocess never started"
+
+            # Reconciler gives up on this same in-flight stop while the
+            # subprocess is still (from the app's perspective) running.
+            with state.lock:
+                state.last_error = giveup_error
+                state._stop_in_flight = False
+                state._stop_in_flight_since = None
+                state._stop_epoch += 1
+
+            proceed.set()
+            t.join(timeout=5)
+
+        assert not t.is_alive()
+        assert result_holder["result"]["status"] != "stopped"
+        assert result_holder["result"]["status"] != "error"
+        assert state.last_error == giveup_error
+        assert state.service_stopped is False
+        assert state._stop_in_flight is False
+
+        # A subsequent force-stop must not be blocked by anything the late
+        # thread should not have touched.
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            result3 = state._force_stop()
+        assert result3["status"] == "stopped"
+
+    # -- AC12: atomicity of _stop_in_flight + _stop_in_flight_since (R8) --
+
+    def test_stop_in_flight_and_since_never_independently_observable(self):
+        """AC12: a reader taking state.lock must see _stop_in_flight and
+        _stop_in_flight_since either both set or both clear, never one
+        without the other."""
+        state = _make_state()
+        observations = []
+        subprocess_started = threading.Event()
+        proceed = threading.Event()
+
+        def blocking_run(cmd, **kwargs):
+            subprocess_started.set()
+            assert proceed.wait(timeout=5), "proceed never signaled"
+            return MagicMock(returncode=0, stderr="")
+
+        def observer():
+            for _ in range(50):
+                with state.lock:
+                    observations.append(
+                        (state._stop_in_flight, state._stop_in_flight_since is not None)
+                    )
+                time.sleep(0.01)
+
+        with patch("subprocess.run", side_effect=blocking_run), \
+             patch("agents_core.doorman_server._write_idle_log"):
+            t = threading.Thread(target=state._force_stop)
+            t.start()
+            assert subprocess_started.wait(timeout=2), "subprocess never started"
+
+            obs_thread = threading.Thread(target=observer)
+            obs_thread.start()
+            obs_thread.join(timeout=2)
+
+            proceed.set()
+            t.join(timeout=5)
+
+        assert not t.is_alive()
+        assert observations, "observer collected no samples"
+        for flag, has_ts in observations:
+            assert flag == has_ts, f"observed flag={flag} has_timestamp={has_ts} independently"
 
 
 class TestBackgroundSweepIntegration:

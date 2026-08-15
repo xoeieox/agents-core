@@ -41,6 +41,27 @@ Environment variables:
                            issues gw-serve stop (default 600; machine-economics
                            boundary that amortizes the ~25s cold-load against burst
                            gaps — not a human-rhythm value)
+  GW_SERVE_STOP_TIMEOUT_SEC — ssh subprocess budget in seconds for `gw-serve stop`,
+                           used by both the manual /v0/force-stop endpoint and the
+                           deferred idle-stop (default 120). GW's own systemd unit
+                           (llama-server.service) is allowed up to TimeoutStopUSec
+                           (600s live-read) to shut down cleanly, so a normal-but-
+                           slow unload can legitimately outlast this budget — that
+                           is by design, not a bug: a timeout here now resolves by
+                           observation (still serving -> "stop_in_progress", down ->
+                           "stopped") rather than being reported as a hard failure
+                           for an unload that is in fact succeeding
+                           (agents-core-doorman-force-stop-timeout-truthfulness-v0).
+                           Deliberately bounded well below TimeoutStopUSec: sizing
+                           it at or above the unit's own allowance would hold
+                           state.lock (or, for the deferred path, the background
+                           loop) for up to ten minutes and freeze /status.
+  GW_SERVE_STOP_GIVEUP_SEC — seconds a stop may report stop_in_progress before the
+                           background reconciler gives up and surfaces a genuine
+                           failure (last_error + a stop_failed idle-log row),
+                           clearing the in-flight flag so a wedged stop cannot
+                           permanently block later attempts (default 900 — above
+                           TimeoutStopUSec with margin).
   DOORMAN_MODE_AWARE_ADMISSION — enable mode-aware deference before the _is_serving()
                                   fast path (HOLE 1), controller-lease-aware serving_mode
                                   (HOLE 2), and the three-state /v1/models big-model probe.
@@ -131,6 +152,24 @@ GW_HOLD_REFRESH_SEC = int(os.environ.get("GW_HOLD_REFRESH_SEC", "45"))
 # Machine-economics boundary: amortizes the ~25s cold-load against burst gaps.
 # Calibrate from /var/log/doorman-idle.jsonl observations — never auto-tuned.
 GW_STOP_GRACE_SEC = int(os.environ.get("GW_STOP_GRACE_SEC", "600"))
+
+# agents-core-doorman-force-stop-timeout-truthfulness-v0 (R3): ssh subprocess
+# budget for `gw-serve stop`, shared by the manual force-stop endpoint and the
+# deferred idle-stop. 120s comfortably covers an ordinary unload, and it is
+# deliberately bounded well below GW's own systemd TimeoutStopUSec (600s)
+# because a timeout here is no longer a truncation — it now resolves by
+# observation (R2), so a slower unload is correctly reported as
+# stop_in_progress rather than waited on. Sizing this at or above the unit's
+# own allowance would re-introduce the responsiveness problem R1 exists to
+# prevent (holding state.lock, or blocking the background loop, for up to
+# ten minutes).
+GW_SERVE_STOP_TIMEOUT_SEC = int(os.environ.get("GW_SERVE_STOP_TIMEOUT_SEC", "120"))
+
+# R8: bounds how long a force-stop may report stop_in_progress before the
+# background reconciler gives up and surfaces a genuine, visible failure.
+# Sized above GW's own TimeoutStopUSec (600s) with margin so a normal (if
+# slow) unload is never mistaken for a hang.
+GW_SERVE_STOP_GIVEUP_SEC = int(os.environ.get("GW_SERVE_STOP_GIVEUP_SEC", "900"))
 
 # Extra benefit-of-the-doubt window past GW_STOP_GRACE_SEC before an indeterminate
 # activity probe (gw-doorman-vllm-activity-probe-v0) falls back to confirmed-idle
@@ -547,6 +586,22 @@ class _NodeState:
         # empty-transition that may never occur if the process starts at zero leases.
         self.idle_since: float | None = time.time()
         self.service_stopped: bool = False     # True after gw-serve stop confirmed
+        # Single-writer stop tracking (agents-core-doorman-force-stop-timeout-
+        # truthfulness-v0, R1/R8/R8a). Read and written ONLY while holding
+        # self.lock — the lock is the memory barrier, no separate atomic type
+        # needed. _stop_in_flight and _stop_in_flight_since are one piece of
+        # state: always set together and cleared together (R8), so a reader
+        # taking self.lock never observes one without the other.
+        self._stop_in_flight: bool = False
+        self._stop_in_flight_since: float | None = None
+        # Monotonic ownership token (R8a): incremented under self.lock every
+        # time _stop_in_flight transitions to True (a new stop attempt begins,
+        # or the reconciler forces a give-up that ends one). The thread that
+        # ran the subprocess captures its epoch and, on completion, only
+        # mutates state if the epoch still matches — otherwise the reconciler
+        # (or a later stop) already resolved this attempt and it must touch
+        # nothing.
+        self._stop_epoch: int = 0
         # Cached serving state (doorman-status-cached-serving-v0)
         self._cached_serving: bool | None = None   # None until first refresh
         self._serving_checked_at: float = 0.0      # walltime of last successful probe
@@ -2170,12 +2225,22 @@ class _NodeState:
     # Manual force-stop (doorman-force-stop-endpoint-v0): bypasses
     # GW_STOP_GRACE_SEC entirely. Mirrors the refresh thread's grace-period
     # stop logic (idempotency guards, state updates) so behavior stays
-    # consistent whichever path issues the stop. Must be called under
-    # self.lock — caller (the /v0/force-stop route) holds it.
+    # consistent whichever path issues the stop. Manages self.lock
+    # internally — the caller (the /v0/force-stop route) must NOT wrap the
+    # call in `with state.lock:` (agents-core-doorman-force-stop-timeout-
+    # truthfulness-v0, R1): the ssh subprocess runs outside the lock so
+    # /status, /lease/acquire and the background loop stay responsive for
+    # the full stop duration, guarded instead by the single-writer
+    # _stop_in_flight flag (test-and-set under the lock before the
+    # subprocess, re-checked under the lock after it returns).
     #
     # Lease guard (gw-force-stop-lease-guard-v0): refuses to stop while any
     # other worker lease is active, so one caller can't evict a model out
-    # from under another consumer's in-flight lease.
+    # from under another consumer's in-flight lease. Re-checked after the
+    # subprocess returns (R7) so a lease acquired while the ssh call was in
+    # flight — which the pre-check could not have seen — is still honoured:
+    # service_stopped is only ever set true at a moment when the lease
+    # guard passes under the lock.
     # ------------------------------------------------------------------
 
     def _worker_lease_blockers(self, exclude_principal: str | None = None) -> list[dict]:
@@ -2208,55 +2273,121 @@ class _NodeState:
         return blockers
 
     def _force_stop(self, exclude_principal: str | None = None) -> dict:
-        if self.service_stopped:
-            return {"status": "already_stopped", "node": self.node_name}
+        with self.lock:
+            if self.service_stopped:
+                return {"status": "already_stopped", "node": self.node_name}
 
-        self._gc_stale()
-        blocking_leases = self._worker_lease_blockers(exclude_principal)
-        if blocking_leases:
-            log.info(
-                f"[{self.node_name}] force-stop: blocked by {len(blocking_leases)} "
-                f"active worker lease(s)"
-            )
-            return {
-                "status": "blocked",
-                "node": self.node_name,
-                "active_leases": blocking_leases,
-            }
+            self._gc_stale()
+            blocking_leases = self._worker_lease_blockers(exclude_principal)
+            if blocking_leases:
+                log.info(
+                    f"[{self.node_name}] force-stop: blocked by {len(blocking_leases)} "
+                    f"active worker lease(s)"
+                )
+                return {
+                    "status": "blocked",
+                    "node": self.node_name,
+                    "active_leases": blocking_leases,
+                }
 
-        log.info(f"[{self.node_name}] force-stop: issuing gw-serve stop (bypassing grace period)")
+            if self._stop_in_flight:
+                # Single-writer (R1): a duplicate request must never launch a
+                # parallel gw-serve stop.
+                since = self._stop_in_flight_since or time.time()
+                return {
+                    "status": "stop_in_progress",
+                    "node": self.node_name,
+                    "waited_seconds": time.time() - since,
+                }
+
+            self._stop_epoch += 1
+            my_epoch = self._stop_epoch
+            self._stop_in_flight = True
+            self._stop_in_flight_since = time.time()
+
+        # Outside self.lock (R1): the ssh subprocess must never block
+        # /status, /lease/acquire, or the background loop for the duration
+        # of a stop. `resolved` tracks whether a path below has already
+        # cleared _stop_in_flight (or determined it doesn't own it) so the
+        # `finally` can defensively clear it on any unexpected exception
+        # without wedging the endpoint (R1's try/finally requirement).
+        resolved = False
         try:
-            stop_proc = subprocess.run(
-                ["ssh", "gravitywell", "gw-serve stop"],
-                capture_output=True, text=True, timeout=60,
+            log.info(
+                f"[{self.node_name}] force-stop: issuing gw-serve stop "
+                f"(bypassing grace period)"
             )
-            if stop_proc.returncode == 0:
-                self.service_stopped = True
-                self.idle_since = None
-                self._idle_since_source = None
-                self._cached_serving = False
-                self._serving_checked_at = time.time()
-                log.info(f"[{self.node_name}] force-stop: gw-serve stop succeeded")
-                _write_idle_log(self.node_name, "force_stopped", 0)
-                return {"status": "stopped", "node": self.node_name, "exit_code": 0}
-            else:
-                # rc != 0: idempotency guard — check if already down
-                if not self._is_serving():
-                    self.service_stopped = True
-                    self.idle_since = None
-                    self._idle_since_source = None
-                    self._cached_serving = False
-                    self._serving_checked_at = time.time()
-                    log.warning(
-                        f"[{self.node_name}] force-stop: gw-serve stop "
-                        f"rc={stop_proc.returncode} but service already down — "
-                        f"treating as success"
-                    )
-                    _write_idle_log(self.node_name, "force_stopped", 0)
+            timed_out = False
+            exc_err: str | None = None
+            stop_proc = None
+            try:
+                stop_proc = subprocess.run(
+                    ["ssh", "gravitywell", "gw-serve stop"],
+                    capture_output=True, text=True, timeout=GW_SERVE_STOP_TIMEOUT_SEC,
+                )
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            except Exception as exc:
+                exc_err = f"force-stop exception: {exc}"
+                log.error(f"[{self.node_name}] {exc_err}")
+
+            # R2: a timeout is not a failure — resolve by observation, not
+            # assumption. Probe outside the lock (same precedent as
+            # _refresh_serving_cache: "probing is a blocking network call").
+            still_serving: bool | None = None
+            if timed_out or (stop_proc is not None and stop_proc.returncode != 0):
+                still_serving = self._is_serving()
+
+            with self.lock:
+                if self._stop_epoch != my_epoch:
+                    # R8a: the reconciler (or a later stop) already resolved
+                    # this attempt while we were outside the lock. We do not
+                    # own it anymore — mutate nothing, clear nothing.
+                    resolved = True
                     return {
-                        "status": "already_stopped", "node": self.node_name,
-                        "exit_code": stop_proc.returncode,
+                        "status": "stop_in_progress",
+                        "node": self.node_name,
+                        "waited_seconds": 0.0,
                     }
+
+                if exc_err is not None:
+                    self.last_error = exc_err
+                    self._stop_in_flight = False
+                    self._stop_in_flight_since = None
+                    resolved = True
+                    return {"status": "error", "node": self.node_name, "error": exc_err}
+
+                if timed_out and still_serving:
+                    # Still progressing — leave service_stopped and
+                    # _stop_in_flight untouched so the background loop (or a
+                    # later force-stop, or the R8 reconciler) reconciles it.
+                    waited = time.time() - (self._stop_in_flight_since or time.time())
+                    log.info(
+                        f"[{self.node_name}] force-stop: gw-serve stop still "
+                        f"running after {GW_SERVE_STOP_TIMEOUT_SEC}s — reporting "
+                        f"stop_in_progress"
+                    )
+                    resolved = True  # deliberately not cleared — genuinely still in flight
+                    return {
+                        "status": "stop_in_progress",
+                        "node": self.node_name,
+                        "waited_seconds": waited,
+                    }
+
+                if timed_out:
+                    # Timed out locally but confirmed down (R2): matches the
+                    # rc==0 path exactly, "stopped" — not a truncation, this
+                    # unload genuinely succeeded within the allowance its own
+                    # unit was granted, just past our local budget.
+                    exit_code = None
+                    status = "stopped"
+                elif stop_proc.returncode == 0:
+                    exit_code = 0
+                    status = "stopped"
+                elif not still_serving:
+                    # rc != 0: idempotency guard — already down.
+                    exit_code = stop_proc.returncode
+                    status = "already_stopped"
                 else:
                     err = (
                         f"gw-serve stop failed rc={stop_proc.returncode}: "
@@ -2264,15 +2395,59 @@ class _NodeState:
                     )
                     log.error(f"[{self.node_name}] {err}")
                     self.last_error = err
+                    self._stop_in_flight = False
+                    self._stop_in_flight_since = None
+                    resolved = True
                     return {
                         "status": "error", "node": self.node_name, "error": err,
                         "exit_code": stop_proc.returncode,
                     }
-        except Exception as exc:
-            err = f"force-stop exception: {exc}"
-            log.error(f"[{self.node_name}] {err}")
-            self.last_error = err
-            return {"status": "error", "node": self.node_name, "error": err}
+
+                # R7: re-check the lease guard, under the lock, before ever
+                # mutating service_stopped. A worker lease acquired while the
+                # subprocess was in flight — invisible to the pre-check —
+                # must still be honoured.
+                self._gc_stale()
+                post_blockers = self._worker_lease_blockers(exclude_principal)
+                if post_blockers:
+                    self._stop_in_flight = False
+                    self._stop_in_flight_since = None
+                    resolved = True
+                    log.info(
+                        f"[{self.node_name}] force-stop: blocked post-subprocess "
+                        f"by {len(post_blockers)} active worker lease(s) acquired "
+                        f"mid-stop"
+                    )
+                    return {
+                        "status": "blocked",
+                        "node": self.node_name,
+                        "active_leases": post_blockers,
+                    }
+
+                self.service_stopped = True
+                self.idle_since = None
+                self._idle_since_source = None
+                self._cached_serving = False
+                self._serving_checked_at = time.time()
+                self._stop_in_flight = False
+                self._stop_in_flight_since = None
+                resolved = True
+                verb = "succeeded" if status == "stopped" else f"rc={exit_code} but service already down"
+                log.info(f"[{self.node_name}] force-stop: gw-serve stop {verb}")
+                _write_idle_log(self.node_name, "force_stopped", 0)
+                result = {"status": status, "node": self.node_name}
+                if exit_code is not None:
+                    result["exit_code"] = exit_code
+                return result
+        finally:
+            if not resolved:
+                # An exception escaped somewhere above that no branch caught
+                # (R1): never wedge the endpoint — clear the flag iff we
+                # still own this attempt.
+                with self.lock:
+                    if self._stop_epoch == my_epoch:
+                        self._stop_in_flight = False
+                        self._stop_in_flight_since = None
 
 
 # ---------------------------------------------------------------------------
@@ -2308,11 +2483,42 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                     # event fire even if no caller happens to be polling — release
                     # is never gated on an acknowledgment.
                     state._sweep_wait_list()
+
+                    # R8: bound stop_in_progress — a wedged stop (manual or
+                    # automatic; the two paths share one writer) cannot report
+                    # progress forever. One atomic critical section: reads
+                    # service_stopped-adjacent state and, on give-up, mutates
+                    # last_error + clears the flag, so no observer sees a
+                    # half-applied giveup.
+                    if state._stop_in_flight and state._stop_in_flight_since is not None:
+                        in_flight_elapsed = time.time() - state._stop_in_flight_since
+                        if in_flight_elapsed >= GW_SERVE_STOP_GIVEUP_SEC:
+                            err = (
+                                f"gw-serve stop unresolved after "
+                                f"{in_flight_elapsed:.0f}s (budget "
+                                f"{GW_SERVE_STOP_GIVEUP_SEC}s) — giving up"
+                            )
+                            log.error(f"[{node_name}] {err}")
+                            state.last_error = err
+                            state._stop_in_flight = False
+                            state._stop_in_flight_since = None
+                            # R8a: invalidate the owning thread's epoch token —
+                            # a late-returning subprocess must not overwrite
+                            # this failure with a stale result.
+                            state._stop_epoch += 1
+                            _write_idle_log(node_name, "stop_failed", 0)
+
                     if not state.leases:
                         # No active leases: check if deferred service stop is due
                         if (
                             state.idle_since is not None
                             and not state.service_stopped
+                            # R5: a manual force-stop already owns the single
+                            # writer for this node — never launch a second
+                            # gw-serve stop, and never block on state.lock
+                            # waiting for it (we already hold the lock; simply
+                            # skip issuing our own this tick).
+                            and not state._stop_in_flight
                         ):
                             idle_elapsed = time.time() - state.idle_since
                             blindness_deadline = (
@@ -2335,10 +2541,22 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                                     f"Safety: guard blocks suspend while service active; "
                                     f"doorman stop enables suspend, never forces it."
                                 )
+                                # Single-writer bookkeeping (R5), shared with
+                                # _force_stop: bumping the epoch and setting
+                                # _stop_in_flight here means a concurrent
+                                # manual force-stop sees this attempt and
+                                # defers to it, and — if this call times out
+                                # while GW is still shutting down — the next
+                                # tick will not re-issue a second gw-serve
+                                # stop for the same unload.
+                                state._stop_epoch += 1
+                                state._stop_in_flight = True
+                                state._stop_in_flight_since = time.time()
                                 try:
                                     stop_proc = subprocess.run(
                                         ["ssh", "gravitywell", "gw-serve stop"],
-                                        capture_output=True, text=True, timeout=60,
+                                        capture_output=True, text=True,
+                                        timeout=GW_SERVE_STOP_TIMEOUT_SEC,
                                     )
                                     if stop_proc.returncode == 0:
                                         state.service_stopped = True
@@ -2346,6 +2564,8 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                                         state._idle_since_source = None
                                         state._cached_serving = False
                                         state._serving_checked_at = time.time()
+                                        state._stop_in_flight = False
+                                        state._stop_in_flight_since = None
                                         stopped_desc = _describe_stopped_units(
                                             stop_proc.stdout, node_name
                                         )
@@ -2367,6 +2587,8 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                                             state._idle_since_source = None
                                             state._cached_serving = False
                                             state._serving_checked_at = time.time()
+                                            state._stop_in_flight = False
+                                            state._stop_in_flight_since = None
                                             log.warning(
                                                 f"[{node_name}] gw-serve stop "
                                                 f"rc={stop_proc.returncode} but service "
@@ -2385,6 +2607,8 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                                             )
                                             log.error(f"[{node_name}] {err}")
                                             state.last_error = err
+                                            state._stop_in_flight = False
+                                            state._stop_in_flight_since = None
                                             backoff = min(
                                                 backoff + 15, GW_HOLD_REFRESH_SEC
                                             )
@@ -2392,10 +2616,46 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                                                 node_name, "stop_failed", 0,
                                                 idle_secs=idle_elapsed,
                                             )
+                                except subprocess.TimeoutExpired:
+                                    # R2/R5: a timeout is not a failure —
+                                    # resolve by observation. Confirmed down
+                                    # -> treat as success; still serving ->
+                                    # leave service_stopped and
+                                    # _stop_in_flight alone (do not write
+                                    # stop_failed, do not re-issue next tick)
+                                    # so a later tick or the R8 reconciler
+                                    # resolves it.
+                                    if not state._is_serving():
+                                        state.service_stopped = True
+                                        state.idle_since = None
+                                        state._idle_since_source = None
+                                        state._cached_serving = False
+                                        state._serving_checked_at = time.time()
+                                        state._stop_in_flight = False
+                                        state._stop_in_flight_since = None
+                                        log.warning(
+                                            f"[{node_name}] gw-serve stop timed out "
+                                            f"after {GW_SERVE_STOP_TIMEOUT_SEC}s but "
+                                            f"service already down — treating as "
+                                            f"success"
+                                        )
+                                        _write_idle_log(
+                                            node_name, "stopped", 0,
+                                            idle_secs=idle_elapsed,
+                                        )
+                                    else:
+                                        log.info(
+                                            f"[{node_name}] gw-serve stop still "
+                                            f"running after "
+                                            f"{GW_SERVE_STOP_TIMEOUT_SEC}s — "
+                                            f"deferring to next tick"
+                                        )
                                 except Exception as exc:
                                     err = f"gw-serve stop exception: {exc}"
                                     log.error(f"[{node_name}] {err}")
                                     state.last_error = err
+                                    state._stop_in_flight = False
+                                    state._stop_in_flight_since = None
                                     backoff = min(backoff + 15, GW_HOLD_REFRESH_SEC)
                                     _write_idle_log(node_name, "stop_failed", 0)
                         continue  # no hold refresh needed for idle node
@@ -2678,8 +2938,10 @@ def create_app(gw_url: str | None = None) -> FastAPI:
             )
 
         state = nodes[node]
-        with state.lock:
-            result = state._force_stop(exclude_principal=exclude_principal)
+        # R1: _force_stop manages state.lock internally (released around the
+        # ssh subprocess) — the route must NOT wrap it in `with state.lock:`,
+        # or the lock would be held for the full stop duration again.
+        result = state._force_stop(exclude_principal=exclude_principal)
 
         if result["status"] == "error":
             return JSONResponse(result, status_code=500)
