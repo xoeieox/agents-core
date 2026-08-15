@@ -24,6 +24,12 @@ Reads configuration from environment:
                            Read by _defer_wait_timeout() to size a retry-loop budget
                            for a `deferrable` acquire waiting on the foreground-priority
                            gate's pending-defer wait-list (gw-router-phase1-foreground-gate).
+  GW_SERVE_STOP_TIMEOUT_SEC — must match doorman-server's setting (default 120). Read
+                           by _force_stop_timeout() to size force_stop()'s default HTTP
+                           timeout above the server's own ssh-subprocess budget for
+                           `gw-serve stop`, so a slow-but-normal unload is never
+                           misread as DoormanUnreachable before the server even answers
+                           (agents-core-doorman-force-stop-timeout-truthfulness-v0).
 
 Raises DoormanUnreachable when the HTTP layer itself fails (connection error,
 timeout). The operator treats DoormanUnreachable exactly like status:"wake_failed":
@@ -100,6 +106,26 @@ def _gw_acquire_timeout() -> float:
         return override_value
 
     return float(derived_timeout)
+
+
+def _force_stop_timeout() -> float:
+    """Derive the force_stop() HTTP timeout from the server's own stop budget.
+
+    Same spirit as _gw_acquire_timeout(): the client must outlive the
+    server's GW_SERVE_STOP_TIMEOUT_SEC (default 120s) budget for the ssh
+    subprocess, or a stop the server is about to correctly resolve as
+    stop_in_progress gets misread as DoormanUnreachable before the server
+    even answers (agents-core-doorman-force-stop-timeout-truthfulness-v0).
+
+    Reads the same GW_SERVE_STOP_TIMEOUT_SEC env var doorman_server.py reads,
+    plus GW_ACQUIRE_MARGIN_SEC (shared margin convention with
+    _gw_acquire_timeout()) to cover the server's own post-subprocess
+    lease-recheck and serving-probe overhead on top of the subprocess budget
+    itself.
+    """
+    gw_serve_stop_timeout_sec = float(os.environ.get("GW_SERVE_STOP_TIMEOUT_SEC", "120"))
+    gw_acquire_margin_sec = float(os.environ.get("GW_ACQUIRE_MARGIN_SEC", "30"))
+    return gw_serve_stop_timeout_sec + gw_acquire_margin_sec
 
 
 def _defer_wait_timeout() -> float:
@@ -286,16 +312,30 @@ class DoormanClient:
                              block the stop (self-exclusion, same convention as
                              drain_count()). Ghost leases (__GHOST_LEASE__) and
                              any other worker's lease still block.
+          timeout: optional per-request timeout override. Defaults to
+                   _force_stop_timeout(), sized above the server's own
+                   GW_SERVE_STOP_TIMEOUT_SEC ssh-subprocess budget so a slow-
+                   but-normal unload is never misread as DoormanUnreachable
+                   before the server answers. An explicit value here always
+                   wins over the derived default.
 
         Returns dict with a status field:
           "stopped" / "already_stopped" — model unloaded (or already was)
           "blocked" — refused; includes active_leases: [{work_id, principal}, ...]
+          "stop_in_progress" — the ssh subprocess exceeded the server's
+                                GW_SERVE_STOP_TIMEOUT_SEC but GW is still
+                                reachable and shutting down; includes
+                                waited_seconds. Not a failure — the unload is
+                                proceeding; poll again or check /status. The
+                                server's own background reconciler resolves a
+                                genuinely wedged stop on a bounded budget.
           "error" — gw-serve stop failed; includes error/exit_code
         """
         body: dict = {"node": node}
         if exclude_principal is not None:
             body["exclude_principal"] = exclude_principal
-        return self._post("/v0/force-stop", body, timeout=timeout)
+        _timeout = timeout if timeout is not None else _force_stop_timeout()
+        return self._post("/v0/force-stop", body, timeout=_timeout)
 
     def mode_owner(self, node: str = "gravitywell") -> dict | None:
         """Get the /v0/mode-owner deference-liveness probe.
