@@ -64,6 +64,14 @@ def _escalate_council_fast_fail(run_id: str, last_heartbeat, reason: str) -> Non
             escalation_policy=first(),
             tier=Tier.HIGH,
             owning_module="agents_core.shared_deliberation.orchestrator",
+            # Dedup on stable failure identity only. Keeps: reason (the actual
+            # failure mode, e.g. "no_heartbeat_after_startup" / "heartbeat_stale").
+            # Drops: run_id (a fresh "YYYY-MM-DD-HHMMSS-<hex>" value generated per
+            # deliberation by council/cli.py::new_run_id()) and last_heartbeat (a
+            # timestamp) — both are per-run uniques that make every fire look novel
+            # under whole-payload hashing
+            # (correction/repair-station-has-no-reader-and-dedup-is-defeated-2026-08-01).
+            signature_fields=["reason"],
         )
     except Exception:
         log.exception("repair-station escalation failed for council fast-fail — suppressed")
@@ -235,6 +243,16 @@ def _maybe_escalate_grounding_denial(
             escalation_policy=first(),
             tier=tier,
             owning_module="agents_core.shared_deliberation.orchestrator",
+            # Dedup on stable failure identity. Keeps: case (absent/denied), repo,
+            # skip_reason, denied_surfaces, reasons, source_repo — these identify
+            # WHAT was denied and WHY. Drops: rounds_affected (which round(s) of
+            # THIS deliberation were affected — varies per run, not a stable
+            # identity) and resolved_sha (the grounding commit SHA, which changes on
+            # nearly every run) — both are per-run uniques that would otherwise make
+            # every fire look novel under whole-payload hashing.
+            signature_fields=[
+                "case", "repo", "skip_reason", "denied_surfaces", "reasons", "source_repo",
+            ],
         )
     except Exception:
         log.exception("repair-station escalation failed for grounding denial — suppressed")

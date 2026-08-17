@@ -321,6 +321,9 @@ def test_council_fast_fail_wired_in_orchestrator(tmp_path):
     assert "run-xyz" in str(captured.get("error_signal", {}))
     assert captured.get("escalation_policy") is not None
     assert captured.get("escalation_policy").kind == "first"
+    # repair-station-close-dedup-triage-v0 Leg 2: dedup on the stable failure
+    # identity only — run_id/last_heartbeat (per-run uniques) must not be in the list.
+    assert captured.get("signature_fields") == ["reason"]
 
 
 def test_council_fast_fail_escalation_smoke(tmp_path, monkeypatch):
@@ -418,3 +421,209 @@ def test_incident_status_and_back_ref_fields_exist(tmp_path):
     updated = _incident_row(db_path, incident_id)
     assert updated["status"] == "resolved"
     assert updated["back_ref"] == "expert-diagnosis-abc"
+
+
+# ---------------------------------------------------------------------------
+# 8. Migration: additive, idempotent, exactly closed_at + prose
+# ---------------------------------------------------------------------------
+
+_ORIGINAL_INCIDENT_COLUMNS = {
+    "incident_id", "station_id", "stable_pointer", "error_signal", "author_intent",
+    "tier", "error_signature", "status", "back_ref", "created_at", "updated_at",
+}
+
+
+def test_migration_adds_exactly_closed_at_and_prose(tmp_path):
+    from agents_core.repair_station._db import get_db
+
+    db_path = tmp_path / "rs.db"
+    db = get_db(db_path)
+    info = db.execute("PRAGMA table_info(incidents)").fetchall()
+    cols = {row["name"] for row in info}
+
+    assert cols == _ORIGINAL_INCIDENT_COLUMNS | {"closed_at", "prose"}
+
+    status_col = next(row for row in info if row["name"] == "status")
+    assert status_col["dflt_value"] == "'open'"
+    assert status_col["notnull"] == 1
+
+
+def test_migration_idempotent_across_two_get_db_calls(tmp_path):
+    """Two get_db() calls against the same file, with the singleton cache cleared
+    in between, must not raise (ALTER TABLE ADD COLUMN on an existing column would
+    raise sqlite3.OperationalError if the PRAGMA table_info guard were missing) and
+    must leave the same schema."""
+    import agents_core.repair_station._db as db_mod
+
+    db_path = tmp_path / "rs.db"
+    db1 = db_mod.get_db(db_path)
+    cols_first = {row["name"] for row in db1.execute("PRAGMA table_info(incidents)").fetchall()}
+
+    db_mod._instances.pop(db_path, None)  # force a fresh _DB() against the same file
+    db2 = db_mod.get_db(db_path)
+    cols_second = {row["name"] for row in db2.execute("PRAGMA table_info(incidents)").fetchall()}
+
+    assert cols_first == cols_second == _ORIGINAL_INCIDENT_COLUMNS | {"closed_at", "prose"}
+
+
+# ---------------------------------------------------------------------------
+# 9. close_incident / dismiss_incident lifecycle
+# ---------------------------------------------------------------------------
+
+def test_close_incident_removes_from_open_list_and_sets_prose(tmp_path):
+    from agents_core.repair_station import close_incident, list_open_incidents
+
+    db_path = tmp_path / "rs.db"
+    incident_id = _fire(db_path, error_signal={"code": "E_CLOSE"})
+
+    assert incident_id in [i.incident_id for i in list_open_incidents(db_path=db_path)]
+
+    close_incident(incident_id, resolution="fixed the underlying config drift", db_path=db_path)
+
+    assert incident_id not in [i.incident_id for i in list_open_incidents(db_path=db_path)]
+
+    row = _incident_row(db_path, incident_id)
+    assert row["status"] == "closed"
+    assert row["prose"] == "fixed the underlying config drift"
+    assert row["closed_at"]
+
+
+def test_dismiss_incident_removes_from_open_list_with_distinct_status(tmp_path):
+    from agents_core.repair_station import dismiss_incident, list_open_incidents
+
+    db_path = tmp_path / "rs.db"
+    incident_id = _fire(db_path, error_signal={"code": "E_DISMISS"})
+
+    dismiss_incident(incident_id, reason="test pollution — sentinel run_id", db_path=db_path)
+
+    assert incident_id not in [i.incident_id for i in list_open_incidents(db_path=db_path)]
+    row = _incident_row(db_path, incident_id)
+    assert row["status"] == "dismissed"
+    assert row["prose"] == "test pollution — sentinel run_id"
+    assert row["closed_at"]
+
+
+def test_close_unknown_incident_refuses(tmp_path):
+    from agents_core.repair_station import close_incident
+
+    db_path = tmp_path / "rs.db"
+    _fire(db_path)  # ensure the table exists / is migrated
+
+    with pytest.raises(ValueError):
+        close_incident("inc-does-not-exist", resolution="n/a", db_path=db_path)
+
+
+def test_double_close_refuses(tmp_path):
+    from agents_core.repair_station import close_incident
+
+    db_path = tmp_path / "rs.db"
+    incident_id = _fire(db_path, error_signal={"code": "E_DOUBLE"})
+
+    close_incident(incident_id, resolution="first close", db_path=db_path)
+    with pytest.raises(ValueError):
+        close_incident(incident_id, resolution="second close", db_path=db_path)
+
+    # Refused second close must not have overwritten the first close's prose
+    row = _incident_row(db_path, incident_id)
+    assert row["prose"] == "first close"
+
+
+def test_dismiss_after_close_refuses(tmp_path):
+    """Cross-verb refusal: dismiss_incident on an already-closed incident is the
+    same caller bug as a double-close and must refuse identically."""
+    from agents_core.repair_station import close_incident, dismiss_incident
+
+    db_path = tmp_path / "rs.db"
+    incident_id = _fire(db_path, error_signal={"code": "E_CROSS"})
+
+    close_incident(incident_id, resolution="closed first", db_path=db_path)
+    with pytest.raises(ValueError):
+        dismiss_incident(incident_id, reason="too late", db_path=db_path)
+
+
+def test_close_requires_nonempty_resolution(tmp_path):
+    from agents_core.repair_station import close_incident
+
+    db_path = tmp_path / "rs.db"
+    incident_id = _fire(db_path)
+
+    with pytest.raises(ValueError):
+        close_incident(incident_id, resolution="   ", db_path=db_path)
+
+
+def test_dismiss_requires_nonempty_reason(tmp_path):
+    from agents_core.repair_station import dismiss_incident
+
+    db_path = tmp_path / "rs.db"
+    incident_id = _fire(db_path)
+
+    with pytest.raises(ValueError):
+        dismiss_incident(incident_id, reason="", db_path=db_path)
+
+
+# ---------------------------------------------------------------------------
+# 10. signature_fields — Leg 2 dedup fix
+# ---------------------------------------------------------------------------
+
+def test_signature_fields_omitted_is_byte_identical_to_whole_payload(tmp_path):
+    """Regression pin: omitting signature_fields must produce exactly today's
+    whole-payload signature."""
+    from agents_core.repair_station.escalate import _compute_signature
+
+    db_path = tmp_path / "rs.db"
+    error_signal = {"code": "E1", "run_id": "abc", "nested": {"x": 1}}
+    incident_id = _fire(db_path, error_signal=error_signal)
+
+    row = _incident_row(db_path, incident_id)
+    assert row["error_signature"] == _compute_signature(error_signal)
+
+
+def test_signature_fields_subset_dedups_across_excluded_field(tmp_path):
+    """Two payloads differing only in an excluded field produce the SAME signature
+    and dedup within the window."""
+    from agents_core.repair_station import escalate, Tier, first
+
+    db_path = tmp_path / "rs.db"
+    kwargs = dict(
+        station_id="test/sig-station",
+        stable_pointer="agents_core/test_module.py",
+        author_intent="test",
+        escalation_policy=first(),
+        tier=Tier.NORMAL,
+        signature_fields=["reason"],
+        db_path=db_path,
+    )
+
+    id1 = escalate(error_signal={"reason": "boom", "run_id": "run-1"}, **kwargs)
+    id2 = escalate(error_signal={"reason": "boom", "run_id": "run-2"}, **kwargs)  # only run_id differs
+
+    assert id1 is not None
+    assert id2 is None  # dedup suppressed — run_id excluded from the signature
+
+    row = _incident_row(db_path, id1)
+    from agents_core.repair_station.escalate import _compute_signature
+    assert row["error_signature"] == _compute_signature({"reason": "boom"})
+
+
+def test_signature_fields_empty_subset_raises(tmp_path):
+    """Provided-but-empty subset (none of the named fields exist in error_signal)
+    raises ValueError rather than hashing an empty object."""
+    from agents_core.repair_station import escalate, Tier, first
+
+    db_path = tmp_path / "rs.db"
+
+    with pytest.raises(ValueError):
+        escalate(
+            station_id="test/empty-sig-station",
+            stable_pointer="agents_core/test_module.py",
+            error_signal={"run_id": "run-1"},
+            author_intent="test",
+            escalation_policy=first(),
+            tier=Tier.NORMAL,
+            signature_fields=["nonexistent_field"],
+            db_path=db_path,
+        )
+
+    # And confirm no incident was created by the refused call
+    from agents_core.repair_station import list_open_incidents
+    assert list_open_incidents(station_id="test/empty-sig-station", db_path=db_path) == []

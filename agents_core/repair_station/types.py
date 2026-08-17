@@ -61,7 +61,29 @@ class Incident:
     author_intent: str
     tier: Tier
     error_signature: str
-    status: str        # "open" | "superseded" | "resolved"
+    status: str        # "open" | "closed" | "dismissed"
     back_ref: str | None  # close-the-loop reference; Expert sets this on resolution
     created_at: str
     updated_at: str
+    closed_at: str | None = None  # UTC ISO; set by close_incident()/dismiss_incident()
+    prose: str | None = None      # close's `resolution` or dismiss's `reason` — one column,
+                                   # the close/dismiss distinction lives in `status` alone.
+
+
+# Per-run-unique field names: values that make an otherwise-identical failure look
+# novel under whole-payload signature hashing (run ids, deliberation ids, timestamps,
+# resolved commit SHAs, per-run counts). This is the exclusion vocabulary shared by
+# Leg 2's `signature_fields` amendments in orchestrator.py (which whitelist the fields
+# to KEEP per station) and Leg 3's triage collapse (which blacklists these fields
+# across all stations to regroup the existing backlog). Keep the two in sync: a field
+# a station excludes via signature_fields should appear here.
+PER_RUN_UNIQUE_KEYS: frozenset[str] = frozenset({
+    "run_id",
+    "deliberation_id",
+    "last_heartbeat",
+    "resolved_sha",
+    "rounds_affected",
+    "timestamp",
+    "created_at",
+    "count",
+})

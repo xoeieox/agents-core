@@ -56,6 +56,27 @@ CREATE INDEX IF NOT EXISTS idx_incidents_station_sig
 CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents (status);
 """
 
+# Additive migration for the close/dismiss lifecycle (repair-station-close-dedup-
+# triage-v0). EXACTLY these two columns — nothing else — and this must never touch
+# the existing `status` column's definition or default. `close_incident()` writes
+# `resolution` and `dismiss_incident()` writes `reason` to the single `prose` column;
+# the close/dismiss distinction lives in `status` alone.
+_INCIDENTS_MIGRATION_COLUMNS: dict[str, str] = {
+    "closed_at": "TEXT",
+    "prose": "TEXT",
+}
+
+
+def _migrate_incidents_table(conn: sqlite3.Connection) -> None:
+    """Add closed_at/prose to `incidents` if missing. Guarded by a PRAGMA table_info
+    check, so repeated calls (every get_db()) are a no-op after the first. Existing
+    rows keep status='open' untouched; no row is ever deleted."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(incidents)").fetchall()}
+    for column, coltype in _INCIDENTS_MIGRATION_COLUMNS.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE incidents ADD COLUMN {column} {coltype}")
+    conn.commit()
+
 
 class _DB:
     def __init__(self, path: Path):
@@ -65,6 +86,7 @@ class _DB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
+        _migrate_incidents_table(self._conn)
         self._lock = threading.RLock()
 
     def execute(self, sql: str, params=()):
