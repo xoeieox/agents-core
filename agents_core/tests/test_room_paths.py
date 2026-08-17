@@ -51,6 +51,7 @@ GOLDEN: dict[str, str] = {
     "intentions": "/srv/lapis/intentions",
     "directives": "/srv/lapis/directives",
     "directives.brief_decisions": "/srv/lapis/directives/brief-decisions",
+    "steers": "/srv/lapis/steers",
     "proposals": "/srv/lapis/proposals",
     "signals": "/srv/lapis/signals",
     "tasks": "/srv/lapis/tasks",

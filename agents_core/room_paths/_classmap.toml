@@ -194,6 +194,11 @@ subpath = "directives/brief-decisions"
 class = "B"
 access = "both"
 
+[keys.steers]
+subpath = "steers"
+class = "B"
+access = "both"
+
 [keys.proposals]
 subpath = "proposals"
 class = "B"
