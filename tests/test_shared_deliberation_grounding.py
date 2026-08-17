@@ -276,6 +276,11 @@ def test_codebase_denial_fires_case_a_high_tier(monkeypatch):
     assert kwargs["stable_pointer"] == "agents_core/shared_deliberation/orchestrator.py"
     assert kwargs["escalation_policy"].kind == "first"
     assert kwargs["error_signal"]["case"] == "denied"
+    # repair-station-close-dedup-triage-v0 Leg 2: dedup on stable failure identity
+    # only — rounds_affected/resolved_sha (per-run uniques) must not be in the list.
+    assert kwargs["signature_fields"] == [
+        "case", "repo", "skip_reason", "denied_surfaces", "reasons", "source_repo",
+    ]
 
 
 def test_non_codebase_surfaces_produce_zero_escalations(monkeypatch):

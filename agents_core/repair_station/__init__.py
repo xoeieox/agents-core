@@ -17,7 +17,13 @@ Usage:
 """
 
 from .types import EscalationPolicy, Incident, Tier, first, n_within
-from .escalate import escalate
+from .escalate import (
+    escalate,
+    get_incident,
+    list_open_incidents,
+    close_incident,
+    dismiss_incident,
+)
 
 __all__ = [
     "Tier",
@@ -26,4 +32,8 @@ __all__ = [
     "n_within",
     "Incident",
     "escalate",
+    "get_incident",
+    "list_open_incidents",
+    "close_incident",
+    "dismiss_incident",
 ]

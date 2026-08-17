@@ -189,6 +189,7 @@ def escalate(
     *,
     owning_module: str = "",
     dedup_window_s: float = DEFAULT_DEDUP_WINDOW_S,
+    signature_fields: list[str] | None = None,
     db_path: Path | None = None,
 ) -> str | None:
     """Fire a repair station.
@@ -206,13 +207,34 @@ def escalate(
         tier:                Priority tier (carried to Leg 2; not acted on here).
         owning_module:       Optional: module path that owns this station (for registry).
         dedup_window_s:      Suppress duplicate incidents within this many seconds (default 1h).
+        signature_fields:    Optional subset of error_signal keys the dedup signature is
+                             computed over (stable failure-identity fields only — exclude
+                             per-run uniques like run ids/timestamps/deliberation ids).
+                             Omitted: byte-identical to today (whole-payload hash). Provided
+                             but matching none of error_signal's keys: raises ValueError
+                             rather than hashing an empty object, which would dedup every
+                             such fire against every other.
         db_path:             Override DB path (used in tests).
 
     Returns:
         incident_id (str) if an incident was created, else None.
+
+    Raises:
+        ValueError: signature_fields was provided but the resulting subset is empty.
     """
     now_iso = _now_iso()
-    error_signature = _compute_signature(error_signal)
+    if signature_fields is not None:
+        signature_subset = {k: error_signal[k] for k in signature_fields if k in error_signal}
+        if not signature_subset:
+            raise ValueError(
+                f"escalate({station_id!r}): signature_fields={signature_fields!r} matched "
+                "none of the keys in error_signal — refusing to hash an empty signature "
+                "(every such fire would dedup against every other, collapsing distinct "
+                "failures into one)"
+            )
+        error_signature = _compute_signature(signature_subset)
+    else:
+        error_signature = _compute_signature(error_signal)
     db = get_db(db_path)
 
     try:
@@ -291,4 +313,57 @@ def _row_to_incident(row) -> Incident:
         back_ref=row["back_ref"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        closed_at=row["closed_at"],
+        prose=row["prose"],
     )
+
+
+def _close_or_dismiss(
+    incident_id: str, *, status: str, prose: str, db_path: Path | None
+) -> None:
+    if not prose or not prose.strip():
+        raise ValueError(f"{status}_incident({incident_id!r}): prose is required")
+
+    db = get_db(db_path)
+    row = db.execute(
+        "SELECT status FROM incidents WHERE incident_id = ?", (incident_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"unknown incident_id: {incident_id!r}")
+    if row["status"] != "open":
+        raise ValueError(
+            f"incident {incident_id!r} is not open (status={row['status']!r}) — "
+            f"refusing to {status} it a second time"
+        )
+
+    now_iso = _now_iso()
+    db.execute(
+        """
+        UPDATE incidents
+           SET status = ?, closed_at = ?, prose = ?, updated_at = ?
+         WHERE incident_id = ?
+        """,
+        (status, now_iso, prose, now_iso, incident_id),
+    )
+    db.commit()
+
+
+def close_incident(incident_id: str, *, resolution: str, db_path: Path | None = None) -> None:
+    """Mark an incident resolved: it was real, and it is fixed.
+
+    `resolution` is one required line of prose (why it's closed). Refuses (raises
+    ValueError) on an unknown incident_id or one that is not currently 'open' — a
+    second close is a caller bug surfaced loudly, never a silent no-op.
+    """
+    _close_or_dismiss(incident_id, status="closed", prose=resolution, db_path=db_path)
+
+
+def dismiss_incident(incident_id: str, *, reason: str, db_path: Path | None = None) -> None:
+    """Mark an incident dismissed: it should not have existed (test pollution,
+    duplicate, misconfigured station).
+
+    `reason` is one required line of prose. Refuses (raises ValueError) on an
+    unknown incident_id or one that is not currently 'open' — a second dismiss is
+    a caller bug surfaced loudly, never a silent no-op.
+    """
+    _close_or_dismiss(incident_id, status="dismissed", prose=reason, db_path=db_path)
