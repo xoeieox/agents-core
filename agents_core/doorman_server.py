@@ -3,7 +3,11 @@
 Runs on BRIX (always-on). Owns wake/suspend management for GravityWell so
 individual callers never need to shell wake-gravitywell or gw-keepawake.
 
-Entry point:  doorman-server  (console_scripts in pyproject.toml)
+Entry point:  scripts/doorman_server.py  (thin bootstrap; systemd runs this
+                     directly — see systemd/doorman-server.service). This
+                     module is logic/API only: create_app() builds the
+                     FastAPI app, the process bootstrap lives outside
+                     agents_core.
 Port:         8407  (DOORMAN_BIND_PORT env var — live-verified free 2026-06-09;
                      8400/8401/8403/8404/8405/8406 are all occupied)
 Bind:         127.0.0.1 by default  (BRIX-local; Unit 1 has no off-box clients)
@@ -3017,25 +3021,3 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         return {"braked": False}
 
     return app
-
-
-# ---------------------------------------------------------------------------
-# Console-script entry point
-# ---------------------------------------------------------------------------
-
-def main():
-    import uvicorn
-
-    host = os.environ.get("DOORMAN_BIND_HOST", "127.0.0.1")
-    port = int(os.environ.get("DOORMAN_BIND_PORT", "8407"))
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    app = create_app()
-    uvicorn.run(app, host=host, port=port, log_level="info")
-
-
-if __name__ == "__main__":
-    main()

@@ -6,9 +6,11 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-# python -m form (not the console script) so it runs without a pip reinstall on the
-# PEP-668 BRIX system interpreter. agents_core resolves from PYTHONPATH=/srv/agents.
-ExecStart=/usr/bin/env python3 -m agents_core.doorman_server
+# Thin bootstrap script (not the console script, not `python -m agents_core...`)
+# so it runs without a pip reinstall on the PEP-668 BRIX system interpreter and
+# keeps the process bootstrap out of the agents_core library (agents-core-doorman-
+# server-library-purity-v0). agents_core resolves from PYTHONPATH=/srv/agents.
+ExecStart=/usr/bin/env python3 /srv/agents/scripts/doorman_server.py
 Environment=PYTHONPATH=/srv/agents
 Restart=on-failure
 RestartSec=5
