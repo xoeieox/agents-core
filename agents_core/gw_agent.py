@@ -651,7 +651,10 @@ class GrepExecutor(ToolExecutor):
 
             # Build ripgrep command - search under cwd for the glob pattern
             # Use -l (files only), -m 100 (max 100 matches)
-            cmd = ["rg", pattern, "-l", "-m", "100", str(self.cwd)]
+            cmd = ["rg", pattern, "-l", "-m", "100"]
+            if path_glob != "**/*":
+                cmd += ["--glob", path_glob]
+            cmd.append(str(self.cwd))
             result = subprocess.run(
                 cmd,
                 capture_output=True,
