@@ -531,13 +531,21 @@ def _call_qwen_backend(prompt: str, system: str = None, timeout: int = 600,
     Context selection priority:
     1. Explicit system= override (task-specific prompts)
     2. Explicit bundle_ids= (chub bundles by ID)
-    3. Default: inertia-ecosystem bundle
+    3. Neither given: no system context (empty messages list stays user-only)
+
+    chub_broker is imported only when bundle_ids= is explicitly passed — this
+    is the sole non-lazy runtime dep agents_core/CLAUDE.md permits ("No hard
+    deps on /srv/agents/scripts/ ... imported only when bundle_ids= is used.
+    Don't add more."). There is no implicit default-bundle fallback: a caller
+    that wants no context passes nothing (system stays None); a caller that
+    wants a specific bundle passes bundle_ids= explicitly
+    (cr-bundle-item-agents-core-1a6e095197).
 
     Returns the response text, or None on failure.
     """
     messages = []
 
-    # System prompt: explicit > bundles > default
+    # System prompt: explicit system= > explicit bundle_ids= > none.
     if system is not None:
         sys_prompt = system
     elif bundle_ids is not None:
@@ -545,9 +553,7 @@ def _call_qwen_backend(prompt: str, system: str = None, timeout: int = 600,
         sel = select_bundles_by_ids(bundle_ids)
         sys_prompt = sel.composed
     else:
-        from chub_broker import select_bundles_by_ids
-        sel = select_bundles_by_ids(["conductor/inertia-ecosystem"])
-        sys_prompt = sel.composed
+        sys_prompt = None
 
     if sys_prompt:
         messages.append({"role": "system", "content": sys_prompt})
@@ -1928,7 +1934,7 @@ def call_llm(prompt: str, system: str = None, timeout: int = 600,
     Context selection priority:
     1. Explicit system= override (task-specific prompts)
     2. Explicit bundle_ids= (chub bundles by ID)
-    3. Default: inertia-ecosystem bundle
+    3. Neither given: no system context
 
     Returns the response text, or None if the operator returned empty content.
     May raise OperatorUnreachableError if the operator backend is unreachable
