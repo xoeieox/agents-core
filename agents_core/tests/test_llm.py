@@ -1631,3 +1631,93 @@ def test_post_chat_completion_degrade_emits_warning_log(caplog):
         "response_format" in r.getMessage() and "400" in r.getMessage()
         for r in warnings
     )
+
+
+# ---------------------------------------------------------------------------
+# gravitywell-27b registry row (agents-core-gw-models-register-27b-seat-v0)
+# ---------------------------------------------------------------------------
+#
+# R1: register the live 27B solo-posture served id in gw_models.yaml.
+# DoD 1: round-trip every alias of the new row, and pin that appending at
+# end-of-file left every PRE-EXISTING alias lookup byte-identical.
+# DoD 3: gw_serving_state() against a stubbed models endpoint serving
+# gravitywell-27b resolves unknown_model=False.
+
+def test_gw27b_registry_lookup_round_trips_all_aliases():
+    """DoD 1: lookup by each alias of the new row (canonical_id, mode_alias,
+    operator_alias, display_label) returns the same entry, and lookup("solo")
+    resolves to the 27B row specifically (mode_alias "solo" is the only
+    live-lookup key unique to this row — operator_alias/canonical_id/
+    display_label are shared with or reused across other rows)."""
+    from agents_core.llm import _gw_registry_lookup
+
+    by_canonical_id = _gw_registry_lookup("gravitywell-27b")
+    assert by_canonical_id is not None
+    assert by_canonical_id.canonical_id == "gravitywell-27b"
+    assert by_canonical_id.mode_alias == "solo"
+    assert by_canonical_id.operator_alias == "gravitywell"
+    assert by_canonical_id.display_label == "qwen3.8-27b-nvfp4"
+    assert by_canonical_id.weights_hint == "Qwen3.8-27B-NVFP4"
+
+    by_display_label = _gw_registry_lookup("qwen3.8-27b-nvfp4")
+    assert by_display_label == by_canonical_id
+
+    by_mode_alias = _gw_registry_lookup("solo")
+    assert by_mode_alias == by_canonical_id
+
+
+def test_gw27b_registry_append_preserves_existing_alias_ordering():
+    """DoD 1: alias-resolution ordering is pinned — lookup("big"),
+    lookup("dual"), lookup("gravitywell") resolve to the SAME rows as before
+    this change. _gw_registry_lookup returns the first file-order match, so
+    appending gravitywell-27b at end-of-file must not shift any of these
+    (byte-identical rows alone would not catch an ordering regression)."""
+    from agents_core.llm import _gw_registry_lookup
+
+    big = _gw_registry_lookup("big")
+    assert big is not None
+    assert big.canonical_id == "gravitywell-122b"
+
+    dual = _gw_registry_lookup("dual")
+    assert dual is not None
+    assert dual.canonical_id == "gravitywell-a3b-nvfp4"
+
+    operator = _gw_registry_lookup("gravitywell")
+    assert operator is not None
+    assert operator.canonical_id == "gravitywell-122b"
+
+
+def _fake_gw_requests_get(url, timeout=None, **kwargs):
+    """Hermetic stand-in for requests.get across all three gw_serving_state
+    sources (endpoint /health, endpoint+slot2 /v1/models, flip-controller
+    /v0/status) — dispatches on URL suffix, never a live call."""
+    resp = MagicMock()
+    if url.endswith("/health"):
+        resp.status_code = 200
+        resp.json.return_value = {}
+    elif url.endswith("/v1/models"):
+        resp.status_code = 200
+        resp.json.return_value = {"data": [{"id": "gravitywell-27b"}]}
+    elif url.endswith("/v0/status"):
+        resp.status_code = 200
+        resp.json.return_value = {"mode": "dual", "units": {}, "in_flight_flip": False}
+    else:
+        resp.status_code = 404
+    return resp
+
+
+def test_gw_serving_state_27b_resolves_unknown_model_false():
+    """DoD 3: gw_serving_state() against a stubbed /v1/models serving
+    gravitywell-27b returns unknown_model=False and a canonical entry —
+    before R1 this served id had no registry row and unknown_model was True
+    (agents-core-gw-models-register-27b-seat-v0 problem statement)."""
+    from agents_core.llm import gw_serving_state
+
+    with patch("agents_core.llm.requests.get", side_effect=_fake_gw_requests_get):
+        state = gw_serving_state(endpoint="http://fake-gw:8081")
+
+    assert state.served_id == "gravitywell-27b"
+    assert state.unknown_model is False
+    assert state.canonical is not None
+    assert state.canonical.canonical_id == "gravitywell-27b"
+    assert state.canonical.mode_alias == "solo"
