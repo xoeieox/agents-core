@@ -610,7 +610,7 @@ class ReadFileExecutor(ToolExecutor):
             path_arg = arguments["path"]
             # Resolve relative to cwd, then verify it's still under cwd
             path = (self.cwd / path_arg).resolve()
-            if not str(path).startswith(str(self.cwd)):
+            if not path.is_relative_to(self.cwd):
                 return {"error": f"path outside cwd: {path}"}
 
             try:
@@ -957,7 +957,7 @@ class WriteFileExecutor(ToolExecutor):
             content = arguments["content"]
 
             path = (self.cwd / path_arg).resolve()
-            if not str(path).startswith(str(self.cwd)):
+            if not path.is_relative_to(self.cwd):
                 return {"error": f"path outside cwd: {path}"}
 
             if len(content) > GW_AGENT_TOOL_INPUT_CAP:
@@ -983,7 +983,7 @@ class ApplyEditExecutor(ToolExecutor):
             new_string = arguments["new_string"]
 
             path = (self.cwd / path_arg).resolve()
-            if not str(path).startswith(str(self.cwd)):
+            if not path.is_relative_to(self.cwd):
                 return {"error": f"path outside cwd: {path}"}
 
             try:
