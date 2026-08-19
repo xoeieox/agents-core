@@ -29,6 +29,7 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -3573,11 +3574,115 @@ class TestProbeVllmMetricsActivity:
             assert state._probe_vllm_metrics_activity(GW_URL_DEFAULT) is None
 
 
+# ---------------------------------------------------------------------------
+# llama.cpp /metrics counter-diff activity probe (agents-core-doorman-class-
+# aware-activity-probe-v0, D1 — Probe C)
+# ---------------------------------------------------------------------------
+
+class TestProbeLlamacppMetricsActivity:
+    """Unit tests for _NodeState._probe_llamacpp_metrics_activity() (Probe C).
+
+    Name-agnostic diff against the previous tick's snapshot - no pinned metric
+    list. The very first successful sample always returns None (no baseline to
+    diff against yet), so every "does it detect X" test primes a baseline with
+    one call before asserting on the second.
+    """
+
+    @staticmethod
+    def _metrics_response(text: str):
+        m = MagicMock(status_code=200)
+        m.text = text
+        return m
+
+    def test_counter_advance_returns_true(self):
+        state = _make_state()
+        bodies = [
+            "llamacpp:prompt_tokens_total 100\nllamacpp:tokens_predicted_total 50\n",
+            "llamacpp:prompt_tokens_total 140\nllamacpp:tokens_predicted_total 50\n",
+        ]
+        with patch("agents_core.doorman_server.requests.get",
+                    side_effect=lambda url, **kw: self._metrics_response(bodies.pop(0))):
+            assert state._probe_llamacpp_metrics_activity(GW_URL_DEFAULT) is None  # first sample
+            assert state._probe_llamacpp_metrics_activity(GW_URL_DEFAULT) is True  # advanced
+
+    def test_no_advance_returns_false(self):
+        state = _make_state()
+        body = "llamacpp:prompt_tokens_total 100\nllamacpp:tokens_predicted_total 50\n"
+        with patch("agents_core.doorman_server.requests.get",
+                    side_effect=lambda url, **kw: self._metrics_response(body)):
+            assert state._probe_llamacpp_metrics_activity(GW_URL_DEFAULT) is None  # first sample
+            assert state._probe_llamacpp_metrics_activity(GW_URL_DEFAULT) is False  # unchanged
+
+    def test_counter_decrease_reseeds_baseline_and_returns_none(self):
+        """A restart resets llama.cpp's counters to zero - never confirmed-idle,
+        and never confirmed-false on the tick immediately after the reset either
+        (the new baseline needs its own second sample to diff against)."""
+        state = _make_state()
+        bodies = [
+            "llamacpp:prompt_tokens_total 500\n",   # first sample: baseline=500
+            "llamacpp:prompt_tokens_total 10\n",    # restart: decrease -> None, reseed to 10
+            "llamacpp:prompt_tokens_total 10\n",    # no advance from the new baseline -> False
+        ]
+        with patch("agents_core.doorman_server.requests.get",
+                    side_effect=lambda url, **kw: self._metrics_response(bodies.pop(0))):
+            assert state._probe_llamacpp_metrics_activity(GW_URL_DEFAULT) is None
+            assert state._probe_llamacpp_metrics_activity(GW_URL_DEFAULT) is None
+            assert state._probe_llamacpp_metrics_activity(GW_URL_DEFAULT) is False
+
+    def test_vllm_only_body_returns_none(self):
+        """No llamacpp:* lines at all - structural absence (e.g. vLLM engine),
+        never confirmed-idle."""
+        state = _make_state()
+        body = 'vllm:num_requests_running{model_name="x",engine="0"} 0.0\n'
+        with patch("agents_core.doorman_server.requests.get",
+                    side_effect=lambda url, **kw: self._metrics_response(body)):
+            assert state._probe_llamacpp_metrics_activity(GW_URL_DEFAULT) is None
+            assert state._probe_llamacpp_metrics_activity(GW_URL_DEFAULT) is None
+
+    def test_connection_error_returns_none(self):
+        state = _make_state()
+        import requests as req_lib
+
+        def mock_conn_error(url, **kwargs):
+            raise req_lib.exceptions.ConnectionError("connection refused")
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_conn_error):
+            assert state._probe_llamacpp_metrics_activity(GW_URL_DEFAULT) is None
+
+    def test_timeout_returns_none(self):
+        state = _make_state()
+        import requests as req_lib
+
+        def mock_timeout(url, **kwargs):
+            raise req_lib.exceptions.Timeout("simulated /metrics timeout")
+
+        with patch("agents_core.doorman_server.requests.get", side_effect=mock_timeout):
+            assert state._probe_llamacpp_metrics_activity(GW_URL_DEFAULT) is None
+
+    def test_non_200_returns_none(self):
+        state = _make_state()
+        with patch("agents_core.doorman_server.requests.get",
+                    return_value=MagicMock(status_code=404)):
+            assert state._probe_llamacpp_metrics_activity(GW_URL_DEFAULT) is None
+
+    def test_malformed_body_returns_none(self):
+        state = _make_state()
+        body = "not prometheus text at all, no matching gauge lines here"
+        with patch("agents_core.doorman_server.requests.get",
+                    side_effect=lambda url, **kw: self._metrics_response(body)):
+            assert state._probe_llamacpp_metrics_activity(GW_URL_DEFAULT) is None
+
+
 class TestProbeSlotActivityMerge:
     """Unit tests for _NodeState._probe_slot_activity() tri-state OR-merge logic.
 
-    Each underlying probe is patched in isolation so this only exercises the merge
-    rule: True if any True; False only if all confirmed False; None otherwise.
+    Each underlying probe (A, B1/B2, and Probe C - agents-core-doorman-class-
+    aware-activity-probe-v0, D1) is patched in isolation so this only exercises
+    the vote-unaware merge rule (state._serving_is_big is None / unset here, the
+    same as flag-off legacy - see TestProbeSlotActivityClassAware for the class-
+    aware non-voting rules): True if any True; False only if all confirmed
+    False; None otherwise. Probe C is always explicitly patched - unpatched, it
+    would issue a real HTTP call.
     """
 
     def test_probe_a_true_probe_b_both_none_combined_true(self):
@@ -3585,7 +3690,8 @@ class TestProbeSlotActivityMerge:
         of the other probes' uncertainty."""
         state = _make_state()
         with patch.object(state, "_probe_llama_slots_activity", return_value=True), \
-             patch.object(state, "_probe_vllm_metrics_activity", return_value=None):
+             patch.object(state, "_probe_vllm_metrics_activity", return_value=None), \
+             patch.object(state, "_probe_llamacpp_metrics_activity", return_value=None):
             assert state._probe_slot_activity() is True
 
     def test_probe_b_slot1_true_combined_true(self):
@@ -3595,7 +3701,8 @@ class TestProbeSlotActivityMerge:
             return True if url == state.gw_url else None
 
         with patch.object(state, "_probe_llama_slots_activity", return_value=False), \
-             patch.object(state, "_probe_vllm_metrics_activity", side_effect=fake_metrics):
+             patch.object(state, "_probe_vllm_metrics_activity", side_effect=fake_metrics), \
+             patch.object(state, "_probe_llamacpp_metrics_activity", return_value=None):
             assert state._probe_slot_activity() is True
 
     def test_probe_b_slot2_true_combined_true(self):
@@ -3606,24 +3713,36 @@ class TestProbeSlotActivityMerge:
             return True if url == slot2 else None
 
         with patch.object(state, "_probe_llama_slots_activity", return_value=False), \
-             patch.object(state, "_probe_vllm_metrics_activity", side_effect=fake_metrics):
+             patch.object(state, "_probe_vllm_metrics_activity", side_effect=fake_metrics), \
+             patch.object(state, "_probe_llamacpp_metrics_activity", return_value=None):
+            assert state._probe_slot_activity() is True
+
+    def test_probe_c_true_combined_true(self):
+        """A llama.cpp counter advance alone (A/B1/B2 all uncertain-or-idle)
+        still wins - a real True always wins regardless of other sources."""
+        state = _make_state()
+        with patch.object(state, "_probe_llama_slots_activity", return_value=False), \
+             patch.object(state, "_probe_vllm_metrics_activity", return_value=None), \
+             patch.object(state, "_probe_llamacpp_metrics_activity", return_value=True):
             assert state._probe_slot_activity() is True
 
     def test_all_confirmed_false_combined_false(self):
         state = _make_state()
         with patch.object(state, "_probe_llama_slots_activity", return_value=False), \
-             patch.object(state, "_probe_vllm_metrics_activity", return_value=False):
+             patch.object(state, "_probe_vllm_metrics_activity", return_value=False), \
+             patch.object(state, "_probe_llamacpp_metrics_activity", return_value=False):
             assert state._probe_slot_activity() is False
 
     def test_all_none_combined_indeterminate(self):
         """Total network blip on every source - never conflated with confirmed-false."""
         state = _make_state()
         with patch.object(state, "_probe_llama_slots_activity", return_value=False), \
-             patch.object(state, "_probe_vllm_metrics_activity", return_value=None):
+             patch.object(state, "_probe_vllm_metrics_activity", return_value=None), \
+             patch.object(state, "_probe_llamacpp_metrics_activity", return_value=None):
             assert state._probe_slot_activity() is None
 
     def test_dispatch_is_concurrent_not_sequential(self):
-        """D2: confirms the three HTTP calls are issued without one blocking on
+        """D2: confirms the four HTTP calls are issued without one blocking on
         another's timeout - staggered slow mocked responses via real threads."""
         state = _make_state()
 
@@ -3643,9 +3762,130 @@ class TestProbeSlotActivityMerge:
             result = state._probe_slot_activity()
             elapsed = time.time() - start
 
-        assert result is False
-        # Sequential would be ~0.6s (3 calls x 0.2s); concurrent stays close to 0.2s.
+        # A=False, B1=False, B2=False (vLLM-shaped body, zero), C=None (Probe C's
+        # first-ever sample has no baseline to diff against yet - see D1) -> the
+        # merge is indeterminate, not confirmed-false, on this first tick.
+        assert result is None
+        # Sequential would be ~0.8s (4 calls x 0.2s); concurrent stays close to 0.2s.
         assert elapsed < 0.4
+
+    def test_pool_sizing_is_four_workers(self):
+        """D1 (gate-adopted): the pool grows max_workers 3 -> 4, Probe C is the
+        fourth concurrent task - tick latency stays the slowest probe, not
+        additive. Asserts the sizing itself, not just the merged result."""
+        state = _make_state()
+        captured = {}
+        real_executor = ThreadPoolExecutor
+
+        def spy_executor(*args, **kwargs):
+            captured["max_workers"] = kwargs.get("max_workers", args[0] if args else None)
+            return real_executor(*args, **kwargs)
+
+        with patch.object(state, "_probe_llama_slots_activity", return_value=False) as m_a, \
+             patch.object(state, "_probe_vllm_metrics_activity", return_value=None) as m_b, \
+             patch.object(state, "_probe_llamacpp_metrics_activity", return_value=None) as m_c, \
+             patch("agents_core.doorman_server.ThreadPoolExecutor", side_effect=spy_executor):
+            state._probe_slot_activity()
+
+        assert captured["max_workers"] == 4
+        assert m_a.call_count == 1
+        assert m_b.call_count == 2  # slot1 + slot2
+        assert m_c.call_count == 1
+
+
+class TestProbeSlotActivityClassAware:
+    """D2 combine matrix: which sources VOTE is driven by self._serving_is_big
+    (resolved earlier the same tick by _refresh_serving_cache) and, for the
+    vLLM class, the declared home posture. class x home-mode x (A,B1,B2,C).
+    """
+
+    def _patch_probes(self, state, a=False, b1=None, b2=None, c=None):
+        def fake_vllm(url):
+            return b2 if url == state._slot2_url() else b1
+        return (
+            patch.object(state, "_probe_llama_slots_activity", return_value=a),
+            patch.object(state, "_probe_vllm_metrics_activity", side_effect=fake_vllm),
+            patch.object(state, "_probe_llamacpp_metrics_activity", return_value=c),
+        )
+
+    # -- llama.cpp class (serving_is_big=True): B1/B2 non-voting, combine A+C --
+
+    def test_llamacpp_class_b1_b2_none_ignored_a_c_false_confirmed_idle(self):
+        """B1/B2 are structurally absent under llama.cpp - their None votes are
+        dropped, not read as indeterminate. A+C both confirmed idle -> False,
+        not None."""
+        state = _make_state()
+        state._serving_is_big = True
+        p_a, p_b, p_c = self._patch_probes(state, a=False, b1=None, b2=None, c=False)
+        with p_a, p_b, p_c:
+            assert state._probe_slot_activity() is False
+
+    def test_llamacpp_class_c_advanced_returns_true(self):
+        """Probe C alone confirming activity wins on a llama.cpp seat - this is
+        the low-duty-cycle traffic case D1 exists to close."""
+        state = _make_state()
+        state._serving_is_big = True
+        p_a, p_b, p_c = self._patch_probes(state, a=False, b1=True, b2=True, c=True)
+        with p_a, p_b, p_c:
+            assert state._probe_slot_activity() is True
+
+    def test_llamacpp_class_a_and_c_both_uncertain_is_indeterminate(self):
+        state = _make_state()
+        state._serving_is_big = True
+        p_a, p_b, p_c = self._patch_probes(state, a=False, b1=None, b2=None, c=None)
+        with p_a, p_b, p_c:
+            assert state._probe_slot_activity() is None
+
+    # -- vLLM class (serving_is_big=False): A non-voting --
+
+    def test_vllm_class_dual_home_mode_combines_b1_and_b2(self):
+        state = _make_state()
+        state._serving_is_big = False
+        with patch.object(state, "_read_declared_home_posture", return_value="dual"):
+            p_a, p_b, p_c = self._patch_probes(state, a=True, b1=False, b2=True, c=None)
+            with p_a, p_b, p_c:
+                # A's True is structurally absent here (non-voting); B2's True wins.
+                assert state._probe_slot_activity() is True
+
+    def test_vllm_class_slot1_solo_confirmed_idle_is_false_not_none(self):
+        """D2's headline fix: a slot1-solo vLLM seat (B2 structurally down by
+        design) must read confirmed-idle (False), not indeterminate (None), when
+        B1 alone confirms idle."""
+        state = _make_state()
+        state._serving_is_big = False
+        with patch.object(state, "_read_declared_home_posture", return_value="slot1-solo"):
+            p_a, p_b, p_c = self._patch_probes(state, a=True, b1=False, b2=None, c=True)
+            with p_a, p_b, p_c:
+                # A and C are non-voting for the vLLM class; B2 is non-voting too
+                # under slot1-solo. Only B1 votes, and it's confirmed idle.
+                assert state._probe_slot_activity() is False
+
+    def test_vllm_class_slot1_solo_b1_true_wins(self):
+        state = _make_state()
+        state._serving_is_big = False
+        with patch.object(state, "_read_declared_home_posture", return_value="slot1-solo"):
+            p_a, p_b, p_c = self._patch_probes(state, a=False, b1=True, b2=None, c=None)
+            with p_a, p_b, p_c:
+                assert state._probe_slot_activity() is True
+
+    # -- Unknown topology (serving_is_big=None): vote-unaware, all sources vote --
+
+    def test_unknown_topology_all_four_vote(self):
+        """No class resolved this tick - combine is unfiltered, exactly as
+        flag-off legacy. (The never-park behavior for this case lives in the
+        park block, not in the combine - see TestUnknownTopologyAlarm.)"""
+        state = _make_state()
+        state._serving_is_big = None
+        p_a, p_b, p_c = self._patch_probes(state, a=False, b1=False, b2=False, c=None)
+        with p_a, p_b, p_c:
+            assert state._probe_slot_activity() is None  # C's None keeps it indeterminate
+
+    def test_unknown_topology_all_confirmed_false_is_false(self):
+        state = _make_state()
+        state._serving_is_big = None
+        p_a, p_b, p_c = self._patch_probes(state, a=False, b1=False, b2=False, c=False)
+        with p_a, p_b, p_c:
+            assert state._probe_slot_activity() is False
 
 
 class TestProbeBlindnessFallback:
@@ -3707,6 +3947,145 @@ class TestProbeBlindnessFallback:
 
         assert len(stop_calls) >= 1
         assert state.service_stopped is True
+
+
+class TestParkReasonDistinction:
+    """D3: the park block's _write_idle_log calls carry a `reason` distinguishing
+    a genuinely confirmed-idle park from one taken only because the blindness
+    bound was exceeded - two distinct strings for the two park outcomes."""
+
+    def test_confirmed_idle_park_at_600s_reason(self):
+        state = _NodeState(GW_URL_DEFAULT)
+        state.idle_since = time.time() - 650  # past 600s grace
+        nodes = {"gravitywell": state}
+        log_calls = []
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
+             patch("time.sleep", side_effect=_StopRefreshLoop), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch.object(state, "_probe_slot_activity", return_value=False), \
+             patch("agents_core.doorman_server.DOORMAN_PROBE_LLAMA_ACTIVITY", True), \
+             patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0), \
+             patch("agents_core.doorman_server.GW_STOP_GRACE_SEC", 600), \
+             patch("agents_core.doorman_server._write_idle_log",
+                   side_effect=lambda *a, **kw: log_calls.append((a, kw))):
+            _run_refresh_thread_one_tick(nodes)
+
+        assert state.service_stopped is True
+        stopped_calls = [kw for a, kw in log_calls if a[1] == "stopped"]
+        assert stopped_calls, f"no 'stopped' idle-log call seen: {log_calls}"
+        assert stopped_calls[0]["reason"] == "confirmed_idle"
+
+    def test_bound_exceeded_park_reason(self):
+        state = _NodeState(GW_URL_DEFAULT)
+        state.idle_since = time.time() - 1600  # past grace + blindness bound
+        nodes = {"gravitywell": state}
+        log_calls = []
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
+             patch("time.sleep", side_effect=_StopRefreshLoop), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch.object(state, "_probe_slot_activity", return_value=None), \
+             patch("agents_core.doorman_server.DOORMAN_PROBE_LLAMA_ACTIVITY", True), \
+             patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0), \
+             patch("agents_core.doorman_server.GW_STOP_GRACE_SEC", 600), \
+             patch("agents_core.doorman_server.DOORMAN_PROBE_BLINDNESS_SEC", 900), \
+             patch("agents_core.doorman_server._write_idle_log",
+                   side_effect=lambda *a, **kw: log_calls.append((a, kw))):
+            _run_refresh_thread_one_tick(nodes)
+
+        assert state.service_stopped is True
+        stopped_calls = [kw for a, kw in log_calls if a[1] == "stopped"]
+        assert stopped_calls, f"no 'stopped' idle-log call seen: {log_calls}"
+        assert stopped_calls[0]["reason"] == "probe_blind_bound_exceeded"
+
+    def test_three_reason_strings_are_distinct(self):
+        """D6.5: confirmed_idle, probe_blind_bound_exceeded, and
+        topology_unknown_no_park are three distinct strings - pinned directly
+        (the scenario tests above pin each one is actually emitted in context)."""
+        reasons = {"confirmed_idle", "probe_blind_bound_exceeded", "topology_unknown_no_park"}
+        assert len(reasons) == 3
+
+
+class TestUnknownTopologyAlarm:
+    """D2/D3, Erah ruling 2026-08-19: unknown topology (serving_is_big None,
+    flag ON) never parks - the grace clock pauses with NO bound and a distinct
+    topology_unknown_no_park alarm fires every tick instead. Flag off preserves
+    today's bound-exceeded park verbatim (legacy path, unchanged)."""
+
+    def _run(self, state, idle_age_sec, *, mode_aware, log_calls, stop_calls, topology=None):
+        state.idle_since = time.time() - idle_age_sec
+        nodes = {"gravitywell": state}
+
+        def fake_run(cmd, **kwargs):
+            if "gw-serve" in str(cmd) and "stop" in str(cmd):
+                stop_calls.append(cmd)
+            return MagicMock(returncode=0, stderr="")
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("time.sleep", side_effect=_StopRefreshLoop), \
+             patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch.object(state, "_probe_slot_activity", return_value=None), \
+             patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
+             patch("agents_core.doorman_server.DOORMAN_PROBE_LLAMA_ACTIVITY", True), \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", mode_aware), \
+             patch("agents_core.doorman_server.GW_HOLD_REFRESH_SEC", 0), \
+             patch("agents_core.doorman_server.GW_STOP_GRACE_SEC", 600), \
+             patch("agents_core.doorman_server.DOORMAN_PROBE_BLINDNESS_SEC", 900), \
+             patch("agents_core.doorman_server._write_idle_log",
+                   side_effect=lambda *a, **kw: log_calls.append((a, kw))):
+            _run_refresh_thread_one_tick(nodes)
+
+    def test_flag_on_unknown_topology_past_bound_no_stop_with_alarm(self):
+        state = _NodeState(GW_URL_DEFAULT)
+        topology = _make_topology_state(authority_gap=True, models_answered=False)
+        log_calls, stop_calls = [], []
+        self._run(state, 1600, mode_aware=True, log_calls=log_calls, stop_calls=stop_calls,
+                   topology=topology)
+
+        assert state._serving_is_big is None  # authority_gap -> unknown, per _refresh_serving_cache
+        assert stop_calls == []
+        assert state.service_stopped is False
+        alarm_calls = [(a, kw) for a, kw in log_calls if a[1] == "topology_unknown_no_park"]
+        assert alarm_calls, f"no topology_unknown_no_park alarm seen: {log_calls}"
+        _, kw = alarm_calls[0]
+        assert kw["reason"] == "topology_unknown_no_park"
+        assert kw["authority_gap"] is True
+        assert kw["models_answered"] is False
+
+    def test_flag_on_unknown_topology_way_past_bound_still_no_stop(self):
+        """Repeat at 3000s (far past the 1500s bound a known class would hit) -
+        still no stop; the alarm has no bound at all."""
+        state = _NodeState(GW_URL_DEFAULT)
+        topology = _make_topology_state(authority_gap=True, models_answered=False)
+        log_calls, stop_calls = [], []
+        self._run(state, 3000, mode_aware=True, log_calls=log_calls, stop_calls=stop_calls,
+                   topology=topology)
+
+        assert state._serving_is_big is None
+        assert stop_calls == []
+        assert state.service_stopped is False
+        alarm_calls = [(a, kw) for a, kw in log_calls if a[1] == "topology_unknown_no_park"]
+        assert alarm_calls
+
+    def test_flag_off_same_state_legacy_bound_exceeded_park_fires(self):
+        """DOORMAN_MODE_AWARE_ADMISSION False -> _serving_is_big is never
+        populated (stays None from __init__), but the unknown-topology alarm
+        must NOT engage - today's bound-exceeded park behavior is unchanged."""
+        state = _NodeState(GW_URL_DEFAULT)
+        assert state._serving_is_big is None  # never populated, flag off
+        log_calls, stop_calls = [], []
+        self._run(state, 1600, mode_aware=False, log_calls=log_calls, stop_calls=stop_calls)
+
+        assert len(stop_calls) >= 1
+        assert state.service_stopped is True
+        alarm_calls = [a for a, kw in log_calls if a[1] == "topology_unknown_no_park"]
+        assert alarm_calls == []
+        stopped_calls = [kw for a, kw in log_calls if a[1] == "stopped"]
+        assert stopped_calls and stopped_calls[0]["reason"] == "probe_blind_bound_exceeded"
 
 
 # ---------------------------------------------------------------------------

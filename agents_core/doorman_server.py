@@ -74,13 +74,24 @@ Environment variables:
                                  dwell-stopping on zero leases (default true; set
                                  "false"/"0" to disable and restore pre-fix
                                  lease-only behavior as a rollback lever). Probes
-                                 BOTH llama.cpp's /slots (big mode) and vLLM's
-                                 /metrics on both dual-mode slots (gw-doorman-
-                                 vllm-activity-probe-v0), concurrently, per tick.
-                                 Tri-state per probe (True/False/None); an
-                                 indeterminate tick pauses the grace-period clock
-                                 rather than either resetting or advancing it,
-                                 bounded by DOORMAN_PROBE_BLINDNESS_SEC.
+                                 llama.cpp's /slots (Probe A) and /metrics counter
+                                 diff (Probe C, agents-core-doorman-class-aware-
+                                 activity-probe-v0 — closes A's once-per-tick
+                                 sampling gap) and vLLM's /metrics on both dual-
+                                 mode slots (Probe B1/B2, gw-doorman-vllm-activity-
+                                 probe-v0), concurrently, per tick. Tri-state per
+                                 probe (True/False/None); which probes VOTE is
+                                 class-aware once DOORMAN_MODE_AWARE_ADMISSION has
+                                 resolved serving_is_big (structurally-absent
+                                 sources for the resolved class are dropped, not
+                                 read as indeterminate); an indeterminate combine
+                                 pauses the grace-period clock rather than either
+                                 resetting or advancing it, bounded by
+                                 DOORMAN_PROBE_BLINDNESS_SEC — except when
+                                 serving_is_big is None (topology unresolved,
+                                 flag on), where the clock pauses with NO bound
+                                 and a topology_unknown_no_park alarm fires every
+                                 tick instead (Erah ruling 2026-08-19).
   DOORMAN_PROBE_BLINDNESS_SEC — extra seconds of benefit-of-the-doubt past
                                  GW_STOP_GRACE_SEC before an indeterminate probe
                                  (both /slots and /metrics unreachable) falls back
@@ -427,6 +438,21 @@ def gw_big_seat_members() -> frozenset[str]:
     )
 
 
+def _topology_models_answered(topology_state) -> bool:
+    """Whether the models endpoint answered on the given GwServingState (or
+    False if topology_state itself is None — unreachable). Same predicate
+    _refresh_serving_cache uses to derive big_probe_state; shared here so the
+    park block's unknown-topology alarm (agents-core-doorman-class-aware-
+    activity-probe-v0, D3) reports the identical diagnostic field rather than
+    a second, possibly-drifting computation of it."""
+    if topology_state is None:
+        return False
+    return (
+        topology_state.source_freshness.get("models_endpoint", {}).get("status")
+        == "answered"
+    )
+
+
 HOLD_NAME = "doorman"
 DOORMAN_IDLE_LOG = os.environ.get("DOORMAN_IDLE_LOG", "/var/log/doorman-idle.jsonl")
 
@@ -622,6 +648,18 @@ class _NodeState:
         # llama-server /slots activity probe (doorman-probe-llama-activity-v0)
         self._last_probed_task_by_slot: dict[int, int] = {}
         self._idle_since_source: str | None = None  # 'lease' | 'probe' | None
+        # Probe C: llama.cpp /metrics counter snapshot, keyed by url, then by
+        # metric-name+labels (agents-core-doorman-class-aware-activity-probe-v0,
+        # D1) — the previous tick's values, diffed to detect activity between
+        # probe ticks (closes Probe A's once-per-tick sampling gap). Mutated
+        # outside self.lock, same convention as _last_probed_task_by_slot.
+        self._llamacpp_metrics_baseline: dict[str, dict[str, float]] = {}
+        # Raw per-source tri-state results from the most recent
+        # _probe_slot_activity() tick, keyed "A"/"B1"/"B2"/"C" — diagnostic
+        # only (D3), read by the park block to name which sources were
+        # indeterminate when a bound-exceeded park fires. Mutated outside
+        # self.lock, same convention as _last_probed_task_by_slot.
+        self._last_probe_raw: dict[str, bool | None] = {}
         # Tri-state dual-slot activity probe (gw-doorman-vllm-activity-probe-v0):
         # True when the most recent _probe_slot_activity() tick was indeterminate
         # (at least one probe ambiguous, none confirmed activity) — read by the
@@ -764,6 +802,96 @@ class _NodeState:
         except Exception as exc:
             log.debug(f"[{self.node_name}] vllm metrics probe ({url}) inconclusive: {exc}")
             return None
+
+    def _probe_llamacpp_metrics_activity(self, url: str) -> bool | None:
+        """Probe C: GET {url}/metrics and diff every llamacpp:* counter/gauge
+        line against the previous tick's snapshot (agents-core-doorman-class-
+        aware-activity-probe-v0, D1) — name-agnostic by design, no pinned
+        metric list, so this survives llama.cpp metric names changing across
+        builds. Closes Probe A's sampling gap: a generation that finished
+        between two ~45s ticks (no is_processing, unchanged id_task at sample
+        time) still shows up here as an advanced counter.
+
+        Returns:
+          True  — at least one llamacpp:* value increased since the last
+                  snapshot (work happened between ticks).
+          False — llamacpp:* lines were present and parsed, but nothing
+                  advanced (confirmed idle).
+          None  — the call failed (timeout/connection-refused/non-200), the
+                  body has no llamacpp:* lines at all (structural absence —
+                  vLLM or another engine on this port, never confirmed-idle),
+                  there is no baseline yet to diff against (first successful
+                  sample), or a value DECREASED since the last snapshot (the
+                  engine restarted and its counters reset to zero — a reset
+                  is never evidence of idleness). The baseline is re-seeded
+                  to the fresh snapshot unconditionally in every one of these
+                  cases where a snapshot was parsed; only the vote withholds.
+
+        Never raises. Must be called OUTSIDE self.lock (blocking HTTP, ~2.5s timeout).
+        """
+        try:
+            resp = requests.get(f"{url}/metrics", timeout=2.5)
+            if resp.status_code != 200:
+                return None
+            current: dict[str, float] = {}
+            for line in resp.text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or not line.startswith("llamacpp:"):
+                    continue
+                # Same brace-aware parsing as Probe B: a naive rsplit(" ", 1)
+                # would silently take a trailing Prometheus timestamp field
+                # as the value if one is ever emitted. Key on name+labels so
+                # each distinct series is diffed independently — one series
+                # resetting can't be masked by another advancing.
+                brace_end = line.find("}")
+                if brace_end != -1:
+                    key = line[:brace_end + 1]
+                    value_str = line[brace_end + 1:].strip().split()
+                else:
+                    parts = line.split(None, 1)
+                    if len(parts) != 2:
+                        continue
+                    key, value_str = parts[0], parts[1].strip().split()
+                if not value_str:
+                    continue
+                try:
+                    current[key] = float(value_str[0])
+                except ValueError:
+                    continue
+        except Exception as exc:
+            log.debug(f"[{self.node_name}] llamacpp metrics probe ({url}) inconclusive: {exc}")
+            return None
+
+        if not current:
+            # No llamacpp:* lines at all — this port isn't serving llama.cpp
+            # (e.g. vLLM). Structural absence, not evidence of idleness.
+            self._llamacpp_metrics_baseline.pop(url, None)
+            return None
+
+        previous = self._llamacpp_metrics_baseline.get(url)
+        # Baseline update and the vote are separate steps (council ruling,
+        # run 2026-08-19-123628): update unconditionally on successful parse.
+        self._llamacpp_metrics_baseline[url] = current
+        if previous is None:
+            return None  # first successful sample — nothing to diff against yet
+
+        reset_detected = False
+        advanced = False
+        for key, value in current.items():
+            prev_value = previous.get(key)
+            if prev_value is None:
+                continue
+            if value < prev_value:
+                reset_detected = True
+            elif value > prev_value:
+                advanced = True
+
+        if reset_detected:
+            # Engine restart: counters reset to zero. Baseline is already
+            # re-seeded above; the vote stays indeterminate for this tick —
+            # a reset is not evidence of idleness.
+            return None
+        return advanced
 
     # ------------------------------------------------------------------
     # Capacity shadow (agents-core-doorman-capacity-shadow-v0)
@@ -935,28 +1063,56 @@ class _NodeState:
             )
 
     def _probe_slot_activity(self) -> bool | None:
-        """Tri-state unmediated-caller activity probe across both signal sources
-        (gw-doorman-vllm-activity-probe-v0) — Probe A (llama.cpp /slots, big mode)
-        and Probe B (vLLM /metrics, both dual slots), dispatched concurrently so
-        total probe-tick latency stays ~2.5s rather than growing additively with
-        each new endpoint.
+        """Tri-state unmediated-caller activity probe across all signal sources
+        (gw-doorman-vllm-activity-probe-v0, extended by agents-core-doorman-
+        class-aware-activity-probe-v0) — Probe A (llama.cpp /slots), Probe B1/B2
+        (vLLM /metrics, both dual slots), and Probe C (llama.cpp /metrics counter
+        diff), dispatched concurrently in a 4-worker pool so total probe-tick
+        latency stays ~2.5s (the slowest probe) rather than growing additively.
 
-        Combines: True if any source confirms activity (a real True always wins,
-        regardless of other sources' uncertainty); False only if every source
-        confirms no activity; None (indeterminate) otherwise — e.g. a transient
-        /metrics blip that must not be conflated with confirmed idleness.
+        Class-aware combine (D2): which sources VOTE depends on self._serving_is_big,
+        resolved earlier THIS tick by _refresh_serving_cache. A source that is
+        structurally absent for the resolved class is dropped rather than voting
+        None — that was the defect (structural absence read as indeterminate,
+        parking a genuinely-idle seat, or blinding a genuinely-busy one):
+
+          - self._serving_is_big is None (flag off, OR flag on but topology
+            unresolved this tick): vote-unaware, exactly as before D2 — all four
+            sources vote. (Unknown topology's never-park behavior lives in the
+            park block, not here — this function's output is unchanged for it.)
+          - True  (llama.cpp class): B1/B2 are structurally absent — non-voting.
+            Combine A + C.
+          - False (vLLM class): A is structurally absent — non-voting. Combine
+            B1 + B2; if the declared home posture is slot1-solo, B2 (Slot 2,
+            parked by design) is non-voting too — combine B1 alone.
+
+        Combines: True if any voting source confirms activity (a real True
+        always wins); False only if every voting source confirms no activity;
+        None (indeterminate) otherwise.
 
         Must be called OUTSIDE self.lock (blocking HTTP via a thread pool).
         """
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        with ThreadPoolExecutor(max_workers=4) as pool:
             fut_a = pool.submit(self._probe_llama_slots_activity)
             fut_b1 = pool.submit(self._probe_vllm_metrics_activity, self.gw_url)
             fut_b2 = pool.submit(self._probe_vllm_metrics_activity, self._slot2_url())
-            results = [fut_a.result(), fut_b1.result(), fut_b2.result()]
+            fut_c = pool.submit(self._probe_llamacpp_metrics_activity, self.gw_url)
+            a, b1, b2, c = fut_a.result(), fut_b1.result(), fut_b2.result(), fut_c.result()
 
-        if any(r is True for r in results):
+        self._last_probe_raw = {"A": a, "B1": b1, "B2": b2, "C": c}
+
+        serving_is_big = self._serving_is_big
+        if serving_is_big is None:
+            votes = [a, b1, b2, c]
+        elif serving_is_big:
+            votes = [a, c]
+        else:
+            home_mode = self._read_declared_home_posture()
+            votes = [b1] if home_mode == "slot1-solo" else [b1, b2]
+
+        if any(v is True for v in votes):
             return True
-        if all(r is False for r in results):
+        if all(v is False for v in votes):
             return False
         return None
 
@@ -978,9 +1134,13 @@ class _NodeState:
         serving-mode-topology-truthful-v0). status_snapshot() only ever reads the
         cached result; it never calls gw_serving_state() itself.
 
-        When DOORMAN_PROBE_LLAMA_ACTIVITY is True, also probes both llama.cpp's
-        /slots and vLLM's /metrics (both dual slots) for unmediated-caller activity
-        (outside the lock) — see _probe_slot_activity.
+        When DOORMAN_PROBE_LLAMA_ACTIVITY is True, also probes llama.cpp's /slots
+        and /metrics and vLLM's /metrics (both dual slots) for unmediated-caller
+        activity (outside the lock) — see _probe_slot_activity. This runs AFTER
+        self._serving_is_big is committed below (a second, brief lock
+        acquisition), because the class-aware combine (D2,
+        agents-core-doorman-class-aware-activity-probe-v0) needs THIS tick's
+        resolved class, not the previous tick's.
         """
         serving = self._is_serving(timeout=2.0)
         creative_serving = self._is_creative_serving()
@@ -996,13 +1156,6 @@ class _NodeState:
                     f"unknown topology resolution: {exc}"
                 )
                 topology_state = None
-
-        # Optional dual-slot activity probe — outside the lock (blocking HTTP).
-        # Tri-state: True (confirmed activity), False (confirmed idle), None
-        # (indeterminate — at least one probe source was ambiguous this tick).
-        probe_activity: bool | None = None
-        if DOORMAN_PROBE_LLAMA_ACTIVITY:
-            probe_activity = self._probe_slot_activity()
 
         with self.lock:
             self._cached_serving = serving
@@ -1024,13 +1177,7 @@ class _NodeState:
                 # classify it (DoD 4a gate amendment: an unregistered served
                 # model must never read as the stronger "refuted"). mode_inferred
                 # is never read here.
-                if topology_state is None:
-                    models_answered = False
-                else:
-                    models_answered = (
-                        topology_state.source_freshness.get("models_endpoint", {}).get("status")
-                        == "answered"
-                    )
+                models_answered = _topology_models_answered(topology_state)
                 if topology_state is None or topology_state.authority_gap or not models_answered:
                     self._big_probe_state = "unknown"
                 elif set(topology_state.served_ids) & gw_big_seat_members():
@@ -1055,6 +1202,16 @@ class _NodeState:
                         f"None rather than guessed; topology_resolution_unknown"
                     )
 
+        # Optional slot-activity probe — outside the lock (blocking HTTP), and
+        # after self._serving_is_big above so the class-aware combine (D2) votes
+        # on THIS tick's resolved class. Tri-state: True (confirmed activity),
+        # False (confirmed idle), None (indeterminate — at least one voting
+        # source was ambiguous this tick).
+        probe_activity: bool | None = None
+        if DOORMAN_PROBE_LLAMA_ACTIVITY:
+            probe_activity = self._probe_slot_activity()
+
+        with self.lock:
             # Probe-driven idle keepalive (doorman-probe-llama-activity-v0, extended by
             # gw-doorman-vllm-activity-probe-v0): an unmediated caller (e.g. OpenCode
             # hitting a dual-mode vLLM slot directly) never acquires a lease, so
@@ -2525,6 +2682,36 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                             and not state._stop_in_flight
                         ):
                             idle_elapsed = time.time() - state.idle_since
+
+                            # Unknown topology (Erah ruling 2026-08-19, agents-core-
+                            # doorman-class-aware-activity-probe-v0 D2/D3): a keeper
+                            # who does not know the nature of the room does not close
+                            # the door. Never park, never guess a class — grace clock
+                            # stays paused with NO bound (unlike the blindness bound
+                            # below), and a distinct alarm fires every tick instead of
+                            # a stop attempt, carrying the same diagnostic fields as
+                            # the topology_resolution_unknown warning. Only applies
+                            # when the flag is ON (_serving_is_big is never populated
+                            # otherwise, so flag-off transparently falls through to
+                            # the unchanged legacy path below).
+                            if DOORMAN_MODE_AWARE_ADMISSION and state._serving_is_big is None:
+                                topo = state._cached_topology_state
+                                _write_idle_log(
+                                    node_name, "topology_unknown_no_park", 0,
+                                    idle_secs=idle_elapsed,
+                                    reason="topology_unknown_no_park",
+                                    authority_gap=None if topo is None else topo.authority_gap,
+                                    models_answered=_topology_models_answered(topo),
+                                    served_ids=None if topo is None else topo.served_ids,
+                                    unknown_model=None if topo is None else topo.unknown_model,
+                                )
+                                log.warning(
+                                    f"[{node_name}] topology_unknown_no_park — idle "
+                                    f"{idle_elapsed:.0f}s but serving class unresolved; "
+                                    f"refusing to park, alarming instead"
+                                )
+                                continue
+
                             blindness_deadline = (
                                 GW_STOP_GRACE_SEC + DOORMAN_PROBE_BLINDNESS_SEC
                             )
@@ -2539,6 +2726,19 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                                     f"proceeding on stale grace period"
                                 )
                             if idle_elapsed >= GW_STOP_GRACE_SEC:
+                                # Idle-log reason (D3): distinguishes a genuinely
+                                # confirmed-idle park from one taken only because the
+                                # blindness bound was exceeded, so the journal line is
+                                # diagnosable rather than reading as one undifferentiated
+                                # "stopped" event.
+                                stop_reason = (
+                                    "probe_blind_bound_exceeded"
+                                    if state._probe_indeterminate else "confirmed_idle"
+                                )
+                                indeterminate_sources = [
+                                    name for name, v in (state._last_probe_raw or {}).items()
+                                    if v is None
+                                ]
                                 log.warning(
                                     f"[{node_name}] idle {idle_elapsed:.0f}s >= grace "
                                     f"{GW_STOP_GRACE_SEC}s — issuing gw-serve stop. "
@@ -2581,6 +2781,8 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                                         _write_idle_log(
                                             node_name, "stopped", 0,
                                             idle_secs=idle_elapsed,
+                                            reason=stop_reason,
+                                            indeterminate_sources=indeterminate_sources,
                                         )
                                     else:
                                         # rc != 0: idempotency guard — check if already down
@@ -2601,6 +2803,8 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                                             _write_idle_log(
                                                 node_name, "stopped", 0,
                                                 idle_secs=idle_elapsed,
+                                                reason=stop_reason,
+                                                indeterminate_sources=indeterminate_sources,
                                             )
                                         else:
                                             # Real failure: still serving
@@ -2619,6 +2823,7 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                                             _write_idle_log(
                                                 node_name, "stop_failed", 0,
                                                 idle_secs=idle_elapsed,
+                                                indeterminate_sources=indeterminate_sources,
                                             )
                                 except subprocess.TimeoutExpired:
                                     # R2/R5: a timeout is not a failure —
@@ -2646,6 +2851,8 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                                         _write_idle_log(
                                             node_name, "stopped", 0,
                                             idle_secs=idle_elapsed,
+                                            reason=stop_reason,
+                                            indeterminate_sources=indeterminate_sources,
                                         )
                                     else:
                                         log.info(
