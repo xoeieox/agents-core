@@ -355,13 +355,16 @@ def notify_failure(task: dict, result: str) -> None:
 # Startup sweep
 # ---------------------------------------------------------------------------
 
-def startup_sweep(queue: ClaudeQueue, council_dir: Path = _COUNCIL_DIR) -> None:
+def startup_sweep(queue: ClaudeQueue, council_dir: Path | None = None) -> None:
     """Crash recovery. Called once before the claim loop begins.
 
     ``council_dir`` defaults to the module-level ``_COUNCIL_DIR`` constant but
     can be overridden — e.g. to inject a ``tmp_path`` in tests without
-    monkeypatching module state.
+    monkeypatching module state. Resolved at call time (not as a default-arg
+    value) so tests that monkeypatch ``_COUNCIL_DIR`` still take effect.
     """
+    if council_dir is None:
+        council_dir = _COUNCIL_DIR
     now = datetime.now(PACIFIC)
     for active_yaml in queue.active_dir.glob("*.yaml"):
         task = queue._read_task(active_yaml)
@@ -1173,14 +1176,16 @@ def _reap_orphan_scopes(queue: ClaudeQueue) -> None:
 # ---------------------------------------------------------------------------
 
 class Daemon:
-    def __init__(self, workers: int, council_dir: Path = _COUNCIL_DIR):
+    def __init__(self, workers: int, council_dir: Path | None = None):
         self.queue = ClaudeQueue()
         self.sem = asyncio.Semaphore(workers)
         self.stop_claiming = asyncio.Event()
         self.in_flight: set[asyncio.Task] = set()
         # Overridable so tests can inject a tmp_path instead of monkeypatching
         # the module-level _COUNCIL_DIR constant — threaded into startup_sweep().
-        self.council_dir = council_dir
+        # Resolved at call time (not as a default-arg value) so tests that
+        # monkeypatch _COUNCIL_DIR still take effect.
+        self.council_dir = council_dir if council_dir is not None else _COUNCIL_DIR
 
     async def _worker(self, task: dict):
         if task.get("task_type") == "council.run":
