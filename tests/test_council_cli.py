@@ -190,6 +190,78 @@ def test_cmd_submit_notify_flag_set_in_task(tmp_path, monkeypatch):
     assert submitted_tasks[-1]["notify"] is False
 
 
+# ---------------------------------------------------------------------------
+# cmd_submit: queued task["model"] must track the actual voicing (not a
+# hard-coded "sonnet" label) — agents-core-council-queue-model-truth-v0.
+# ---------------------------------------------------------------------------
+
+def test_cmd_submit_default_voicing_sets_model_field_to_gravitywell(tmp_path, monkeypatch):
+    """No --voicing flag -> parser default (gravitywell) must be the queued model."""
+    from agents_core.council import cli as council_cli
+    from agents_core.council.cli import build_parser
+
+    monkeypatch.setattr(council_cli, "COUNCIL_DIR", tmp_path)
+    monkeypatch.setattr(council_cli, "LOG_DIR", tmp_path / "logs")
+
+    submitted_tasks = []
+
+    class _FakeQueue:
+        def submit(self, task, task_id=None):
+            submitted_tasks.append(task)
+            return task_id
+
+    monkeypatch.setattr(council_cli, "gather_mem_context", lambda d: {"terms": [], "hits": []})
+    monkeypatch.setattr(council_cli, "build_roster", lambda: [])
+    monkeypatch.setattr(
+        council_cli, "select_entities",
+        lambda **kw: {"selected": ["a", "b"], "reasoning": "x"},
+    )
+
+    import agents_core.claude_queue as cq_mod
+    monkeypatch.setattr(cq_mod, "ClaudeQueue", lambda: _FakeQueue())
+
+    args = build_parser().parse_args(["submit", "some decision"])
+    assert args.voicing == "gravitywell"  # sanity: parser default unchanged
+
+    rc = council_cli.cmd_submit(args)
+
+    assert rc == 0
+    assert submitted_tasks[-1]["model"] == "gravitywell"
+
+
+@pytest.mark.parametrize("voicing", ["local", "phala"])
+def test_cmd_submit_explicit_voicing_sets_model_field(voicing, tmp_path, monkeypatch):
+    """--voicing local / --voicing phala must be the queued model, not "sonnet"."""
+    from agents_core.council import cli as council_cli
+    from agents_core.council.cli import build_parser
+
+    monkeypatch.setattr(council_cli, "COUNCIL_DIR", tmp_path)
+    monkeypatch.setattr(council_cli, "LOG_DIR", tmp_path / "logs")
+
+    submitted_tasks = []
+
+    class _FakeQueue:
+        def submit(self, task, task_id=None):
+            submitted_tasks.append(task)
+            return task_id
+
+    monkeypatch.setattr(council_cli, "gather_mem_context", lambda d: {"terms": [], "hits": []})
+    monkeypatch.setattr(council_cli, "build_roster", lambda: [])
+    monkeypatch.setattr(
+        council_cli, "select_entities",
+        lambda **kw: {"selected": ["a", "b"], "reasoning": "x"},
+    )
+
+    import agents_core.claude_queue as cq_mod
+    monkeypatch.setattr(cq_mod, "ClaudeQueue", lambda: _FakeQueue())
+
+    args = build_parser().parse_args(["submit", "some decision", "--voicing", voicing])
+    rc = council_cli.cmd_submit(args)
+
+    assert rc == 0
+    assert submitted_tasks[-1]["model"] == voicing
+
+
 def test_cmd_submit_description_truncated_at_80(tmp_path, monkeypatch):
     from agents_core.council import cli as council_cli
 
