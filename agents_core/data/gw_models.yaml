@@ -44,3 +44,17 @@ models:
     operator_alias: gravitywell
     display_label: qwen3.6-35b-a3b-fp8-coder
     weights_hint: "Qwen3.6-35B-A3B-FP8-dynamic"
+
+  # 27B solo posture (agents-core-gw-models-register-27b-seat-v0) — the live
+  # served id on GW's most common posture, unregistered until this row.
+  # mode_alias "solo" matches gw_phase_models.py's existing "solo" ->
+  # "gravitywell-27b" vocabulary; NOT "big" (would silently join
+  # gw_big_seat_members() and flip serving_is_big True on a solo posture)
+  # and NOT "dual" (would misreport _topology_serving_mode). Appended at
+  # END OF FILE — _gw_registry_lookup matches in file order and returns the
+  # first hit, so appending here keeps every existing lookup byte-identical.
+  - canonical_id: gravitywell-27b
+    mode_alias: solo
+    operator_alias: gravitywell
+    display_label: qwen3.8-27b-nvfp4
+    weights_hint: "Qwen3.8-27B-NVFP4"

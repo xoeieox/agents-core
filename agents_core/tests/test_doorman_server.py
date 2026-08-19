@@ -1725,6 +1725,85 @@ class TestWarmBoxModeConvergence:
 
 
 # ---------------------------------------------------------------------------
+# gravitywell-27b un-masked flip path (agents-core-gw-models-register-27b-
+# seat-v0, R2) — registering the 27B row makes unknown_model=False for this
+# served id, which opens a previously-masked branch of the warm-box mode-
+# convergence path above: a mode-bearing acquire against a warm box serving
+# gravitywell-27b can now resolve a confident posture and command a flip,
+# where before registration it always fell through to TOPOLOGY_UNRESOLVED_SKIP.
+# This is the designed behaviour being restored (see spec R2), pinned here in
+# both directions so the actuation-behaviour change is deliberate, not absorbed.
+# ---------------------------------------------------------------------------
+
+class TestGw27bUnmaskedFlipPath:
+    def test_27b_registered_divergent_mode_commands_flip(self):
+        """Positive direction: 27B served + now registered (unknown_model=
+        False) + controller reports a divergent mode ("dual") + mode-bearing
+        acquire requests "big" => flip commanded (_wake_big called once).
+        Before R1 this same topology read unknown_model=True and
+        _resolve_live_posture short-circuited to "unknown" — no flip ever
+        issued for this served id."""
+        state = _make_state()
+        topology = _make_topology_state(
+            mode="dual", served_ids=["gravitywell-27b"],
+            unknown_model=False, distinct_second_model=True,
+        )
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
+             patch.object(state, "_wake_big", return_value=True) as mock_big, \
+             patch.object(state, "_wake_dual") as mock_dual:
+            result = state.ensure_serving(role="mode-controller", mode="big", work_id="flip-27b")
+
+        assert result is True
+        mock_big.assert_called_once()
+        mock_dual.assert_not_called()
+
+    def test_27b_registered_matching_mode_no_flip(self):
+        """Negative direction 1: 27B served + registered + controller-reported
+        mode already matches the requested mode => idempotent, no gw-serve
+        issued."""
+        state = _make_state()
+        topology = _make_topology_state(
+            mode="dual", served_ids=["gravitywell-27b"],
+            unknown_model=False, distinct_second_model=True,
+        )
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
+             patch.object(state, "_wake_big") as mock_big, \
+             patch.object(state, "_wake_dual") as mock_dual:
+            result = state.ensure_serving(role="mode-controller", mode="dual", work_id="flip-27b")
+
+        assert result is True
+        mock_big.assert_not_called()
+        mock_dual.assert_not_called()
+
+    def test_27b_registered_unresolved_topology_still_skips(self):
+        """Negative direction 2: 27B served + registered, but topology
+        resolution itself is unresolved (authority_gap) => registering the
+        row does NOT remove the unresolved-skip safety net — still no
+        gw-serve, still the TOPOLOGY_UNRESOLVED_SKIP structured WARN."""
+        state = _make_state()
+        topology = _make_topology_state(
+            served_ids=["gravitywell-27b"], unknown_model=False, authority_gap=True,
+        )
+        with patch.object(state, "_is_serving", return_value=True), \
+             patch.object(state, "_is_creative_serving", return_value=False), \
+             patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
+             patch.object(state, "_wake_big") as mock_big, \
+             patch.object(state, "_wake_dual") as mock_dual, \
+             patch("agents_core.doorman_server.log") as mock_log:
+            result = state.ensure_serving(role="mode-controller", mode="big", work_id="flip-27b")
+
+        assert result is True
+        mock_big.assert_not_called()
+        mock_dual.assert_not_called()
+        warn_payloads = [c.args[0] for c in mock_log.warning.call_args_list]
+        assert any("TOPOLOGY_UNRESOLVED_SKIP" in p for p in warn_payloads)
+
+
+# ---------------------------------------------------------------------------
 # Deference HTTP endpoint tests (doorman-mode-deference-v0)
 # ---------------------------------------------------------------------------
 
@@ -2638,8 +2717,11 @@ class TestModeAwareBigPredicate:
     def test_ac6b2_unregistered_model_is_unknown_not_refuted(self):
         """DoD 4a (gate amendment, unanimous Facets + Council,
         2026-08-12-214706-ac3633/-da5dbc): a served id with NO gw_models.yaml
-        row at all (e.g. gravitywell-27b — absent from the registry today)
-        must read big_probe_state='unknown' and serving_is_big=None, never
+        row at all (e.g. gravitywell-vibethinker — absent from the registry
+        as of this writing; gravitywell-27b was the prior example here but
+        was registered by agents-core-gw-models-register-27b-seat-v0, so the
+        fixture was re-anchored to a genuinely unregistered id — R3) must
+        read big_probe_state='unknown' and serving_is_big=None, never
         'refuted'/False. 'refuted' means the registry was consulted and the
         served id is a KNOWN non-member; 'unknown' means the served id could
         not be classified at all. Pinned separately from
@@ -2647,7 +2729,7 @@ class TestModeAwareBigPredicate:
         test can't pass for the wrong reason."""
         state = _make_state()
         topology = _make_topology_state(
-            mode="big", served_ids=["gravitywell-27b"], unknown_model=True,
+            mode="big", served_ids=["gravitywell-vibethinker"], unknown_model=True,
         )
 
         with patch("agents_core.doorman_server.gw_serving_state", return_value=topology), \
