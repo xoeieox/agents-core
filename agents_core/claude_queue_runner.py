@@ -355,8 +355,13 @@ def notify_failure(task: dict, result: str) -> None:
 # Startup sweep
 # ---------------------------------------------------------------------------
 
-def startup_sweep(queue: ClaudeQueue) -> None:
-    """Crash recovery. Called once before the claim loop begins."""
+def startup_sweep(queue: ClaudeQueue, council_dir: Path = _COUNCIL_DIR) -> None:
+    """Crash recovery. Called once before the claim loop begins.
+
+    ``council_dir`` defaults to the module-level ``_COUNCIL_DIR`` constant but
+    can be overridden — e.g. to inject a ``tmp_path`` in tests without
+    monkeypatching module state.
+    """
     now = datetime.now(PACIFIC)
     for active_yaml in queue.active_dir.glob("*.yaml"):
         task = queue._read_task(active_yaml)
@@ -408,7 +413,7 @@ def startup_sweep(queue: ClaudeQueue) -> None:
 
     # Hoisted out of the council-orphan block below so both it and the
     # narrative-emit orphan-spec pass can rely on queued_ids regardless of
-    # whether _COUNCIL_DIR exists on this host.
+    # whether council_dir exists on this host.
     import yaml as _yaml
     queued_ids: set[str] = set()
     for subdir_name in ("pending", "active", "completed", "failed"):
@@ -423,9 +428,9 @@ def startup_sweep(queue: ClaudeQueue) -> None:
 
     # Council orphan recovery: mark deliberating runs that have no
     # corresponding queue task and are older than _COUNCIL_ORPHAN_AGE_SECS.
-    if _COUNCIL_DIR.exists():
+    if council_dir.exists():
         sweep_now = datetime.now()  # naive — matches council YAML created_at
-        for run_yaml in _COUNCIL_DIR.glob("*.yaml"):
+        for run_yaml in council_dir.glob("*.yaml"):
             try:
                 run_data = _yaml.safe_load(run_yaml.read_text())
             except Exception:
@@ -1168,11 +1173,14 @@ def _reap_orphan_scopes(queue: ClaudeQueue) -> None:
 # ---------------------------------------------------------------------------
 
 class Daemon:
-    def __init__(self, workers: int):
+    def __init__(self, workers: int, council_dir: Path = _COUNCIL_DIR):
         self.queue = ClaudeQueue()
         self.sem = asyncio.Semaphore(workers)
         self.stop_claiming = asyncio.Event()
         self.in_flight: set[asyncio.Task] = set()
+        # Overridable so tests can inject a tmp_path instead of monkeypatching
+        # the module-level _COUNCIL_DIR constant — threaded into startup_sweep().
+        self.council_dir = council_dir
 
     async def _worker(self, task: dict):
         if task.get("task_type") == "council.run":
@@ -1195,7 +1203,7 @@ class Daemon:
                     )
 
     async def run(self):
-        startup_sweep(self.queue)
+        startup_sweep(self.queue, council_dir=self.council_dir)
         log.info("startup sweep complete, entering claim loop")
         while not self.stop_claiming.is_set():
             try:
