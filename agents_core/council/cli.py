@@ -1992,7 +1992,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         "task_type": "council.run",
         "description": description,
         "priority": 50,  # Priority.NORMAL
-        "model": "sonnet",
+        "model": args.voicing,
         "notify": bool(notify),
         "timeout_seconds": timeout_seconds,
         "payload": {
