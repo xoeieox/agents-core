@@ -233,7 +233,7 @@ async def test_daemon_claim_loop_withholds_under_pressure(monkeypatch, caplog):
         queue_dir = None
 
     # Mock startup_sweep.
-    def fake_startup_sweep(q):
+    def fake_startup_sweep(q, **kwargs):
         pass
 
     monkeypatch.setattr(runner_mod, "startup_sweep", fake_startup_sweep)
@@ -293,7 +293,7 @@ async def test_daemon_claim_loop_proceeds_when_guard_clear(monkeypatch, caplog):
         active_dir = None
         queue_dir = None
 
-    def fake_startup_sweep(q):
+    def fake_startup_sweep(q, **kwargs):
         pass
 
     monkeypatch.setattr(runner_mod, "startup_sweep", fake_startup_sweep)
@@ -350,7 +350,7 @@ async def test_daemon_freeze_guard_flag_disables(monkeypatch):
         active_dir = None
         queue_dir = None
 
-    def fake_startup_sweep(q):
+    def fake_startup_sweep(q, **kwargs):
         pass
 
     monkeypatch.setattr(runner_mod, "startup_sweep", fake_startup_sweep)
@@ -464,7 +464,7 @@ async def test_daemon_run_log_discipline_multi_tick(monkeypatch, caplog):
         active_dir = None
         queue_dir = None
 
-    def fake_startup_sweep(q):
+    def fake_startup_sweep(q, **kwargs):
         pass
 
     monkeypatch.setattr(runner_mod, "startup_sweep", fake_startup_sweep)
@@ -517,7 +517,7 @@ async def test_daemon_claim_loop_crash_exits_loud(monkeypatch, caplog):
         active_dir = None
         queue_dir = None
 
-    def fake_startup_sweep(q):
+    def fake_startup_sweep(q, **kwargs):
         pass
 
     monkeypatch.setattr(runner_mod, "startup_sweep", fake_startup_sweep)
@@ -556,7 +556,7 @@ async def test_daemon_claim_loop_reraises_cancelled_error(monkeypatch, caplog):
         active_dir = None
         queue_dir = None
 
-    def fake_startup_sweep(q):
+    def fake_startup_sweep(q, **kwargs):
         pass
 
     monkeypatch.setattr(runner_mod, "startup_sweep", fake_startup_sweep)
@@ -589,7 +589,7 @@ async def test_daemon_claim_loop_reraises_generator_exit(monkeypatch, caplog):
         active_dir = None
         queue_dir = None
 
-    def fake_startup_sweep(q):
+    def fake_startup_sweep(q, **kwargs):
         pass
 
     monkeypatch.setattr(runner_mod, "startup_sweep", fake_startup_sweep)
@@ -635,6 +635,53 @@ def test_startup_sweep_clears_ghost_in_flight_entry(tmp_path, monkeypatch):
     import json
     persisted = json.loads(queue.state_path.read_text())
     assert "ghost-id" not in persisted["in_flight"]
+
+
+def test_startup_sweep_accepts_council_dir_arg_without_monkeypatch(tmp_path):
+    """council_dir is a real parameter (default _COUNCIL_DIR) — tests can pass
+    a tmp_path directly instead of monkeypatching the module constant."""
+    from agents_core.claude_queue import ClaudeQueue
+
+    council_dir = tmp_path / "council"
+    council_dir.mkdir()
+    (council_dir / "orphan.yaml").write_text(
+        "run_id: orphan\nstatus: deliberating\ncreated_at: '2020-01-01T00:00:00'\n"
+    )
+
+    queue = ClaudeQueue(queue_dir=tmp_path / "claude-queue")
+
+    with patch("subprocess.run"):
+        runner_mod.startup_sweep(queue, council_dir=council_dir)
+
+    import yaml
+    written = yaml.safe_load((council_dir / "orphan.yaml").read_text())
+    assert written["status"] == "failed"
+    assert written["error"] == "runner_crash_recovery"
+
+
+def test_daemon_threads_council_dir_into_startup_sweep(tmp_path, monkeypatch):
+    """Daemon(council_dir=...) is stored and passed through to startup_sweep()
+    on run() — no monkeypatching of module state required for injection."""
+    monkeypatch.setattr(runner_mod, "POLL_INTERVAL_S", 0.001)
+
+    seen: list = []
+
+    def fake_startup_sweep(q, council_dir=None, **kwargs):
+        seen.append(council_dir)
+
+    monkeypatch.setattr(runner_mod, "startup_sweep", fake_startup_sweep)
+    monkeypatch.setattr(runner_mod, "_spawn_freeze_guard_block_reason", lambda: None)
+
+    injected_dir = tmp_path / "council"
+    daemon = runner_mod.Daemon(workers=2, council_dir=injected_dir)
+    assert daemon.council_dir == injected_dir
+
+    daemon.queue.claim = lambda: None
+    daemon.request_stop()  # stop_claiming already set — run() does the sweep then exits immediately
+
+    asyncio.run(daemon.run())
+
+    assert seen == [injected_dir]
 
 
 # ---------------------------------------------------------------------------
