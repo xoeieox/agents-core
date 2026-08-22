@@ -74,9 +74,16 @@ def record(
     signal_strength: str = DEFAULT_SIGNAL_STRENGTH,
     extra: dict | None = None,
     now: datetime | None = None,
+    ts_iso: str | None = None,
 ) -> Path:
     """Append one observation entry to the per-agent-per-date JSONL file.
-    Returns the path written to."""
+    Returns the path written to.
+
+    ts_iso, if given, is used verbatim as the entry's timestamp (and as
+    input to compute_obs_id), instead of being derived from `now`. Pass
+    this when a caller has already computed the timestamp string it needs
+    to match against (e.g. to print an obs_id alongside the write) so the
+    formatting logic isn't duplicated and can't drift out of sync."""
     if observation_type not in VALID_OBSERVATION_TYPES:
         raise ValueError(
             f"observation_type must be one of {sorted(VALID_OBSERVATION_TYPES)}, "
@@ -111,13 +118,16 @@ def record(
         ):
             raise TypeError("informed_by must be a list of strings")
 
-    ts = now if now is not None else datetime.now(timezone.utc)
-    if ts.tzinfo is None:
-        raise ValueError("now must be timezone-aware")
+    if ts_iso is not None:
+        date_str = datetime.fromisoformat(ts_iso).astimezone(timezone.utc).strftime("%Y-%m-%d")
+    else:
+        ts = now if now is not None else datetime.now(timezone.utc)
+        if ts.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
 
-    ts_utc = ts.astimezone(timezone.utc)
-    ts_iso = ts_utc.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    date_str = ts_utc.strftime("%Y-%m-%d")
+        ts_utc = ts.astimezone(timezone.utc)
+        ts_iso = ts_utc.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        date_str = ts_utc.strftime("%Y-%m-%d")
 
     obs_id = compute_obs_id(agent_id, ts_iso, observation_type, content)
 
@@ -456,9 +466,10 @@ def _cli_record(args: list[str]) -> None:
     if ns.extra_json:
         extra = json.loads(ns.extra_json)
 
-    # Generate now upfront so we can compute obs_id without a post-write search scan.
-    now = datetime.now(timezone.utc)
-    ts_iso = now.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    # Compute ts_iso upfront and pass it straight through to record(), so the
+    # obs_id printed here is guaranteed to match the one persisted (same string,
+    # not two independent derivations that could drift out of sync).
+    ts_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
     obs_id_out = compute_obs_id(ns.agent_id, ts_iso, ns.observation_type, ns.content)
 
     path = record(
@@ -473,7 +484,7 @@ def _cli_record(args: list[str]) -> None:
         informed_by=ns.informed_by if ns.informed_by else None,
         signal_strength=ns.signal_strength,
         extra=extra,
-        now=now,
+        ts_iso=ts_iso,
     )
 
     print(f"{path}\t{obs_id_out}")
