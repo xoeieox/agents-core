@@ -332,6 +332,16 @@ def lineage(
 
     Each entry in forward/backward has _lineage_depth added (int, distance from root).
     Direction filter empties the unwanted list. Cycles broken by visited-set on obs_id.
+
+    Memory footprint: this loads every entry across every agent directory and every
+    date file into memory (an unfiltered search()) to build the by_id and cited_by
+    indexes, then walks obs_id's citation chain over those in-memory indexes. Cost is
+    O(total entries in the store), not O(entries in obs_id's citation chain) — for a
+    store with many agents/dates this holds the full corpus in memory even when the
+    chain being resolved is small. Fine at current scale; if the store grows large
+    enough for this to matter, the fix is a persistent obs_id -> file-offset (or
+    obs_id -> citing-obs_id) index so lookups can target only the citation chain
+    instead of scanning the whole store.
     """
     if direction not in ("forward", "backward", "both"):
         raise ValueError(
