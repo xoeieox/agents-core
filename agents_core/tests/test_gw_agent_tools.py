@@ -215,3 +215,38 @@ class TestGrepExecutor:
             result = executor.execute({"pattern": "pattern"})
             if isinstance(result, str) and len(result) > GW_AGENT_TOOL_OUTPUT_CAP:
                 assert "…[truncated]" in result
+
+    @pytest.mark.skipif(not _has_ripgrep(), reason="ripgrep not installed")
+    def test_grep_path_glob_scoped_finds_match(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "config").mkdir()
+            (tmpdir_path / "docs").mkdir()
+            (tmpdir_path / "config" / "gw-topology.yaml").write_text("slot1-laguna: true\n")
+            (tmpdir_path / "docs" / "other.md").write_text("slot1-laguna\n")
+
+            executor = GrepExecutor(tmpdir)
+            result = executor.execute(
+                {"pattern": "slot1-laguna", "path_glob": "config/*"}
+            )
+            assert isinstance(result, str)
+            assert result != "(no matches)"
+            assert "config/gw-topology.yaml" in result
+            assert "docs/other.md" not in result
+
+    @pytest.mark.skipif(not _has_ripgrep(), reason="ripgrep not installed")
+    def test_grep_path_glob_nested_finds_match(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "config" / "nested").mkdir(parents=True)
+            (tmpdir_path / "config" / "nested" / "deep.yaml").write_text("needle-xyz\n")
+            (tmpdir_path / "config" / "sibling.txt").write_text("needle-xyz\n")
+
+            executor = GrepExecutor(tmpdir)
+            result = executor.execute(
+                {"pattern": "needle-xyz", "path_glob": "**/*.yaml"}
+            )
+            assert isinstance(result, str)
+            assert result != "(no matches)"
+            assert "config/nested/deep.yaml" in result
+            assert "sibling.txt" not in result
