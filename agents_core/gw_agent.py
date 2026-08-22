@@ -654,12 +654,12 @@ class GrepExecutor(ToolExecutor):
             cmd = ["rg", pattern, "-l", "-m", "100"]
             if path_glob != "**/*":
                 cmd += ["--glob", path_glob]
-            cmd.append(str(self.cwd))
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 timeout=10,
+                cwd=str(self.cwd),
             )
 
             if result.returncode == 0:
