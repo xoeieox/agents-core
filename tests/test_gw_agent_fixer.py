@@ -842,7 +842,7 @@ class TestNoProgressGuard:
             r.raise_for_status = MagicMock()
 
         with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
