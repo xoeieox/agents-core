@@ -361,6 +361,102 @@ class TestCallGwAgentWriteable:
         assert fixer_result["steps"] is transcript
         assert len(transcript) >= 2
 
+    def test_writeable_new_untracked_file_appears_in_final_diff(self, tmp_path):
+        """Regression (agents-core-local-fixer-final-diff-untracked-v0).
+
+        A writeable run whose ONLY change is creating a new untracked file
+        (no tracked file modified) must produce a non-empty final_diff that
+        contains the new file's content. A bare `git diff` (unstaged, tracked
+        only) is blind to untracked files and produced an empty diff, causing
+        the harness to discard the work as "empty diff - no PR".
+        """
+        repo = _tmp_git_repo(tmp_path)
+
+        # Step 1: create a brand-new file (untracked; nothing else changes)
+        new_content = "print('gpu1 lease')\n"
+        step1 = _make_tool_call_response(
+            "write_file", {"path": "scripts/new_tool.py", "content": new_content}, "c1"
+        )
+        step3 = _make_stop_response("All done.")
+
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=step1)),
+            MagicMock(status_code=200, json=MagicMock(return_value=step3)),
+        ]
+        for r in responses:
+            r.raise_for_status = MagicMock()
+
+        with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
+            mock_client = MagicMock()
+            mock_client.acquire.return_value = {"status": "serving"}
+            MockDoorman.return_value = mock_client
+
+            result = call_gw_agent(
+                prompt="Add a new script.",
+                cwd=str(repo),
+                writeable=True,
+                acquire_lease=True,
+                backend_url=None,
+            )
+
+        assert isinstance(result, tuple)
+        fixer_result, transcript = result
+
+        # The new file must exist on disk
+        assert (repo / "scripts" / "new_tool.py").read_text() == new_content
+
+        # final_diff must be non-empty and contain the new file's content
+        final_diff = fixer_result["final_diff"]
+        assert isinstance(final_diff, str)
+        assert len(final_diff) > 0
+        assert "scripts/new_tool.py" in final_diff
+        assert new_content.strip() in final_diff
+
+        # concluded=True because the run ended on stop
+        assert fixer_result["concluded"] is True
+        assert fixer_result["steps"] is transcript
+
+    def test_build_fixer_result_add_failure_yields_empty_diff_with_diagnostic(self, tmp_path, capsys):
+        """Compound fail-safe: a failed `git add -A` -> final_diff == "" and a
+        distinct stderr diagnostic (transient staging error must be
+        distinguishable from a genuine empty run)."""
+        repo = _tmp_git_repo(tmp_path)
+        (repo / "brand_new.py").write_text("y = 1\n")  # would be staged if add worked
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=128, stdout="")
+            result = _build_fixer_result(str(repo), [], concluded=True)
+
+        assert result["final_diff"] == ""
+        # add -A must be attempted with the same capture/timeout discipline
+        args = mock_run.call_args_list[0]
+        assert args[0][0] == ["git", "-C", str(repo), "add", "-A"]
+        assert args[1].get("capture_output") is True
+        assert args[1].get("timeout") == 15
+        # distinct diagnostic on add -A failure
+        err = capsys.readouterr().err
+        assert "WARN: _build_fixer_result: git add -A failed (rc=128)" in err
+
+    def test_build_fixer_result_cached_diff_failure_yields_empty_diff(self, tmp_path, capsys):
+        """Compound fail-safe: add succeeds but `git diff --cached` fails ->
+        final_diff == "" (an undetected diff never fabricates work)."""
+        repo = _tmp_git_repo(tmp_path)
+        (repo / "brand_new.py").write_text("y = 1\n")
+
+        def fake_run(cmd, **kwargs):
+            if "add" in cmd:
+                return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=1, stdout="should-not-appear\n")
+
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            result = _build_fixer_result(str(repo), [], concluded=True)
+
+        assert result["final_diff"] == ""
+        assert "should-not-appear" not in result["final_diff"]
+        # second call must be the staged diff
+        assert mock_run.call_args_list[1][0][0] == ["git", "-C", str(repo), "diff", "--cached"]
+
     def test_writeable_ignores_return_transcript_arg(self, tmp_path):
         repo = _tmp_git_repo(tmp_path)
         step1 = _make_stop_response("Done.")
