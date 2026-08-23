@@ -1121,14 +1121,35 @@ def _build_fixer_result(
     interrupted: bool = False,
     interrupt_reason: str = "",
 ) -> dict:
-    """Build a FixerResult dict from the completed writeable run."""
-    diff_result = subprocess.run(
-        ["git", "-C", cwd, "diff"],
+    """Build a FixerResult dict from the completed writeable run.
+
+    The work product is the full staged diff: stage everything (including new
+    untracked files) with `git add -A`, then diff the index against HEAD with
+    `git diff --cached`. A bare `git diff` is blind to new untracked files, so
+    a run whose deliverables are entirely new files would otherwise register
+    an empty diff and be discarded by the harness. Staging here is a no-op for
+    the harness's own `git add -A` + commit (idempotent).
+    """
+    add_result = subprocess.run(
+        ["git", "-C", cwd, "add", "-A"],
         capture_output=True,
         text=True,
         timeout=15,
     )
-    final_diff = diff_result.stdout if diff_result.returncode == 0 else ""
+    if add_result.returncode != 0:
+        print(
+            f"WARN: _build_fixer_result: git add -A failed (rc={add_result.returncode}) - final_diff empty",
+            file=sys.stderr,
+        )
+        final_diff = ""
+    else:
+        diff_result = subprocess.run(
+            ["git", "-C", cwd, "diff", "--cached"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        final_diff = diff_result.stdout if diff_result.returncode == 0 else ""
 
     last_test_outcome = None
     for entry in reversed(transcript):
