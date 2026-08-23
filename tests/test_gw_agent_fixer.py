@@ -327,7 +327,7 @@ class TestCallGwAgentWriteable:
             r.raise_for_status = MagicMock()
 
         with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -368,7 +368,7 @@ class TestCallGwAgentWriteable:
         responses[0].raise_for_status = MagicMock()
 
         with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -395,7 +395,7 @@ class TestCallGwAgentWriteable:
         responses[0].raise_for_status = MagicMock()
 
         with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -435,7 +435,7 @@ class TestReadOnlyRegression:
             return responses.pop(0)
 
         with patch("agents_core.gw_agent.requests.post", side_effect=fake_post), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -466,7 +466,7 @@ class TestReadOnlyRegression:
             return responses.pop(0)
 
         with patch("agents_core.gw_agent.requests.post", side_effect=fake_post), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -510,7 +510,7 @@ class TestSwarmPayloadSafety:
         _tmp_git_repo(Path(cwd))
 
         with patch("agents_core.gw_agent.requests.post", side_effect=fake_post), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -570,7 +570,7 @@ class TestSwarmPayloadSafety:
             return r
 
         with patch("agents_core.gw_agent.requests.post", side_effect=fake_post), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -613,7 +613,7 @@ class TestSwarmPayloadSafety:
             return r
 
         with patch("agents_core.gw_agent.requests.post", side_effect=fake_post), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -703,7 +703,7 @@ class TestNoProgressGuard:
                 r.raise_for_status = MagicMock()
 
         with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -814,7 +814,7 @@ class TestNoProgressGuard:
             r.raise_for_status = MagicMock()
 
         with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -842,7 +842,7 @@ class TestNoProgressGuard:
             r.raise_for_status = MagicMock()
 
         with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -878,7 +878,7 @@ class TestToolSurfaceTruthBlock:
             return responses.pop(0)
 
         with patch("agents_core.gw_agent.requests.post", side_effect=fake_post), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -1030,7 +1030,7 @@ class TestNudgeMessage:
             return r
 
         with patch("agents_core.gw_agent.requests.post", side_effect=fake_post), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -1076,7 +1076,7 @@ class TestHandlerHookSupervision:
             return r
 
         with patch("agents_core.gw_agent.requests.post", side_effect=fake_post), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -1328,7 +1328,7 @@ class TestEffectiveDefaultRaisedToTwelve:
             r.raise_for_status = MagicMock()
 
         with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -1357,7 +1357,7 @@ class TestEffectiveDefaultRaisedToTwelve:
             r.raise_for_status = MagicMock()
 
         with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -1389,7 +1389,7 @@ class TestExploreCeiling:
             r.raise_for_status = MagicMock()
 
         with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client
@@ -1467,7 +1467,7 @@ class TestRegressionFullAbort:
             r.raise_for_status = MagicMock()
 
         with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
-             patch("agents_core.gw_agent.DoormanClient") as MockDoorman:
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
             mock_client = MagicMock()
             mock_client.acquire.return_value = {"status": "serving"}
             MockDoorman.return_value = mock_client

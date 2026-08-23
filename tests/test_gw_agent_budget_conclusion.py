@@ -156,7 +156,7 @@ class TestBudgetForcesConclusion:
         fc_stop = _mock_resp(_make_stop_response('{"verdict": "early", "findings": []}'))
 
         def spy_force(messages, backend_url, timeout, json_mode, log, is_swarm=False,
-                      call_timeout=None, partial=False):
+                      call_timeout=None, partial=False, served_model_out=None, model=None):
             return '{"verdict": "early", "findings": []}'
 
         repo = _tmp_git_repo(tmp_path)
@@ -185,7 +185,7 @@ class TestBudgetForcesConclusion:
         captured_partial = []
 
         def spy_force(messages, backend_url, timeout, json_mode, log, is_swarm=False,
-                      call_timeout=None, partial=False):
+                      call_timeout=None, partial=False, served_model_out=None, model=None):
             captured_partial.append(partial)
             return '{"verdict": "partial ok", "findings": []}'
 
@@ -225,7 +225,7 @@ class TestConclusionGetsRemainingBudget:
         captured = []
 
         def spy_force(messages, backend_url, timeout, json_mode, log, is_swarm=False,
-                      call_timeout=None, partial=False):
+                      call_timeout=None, partial=False, served_model_out=None, model=None):
             captured.append(call_timeout)
             return '{"verdict": "ok", "findings": []}'
 
@@ -255,7 +255,7 @@ class TestConclusionGetsRemainingBudget:
         captured = []
 
         def spy_force(messages, backend_url, timeout, json_mode, log, is_swarm=False,
-                      call_timeout=None, partial=False):
+                      call_timeout=None, partial=False, served_model_out=None, model=None):
             captured.append(call_timeout)
             return "partial verdict"
 
