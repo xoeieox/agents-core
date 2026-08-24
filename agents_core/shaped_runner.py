@@ -24,7 +24,9 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from agents_core.llm import call_claude_cli
 from agents_core.room_paths import room_path
@@ -242,6 +244,193 @@ def _build_meta(result: str | None, envelope: dict | None) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# D1 + D6 (agents-core-local-fixer-harness-fix-v0): positive-only test gate
+# and friction logging.
+#
+# The legacy gate used the model's LAST run_tests outcome: if that outcome
+# was a pre-existing failure (or a non-existent test file), a 207-passing-
+# test diff was discarded. The positive-only gate instead checks that every
+# test the model CREATED OR EDITED in this run passes; pre-existing failures
+# are logged (and witnessed via a friction mem entry, D6) but do NOT block.
+#
+# Fail-closed: when the model touched no tests at all (production-code-only
+# fix), the gate falls back to the legacy _tests_passed(last_test_outcome)
+# behavior so a fixer cannot merge untested production code by simply
+# refusing to write tests.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_test_path(cwd: str, path: str) -> str:
+    """Resolve a test-file path against cwd and return a CWD-relative POSIX form.
+
+    Both the write_file/apply_edit targets and the run_tests targets are
+    resolved against the same cwd before comparison, so a relative target
+    ("tests/test_foo.py") and an absolute target ("/worktree/tests/test_foo.py")
+    both match (agents-core-local-fixer-harness-fix-v0, D1 mandated amendment).
+    """
+    from pathlib import Path as _P
+    raw = (path or "").strip()
+    if not raw:
+        return ""
+    p = _P(raw)
+    if not p.is_absolute():
+        p = _P(cwd) / p
+    try:
+        rel = p.resolve().relative_to(_P(cwd).resolve())
+        return rel.as_posix()
+    except (ValueError, OSError):
+        # Path is outside cwd (or unresolvable) — keep the raw string so the
+        # comparison degrades to exact-match rather than silently dropping
+        # the entry (which would under-count model_touched_tests).
+        return raw
+
+
+def _collect_model_touched_tests(transcript: list[dict], cwd: str) -> set[str]:
+    """Collect the CWD-relative paths of test files the model created/edited.
+
+    Scans the run transcript for successful write_file/apply_edit calls whose
+    target resolves under tests/ (or is a test_*.py file). Paths are resolved
+    against cwd before comparison (D1 mandated amendment).
+    """
+    touched: set[str] = set()
+    for entry in transcript or []:
+        if entry.get("tool_name") not in ("write_file", "apply_edit"):
+            continue
+        if entry.get("error") is not None:
+            continue  # a failed write did not actually touch the file
+        args = entry.get("arguments") or {}
+        path = args.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+        rel = _resolve_test_path(cwd, path)
+        if not rel:
+            continue
+        if rel.startswith("tests/") or "/tests/" in rel or rel.startswith("test_"):
+            touched.add(rel)
+    return touched
+
+
+def _extract_failed_node_ids(last_test_outcome: dict | None) -> list[str]:
+    """Extract pytest node IDs of failed/error tests from a run_tests outcome.
+
+    Parses the outcome's output_tail for lines like
+    'FAILED tests/test_foo.py::TestX::test_y' / 'ERROR tests/test_foo.py'.
+    Returns [] when the outcome is absent or no node IDs are visible.
+    """
+    if not last_test_outcome:
+        return []
+    tail = last_test_outcome.get("output_tail") or ""
+    node_ids: list[str] = []
+    for line in tail.splitlines():
+        line = line.strip()
+        if line.startswith(("FAILED ", "ERROR ", "ERROR at setup of ")):
+            # Node ID is the last whitespace-separated token (file::Class::fn).
+            # 'ERROR at setup of tests/test_foo.py::test_y' -> the node is the
+            # token after 'of'.
+            if line.startswith("ERROR at setup of "):
+                node = line[len("ERROR at setup of "):].strip()
+            else:
+                node = line.rsplit(" ", 1)[-1].strip()
+            if node and node not in node_ids:
+                node_ids.append(node)
+    return node_ids
+
+
+def _slugify(node_id: str) -> str:
+    """Slug a pytest node ID for use in a friction mem key (stable, no date)."""
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", node_id).strip("-").lower()
+    return slug or "unknown"
+
+
+def _error_signature(node_id: str, last_test_outcome: dict | None) -> str:
+    """Build a STABLE error signature: exception type + test node ID.
+
+    The raw error string embeds episode titles/paths/counts and would break
+    cross-run dedup on wording drift (Council AC7a), so the signature keys on
+    the exception type (parsed from the outcome's output_tail) plus the node
+    ID only. When no exception type is visible, 'unknown' is used so the
+    signature is still stable for the same node ID.
+    """
+    exc_type = "unknown"
+    tail = (last_test_outcome or {}).get("output_tail") or ""
+    # Look for a 'E <ExceptionType>:' line (pytest's short failure format).
+    for line in tail.splitlines():
+        m = re.match(r"^\s*E\s+([A-Za-z_][A-Za-z0-9_.]*)\s*:", line)
+        if m:
+            exc_type = m.group(1)
+            break
+    return f"{exc_type}@{node_id}"
+
+
+def _write_friction_entry(
+    *,
+    repo: str,
+    node_id: str,
+    error_signature: str,
+    task_id: str,
+    today: str,
+    log: Callable[[str], None] | None = None,
+) -> None:
+    """Write (or dedup-update) a friction mem entry for a pre-existing test failure.
+
+    D6 (agents-core-local-fixer-harness-fix-v0): the friction entry is the
+    signal a future daemon-side follow-up spec will scan for (status: open)
+    and autonomously dispatch a fixer on. Key is friction/<repo>-<node-slug>
+    (NO date in the key) so the same pre-existing failure across runs maps to
+    the same key. Dedup: if the entry exists and is status: open, refresh
+    last_seen/last_task_id without duplicating; if status: resolved, flip
+    back to open (the friction recurred).
+
+    Never raises: a friction-write failure is logged and swallowed so it can
+    never block the test gate or the PR tail.
+    """
+    key = f"friction/{repo}-{_slugify(node_id)}"
+    try:
+        from agents_core.mem import MemoryStore
+
+        store = MemoryStore()
+        try:
+            existing = store.get(key)
+            if existing:
+                existing_json = {}
+                try:
+                    existing_json = json.loads(existing.get("content") or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    existing_json = {}
+                status = existing_json.get("status", "open")
+                if status == "open":
+                    existing_json["last_seen"] = today
+                    existing_json["last_task_id"] = task_id
+                    store.set(key, json.dumps(existing_json, ensure_ascii=False),
+                              tags=["friction", "test-gate", repo])
+                else:
+                    existing_json["status"] = "open"
+                    existing_json["last_seen"] = today
+                    existing_json["last_task_id"] = task_id
+                    store.set(key, json.dumps(existing_json, ensure_ascii=False),
+                              tags=["friction", "test-gate", repo])
+            else:
+                entry = {
+                    "status": "open",
+                    "test_node_id": node_id,
+                    "error_signature": error_signature,
+                    "first_seen": today,
+                    "last_seen": today,
+                    "first_task_id": task_id,
+                    "last_task_id": task_id,
+                }
+                store.set(key, json.dumps(entry, ensure_ascii=False),
+                          tags=["friction", "test-gate", repo])
+        finally:
+            store.close()
+    except Exception as exc:
+        if log:
+            log(f"WARN: friction entry write failed for {key}: {exc}")
+        else:
+            print(f"WARN: friction entry write failed for {key}: {exc}", file=sys.stderr)
+
+
 def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
     """Deterministic git/PR tail for the local-fixer engine.
 
@@ -371,6 +560,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         last_test_outcome = fixer_result.get("last_test_outcome")
         max_steps_hit = fixer_result.get("max_steps_reached", False)
         no_progress_hit = fixer_result.get("no_progress", False)
+        stop_reason = fixer_result.get("stop_reason", "")
 
         def _tests_passed(outcome: dict | None) -> bool:
             if not outcome:
@@ -381,11 +571,90 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                 and int(outcome.get("errors") or 0) == 0
             )
 
+        # D1 (agents-core-local-fixer-harness-fix-v0): positive-only test gate.
+        # The legacy gate used the model's LAST run_tests outcome; a pre-existing
+        # failure (or a non-existent test file) as the last outcome discarded a
+        # 207-passing-test diff. The positive-only gate instead checks that
+        # every test the model CREATED OR EDITED in this run passes.
+        #
+        # Paths are resolved against cwd before comparison (D1 mandated
+        # amendment) so a relative write_file target and an absolute run_tests
+        # target both match.
+        #
+        # Fail-closed: when the model touched no tests at all (production-code-
+        # only fix), the gate falls back to the legacy _tests_passed behavior
+        # so a fixer cannot merge untested production code by simply refusing
+        # to write tests.
+        model_touched_tests = _collect_model_touched_tests(transcript, cwd)
+        gate_passed = False
+        if model_touched_tests:
+            # Positive-only gate: every test the model touched must pass.
+            # A touched test "fails" if a FAILED/ERROR node ID refers to it.
+            # A node ID "refers to" a touched test file if the node's file
+            # part equals the touched path (file-level failure) OR the node
+            # is a specific test within that file (node-level failure).
+            # The run must also have at least one passing test (a 0-passed
+            # run is never a pass, even if the model's tests were not the
+            # ones that failed).
+            failed_node_ids = _extract_failed_node_ids(last_test_outcome)
+            touched_failures = [
+                t for t in model_touched_tests
+                if any(
+                    n.split("::")[0] == t or n == t
+                    for n in failed_node_ids
+                )
+            ]
+            if last_test_outcome is not None:
+                passed_c = int(last_test_outcome.get("passed") or 0)
+                if passed_c > 0 and not touched_failures:
+                    gate_passed = True
+        else:
+            # Fail-closed fallback: no tests touched -> legacy gate.
+            gate_passed = _tests_passed(last_test_outcome)
+
+        # D6 (agents-core-local-fixer-harness-fix-v0): witness pre-existing
+        # failures via a friction mem entry so a future daemon-side follow-up
+        # can pick them up autonomously. Pre-existing = a failed node ID whose
+        # file the model did NOT touch. Logged but never blocks the gate.
+        if last_test_outcome is not None:
+            failed_node_ids = _extract_failed_node_ids(last_test_outcome)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            for node in failed_node_ids:
+                node_file = node.split("::")[0]
+                if node_file in model_touched_tests:
+                    continue  # the model's own test failed — that's the gate's concern
+                sig = _error_signature(node, last_test_outcome)
+                _write_friction_entry(
+                    repo=bare_repo,
+                    node_id=node,
+                    error_signature=sig,
+                    task_id=task_id,
+                    today=today,
+                    log=lambda m: print(m, file=sys.stderr),
+                )
+                print(
+                    f"INFO: local-fixer: pre-existing test failure witnessed "
+                    f"(friction entry written): {node}",
+                    file=sys.stderr,
+                )
+
+        # A mem-search-loop abort (D5) is a distinct failure mode: the model
+        # burned the budget on redundant searches and made no edits. Do not
+        # salvage or PR — log the distinct stop_reason and return "".
+        if stop_reason == "mem_search_loop":
+            print(
+                "WARN: local-fixer: run aborted - mem_search_loop "
+                "(redundant mem searches; no edits made)",
+                file=sys.stderr,
+            )
+            return ""
+
         salvaged = False
         if not concluded:
-            if (max_steps_hit or no_progress_hit) and final_diff.strip() and _tests_passed(last_test_outcome):
+            if (max_steps_hit or no_progress_hit) and final_diff.strip() and gate_passed:
                 # Budget ceiling OR no-progress abort, but the diff is clean and
-                # tests pass — salvage the verified work as a PR rather than discard.
+                # the model's own tests pass — salvage the verified work as a
+                # PR rather than discard.
                 salvaged = True
             elif no_progress_hit:
                 print(
@@ -410,11 +679,19 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             if not final_diff.strip():
                 print("WARN: local-fixer: empty diff — no PR", file=sys.stderr)
                 return ""
-            if last_test_outcome is not None:
-                passed = int(last_test_outcome.get("passed") or 0)
-                if passed == 0:
-                    print("WARN: local-fixer: zero passing tests — no PR", file=sys.stderr)
-                    return ""
+            if not gate_passed:
+                # D1 (agents-core-local-fixer-harness-fix-v0): the positive-only
+                # gate (or its fail-closed legacy fallback) rejected this run —
+                # do not PR. The model's own tests did not all pass (or no
+                # tests were touched and the legacy gate failed).
+                print(
+                    "WARN: local-fixer: test gate failed "
+                    f"(model_touched_tests={sorted(model_touched_tests) if model_touched_tests else '[] (legacy gate)'}; "
+                    f"last_test_outcome passed={int((last_test_outcome or {}).get('passed') or 0)} "
+                    f"failed={int((last_test_outcome or {}).get('failed') or 0)}) — no PR",
+                    file=sys.stderr,
+                )
+                return ""
 
         # Deterministic git (model never touches git)
         def _git(*args: str) -> subprocess.CompletedProcess:
