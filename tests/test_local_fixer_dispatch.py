@@ -315,7 +315,7 @@ def test_run_local_fixer_branch_name_uses_slug(tmp_path):
     ):
         sr._run_local_fixer(spec, str(tmp_path))
 
-    # cmd = ["git", "-C", cwd, "checkout", "-b", branch]
+    # cmd = ["git", "-C", cwd, "checkout", "-B", branch]
     branch_cmds = [c for c in git_calls if len(c) > 3 and c[3] == "checkout"]
     assert any("lapis/my-target-v0/forced" in " ".join(c) for c in branch_cmds)
 
@@ -422,6 +422,47 @@ def test_run_local_fixer_local_ignores_existing_branch(tmp_path):
     assert url == "http://x/pulls/1"
     mock_setup.assert_called_once()
     assert mock_setup.call_args.args[2] == "main"
+
+
+def test_run_local_fixer_retry_reset_stale_local_branch_ref(tmp_path):
+    """fixer_retry: checkout uses -B so a stale local ref is reset, not a fatal."""
+    spec = json.loads(_make_spec(
+        tmp_path, agent_type="fixer_retry", slug="forced",
+        existing_branch="lapis/my-target-v0/forced",
+    ).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    git_calls = []
+    setup_refs = []
+
+    def fake_run(cmd, **kwargs):
+        git_calls.append(cmd)
+        return MagicMock(returncode=0, stderr="")
+
+    def fake_setup(task_id, cwd, ref):
+        setup_refs.append(ref)
+        return _fake_handle(worktree)
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value=(_good_fixer_result(), [])),
+        patch("agents_core.worktree.setup_worktree", side_effect=fake_setup),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", return_value={"html_url": "http://x/pulls/1"}),
+        patch("subprocess.run", side_effect=fake_run),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        sr._run_local_fixer(spec, str(tmp_path))
+
+    # (a) the worktree was set up from the verified existing branch (origin/<branch>)
+    # before any checkout ran - the reset target is the correct base.
+    assert setup_refs == ["lapis/my-target-v0/forced"]
+    # (b) the checkout uses -B (resets a stale local ref), not -b (fatals on it).
+    checkout_cmds = [c for c in git_calls if len(c) > 5 and c[3] == "checkout"]
+    assert any(c[4] == "-B" and c[5] == "lapis/my-target-v0/forced" for c in checkout_cmds)
 
 
 # ---------------------------------------------------------------------------
