@@ -1651,6 +1651,20 @@ class _NodeState:
                 "enqueued_at": enqueued_at, "reason": reason, "role": role,
                 "principal": principal if principal is not None else GHOST_PRINCIPAL,
             }
+            # One warning-level line at the enqueue point (defer/wait-list path
+            # only; grants stay visible via the idle-log). Added after the
+            # 2026-08-24 berth incident, where the true admission-defer
+            # mechanism was invisible in the logs and had to be reconstructed
+            # from idle-log resumed/idle_start pairs (shaper-swarm-payload-
+            # carry-v0, item 2). Logging only — no decision-logic change.
+            gating = self._gating_protected_lease(principal)
+            log.warning(
+                f"[{self.node_name}] enqueue-defer work_id={work_id} "
+                f"principal={principal if principal is not None else GHOST_PRINCIPAL} "
+                f"gating_lease={gating['work_id'] if gating else 'brake'} "
+                f"gating_principal={gating['principal'] if gating else 'n/a'} "
+                f"wait_list_depth={len(self.wait_list)}"
+            )
             return {
                 "status": "pending_defer",
                 "work_id": work_id,
