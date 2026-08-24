@@ -233,6 +233,29 @@ def _classify_exception(exc: Exception) -> tuple[str, float | None]:
     return GW_REASON_REQUEST_FAILED, None
 
 
+# D4 (agents-core-local-fixer-harness-fix-v0): explicit max_tokens default for
+# step payloads. The GW llama.cpp endpoint treats an absent max_tokens as
+# "no limit", but the actual server enforces a smaller ceiling, so long model
+# responses get truncated mid-edit and apply_edit fails with "old_string not
+# found". Setting an explicit default makes the payload honest about the
+# ceiling. Overridable via GW_AGENT_MAX_TOKENS.
+GW_AGENT_DEFAULT_MAX_TOKENS: Final[int] = 8192
+
+
+def _resolve_max_tokens(env_name: str = "GW_AGENT_MAX_TOKENS",
+                        default: int = GW_AGENT_DEFAULT_MAX_TOKENS) -> int:
+    """Read the max_tokens override from the environment; fall back on bad input."""
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        logger.warning("[gw_agent] invalid %s=%r; falling back to default %d", env_name, raw, default)
+        return default
+    return val if val > 0 else default
+
+
 def build_step_payload(
     *,
     model: str | None,
@@ -253,8 +276,20 @@ def build_step_payload(
     healthy seat while the real call fails. `tools` may be the OpenAI-format
     dict keyed by name (as stored in DEFAULT_READONLY_TOOLS/DEFAULT_FIXER_TOOLS)
     or an already-flattened list — dict is flattened via `.values()`.
+
+    max_tokens: explicit ceiling for the model's response. When None (default)
+    the GW_AGENT_MAX_TOKENS env override (default 8192) is applied so the
+    payload is never sent with an implicit server-enforced ceiling
+    (agents-core-local-fixer-harness-fix-v0, D4).
     """
     _tools = list(tools.values()) if isinstance(tools, dict) else tools
+    # D4 (agents-core-local-fixer-harness-fix-v0): apply an explicit max_tokens
+    # default (GW_AGENT_MAX_TOKENS, default 8192) when the caller did not
+    # supply one, so the payload is never sent with an implicit
+    # server-enforced ceiling that truncates long responses mid-edit.
+    _effective_max_tokens = (
+        max_tokens if max_tokens is not None else _resolve_max_tokens()
+    )
     return {
         **({} if model is None else {"model": model}),
         "messages": messages,
@@ -262,7 +297,7 @@ def build_step_payload(
         "tool_choice": "auto",
         "temperature": temperature,
         **({} if is_swarm else {"chat_template_kwargs": {"enable_thinking": think}}),
-        **({} if max_tokens is None else {"max_tokens": max_tokens}),
+        "max_tokens": _effective_max_tokens,
     }
 
 
@@ -644,10 +679,35 @@ class GrepExecutor(ToolExecutor):
     def __init__(self, cwd: str | None = None):
         self.cwd = Path(cwd or "/srv/agents").resolve()
 
+    def _sanitize_glob(self, path_glob: str) -> str:
+        """Sanitize a model-supplied path_glob into a CWD-relative ripgrep glob.
+
+        D2 (agents-core-local-fixer-harness-fix-v0): ripgrep's --glob expects a
+        CWD-relative pattern. If the model passes an absolute path (e.g. the
+        worktree root) as path_glob, the glob matches nothing and the search
+        silently returns no matches, burning steps. Strip the self.cwd prefix
+        to make it relative; an empty or "." result becomes "**/*".
+        """
+        glob = (path_glob or "").strip()
+        if not glob:
+            return "**/*"
+        if glob.startswith("/"):
+            cwd_str = str(self.cwd)
+            if glob == cwd_str or glob == cwd_str.rstrip("/"):
+                return "**/*"
+            prefix = cwd_str.rstrip("/") + "/"
+            if glob.startswith(prefix):
+                glob = glob[len(prefix):]
+            elif glob.startswith(cwd_str.rstrip("/")):
+                glob = glob[len(cwd_str.rstrip("/")):].lstrip("/")
+            if not glob or glob == ".":
+                return "**/*"
+        return glob
+
     def execute(self, arguments: dict) -> str | dict:
         try:
             pattern = arguments["pattern"]
-            path_glob = arguments.get("path_glob", "**/*")
+            path_glob = self._sanitize_glob(arguments.get("path_glob", "**/*"))
 
             # Build ripgrep command - search under cwd for the glob pattern
             # Use -l (files only), -m 100 (max 100 matches)
@@ -1120,6 +1180,7 @@ def _build_fixer_result(
     budget_forced: bool = False,
     interrupted: bool = False,
     interrupt_reason: str = "",
+    stop_reason: str = "",
 ) -> dict:
     """Build a FixerResult dict from the completed writeable run.
 
@@ -1169,6 +1230,12 @@ def _build_fixer_result(
         "budget_forced": budget_forced,
         "interrupted": interrupted,
         "interrupt_reason": interrupt_reason,
+        # D5 (agents-core-local-fixer-harness-fix-v0): distinct stop reason for
+        # the mem-search loop abort so the harness/daemon can tell a
+        # loop-detected abort apart from a generic timeout or no-progress
+        # abort. Empty string when the run was not aborted by the loop
+        # detector.
+        "stop_reason": stop_reason,
         "steps": transcript,
     }
 
@@ -1178,7 +1245,11 @@ DEFAULT_READONLY_TOOLS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file from the repository, optionally within a line range. Path is resolved and confined to cwd.",
+            "description": (
+                "Read a file from the repository, optionally within a line range. "
+                "Path is resolved and confined to cwd. Returns up to 8192 bytes per read; "
+                "for larger files, use start_line/end_line to page through."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1508,6 +1579,77 @@ def _build_handler_context(
     }
 
 
+# ---------------------------------------------------------------------------
+# D5 (agents-core-local-fixer-harness-fix-v0): mem-search loop detection.
+#
+# A fixer can drift into a loop of redundant `mem search` calls (run
+# 163732_6641 made 178 mem searches, 0 edits, burning the entire 400-step
+# budget). The sliding window below tracks the last 5 mem-search queries
+# (normalized: lowercase + strip) and resets on any non-mem-search tool
+# action. Two-stage threshold: inject a synthetic "stop searching" user
+# message when the window fills with 5 identical normalized queries, and
+# abort the run with stop_reason="mem_search_loop" when 5 more identical
+# queries fill the window after the injection.
+# ---------------------------------------------------------------------------
+MEM_SEARCH_LOOP_WINDOW: Final[int] = 5
+MEM_SEARCH_LOOP_INJECT_TEXT: Final[str] = (
+    "You are repeating mem searches. Stop searching and start implementing. "
+    "Use the context you already have."
+)
+
+
+def _normalize_mem_query(query: Any) -> str:
+    """Normalize a mem-search query for loop comparison: lowercase + strip."""
+    if not isinstance(query, str):
+        query = "" if query is None else str(query)
+    return query.strip().lower()
+
+
+class _MemSearchLoopDetector:
+    """Sliding-window detector for redundant consecutive mem-search calls.
+
+    Feed every tool call via record(). Any non-mem-search call (or a mem call
+    that is not a search) resets the window to empty — the model is doing
+    work, not looping. When the window fills with
+    MEM_SEARCH_LOOP_WINDOW identical normalized queries:
+      - first time: record() returns "inject" (caller appends the synthetic
+        user message), and the window is cleared so the next
+        MEM_SEARCH_LOOP_WINDOW identical queries escalate;
+      - second time (5 more identical queries after the injection):
+        record() returns "abort" (caller halts the run with
+        stop_reason="mem_search_loop").
+    """
+
+    def __init__(self) -> None:
+        self._window: list[str] = []
+        self._injected = False
+
+    @property
+    def injected(self) -> bool:
+        return self._injected
+
+    def record(self, tool_name: str, tool_args: dict) -> str | None:
+        """Record one tool call; return 'inject', 'abort', or None."""
+        if tool_name == "mem" and isinstance(tool_args, dict) \
+                and tool_args.get("action") == "search":
+            norm = _normalize_mem_query(tool_args.get("query"))
+            self._window.append(norm)
+            if len(self._window) > MEM_SEARCH_LOOP_WINDOW:
+                self._window.pop(0)
+            if len(self._window) == MEM_SEARCH_LOOP_WINDOW:
+                if len(set(self._window)) == 1:
+                    if self._injected:
+                        return "abort"
+                    self._injected = True
+                    self._window = []
+                    return "inject"
+        else:
+            # Any non-mem-search action resets the window (the model is doing
+            # work, not looping).
+            self._window = []
+        return None
+
+
 def _resolve_int_env(env_name: str, default: int, log: Callable[[str], None] | None) -> int:
     """Read an int override from the environment; fall back (and log once) on bad input."""
     raw = os.environ.get(env_name)
@@ -1787,6 +1929,13 @@ def _call_gw_agent_impl(
     _interrupted = False
     _interrupt_reason = ""
     _interrupted_step = 0
+    # D5 (agents-core-local-fixer-harness-fix-v0): mem-search loop detector.
+    # Sliding window of the last 5 mem-search queries (normalized); resets on
+    # any non-mem-search tool action. Injects a synthetic "stop searching"
+    # message at 5 consecutive identical queries and aborts the run with
+    # stop_reason="mem_search_loop" at 5 more after the injection.
+    _mem_loop_detector = _MemSearchLoopDetector()
+    _mem_loop_stop_reason = ""
 
     # Acquire doorman lease for the whole run (unless acquire_lease=False for swarm).
     from agents_core.doorman_client import DoormanClient, DoormanUnreachable, _gw_acquire_timeout
@@ -2071,6 +2220,34 @@ def _call_gw_agent_impl(
                                 _interrupted_step = step_num + 1
                         if _interrupted:
                             break
+
+                        # D5 (agents-core-local-fixer-harness-fix-v0): mem-search
+                        # loop detection. Record this tool call in the sliding
+                        # window BEFORE execution so a loop of redundant searches
+                        # is caught even when the searches themselves error. Any
+                        # non-mem-search action resets the window.
+                        _mem_loop_signal = _mem_loop_detector.record(tool_name, tool_args)
+                        if _mem_loop_signal == "inject":
+                            if log:
+                                log(
+                                    "[gw_agent] mem-search loop detector: 5 consecutive "
+                                    "identical mem searches - injecting stop-searching nudge"
+                                )
+                            messages.append({
+                                "role": "user",
+                                "content": MEM_SEARCH_LOOP_INJECT_TEXT,
+                            })
+                        elif _mem_loop_signal == "abort":
+                            if log:
+                                log(
+                                    "[gw_agent] mem-search loop detector: 5 more identical "
+                                    "mem searches after the nudge - aborting with "
+                                    "stop_reason=mem_search_loop"
+                                )
+                            _mem_loop_stop_reason = "mem_search_loop"
+                            _interrupted = True
+                            _interrupt_reason = "mem_search_loop"
+                            _interrupted_step = step_num + 1
 
                         # Before-tool gate (fail-closed: raising rejects this tool, loop continues)
                         _gate_override: dict | None = None
@@ -2394,7 +2571,8 @@ def _call_gw_agent_impl(
                 _restart_for_perturbation = False
                 continue
 
-            # Interrupted: cancel_check or before_tool stop halted the loop.
+            # Interrupted: cancel_check, before_tool stop, or the D5 mem-search
+            # loop detector halted the loop.
             if _interrupted:
                 if log:
                     log(f"[gw_agent] interrupted at step {_interrupted_step} reason={_interrupt_reason}")
@@ -2403,6 +2581,11 @@ def _call_gw_agent_impl(
                     interrupted=True, interrupt_reason=_interrupt_reason,
                     interrupted_step=_interrupted_step,
                     reason_out=reason_out,
+                    # D5 (agents-core-local-fixer-harness-fix-v0): carry the
+                    # distinct stop_reason (e.g. "mem_search_loop") through to
+                    # the FixerResult so the harness can log it and the daemon
+                    # can see it as a distinct failure mode.
+                    stop_reason=_mem_loop_stop_reason,
                 )
 
             # Exhausted max_steps without conclusion; try forced conclusion.
@@ -2798,11 +2981,15 @@ def _finalize_writeable_or_readonly(
     interrupted_step: int = 0,
     reason_out: list[str] | None = None,
     reason: str | None = None,
+    stop_reason: str = "",
 ) -> str | None | tuple:
     """Route to FixerResult or plain result based on writeable flag.
 
     reason_out/reason are only consulted on the readonly (writeable=False) leg - a
     writeable=True call always returns a FixerResult here and never touches reason_out.
+    stop_reason (D5, agents-core-local-fixer-harness-fix-v0) is a distinct
+    machine-readable abort reason carried on the FixerResult (e.g.
+    "mem_search_loop" when the mem-search loop detector aborted the run).
     """
     if writeable:
         fixer = _build_fixer_result(
@@ -2813,6 +3000,7 @@ def _finalize_writeable_or_readonly(
             budget_forced=budget_forced,
             interrupted=interrupted,
             interrupt_reason=interrupt_reason,
+            stop_reason=stop_reason,
         )
         return (fixer, transcript)
     return _finalize_result(
