@@ -453,6 +453,73 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
     transcript_path = _ARTIFACT_DIR / f"{task_id}-gw-transcript.json"
 
     worktree_path = None
+
+    # ------------------------------------------------------------------
+    # Supervisor lease (gw-gpu1-berth-standing-seat-v0, leg 2, Doorman B).
+    #
+    # A doorman lease held for the WHOLE local-fixer job (entry acquire,
+    # finally release) so the doorman's mid-job stop machinery (force-stop's
+    # _worker_lease_blockers guard) cannot stop the seat out from under an
+    # in-flight fixer job. Distinct from the per-run job lease that
+    # call_gw_agent acquires internally (work_id=task_id): the lease dict is
+    # keyed by work_id, so a same-key lease would be clobbered and released
+    # mid-job by the inner finally. This lease uses work_id=f"{task_id}-berth-
+    # sup", principal="fixer-supervisor", role="worker" (force-stop blocks
+    # ONLY role="worker" leases with principal self-exclusion), and
+    # lease_class="deferrable" (the fixer's existing class).
+    #
+    # TTL = timeout_s + 60 — the same arithmetic as the per-run lease
+    # (the queue's hard cap). Acquired at entry + setup lag, it structurally
+    # outlives the process killed at submit + timeout_s + 60, so NO renewal
+    # is needed.
+    #
+    # SOFT FAIL: acquire failure (DoormanUnreachable, pending_defer, or any
+    # exception) is logged and the job PROCEEDS un-supervised. The lease is a
+    # safety net, never a gate on job progress.
+    # ------------------------------------------------------------------
+    sup_lease_client = None
+    sup_lease_id = f"{task_id}-berth-sup"
+    try:
+        from agents_core.doorman_client import (
+            DoormanClient,
+            DoormanUnreachable,
+        )
+
+        sup_lease_client = DoormanClient()
+        acq = sup_lease_client.acquire(
+            "gravitywell",
+            sup_lease_id,
+            int(spec.get("timeout_s", 1800)) + 60,
+            "fixer-job-supervisor",
+            role="worker",
+            principal="fixer-supervisor",
+            lease_class="deferrable",
+        )
+        # acquire() RETURNS a status dict (it does not raise on
+        # pending_defer/deferred): only "serving" means a lease was
+        # registered. Any other status is a soft fail - log it and drop
+        # the client so the finally-release is skipped (the spec's
+        # soft-fail contract: log + job proceeds un-supervised).
+        if not isinstance(acq, dict) or acq.get("status") != "serving":
+            _status = acq.get("status") if isinstance(acq, dict) else type(acq).__name__
+            print(
+                f"WARN: local-fixer: supervisor lease acquire soft-failed "
+                f"(work_id={sup_lease_id}, status={_status}) - job proceeds "
+                f"un-supervised",
+                file=sys.stderr,
+            )
+            sup_lease_client = None
+    except Exception as exc:
+        # Soft fail: the job proceeds un-supervised. The per-run job lease
+        # (keep-both) still holds on a defer, and the guard 2c covers the
+        # suspend layer regardless.
+        print(
+            f"WARN: local-fixer: supervisor lease acquire soft-failed "
+            f"(work_id={sup_lease_id}): {exc}",
+            file=sys.stderr,
+        )
+        sup_lease_client = None
+
     try:
         from agents_core.gw_agent import call_gw_agent
         from agents_core.worktree import setup_worktree, teardown_worktree
@@ -539,6 +606,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             max_steps=_max_steps,
             backend_url=spec.get("backend_url"),
             acquire_lease=spec.get("acquire_lease", True),
+            swarm_payload=spec.get("swarm_payload", False),
             lease_class="deferrable",
             model=spec.get("model"),
             handler_hook=_handler_hook,
@@ -782,6 +850,24 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         return ""
 
     finally:
+        # Release the supervisor lease (gw-gpu1-berth-standing-seat-v0, leg 2,
+        # Doorman B). Mirrors the per-run lease's finally-release in
+        # gw_agent.py: released on BOTH the success and failure paths. Soft
+        # fail: a release failure is logged and swallowed — the TTL bounds the
+        # zombie window (<= TTL + one GC tick) if the release is lost.
+        if sup_lease_client is not None:
+            try:
+                sup_lease_client.release("gravitywell", sup_lease_id)
+            except Exception as exc:
+                print(
+                    f"WARN: local-fixer: supervisor lease release failed "
+                    f"(work_id={sup_lease_id}): {exc}",
+                    file=sys.stderr,
+                )
+            try:
+                sup_lease_client.close()
+            except Exception:
+                pass
         if worktree_path is not None:
             try:
                 teardown_worktree(task_id, effective_cwd)

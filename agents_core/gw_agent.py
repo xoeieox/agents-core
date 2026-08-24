@@ -1701,6 +1701,7 @@ def _call_gw_agent_impl(
     handler_objective: str = "",
     handler_max_interventions: int = 2,
     skip_probe: bool = False,
+    swarm_payload: bool = False,
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Run a multi-step read-only tool-loop on GravityWell.
 
@@ -1866,7 +1867,14 @@ def _call_gw_agent_impl(
 
     # Capture swarm flag BEFORE backend_url is reassigned to GW_URL.
     # After the reassignment backend_url is never None, so testing it downstream is useless.
-    _is_swarm = (backend_url is not None) and (not acquire_lease)
+    #
+    # swarm_payload (gw-gpu1-berth-standing-seat-v0, leg 2, keep-both): an
+    # EXPLICIT registry key that OR's into the condition, so the berth seat
+    # (backend_url set + acquire_lease true) runs the swarm shape (field drops,
+    # NInfer-compatible) WHILE still holding the per-run doorman lease. Every
+    # existing seat's _is_swarm value is UNCHANGED: the new key defaults False
+    # and the legacy computation is untouched (the parity table test pins this).
+    _is_swarm = swarm_payload or ((backend_url is not None) and (not acquire_lease))
 
     if tools is None:
         tools = DEFAULT_FIXER_TOOLS if writeable else DEFAULT_READONLY_TOOLS
@@ -2705,6 +2713,7 @@ def call_gw_agent(
     handler_objective: str = "",
     handler_max_interventions: int = 2,
     skip_probe: bool = False,
+    swarm_payload: bool = False,
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Locality-ledger side-write wrapper around _call_gw_agent_impl().
 
@@ -2737,6 +2746,7 @@ def call_gw_agent(
             reason_out=reason_out, served_model_out=_locality_served,
             model=model, handler_hook=handler_hook, handler_objective=handler_objective,
             handler_max_interventions=handler_max_interventions, skip_probe=skip_probe,
+            swarm_payload=swarm_payload,
         )
         return _locality_result
     except Exception:
