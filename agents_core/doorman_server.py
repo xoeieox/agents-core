@@ -216,6 +216,38 @@ GW_DUAL_WAKE_DEADLINE_SEC = int(os.environ.get("GW_DUAL_WAKE_DEADLINE_SEC", "720
 # Slot 2's port — Slot 2's base host is derived from GW_URL (Slot 1), not re-hardcoded.
 GW_SLOT2_PORT = int(os.environ.get("GW_SLOT2_PORT", "8082"))
 
+# ---------------------------------------------------------------------------
+# GPU 1 (the berth) awareness — gw-gpu1-berth-standing-seat-v0, leg 2.
+#
+# The 3090 Ti (GravityWell GPU 1) hosts the standing NInfer Qwen3.8-27B fixer
+# seat (the "berth") at host port :8082. It is a SEPARATE card from the GPU 0
+# production seat, so its activity is engine-independent of whatever class
+# :8081 is serving — the berth's Glances telemetry source votes in ALL
+# combine branches, not just one.
+#
+# The telemetry source is Glances (API v4, /api/4/gpu/), promoted to a
+# supervised unit in leg 1. It binds the tailnet interface (NOT 0.0.0.0 —
+# the no-unauthenticated-LAN-exposure invariant); the doorman reaches it
+# over the tailnet. Env seams for hermetic tests:
+#   DOORMAN_GLANCES_URL — base URL of the Glances API (default the tailnet
+#                         address; the /api/4/gpu/ path is appended).
+#   DOORMAN_GPU1_PROC_THRESHOLD — the proc>threshold test for the True vote
+#                         (default 0: ANY proc>0 sample is activity).
+#   DOORMAN_GPU1_MEM_THRESHOLD_PCT — DIAGNOSTIC ONLY (distinguishes the
+#                         "berth resident" ~77% mem from an ollama baseline
+#                         context in the status surface). NEVER part of the
+#                         vote: the vote is proc-only (the S2 binding
+#                         statement — an idle-but-warm berth MUST vote False
+#                         or the box never sleeps).
+# ---------------------------------------------------------------------------
+DOORMAN_GLANCES_URL = os.environ.get(
+    "DOORMAN_GLANCES_URL", "http://203.0.113.11:61208"
+)
+DOORMAN_GPU1_PROC_THRESHOLD = float(os.environ.get("DOORMAN_GPU1_PROC_THRESHOLD", "0"))
+DOORMAN_GPU1_MEM_THRESHOLD_PCT = float(
+    os.environ.get("DOORMAN_GPU1_MEM_THRESHOLD_PCT", "50")
+)
+
 # The async-initiate ssh call for dual mode only needs to spawn the backgrounded
 # `gw-serve dual` remotely and return — it must NOT block for the ~488s bring-up
 # (that's what the health-poll loop in _wake_dual is for). A short timeout here
@@ -655,11 +687,20 @@ class _NodeState:
         # outside self.lock, same convention as _last_probed_task_by_slot.
         self._llamacpp_metrics_baseline: dict[str, dict[str, float]] = {}
         # Raw per-source tri-state results from the most recent
-        # _probe_slot_activity() tick, keyed "A"/"B1"/"B2"/"C" — diagnostic
-        # only (D3), read by the park block to name which sources were
-        # indeterminate when a bound-exceeded park fires. Mutated outside
-        # self.lock, same convention as _last_probed_task_by_slot.
+        # _probe_slot_activity() tick, keyed "A"/"B1"/"B2"/"C"/"GPU1" —
+        # diagnostic only (D3), read by the park block to name which sources
+        # were indeterminate when a bound-exceeded park fires. Mutated
+        # outside self.lock, same convention as _last_probed_task_by_slot.
         self._last_probe_raw: dict[str, bool | None] = {}
+        # GPU 1 (berth) Glances diagnostics from the most recent probe tick
+        # (gw-gpu1-berth-standing-seat-v0, leg 2): mem_pct/proc are the raw
+        # Glances readings (mem is DIAGNOSTIC ONLY — never part of the vote,
+        # which is proc-only); seat_health is the berth's :8082 /health 200.
+        # Populated by _probe_gpu1_glances() outside self.lock, read by
+        # status_snapshot() under the lock (plain reads of immutable scalars).
+        self._gpu1_glances_mem_pct: float | None = None
+        self._gpu1_glances_proc: float | None = None
+        self._gpu1_seat_health: bool | None = None
         # Tri-state dual-slot activity probe (gw-doorman-vllm-activity-probe-v0):
         # True when the most recent _probe_slot_activity() tick was indeterminate
         # (at least one probe ambiguous, none confirmed activity) — read by the
@@ -1062,13 +1103,87 @@ class _NodeState:
                 actual_defer=actual_defer,
             )
 
+    def _probe_gpu1_glances(self) -> bool | None:
+        """Probe E: the GPU 1 (berth) Glances activity probe
+        (gw-gpu1-berth-standing-seat-v0, leg 2).
+
+        GET {DOORMAN_GLANCES_URL}/api/4/gpu/ (Glances API v4; the API issues
+        a 307 the client follows — requests follows redirects by default).
+        The response is a JSON LIST of per-GPU objects with `gpu_id`/`mem`/
+        `proc` (the T1c contract). The berth is GPU 1 — a SEPARATE card from
+        the GPU 0 production seat — so this source is engine-independent of
+        whatever class :8081 is serving and votes in ALL combine branches.
+
+        Tri-state, mirroring Probe B's discipline (non-200/exception -> None,
+        NEVER a spurious False):
+          True  — nvidia1.proc > DOORMAN_GPU1_PROC_THRESHOLD (any proc>0
+                  sample resets idle_since, same semantics as the existing
+                  probe-activity re-arm).
+          False — nvidia1.proc == 0, INCLUDING the idle-but-warm berth
+                  (mem ~77%, proc 0). The expected standing state MUST vote
+                  False or the box never sleeps (the S2 binding statement).
+                  The vote is PROC-ONLY by design: mem is a residency
+                  diagnostic (it belongs to the guard's suspend check + the
+                  stop's drain verify, not the sleep predicate).
+          None  — unreachable/unparsable (dead Glances, timeout, malformed
+                  list). A dead Glances maps to the BOUNDED probe-blindness
+                  class (the existing grace+900=1500s semantics, then
+                  proceed to stop) — NOT the topology-unknown unbounded
+                  never-park class, which is reserved for a fundamentally
+                  unclassifiable seat.
+
+        Also updates the diagnostic fields _gpu1_glances_mem_pct /
+        _gpu1_glances_proc / _gpu1_seat_health (status surface). Never
+        raises. Must be called OUTSIDE self.lock (blocking HTTP, ~2.5s cap).
+        """
+        # Seat health: the berth's own :8082 /health (200 = seat up).
+        try:
+            resp = requests.get(f"{self._slot2_url()}/health", timeout=2.5)
+            self._gpu1_seat_health = resp.status_code == 200
+        except Exception:
+            self._gpu1_seat_health = False
+
+        try:
+            resp = requests.get(f"{DOORMAN_GLANCES_URL}/api/4/gpu/", timeout=2.5)
+            if resp.status_code != 200:
+                return None
+            gpus = resp.json()
+            if not isinstance(gpus, list):
+                return None
+            gpu1 = next(
+                (
+                    g for g in gpus
+                    if isinstance(g, dict) and str(g.get("gpu_id")) == "1"
+                ),
+                None,
+            )
+            if gpu1 is None:
+                return None
+            proc = gpu1.get("proc")
+            mem = gpu1.get("mem")
+            if not isinstance(proc, (int, float)):
+                return None
+            if isinstance(mem, (int, float)):
+                self._gpu1_glances_mem_pct = float(mem)
+            self._gpu1_glances_proc = float(proc)
+            return proc > DOORMAN_GPU1_PROC_THRESHOLD
+        except Exception as exc:
+            log.debug(f"[{self.node_name}] gpu1 glances probe inconclusive: {exc}")
+            return None
+
     def _probe_slot_activity(self) -> bool | None:
         """Tri-state unmediated-caller activity probe across all signal sources
         (gw-doorman-vllm-activity-probe-v0, extended by agents-core-doorman-
         class-aware-activity-probe-v0) — Probe A (llama.cpp /slots), Probe B1/B2
-        (vLLM /metrics, both dual slots), and Probe C (llama.cpp /metrics counter
-        diff), dispatched concurrently in a 4-worker pool so total probe-tick
-        latency stays ~2.5s (the slowest probe) rather than growing additively.
+        (vLLM /metrics, both dual slots), Probe C (llama.cpp /metrics counter
+        diff), and Probe E (the GPU 1 / berth Glances vote,
+        gw-gpu1-berth-standing-seat-v0), dispatched concurrently in a 5-worker
+        pool so total probe-tick latency stays ~2.5s (the slowest probe)
+        rather than growing additively.
+
+        Probe E is engine-independent (the berth is a separate card from
+        :8081's class) and therefore votes in ALL combine branches below —
+        it is not dropped by the class-aware filter.
 
         Class-aware combine (D2): which sources VOTE depends on self._serving_is_big,
         resolved earlier THIS tick by _refresh_serving_cache. A source that is
@@ -1077,7 +1192,7 @@ class _NodeState:
         parking a genuinely-idle seat, or blinding a genuinely-busy one):
 
           - self._serving_is_big is None (flag off, OR flag on but topology
-            unresolved this tick): vote-unaware, exactly as before D2 — all four
+            unresolved this tick): vote-unaware, exactly as before D2 — all
             sources vote. (Unknown topology's never-park behavior lives in the
             park block, not here — this function's output is unchanged for it.)
           - True  (llama.cpp class): B1/B2 are structurally absent — non-voting.
@@ -1085,6 +1200,10 @@ class _NodeState:
           - False (vLLM class): A is structurally absent — non-voting. Combine
             B1 + B2; if the declared home posture is slot1-solo, B2 (Slot 2,
             parked by design) is non-voting too — combine B1 alone.
+          - Probe E (the GPU 1 / berth Glances vote) is NOT dropped by the
+            class-aware filter: the berth is a separate card from :8081's
+            class, so it votes in ALL three branches (appended to the vote
+            list above).
 
         Combines: True if any voting source confirms activity (a real True
         always wins); False only if every voting source confirms no activity;
@@ -1092,23 +1211,30 @@ class _NodeState:
 
         Must be called OUTSIDE self.lock (blocking HTTP via a thread pool).
         """
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=5) as pool:
             fut_a = pool.submit(self._probe_llama_slots_activity)
             fut_b1 = pool.submit(self._probe_vllm_metrics_activity, self.gw_url)
             fut_b2 = pool.submit(self._probe_vllm_metrics_activity, self._slot2_url())
             fut_c = pool.submit(self._probe_llamacpp_metrics_activity, self.gw_url)
-            a, b1, b2, c = fut_a.result(), fut_b1.result(), fut_b2.result(), fut_c.result()
+            # Probe E (gw-gpu1-berth-standing-seat-v0): the GPU 1 (berth)
+            # Glances vote. Engine-independent — the berth is a separate card
+            # from :8081's class — so it votes in ALL combine branches below.
+            fut_gpu1 = pool.submit(self._probe_gpu1_glances)
+            (a, b1, b2, c, gpu1) = (
+                fut_a.result(), fut_b1.result(), fut_b2.result(),
+                fut_c.result(), fut_gpu1.result(),
+            )
 
-        self._last_probe_raw = {"A": a, "B1": b1, "B2": b2, "C": c}
+        self._last_probe_raw = {"A": a, "B1": b1, "B2": b2, "C": c, "GPU1": gpu1}
 
         serving_is_big = self._serving_is_big
         if serving_is_big is None:
-            votes = [a, b1, b2, c]
+            votes = [a, b1, b2, c, gpu1]
         elif serving_is_big:
-            votes = [a, c]
+            votes = [a, c, gpu1]
         else:
             home_mode = self._read_declared_home_posture()
-            votes = [b1] if home_mode == "slot1-solo" else [b1, b2]
+            votes = ([b1] if home_mode == "slot1-solo" else [b1, b2]) + [gpu1]
 
         if any(v is True for v in votes):
             return True
@@ -1833,9 +1959,36 @@ class _NodeState:
         return False
 
     def _is_slot2_serving(self, timeout: float = 3.0) -> bool:
+        """Slot 2 readiness — ENGINE-AWARE (gw-gpu1-berth-standing-seat-v0,
+        leg 2, Fix 2 / port hazard (b)).
+
+        The berth (NInfer Qwen3.8-27B) sits on the SAME host port as Slot 2
+        (:8082, GW_SLOT2_PORT). NInfer's own /health answers 200 on :8082, so
+        a bare health check would declare "dual ready" against the WRONG
+        engine (the false dual-readiness hazard). Slot 2 is ready iff
+        :8082/health is 200 AND :8082/v1/models contains a model with
+        owned_by == "vllm" (the vLLM seat's shape). A 200 with a non-vLLM
+        payload (the berth) = NOT ready — the poll keeps waiting (the
+        existing giveup/retry machinery bounds the window; a late wake is the
+        safe direction, a false-ready is not).
+        """
         try:
             resp = requests.get(f"{self._slot2_url()}/health", timeout=timeout)
-            return resp.status_code == 200
+            if resp.status_code != 200:
+                return False
+            models_resp = requests.get(
+                f"{self._slot2_url()}/v1/models", timeout=timeout
+            )
+            if models_resp.status_code != 200:
+                return False
+            payload = models_resp.json()
+            models = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(models, list):
+                return False
+            return any(
+                isinstance(m, dict) and m.get("owned_by") == "vllm"
+                for m in models
+            )
         except Exception:
             return False
 
@@ -2088,7 +2241,26 @@ class _NodeState:
         the existing gw-serve stop verb (already safe/idempotent per
         gravitywell-doorman-clean-stop-v0) rather than inventing a new host-script
         surface. Errors are swallowed — this is a safety net, not the primary path.
+
+        LEASE GATE (gw-gpu1-berth-standing-seat-v0, leg 2, Fix 1 — critique
+        mandatory refinement b): the cleanup fired `gw-serve stop`
+        UNCONDITIONALLY. With DOORMAN_DEFAULT_SERVE_MODE=dual (live), a failed
+        dual launch while a supervisor lease is held would stop ALL seats
+        mid-job. The _worker_lease_blockers guard (the :2407-2434 pattern) now
+        blocks the stop when an active role="worker" lease exists; a blocked
+        cleanup logs and leaves the half-initialized wake to the existing
+        giveup/reconciler path.
         """
+        with self.lock:
+            self._gc_stale()
+            blockers = self._worker_lease_blockers()
+        if blockers:
+            log.warning(
+                f"[{self.node_name}] dual-initiation cleanup: BLOCKED by "
+                f"{len(blockers)} active worker lease(s) — leaving the "
+                f"half-initialized wake to the giveup/reconciler path"
+            )
+            return
         try:
             subprocess.run(
                 ["ssh", "gravitywell", "gw-serve stop"],
@@ -2380,6 +2552,28 @@ class _NodeState:
                 # import form the wake path itself uses (`from scripts import
                 # gw_topology`) — a single source of truth about importability.
                 "actuator_available": _gw_topology_importable(),
+                # GPU 1 (berth) awareness block (gw-gpu1-berth-standing-seat-v0,
+                # leg 2): the operator surface for "what does the doorman see on
+                # the 3090?". glances=dead + last_vote=None makes the bounded
+                # probe-blindness mapping OBSERVABLE (a dead Glances maps to the
+                # existing grace+900=1500s blind bound, then a stop with
+                # stop_reason="probe_blind_bound_exceeded" — NOT the
+                # topology-unknown unbounded never-park path). glances_mem_pct
+                # is DIAGNOSTIC ONLY (never part of the proc-only vote); the
+                # calibrated +0.65 pp driver-overhead offset (T1c: 90.80% smi vs
+                # 91.45% glances) is noted on the field.
+                "gpu1": {
+                    "berth_unit": self._gpu1_seat_health,
+                    "seat_health": self._gpu1_seat_health,
+                    "glances": (
+                        "reachable"
+                        if self._gpu1_glances_proc is not None
+                        else "dead"
+                    ),
+                    "glances_mem_pct": self._gpu1_glances_mem_pct,
+                    "glances_proc": self._gpu1_glances_proc,
+                    "last_vote": self._last_probe_raw.get("GPU1"),
+                },
             }
 
     # ------------------------------------------------------------------
