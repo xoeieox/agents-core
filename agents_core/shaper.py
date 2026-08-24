@@ -125,6 +125,7 @@ class ShapedAgent:
     engine: str = "claude"
     backend_url: str | None = None
     acquire_lease: bool = True
+    swarm_payload: bool = False
 
 
 @dataclass
@@ -172,6 +173,7 @@ class Shaper:
             if isinstance(backend_url, str):
                 backend_url = backend_url.strip() or None
             acquire_lease = _bool_val(body.get("acquire_lease", True))
+            swarm_payload = _bool_val(body.get("swarm_payload", False))
 
             # Phantom-swarm guardrail: acquire_lease=false with no backend_url would
             # hit the default GravityWell endpoint without acquiring a lease to wake
@@ -198,6 +200,7 @@ class Shaper:
                 engine=str(body.get("engine", "claude")),
                 backend_url=backend_url,
                 acquire_lease=acquire_lease,
+                swarm_payload=swarm_payload,
             )
         self._registry = registry
 
@@ -277,6 +280,7 @@ class Shaper:
             "model": agent.model,
             "backend_url": agent.backend_url,
             "acquire_lease": agent.acquire_lease,
+            "swarm_payload": agent.swarm_payload,
             "timeout_s": agent.timeout_s,
             "system": system,
             "prompt": user_prompt,
