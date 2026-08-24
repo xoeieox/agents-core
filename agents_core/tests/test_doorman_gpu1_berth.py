@@ -52,10 +52,16 @@ def _make_state(gw_url: str = GW_URL_DEFAULT) -> _NodeState:
     return _NodeState(gw_url)
 
 
-def _glances_list(proc: float, mem: float, gpu_id: str = "1"):
-    """A Glances API v4 /api/4/gpu/ LIST payload with one GPU entry."""
+def _glances_list(proc: float, mem: float, gpu_id: str = "nvidia1"):
+    """A Glances API v4 /api/4/gpu/ LIST payload with one GPU entry.
+
+    gpu_id uses the REAL glances v4 shape - "nvidia<N>" where N is the CUDA
+    device index (the berth is CUDA device 1; the primary card is nvidia0).
+    The old fixture hard-coded the bare index ("1"), which the live API does
+    not emit - so the suite validated against a shape the production glances
+    never returns. (finding/doorman-gpu1-glances-gpu-id-2026-08-24)"""
     return [
-        {"gpu_id": "0", "mem": 10.0, "proc": 0.0},
+        {"gpu_id": "nvidia0", "mem": 10.0, "proc": 0.0},
         {"gpu_id": gpu_id, "mem": mem, "proc": proc},
     ]
 
@@ -128,16 +134,17 @@ class TestGpu1ProbeTriState:
         state = _make_state()
         with patch("agents_core.doorman_server.requests.get", side_effect=[
             _mock_resp(200),
-            _mock_resp(200, {"gpu_id": "1", "proc": 0.0, "mem": 77.0}),
+            _mock_resp(200, {"gpu_id": "nvidia1", "proc": 0.0, "mem": 77.0}),
         ]):
             assert state._probe_gpu1_glances() is None
 
     def test_missing_gpu1_entry_votes_none(self):
-        """A LIST with no gpu_id=="1" entry -> None (no reading, not idle)."""
+        """A LIST with no index-1 (nvidia1) entry -> None (no reading, not
+        idle): only the primary card (nvidia0) is present."""
         state = _make_state()
         with patch("agents_core.doorman_server.requests.get", side_effect=[
             _mock_resp(200),
-            _mock_resp(200, [{"gpu_id": "0", "mem": 10.0, "proc": 0.0}]),
+            _mock_resp(200, [{"gpu_id": "nvidia0", "mem": 10.0, "proc": 0.0}]),
         ]):
             assert state._probe_gpu1_glances() is None
 

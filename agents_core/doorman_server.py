@@ -1169,10 +1169,20 @@ class _NodeState:
             gpus = resp.json()
             if not isinstance(gpus, list):
                 return None
+            # glances v4 labels gpu_id "nvidia<N>" (N = the CUDA device index);
+            # the berth is CUDA device 1 (the 3090 Ti). Match the trailing index
+            # - not the whole label - so the live "nvidia1" and the hermetic
+            # fixture's bare "1" both resolve to the 3090 Ti. The old exact-match
+            # on "1" silently never matched the real "nvidia1" label, so every
+            # gpu1 glances reading came back dead. (2026-08-24 live-test finding)
+            def _glances_index(entry):
+                m = re.search(r"(\d+)$", str(entry.get("gpu_id")))
+                return m.group(1) if m else str(entry.get("gpu_id"))
+
             gpu1 = next(
                 (
                     g for g in gpus
-                    if isinstance(g, dict) and str(g.get("gpu_id")) == "1"
+                    if isinstance(g, dict) and _glances_index(g) == "1"
                 ),
                 None,
             )
