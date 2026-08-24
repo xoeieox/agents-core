@@ -427,7 +427,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                 print(f"WARN: local-fixer: git {args[0]} timed out", file=sys.stderr)
                 return subprocess.CompletedProcess(["git", "-C", cwd, *args], 1, "", "timeout")
 
-        r = _git("checkout", "-b", branch)
+        r = _git("checkout", "-B", branch)
         if r.returncode != 0:
             print(f"WARN: local-fixer: git checkout -b failed: {r.stderr.strip()}", file=sys.stderr)
             return ""
