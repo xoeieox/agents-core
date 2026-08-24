@@ -701,6 +701,12 @@ class _NodeState:
         self._gpu1_glances_mem_pct: float | None = None
         self._gpu1_glances_proc: float | None = None
         self._gpu1_seat_health: bool | None = None
+        # berth_unit: the ninfer-fixer systemd unit state (active/inactive) -
+        # DISTINCT from seat_health (the :8082 /health 200). Populated by
+        # _probe_gpu1_glances() (same tick, outside self.lock, never raises);
+        # None = unknown (pre-probe, ssh timeout/error). Never conflated with
+        # the seat health.
+        self._gpu1_berth_unit: bool | None = None
         # Tri-state dual-slot activity probe (gw-doorman-vllm-activity-probe-v0):
         # True when the most recent _probe_slot_activity() tick was indeterminate
         # (at least one probe ambiguous, none confirmed activity) — read by the
@@ -1142,6 +1148,19 @@ class _NodeState:
             self._gpu1_seat_health = resp.status_code == 200
         except Exception:
             self._gpu1_seat_health = False
+
+        # berth_unit: the ninfer-fixer systemd unit state (active/inactive) -
+        # distinct from seat_health (the :8082 /health 200). Probed over the
+        # doorman's existing gravitywell ssh channel; timeout/error -> None
+        # (unknown). Never conflated with the seat health.
+        try:
+            r = subprocess.run(
+                ["ssh", "gravitywell", "systemctl", "is-active", "ninfer-fixer"],
+                capture_output=True, text=True, timeout=3.0,
+            )
+            self._gpu1_berth_unit = r.stdout.strip() == "active"
+        except Exception:
+            self._gpu1_berth_unit = None
 
         try:
             resp = requests.get(f"{DOORMAN_GLANCES_URL}/api/4/gpu/", timeout=2.5)
@@ -2563,7 +2582,11 @@ class _NodeState:
                 # calibrated +0.65 pp driver-overhead offset (T1c: 90.80% smi vs
                 # 91.45% glances) is noted on the field.
                 "gpu1": {
-                    "berth_unit": self._gpu1_seat_health,
+                    "berth_unit": (
+                        "active" if self._gpu1_berth_unit is True
+                        else "inactive" if self._gpu1_berth_unit is False
+                        else None
+                    ),
                     "seat_health": self._gpu1_seat_health,
                     "glances": (
                         "reachable"

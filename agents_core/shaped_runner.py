@@ -486,7 +486,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         )
 
         sup_lease_client = DoormanClient()
-        sup_lease_client.acquire(
+        acq = sup_lease_client.acquire(
             "gravitywell",
             sup_lease_id,
             int(spec.get("timeout_s", 1800)) + 60,
@@ -495,6 +495,20 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             principal="fixer-supervisor",
             lease_class="deferrable",
         )
+        # acquire() RETURNS a status dict (it does not raise on
+        # pending_defer/deferred): only "serving" means a lease was
+        # registered. Any other status is a soft fail - log it and drop
+        # the client so the finally-release is skipped (the spec's
+        # soft-fail contract: log + job proceeds un-supervised).
+        if not isinstance(acq, dict) or acq.get("status") != "serving":
+            _status = acq.get("status") if isinstance(acq, dict) else type(acq).__name__
+            print(
+                f"WARN: local-fixer: supervisor lease acquire soft-failed "
+                f"(work_id={sup_lease_id}, status={_status}) - job proceeds "
+                f"un-supervised",
+                file=sys.stderr,
+            )
+            sup_lease_client = None
     except Exception as exc:
         # Soft fail: the job proceeds un-supervised. The per-run job lease
         # (keep-both) still holds on a defer, and the guard 2c covers the
@@ -592,6 +606,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             max_steps=_max_steps,
             backend_url=spec.get("backend_url"),
             acquire_lease=spec.get("acquire_lease", True),
+            swarm_payload=spec.get("swarm_payload", False),
             lease_class="deferrable",
             model=spec.get("model"),
             handler_hook=_handler_hook,

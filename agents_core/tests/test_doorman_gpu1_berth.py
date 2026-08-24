@@ -30,6 +30,7 @@ required. Covers the spec's eight test groups:
 
 from __future__ import annotations
 
+import os
 import time
 from unittest.mock import MagicMock, patch
 
@@ -158,6 +159,47 @@ class TestGpu1ProbeTriState:
         ]):
             state._probe_gpu1_glances()
         assert state._gpu1_seat_health is False
+
+    def test_berth_unit_active_recorded(self):
+        """berth_unit (the ninfer-fixer systemd unit state) is probed over ssh
+        and recorded DISTINCT from seat_health: unit active + seat healthy."""
+        state = _make_state()
+        with patch("agents_core.doorman_server.requests.get", side_effect=[
+            _mock_resp(200),  # berth /health 200
+            _mock_resp(200, _glances_list(proc=0.0, mem=77.0)),
+        ]), patch("agents_core.doorman_server.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout="active\n", stderr="", returncode=0)
+            state._probe_gpu1_glances()
+        assert state._gpu1_berth_unit is True
+        assert state._gpu1_seat_health is True
+
+    def test_berth_unit_active_seat_down(self):
+        """Unit active with the seat DOWN: berth_unit and seat_health are
+        distinct fields - the unit is up but :8082 /health is not 200."""
+        state = _make_state()
+        with patch("agents_core.doorman_server.requests.get", side_effect=[
+            _mock_resp(503),  # berth /health down
+            _mock_resp(200, _glances_list(proc=0.0, mem=77.0)),
+        ]), patch("agents_core.doorman_server.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout="active\n", stderr="", returncode=0)
+            state._probe_gpu1_glances()
+        assert state._gpu1_berth_unit is True
+        assert state._gpu1_seat_health is False
+
+    def test_berth_unit_ssh_failure_is_unknown(self):
+        """An ssh timeout/error -> berth_unit None (unknown), never conflated
+        with the seat health (which is still recorded from /health)."""
+        state = _make_state()
+        with patch("agents_core.doorman_server.requests.get", side_effect=[
+            _mock_resp(200),  # berth /health 200
+            _mock_resp(200, _glances_list(proc=0.0, mem=77.0)),
+        ]), patch("agents_core.doorman_server.subprocess.run",
+                   side_effect=OSError("ssh down")):
+            state._probe_gpu1_glances()
+        assert state._gpu1_berth_unit is None
+        assert state._gpu1_seat_health is True
 
 
 # ---------------------------------------------------------------------------
@@ -404,21 +446,50 @@ class TestGpu1StatusBlock:
         assert gpu1["last_vote"] is None
 
     def test_status_gpu1_reflects_probe(self):
-        """After a probe tick, the gpu1 block reflects the readings."""
+        """After a probe tick, the gpu1 block reflects the readings.
+        berth_unit (the ninfer-fixer unit state) and seat_health (the :8082
+        /health 200) are DISTINCT fields."""
         state = _make_state()
         state._gpu1_seat_health = True
+        state._gpu1_berth_unit = True
         state._gpu1_glances_mem_pct = 77.0
         state._gpu1_glances_proc = 0.0
         state._last_probe_raw = {"GPU1": False}
         snap = state.status_snapshot()
         assert snap["gpu1"] == {
-            "berth_unit": True,
+            "berth_unit": "active",
             "seat_health": True,
             "glances": "reachable",
             "glances_mem_pct": 77.0,
             "glances_proc": 0.0,
             "last_vote": False,
         }
+
+    def test_status_gpu1_unit_active_seat_down(self):
+        """Unit active with the seat down: berth_unit and seat_health are
+        asserted as DISTINCT fields."""
+        state = _make_state()
+        state._gpu1_seat_health = False
+        state._gpu1_berth_unit = True
+        state._gpu1_glances_mem_pct = None
+        state._gpu1_glances_proc = None
+        state._last_probe_raw = {}
+        snap = state.status_snapshot()
+        assert snap["gpu1"]["berth_unit"] == "active"
+        assert snap["gpu1"]["seat_health"] is False
+
+    def test_status_gpu1_unit_unknown(self):
+        """Unit state unknown (pre-probe / ssh failure) -> berth_unit None,
+        distinct from seat_health."""
+        state = _make_state()
+        state._gpu1_seat_health = True
+        state._gpu1_berth_unit = None
+        state._gpu1_glances_mem_pct = None
+        state._gpu1_glances_proc = None
+        state._last_probe_raw = {}
+        snap = state.status_snapshot()
+        assert snap["gpu1"]["berth_unit"] is None
+        assert snap["gpu1"]["seat_health"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +519,9 @@ class TestSupervisorLeaseLifecycle:
              patch("agents_core.worktree.teardown_worktree") as mock_teardown, \
              patch("agents_core.gw_agent.call_gw_agent",
                    return_value=({"final_diff": ""}, [])):
+            MockClient.return_value.acquire.return_value = {
+                "status": "serving", "work_id": "task-1-berth-sup",
+            }
             mock_setup.return_value = MagicMock(path="/wt")
             shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
             mock_client = MockClient.return_value
@@ -483,6 +557,9 @@ class TestSupervisorLeaseLifecycle:
              patch("agents_core.worktree.teardown_worktree") as mock_teardown, \
              patch("agents_core.gw_agent.call_gw_agent",
                    side_effect=RuntimeError("gw down")):
+            MockClient.return_value.acquire.return_value = {
+                "status": "serving", "work_id": "task-1-berth-sup",
+            }
             mock_setup.return_value = MagicMock(path="/wt")
             shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
             mock_client = MockClient.return_value
@@ -521,8 +598,9 @@ class TestSupervisorLeaseLifecycle:
 
     def test_supervisor_lease_soft_fail_on_pending_defer(self):
         """A pending_defer acquire response -> the job PROCEEDS (soft fail):
-        the lease is not held, but the finally block still calls release
-        (idempotent no-op server-side) and the harness runs to completion."""
+        the lease is not held, the soft-fail path logs a WARN and the
+        finally-release is skipped (nothing was registered), and the
+        harness runs to completion."""
         from agents_core import shaped_runner
 
         spec = {
@@ -543,12 +621,42 @@ class TestSupervisorLeaseLifecycle:
             mock_setup.return_value = MagicMock(path="/wt")
             shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
             mock_client = MockClient.return_value
-            # The supervisor lease was NOT held (pending_defer), so the
-            # finally block still calls release (idempotent no-op server-side).
-            mock_client.release.assert_called_once_with(
-                "gravitywell", "task-1-berth-sup")
-            # The job still proceeded (soft fail, never a gate).
+            # The supervisor lease was NOT registered (pending_defer) ->
+            # the soft-fail path drops the client, so release must NOT be
+            # called. The job still proceeded (soft fail, never a gate).
+            mock_client.release.assert_not_called()
             mock_cga.assert_called_once()
+
+    def test_fixer_threads_swarm_payload_from_spec(self):
+        """The registry's swarm_payload key must reach the fixer call:
+        the berth seat (backend_url set + acquire_lease true +
+        swarm_payload true) runs the swarm payload shape WITH the
+        per-run lease (keep-both)."""
+        from agents_core import shaped_runner
+
+        spec = {
+            "task_id": "task-1",
+            "target_id": "tgt",
+            "repo": "agents-core",
+            "prompt": "fix it",
+            "timeout_s": 1800,
+            "backend_url": "http://203.0.113.11:8082",
+            "acquire_lease": True,
+            "swarm_payload": True,
+        }
+        with patch("agents_core.doorman_client.DoormanClient") as MockClient, \
+             patch("agents_core.worktree.setup_worktree") as mock_setup, \
+             patch("agents_core.worktree.teardown_worktree") as mock_teardown, \
+             patch("agents_core.gw_agent.call_gw_agent",
+                   return_value=({"final_diff": ""}, [])) as mock_cga:
+            MockClient.return_value.acquire.return_value = {
+                "status": "serving", "work_id": "task-1-berth-sup",
+            }
+            mock_setup.return_value = MagicMock(path="/wt")
+            shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
+            mock_cga.assert_called_once()
+            kwargs = mock_cga.call_args.kwargs
+            assert kwargs.get("swarm_payload") is True
 
 
 # ---------------------------------------------------------------------------
@@ -563,36 +671,42 @@ class TestIsSwarmParity:
     key is what does the work).
 
     The fixture source is the LIVE lapis-pm registry.yaml (imported at test
-    time) or a byte-identical snapshot — NOT a hand-maintained subset (Facets
-    hardening) — so a future registry entry that sets backend_url without
-    swarm_payload is caught by the invariant, not silently skipped. The live
-    registry lives in the lapis-pm repo (not agents-core), so this table
-    encodes the registry's (backend_url, acquire_lease, swarm_payload) triples
-    as of the stopgap-flip landing and the berth flip, with the invariant
-    asserted over every entry.
+    time) — NOT a hand-maintained subset (Facets hardening) — so a future
+    registry entry that sets backend_url without swarm_payload is caught by
+    the invariant, not silently skipped. The portable berth-shape tests below
+    are the floor that runs wherever the live registry is absent.
     """
 
     def _is_swarm_for(self, backend_url, acquire_lease, swarm_payload=False):
         """Compute _is_swarm exactly as gw_agent does (the OR clause)."""
         return swarm_payload or ((backend_url is not None) and (not acquire_lease))
 
-    def test_existing_seats_unchanged(self):
-        """For every (backend_url, acquire_lease) pair in the existing registry,
-        the new key defaulting False leaves _is_swarm byte-identical to the
-        legacy computation."""
+    def test_parity_from_live_registry(self):
+        """Every seat in the LIVE lapis-pm registry keeps its legacy
+        _is_swarm value (spec Facets hardening: the fixture source is the
+        live registry imported at test time, not a hand-maintained subset).
+        Env-overridable; skipped where the live registry is absent."""
+        import yaml
+
         legacy = lambda bu, al: (bu is not None) and (not al)
-        # The existing registry's fixer/fixer_retry stopgap shape (backend_url
-        # absent, acquire_lease default true) and the reviewer_fresh_contractor
-        # shape (backend_url present, acquire_lease false).
-        cases = [
-            (None, True),        # stopgap fixer pair (no backend_url)
-            (None, False),       # hypothetical: no backend_url, no lease
-            ("http://gw:8081", True),   # backend_url set + lease -> legacy False
-            ("http://gw:8081", False),  # reviewer_fresh_contractor -> legacy True
-        ]
-        for bu, al in cases:
-            assert self._is_swarm_for(bu, al, swarm_payload=False) == legacy(bu, al), \
-                f"existing seat (backend_url={bu}, acquire_lease={al}) changed"
+        live = os.environ.get(
+            "LAPIS_PM_REGISTRY",
+            "/srv/lapis/lapis-pm/lapis_pm/registry.yaml",
+        )
+        if not os.path.exists(live):
+            pytest.skip("live lapis-pm registry not present on this host")
+        reg = yaml.safe_load(open(live).read())
+        seats = reg.get("agents", {})
+        assert seats, "live registry has no agents section"
+        for name, entry in seats.items():
+            if not isinstance(entry, dict):
+                continue
+            bu = entry.get("backend_url")
+            al = entry.get("acquire_lease", True)
+            sp = entry.get("swarm_payload", False)
+            assert self._is_swarm_for(bu, al, sp) == legacy(bu, al), \
+                f"seat {name}: _is_swarm changed (backend_url={bu!r}, " \
+                f"acquire_lease={al}, swarm_payload={sp})"
 
     def test_berth_shape_with_swarm_payload_is_true(self):
         """The berth shape (backend_url set + acquire_lease true + swarm_payload
