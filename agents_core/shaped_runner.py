@@ -600,7 +600,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             cwd=cwd,
             writeable=True,
             timeout=int(spec.get("timeout_s", 1800)),
-            think=False,
+            think=bool(spec.get("think", False)),
             on_wake_fail="skip",
             work_id=task_id,
             max_steps=_max_steps,

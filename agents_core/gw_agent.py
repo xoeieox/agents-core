@@ -297,6 +297,7 @@ def build_step_payload(
         "tool_choice": "auto",
         "temperature": temperature,
         **({} if is_swarm else {"chat_template_kwargs": {"enable_thinking": think}}),
+        **({"enable_thinking": False} if (is_swarm and not think) else {}),
         "max_tokens": _effective_max_tokens,
     }
 
@@ -2941,6 +2942,7 @@ def _force_conclusion(
                 "messages": messages,
                 "temperature": 0.3,
                 **({} if is_swarm else {"chat_template_kwargs": {"enable_thinking": False}}),
+                **({"enable_thinking": False} if is_swarm else {}),
                 **({} if _response_format is None else {"response_format": _response_format}),
             },
             timeout=post_timeout,
