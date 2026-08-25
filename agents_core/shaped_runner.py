@@ -586,6 +586,32 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         worktree_path = handle.path
         cwd = str(worktree_path)
 
+        # Stage the bound spec into the worktree so the model can page it
+        # (its file readers are cwd-confined; /srv/lapis/planning is unreadable).
+        # Best-effort: any miss degrades to "run exactly as today".
+        spec_src = room_path("planning.specs") / f"{target_id}.md"
+        spec_dst = Path(cwd) / "lapis-spec.md"
+        try:
+            if not (spec_src.exists() and spec_src.stat().st_size > 0):
+                print(
+                    f"WARN: local-fixer: bound spec missing or empty at {spec_src}; continuing without staging",
+                    file=sys.stderr,
+                )
+            elif spec_dst.exists():
+                print(
+                    f"WARN: local-fixer: refusing to clobber existing {spec_dst} (tracked-file collision guard)",
+                    file=sys.stderr,
+                )
+            else:
+                spec_dst.write_text(spec_src.read_text())
+                print(
+                    f"[local-fixer] spec staged into worktree: lapis-spec.md "
+                    f"({spec_dst.stat().st_size} bytes) - read it in line windows before implementing",
+                    file=sys.stderr,
+                )
+        except OSError as exc:
+            print(f"WARN: local-fixer: spec staging failed: {exc}", file=sys.stderr)
+
         # Resolve max_steps: spec JSON > env GW_AGENT_MAX_STEPS > local-fixer default 60.
         if spec.get("max_steps") is not None:
             _max_steps = int(spec["max_steps"])
@@ -613,6 +639,13 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             handler_objective=_handler_objective,
             handler_max_interventions=_handler_max_interventions,
         )
+
+        # Remove the staged spec before the deterministic git tail so it is
+        # never committed/pushed into the PR branch.
+        try:
+            (Path(cwd) / "lapis-spec.md").unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"WARN: local-fixer: staged spec remove failed: {exc}", file=sys.stderr)
 
         # Persist transcript regardless of outcome
         try:
@@ -713,6 +746,19 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             print(
                 "WARN: local-fixer: run aborted - mem_search_loop "
                 "(redundant mem searches; no edits made)",
+                file=sys.stderr,
+            )
+            return ""
+
+        # Output-budget exhaustion is a distinct failure mode: the response was
+        # cut at max_tokens; work (if any) may be incomplete and a truncated
+        # write_file can leave a half-written file. Do NOT salvage or PR - log
+        # the distinct stop_reason and return "".
+        if stop_reason == "output_budget_exhausted":
+            print(
+                "WARN: local-fixer: run aborted - output budget exhausted "
+                "(finish_reason=output_limit/length; response truncated at "
+                "max_tokens - work may be incomplete, no PR)",
                 file=sys.stderr,
             )
             return ""
