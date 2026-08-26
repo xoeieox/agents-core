@@ -1836,3 +1836,162 @@ class TestDeferrableAcquireRetry:
             assert result == "fallback result"
             mock_fallback.assert_called_once()
             mock_doorman.release.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# D6 (agents-core-local-fixer-spec-visibility-and-loud-truncation-v0): output-
+# budget truncation as a distinct failure on writeable runs (D4) and the
+# untracked staged-spec exclusion in _build_fixer_result (D3).
+# ---------------------------------------------------------------------------
+
+class TestOutputBudgetTruncation:
+    """D4: finish_reason in (output_limit, length) on a WRITEABLE run finalizes
+    as a distinct failure (concluded=False, stop_reason=
+    'output_budget_exhausted') - NOT a voluntary stop. F1: the readonly
+    catch-all is unchanged, so an unknown finish_reason still concludes."""
+
+    def test_finish_output_limit_is_distinct_failure_writeable(self, tmp_path):
+        """Writeable run, text-only first response with finish_reason=
+        'output_limit' -> FixerResult concluded=False +
+        stop_reason='output_budget_exhausted'."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+            mock_post.return_value.json.return_value = {
+                "choices": [
+                    {
+                        "message": {"content": "partial work", "tool_calls": []},
+                        "finish_reason": "output_limit",
+                    }
+                ],
+                "usage": {"total_tokens": 10},
+            }
+            fixer, _transcript = call_gw_agent(
+                prompt="Fix this.",
+                cwd=str(tmp_path),
+                writeable=True,
+                max_steps=5,
+                backend_url="http://gw-test:8081",
+            )
+
+        assert fixer["concluded"] is False
+        assert fixer["stop_reason"] == "output_budget_exhausted"
+
+    def test_finish_length_is_distinct_failure_writeable(self, tmp_path):
+        """Same shape with the OpenAI-compatible spelling finish_reason='length'."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+            mock_post.return_value.json.return_value = {
+                "choices": [
+                    {
+                        "message": {"content": "partial work", "tool_calls": []},
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {"total_tokens": 10},
+            }
+            fixer, _transcript = call_gw_agent(
+                prompt="Fix this.",
+                cwd=str(tmp_path),
+                writeable=True,
+                max_steps=5,
+                backend_url="http://gw-test:8081",
+            )
+
+        assert fixer["concluded"] is False
+        assert fixer["stop_reason"] == "output_budget_exhausted"
+
+    def test_unknown_finish_reason_keeps_voluntary_stop(self, tmp_path):
+        """finish_reason='content_filter' (unknown, NOT output_limit/length)
+        takes the unchanged catch-all: the writeable run concludes (D4 does not
+        broaden the truncation branch)."""
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post") as mock_post:
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            mock_doorman.acquire.return_value = {"status": "serving"}
+            mock_post.return_value.json.return_value = {
+                "choices": [
+                    {
+                        "message": {"content": "partial work", "tool_calls": []},
+                        "finish_reason": "content_filter",
+                    }
+                ],
+                "usage": {"total_tokens": 10},
+            }
+            fixer, _transcript = call_gw_agent(
+                prompt="Fix this.",
+                cwd=str(tmp_path),
+                writeable=True,
+                max_steps=5,
+                backend_url="http://gw-test:8081",
+            )
+
+        assert fixer["concluded"] is True
+        assert fixer["stop_reason"] == ""
+
+
+class TestBuildFixerResultLapisSpec:
+    """D3: an UNTRACKED staged lapis-spec.md is unstaged before diff --cached
+    (it never pollutes final_diff); a TRACKED lapis-spec.md (a repo of its
+    own) is protected by the cat-file -e guard and its change IS in
+    final_diff."""
+
+    @staticmethod
+    def _git(repo, *args):
+        import subprocess
+
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True, text=True, check=True,
+        )
+
+    def test_build_fixer_result_excludes_untracked_lapis_spec(self, tmp_path):
+        """Base commit without lapis-spec.md; modify the tracked file + create
+        the UNTRACKED staged spec -> final_diff has the tracked change and NOT
+        the staged spec."""
+        from agents_core.gw_agent import _build_fixer_result
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        self._git(repo, "config", "user.email", "tester@example.com")
+        self._git(repo, "config", "user.name", "Tester")
+        (repo / "hello.txt").write_text("one\n")
+        self._git(repo, "add", "hello.txt")
+        self._git(repo, "commit", "-qm", "base")
+        (repo / "hello.txt").write_text("two\n")
+        (repo / "lapis-spec.md").write_text("staged spec body\n")
+
+        result = _build_fixer_result(str(repo), [], concluded=True)
+
+        assert result["concluded"] is True
+        assert "hello.txt" in result["final_diff"]
+        assert "lapis-spec.md" not in result["final_diff"]
+
+    def test_build_fixer_result_keeps_tracked_lapis_spec(self, tmp_path):
+        """Base commit COMMITS a lapis-spec.md; modify it -> final_diff DOES
+        contain the change (the guard never unstages real work)."""
+        from agents_core.gw_agent import _build_fixer_result
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        self._git(repo, "config", "user.email", "tester@example.com")
+        self._git(repo, "config", "user.name", "Tester")
+        (repo / "hello.txt").write_text("one\n")
+        (repo / "lapis-spec.md").write_text("original spec\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-qm", "base with tracked spec")
+        (repo / "lapis-spec.md").write_text("changed spec body\n")
+
+        result = _build_fixer_result(str(repo), [], concluded=True)
+
+        assert result["concluded"] is True
+        assert "lapis-spec.md" in result["final_diff"]
+        assert "changed spec body" in result["final_diff"]
