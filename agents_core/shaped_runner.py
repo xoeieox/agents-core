@@ -22,6 +22,7 @@ Invoked as: python3 -m agents_core.shaped_runner <spec.json>
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -311,6 +312,42 @@ def _collect_model_touched_tests(transcript: list[dict], cwd: str) -> set[str]:
     return touched
 
 
+def _collect_diff_touched_tests(cwd: str) -> set[str]:
+    """Collect the CWD-relative paths of test files in the staged diff.
+
+    The opencode-tail counterpart of _collect_model_touched_tests: opencode
+    has no gw_agent transcript, so the source is the git index
+    (`git diff --name-status --cached`), NOT a tool-call transcript (a
+    transcript-shaped extractor reads tool_name/arguments and would return
+    empty on a diff - Lens-3 finding). Call it AFTER `git add -A` so newly
+    created (untracked) test files are staged and visible. Mirrors the
+    tests/ filter of _collect_model_touched_tests. A rename row
+    (R100\told\tnew) contributes its NEW path (the last field).
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, "diff", "--name-status", "--cached"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        print("WARN: _collect_diff_touched_tests: git diff --name-status timed out",
+              file=sys.stderr)
+        return set()
+    if r.returncode != 0:
+        return set()
+    touched: set[str] = set()
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        path = parts[-1].strip()
+        if not path:
+            continue
+        if path.startswith("tests/") or "/tests/" in path or path.startswith("test_"):
+            touched.add(path)
+    return touched
+
+
 def _extract_failed_node_ids(last_test_outcome: dict | None) -> list[str]:
     """Extract pytest node IDs of failed/error tests from a run_tests outcome.
 
@@ -325,13 +362,18 @@ def _extract_failed_node_ids(last_test_outcome: dict | None) -> list[str]:
     for line in tail.splitlines():
         line = line.strip()
         if line.startswith(("FAILED ", "ERROR ", "ERROR at setup of ")):
-            # Node ID is the last whitespace-separated token (file::Class::fn).
-            # 'ERROR at setup of tests/test_foo.py::test_y' -> the node is the
-            # token after 'of'.
+            # Node ID is the FIRST token after the FAILED/ERROR prefix.
+            # Pytest's short summary appends the failure reason after the
+            # node ID ('FAILED path::node - <reason>'), so the LAST token
+            # (rsplit) would grab the reason's last word and the D1
+            # touched-failure match would silently miss the failure.
+            # 'ERROR at setup of tests/test_foo.py::test_y' -> the node is
+            # the token after 'of'.
             if line.startswith("ERROR at setup of "):
                 node = line[len("ERROR at setup of "):].strip()
             else:
-                node = line.rsplit(" ", 1)[-1].strip()
+                _parts = line.split(" ", 2)
+                node = _parts[1].strip() if len(_parts) >= 2 else ""
             if node and node not in node_ids:
                 node_ids.append(node)
     return node_ids
@@ -921,6 +963,723 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                 print(f"WARN: local-fixer: worktree teardown failed: {exc}", file=sys.stderr)
 
 
+# Tail budget (seconds) for the local-opencode engine's deterministic tail
+# (S4d, rev-3): 180s test cap + 4x30s git ops + PR create + margin. The queue's
+# hard kill lands at timeout_s + 60 (shaper.py); the model loop is budgeted at
+# timeout_s - TAIL_BUDGET - setup_lag (setup_lag measured at runtime), so a
+# deadline-killed run still has the full TAIL_BUDGET for its tail. Best-effort
+# bound, not a guarantee (Invariant 8).
+TAIL_BUDGET = 300
+
+# HARNESS-OWNS-GIT contract preamble (S4a / Invariant 3). Composed by the
+# engine and prepended to the bound intent. spec["system"] is deliberately NOT
+# passed to opencode: it carries the registry's model-side git protocol
+# (checkout -b / add / commit / push / self-PR), which would collide with the
+# deterministic tail. This is a DELIBERATE divergence from _run_local_fixer,
+# which passes its system prompt because that model has no git tool.
+_HARNESS_OWNS_GIT_PREAMBLE = """\
+HARNESS-OWNS-GIT CONTRACT - read this before doing anything:
+- You are working inside an isolated git worktree. Make all code and test
+  edits IN THIS WORKTREE ONLY.
+- Do NOT run `git commit`, `git push`, `git checkout`, `git branch`, or
+  `git add` (any form, including `git add -A`). The harness owns the git
+  tail: it derives your diff from the uncommitted worktree state, commits,
+  pushes and opens the PR itself. If you move any git state (HEAD, index,
+  branches, remotes), your work will be DISCARDED.
+- Do NOT background or daemonize any process (no `&`, no `nohup`, no
+  `setsid`, no long-running services). Every command must finish before
+  you move on.
+- Do NOT `pip install` outside the isolated environment: pip user-installs
+  are pinned to this worktree (PIP_USER / PYTHONUSERBASE are set); do not
+  override them or write to host Python. The harness owns the test run.
+"""
+
+
+def _run_local_opencode(spec: dict, base_cwd: str | None) -> str:
+    """Deterministic git/PR tail for the local-opencode engine.
+
+    Runs the fixer under the opencode tool loop (`opencode run`) in its own
+    per-task worktree. The harness owns git: the model is contractually told
+    not to commit/push/branch, and the tail re-derives the diff + test
+    outcome from uncommitted worktree state (tail re-derivation: chunk 3).
+    Returns a PR URL on success, "" on any failure - never raises.
+    """
+    import signal
+    import time
+
+    task_id = spec.get("task_id") or spec.get("slot_id") or "lo-unknown"
+    target_id = spec.get("target_id", "unknown")
+    repo = spec.get("repo", "")
+    base_branch = spec.get("base_branch", "main")
+    slug = spec.get("slug", "local")
+    bare_repo = repo.rsplit("/", 1)[-1] if repo else "agents-core"
+    effective_cwd = base_cwd or "/srv/agents"
+    opencode_bin = os.environ.get(
+        "OPENCODE_BIN", "/home/user/.opencode/bin/opencode"
+    )
+    opencode_model = spec.get("opencode_model", "gravitywell/gravitywell-slot1")
+
+    _ARTIFACT_DIR = room_path("gpu_queue.shaped")
+    events_path = _ARTIFACT_DIR / f"{task_id}-opencode-events.json"
+    stderr_path = _ARTIFACT_DIR / f"{task_id}-opencode-stderr.log"
+
+    worktree_path = None
+    opencode_pgid = None  # S4f: process-group leader pid, killpg'd in the finally
+
+    # setup_lag timer starts here: the MEASURED worktree-setup + supervisor-
+    # lease duration (S4d/rev-3) is captured after setup, before the model
+    # loop, and subtracted from the loop budget.
+    setup_started = time.monotonic()
+
+    # ------------------------------------------------------------------
+    # Supervisor lease (duplicated from the _run_local_fixer :480-521
+    # pattern, host-keyed "gravitywell", opencode adaptations).
+    #
+    # A doorman lease held for the WHOLE local-opencode job (entry acquire,
+    # finally release) so the doorman's mid-job stop machinery (force-stop's
+    # _worker_lease_blockers guard) cannot stop the seat out from under an
+    # in-flight opencode job. work_id is f"{task_id}-berth-sup" so it cannot
+    # be clobbered by a per-run lease on task_id; the distinct principal/role
+    # keeps this engine's supervisor lease from colliding with the
+    # local-fixer's on one doorman.
+    #
+    # TTL = timeout_s + 60 (the queue's hard cap) - acquired at entry, it
+    # structurally outlives the process killed at submit + timeout_s + 60,
+    # so NO renewal is needed.
+    #
+    # SOFT FAIL: acquire failure is logged and the job PROCEEDS
+    # un-supervised. The lease is a safety net, never a gate.
+    # ------------------------------------------------------------------
+    sup_lease_client = None
+    sup_lease_id = f"{task_id}-berth-sup"
+    try:
+        from agents_core.doorman_client import (
+            DoormanClient,
+            DoormanUnreachable,
+        )
+
+        sup_lease_client = DoormanClient()
+        acq = sup_lease_client.acquire(
+            "gravitywell",
+            sup_lease_id,
+            int(spec.get("timeout_s", 1800)) + 60,
+            "opencode-job-supervisor",
+            role="worker",
+            principal="opencode-supervisor",
+            lease_class="deferrable",
+        )
+        # acquire() RETURNS a status dict (it does not raise on
+        # pending_defer/deferred): only "serving" means a lease was
+        # registered. Any other status is a soft fail - log it and drop
+        # the client so the finally-release is skipped.
+        if not isinstance(acq, dict) or acq.get("status") != "serving":
+            _status = acq.get("status") if isinstance(acq, dict) else type(acq).__name__
+            print(
+                f"WARN: local-opencode: supervisor lease acquire soft-failed "
+                f"(work_id={sup_lease_id}, status={_status}) - job proceeds "
+                f"un-supervised",
+                file=sys.stderr,
+            )
+            sup_lease_client = None
+    except Exception as exc:
+        # Soft fail: the job proceeds un-supervised.
+        print(
+            f"WARN: local-opencode: supervisor lease acquire soft-failed "
+            f"(work_id={sup_lease_id}): {exc}",
+            file=sys.stderr,
+        )
+        sup_lease_client = None
+
+    try:
+        from agents_core.worktree import setup_worktree, teardown_worktree
+
+        # fixer_retry dispatches target an already-open PR - the worktree
+        # must start from the PR's own branch, not base_branch (main), or
+        # the target files simply won't exist in the checkout. Verify the
+        # branch is really on origin first (duplicated from the local-fixer
+        # worktree-setup pattern; with full bash the model could
+        # self-correct, but failing loud is the same shape).
+        existing_branch = spec.get("existing_branch") or ""
+        worktree_ref = base_branch
+        if spec.get("agent_type") == "fixer_retry" and existing_branch:
+            try:
+                verify = subprocess.run(
+                    ["git", "-C", effective_cwd, "ls-remote", "--exit-code", "origin", existing_branch],
+                    capture_output=True, text=True, timeout=30,
+                )
+                verified = verify.returncode == 0
+            except subprocess.TimeoutExpired:
+                verified = False
+            if not verified:
+                print(
+                    f"ERROR: local-opencode: existing_branch {existing_branch} not found on origin",
+                    file=sys.stderr,
+                )
+                return ""
+            worktree_ref = existing_branch
+
+        # Own per-task worktree (like local-fixer; shaper sets
+        # worktree_required=False for local-opencode, S2). handle.env
+        # carries the pip-isolation env (PYTHONUSERBASE + PIP_USER) that
+        # must be forwarded to the opencode subprocess (F10).
+        handle = setup_worktree(task_id, effective_cwd, worktree_ref)
+        worktree_path = handle.path
+        cwd = str(worktree_path)
+
+        # base_sha (F2 integrity check): the worktree starts detached at a
+        # known commit. The tail (chunk 3) fails closed - no PR - if HEAD
+        # moved off this sha: the model moved git state and the
+        # deterministic tail's invariants are broken.
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=cwd, capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+
+        # S4d: budget the model loop. setup_lag is the MEASURED worktree-
+        # setup + supervisor-lease duration (rev-3: unbounded under seat
+        # contention, so it is subtracted, not assumed). Total wall =
+        # setup_lag + loop_budget + tail = timeout_s + 60 - TAIL_BUDGET +
+        # tail, so the tail finishes iff tail_cost < TAIL_BUDGET.
+        setup_lag = time.monotonic() - setup_started
+        loop_budget = int(spec.get("timeout_s", 1800)) - TAIL_BUDGET - int(setup_lag)
+        if loop_budget <= 0:
+            print(
+                f"ERROR: local-opencode: setup_lag {setup_lag:.1f}s leaves no "
+                f"model-loop budget (timeout_s={spec.get('timeout_s')}, "
+                f"TAIL_BUDGET={TAIL_BUDGET}s); failing closed",
+                file=sys.stderr,
+            )
+            return ""
+
+        # S4a: the harness-owns-git contract, composed by the engine from
+        # the preamble + the bound intent. spec["system"] is NOT passed
+        # (see _HARNESS_OWNS_GIT_PREAMBLE).
+        contract = _HARNESS_OWNS_GIT_PREAMBLE + "\n" + spec["prompt"]
+
+        argv = [
+            opencode_bin,
+            "run",
+            "--auto",
+            "--format", "json",
+            "-m", opencode_model,
+            "--dir", cwd,
+            "--title", f"fixer-{task_id}",
+            contract,
+        ]
+
+        # Launch opencode as its own session leader (start_new_session=True)
+        # so its pid IS the process-group id: a timeout/finally killpg
+        # reaches the whole tree (F6/F9). Popen + wait (not subprocess.run):
+        # run's timeout-kill SIGKILLs only the direct child, orphaning
+        # opencode's bash children, and its pid is not exposed pre-wait -
+        # the pgid must be captured pre-completion for the finally-killpg.
+        _ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+        deadline_killed = False
+        with open(events_path, "wb") as _events, open(stderr_path, "wb") as _err:
+            proc = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                stdout=_events,
+                stderr=_err,
+                env={**os.environ, **handle.env, "OPENCODE_BIN": opencode_bin},
+                start_new_session=True,
+            )
+            opencode_pgid = proc.pid
+            try:
+                proc.wait(timeout=loop_budget)
+            except subprocess.TimeoutExpired:
+                # S4d: the loop budget is exhausted - a deadline kill, NOT a
+                # model admission of stall. The tail (chunk 3) re-derives
+                # whatever is on disk and can salvage. Kill the whole group
+                # now; the finally-killpg is the idempotent backstop for
+                # every other exit path.
+                deadline_killed = True
+                print(
+                    f"WARN: local-opencode: model loop hit the loop budget "
+                    f"({loop_budget}s); killing the opencode process group "
+                    f"(pgid={opencode_pgid})",
+                    file=sys.stderr,
+                )
+                try:
+                    os.killpg(opencode_pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            rc = proc.wait()
+        print(
+            f"INFO: local-opencode: model loop done (task={task_id}, "
+            f"exit={rc}, deadline_killed={deadline_killed}, "
+            f"setup_lag={setup_lag:.1f}s, loop_budget={loop_budget}s) - "
+            f"events: {events_path}, stderr: {stderr_path}",
+            file=sys.stderr,
+        )
+
+        # ------------------------------------------------------------------
+        # Deterministic tail re-derivation (S4b).
+        #
+        # opencode is dead by now (clean exit, deadline kill, or the
+        # finally-killpg below), so everything from here is re-derived from
+        # the uncommitted worktree state: HEAD integrity (F2), the staged
+        # diff (F1), the targeted test outcome (F4), the D1 gate, and the
+        # terminal state. The tail is authoritative (Invariant 3): the model
+        # self-committing yields an empty diff and no PR.
+        # ------------------------------------------------------------------
+        branch = f"lapis/{target_id}/{slug}"
+
+        # Deterministic git helper (the _run_local_fixer :811-819 nested
+        # closure, duplicated - it is not importable).
+        def _git(*args: str) -> subprocess.CompletedProcess:
+            try:
+                return subprocess.run(
+                    ["git", "-C", cwd, *args],
+                    capture_output=True, text=True, timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                print(f"WARN: local-opencode: git {args[0]} timed out", file=sys.stderr)
+                return subprocess.CompletedProcess(["git", "-C", cwd, *args], 1, "", "timeout")
+
+        # F2 integrity: HEAD must still be at the base commit the worktree
+        # started from. A move means the model touched git state against the
+        # HARNESS-OWNS-GIT contract and the deterministic tail's invariants
+        # are broken - fail closed, no PR (distinct WARN).
+        head_now = _git("rev-parse", "HEAD")
+        if head_now.returncode != 0 or head_now.stdout.strip() != base_sha:
+            print(
+                f"WARN: local-opencode: HEAD moved off base_sha "
+                f"(base={base_sha[:12]}, now={head_now.stdout.strip()[:12] or head_now.stderr.strip()}) "
+                f"- model moved git state; fail-closed, no PR",
+                file=sys.stderr,
+            )
+            return ""
+
+        # F1: stage everything (including new untracked files), unstage the
+        # staged-spec guard, diff the index against HEAD. A bare `git diff`
+        # or `git diff HEAD` is blind to new untracked files, so a run whose
+        # deliverables are all new files would register an empty diff and be
+        # discarded (gw_agent.py:1186-1231 pattern - copied, not invented).
+        r = _git("add", "-A")
+        if r.returncode != 0:
+            print(f"WARN: local-opencode: git add -A failed: {r.stderr.strip()}", file=sys.stderr)
+            return ""
+        # Staged-spec guard (gw_agent.py:1208-1224): if a lapis-spec.md copy
+        # is UNTRACKED at HEAD, unstage it so a spec hunk never pollutes
+        # final_diff. A repo that tracks its own lapis-spec.md is protected:
+        # cat-file -e succeeds and we never discard real work.
+        probe = _git("cat-file", "-e", "HEAD:lapis-spec.md")
+        if probe.returncode != 0:
+            _git("reset", "-q", "--", "lapis-spec.md")
+        r = _git("diff", "--cached")
+        final_diff = r.stdout if r.returncode == 0 else ""
+        # Work presence: `git status --porcelain` non-empty. This is the
+        # "did the run leave anything" check - it covers untracked-only runs
+        # a bare `git diff HEAD` would discard.
+        r = _git("status", "--porcelain")
+        work_present = r.returncode == 0 and bool(r.stdout.strip())
+        if not work_present:
+            print(
+                f"WARN: local-opencode: no work on disk (git status --porcelain "
+                f"empty, task={task_id}) - no PR",
+                file=sys.stderr,
+            )
+            return ""
+
+        # F4: the deterministic targeted test step, in the RunTestsExecutor
+        # shape (gw_agent.py:1074-1164): `sys.executable -m pytest`, a 180s
+        # cap (a network-waiting test cannot stall the tail), and
+        # _parse_pytest_outcome. The touched-test source is the STAGED DIFF
+        # (a git-diff source), not a transcript.
+        touched_tests = _collect_diff_touched_tests(cwd)
+        from agents_core.gw_agent import _parse_pytest_outcome
+
+        def _decode_partial(data) -> str:
+            if data is None:
+                return ""
+            if isinstance(data, (bytes, bytearray)):
+                return data.decode(errors="replace")
+            return str(data)
+
+        test_cmd = [sys.executable, "-m", "pytest"]
+        if touched_tests:
+            # The diff touched test files -> run exactly those.
+            test_cmd.extend(sorted(touched_tests))
+        else:
+            # No test files touched -> the repo's deterministic baseline
+            # run: test_command (a per-repo registry key; the pilot sets it
+            # to the measured-green subset, which is how the repo's
+            # accepted-baseline reds are excluded from the run) scoped to
+            # the repo's test dir, minus integration/smoke.
+            base_test_cmd = spec.get("test_command") or ""
+            if base_test_cmd:
+                test_cmd.extend(shlex.split(base_test_cmd))
+            else:
+                test_cmd.extend(
+                    d for d in ("tests", "agents_core/tests")
+                    if (Path(cwd) / d).is_dir()
+                )
+            test_cmd.extend(["-m", "not integration and not smoke"])
+        test_cmd.append("-q")
+
+        # F4 env: the model's worktree-pinned pip installs (handle.env's
+        # PYTHONUSERBASE) must stay visible to the test run, but that
+        # redirect ALSO hides the harness interpreter's own user site - on a
+        # host whose runner python finds pytest in ~/.local (BRIX's system
+        # python3), the run would die ModuleNotFoundError before collecting
+        # a single test and the D1 gate would fail closed forever. Preserve
+        # the unredirected user site via PYTHONPATH, which PYTHONUSERBASE
+        # does not override (the worktree .pyuserbase site is still the
+        # user site for the child, so the model's installs are visible too).
+        from site import getusersitepackages as _usersite
+        _host_usersite = _usersite()
+        _f4_env = {**os.environ, **handle.env}
+        if _host_usersite and os.path.isdir(_host_usersite):
+            _f4_env["PYTHONPATH"] = os.pathsep.join(
+                p for p in (_host_usersite, os.environ.get("PYTHONPATH")) if p
+            )
+        _pytest_output = ""
+        _pytest_rc = -1
+        _pytest_timed_out = False
+        try:
+            _r = subprocess.run(
+                test_cmd,
+                capture_output=True, text=True,
+                timeout=180,
+                cwd=cwd,
+                env=_f4_env,
+                shell=False,
+            )
+            _pytest_output = _r.stdout + _r.stderr
+            _pytest_rc = _r.returncode
+        except subprocess.TimeoutExpired as _e:
+            _pytest_output = (
+                _decode_partial(_e.stdout)
+                + _decode_partial(_e.stderr)
+                + f"\n[TIMEOUT after 180s]"
+            )
+            _pytest_timed_out = True
+        last_test_outcome = _parse_pytest_outcome(
+            _pytest_output, _pytest_rc, _pytest_timed_out
+        )
+
+        # D1 decision block (the _run_local_fixer :690-714 pattern,
+        # duplicated inline with opencode adaptation): positive-only -
+        # every test the diff touched passes, and the run has at least one
+        # pass; fail-closed - no test files touched -> the deterministic
+        # targeted run must be green (the accepted-baseline reds are
+        # excluded from the run itself via the per-repo test_command, S4b).
+        def _tests_passed(outcome: dict | None) -> bool:
+            if not outcome:
+                return False
+            return (
+                int(outcome.get("passed") or 0) > 0
+                and int(outcome.get("failed") or 0) == 0
+                and int(outcome.get("errors") or 0) == 0
+            )
+
+        gate_passed = False
+        if touched_tests:
+            # Positive-only gate: a touched test "fails" if a FAILED/ERROR
+            # node ID refers to it (file-level or node-level). The run must
+            # also have at least one passing test.
+            failed_node_ids = _extract_failed_node_ids(last_test_outcome)
+            touched_failures = [
+                t for t in touched_tests
+                if any(
+                    n.split("::")[0] == t or n == t
+                    for n in failed_node_ids
+                )
+            ]
+            if last_test_outcome is not None:
+                passed_c = int(last_test_outcome.get("passed") or 0)
+                if passed_c > 0 and not touched_failures:
+                    gate_passed = True
+        else:
+            # Fail-closed fallback: no tests touched -> the targeted run
+            # must be green.
+            gate_passed = _tests_passed(last_test_outcome)
+
+        # concluded: opencode exited 0. A deadline kill (loop budget
+        # exhausted) or any non-zero exit is NOT concluded. There is no
+        # max_steps / no_progress / mem_search_loop here - opencode does not
+        # report them.
+        concluded = (rc == 0) and not deadline_killed
+
+        salvaged = False
+        if not concluded:
+            if deadline_killed and final_diff.strip() and gate_passed:
+                # Terminal state 2: the loop budget expired mid-work, but
+                # what is on disk is clean and green - salvage it as a PR.
+                # (The salvage sign-off marker is attached in chunk 4: a
+                # deadline kill can truncate the final write, so human
+                # sign-off is always required.)
+                salvaged = True
+                print(
+                    f"INFO: local-opencode: harness-salvaged clean diff on "
+                    f"deadline kill (target={target_id}, task={task_id})",
+                    file=sys.stderr,
+                )
+            else:
+                # Terminal state 3: not concluded without a salvageable
+                # clean-diff+green-tests. Distinct WARN per case.
+                if deadline_killed and not final_diff.strip():
+                    print(
+                        f"WARN: local-opencode: deadline kill with empty diff "
+                        f"(task={task_id}) - no PR",
+                        file=sys.stderr,
+                    )
+                elif deadline_killed:
+                    print(
+                        f"WARN: local-opencode: deadline kill with test gate "
+                        f"failed (task={task_id}) - no PR",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"WARN: local-opencode: opencode exited non-zero "
+                        f"(exit={rc}) - no PR",
+                        file=sys.stderr,
+                    )
+                return ""
+
+        if not salvaged:
+            if not final_diff.strip():
+                print(
+                    f"WARN: local-opencode: empty diff (work present but nothing "
+                    f"diffed vs HEAD, task={task_id}) - no PR",
+                    file=sys.stderr,
+                )
+                return ""
+            if not gate_passed:
+                print(
+                    "WARN: local-opencode: test gate failed "
+                    f"(touched_tests={sorted(touched_tests) if touched_tests else '[] (targeted baseline run)'}; "
+                    f"passed={int((last_test_outcome or {}).get('passed') or 0)} "
+                    f"failed={int((last_test_outcome or {}).get('failed') or 0)} "
+                    f"errors={int((last_test_outcome or {}).get('errors') or 0)}) - no PR",
+                    file=sys.stderr,
+                )
+                return ""
+
+        # Terminal state 1 (or 2 when salvaged): deterministic git/PR tail
+        # (duplicated from the _run_local_fixer :821-892 shape with
+        # opencode adaptations). checkout -B is the resolved upstream fix
+        # (the old `checkout -b` fixer_retry fatal is gone); the index
+        # already carries the F1 diff, the re-add is idempotent (the model
+        # is dead; nothing else writes to the worktree).
+        import agents_core.forgejo as _forgejo
+
+        r = _git("checkout", "-B", branch)
+        if r.returncode != 0:
+            print(f"WARN: local-opencode: git checkout -B failed: {r.stderr.strip()}", file=sys.stderr)
+            return ""
+        r = _git("add", "-A")
+        if r.returncode != 0:
+            print(f"WARN: local-opencode: git add -A failed: {r.stderr.strip()}", file=sys.stderr)
+            return ""
+        # Re-apply the staged-spec guard after the re-stage (defensive: the
+        # tail's add -A could re-stage a model-created lapis-spec.md).
+        probe = _git("cat-file", "-e", "HEAD:lapis-spec.md")
+        if probe.returncode != 0:
+            _git("reset", "-q", "--", "lapis-spec.md")
+        r = _git("commit", "-m", f"fix({target_id}): local-opencode harness")
+        if r.returncode != 0:
+            print(f"WARN: local-opencode: git commit failed: {r.stderr.strip()}", file=sys.stderr)
+            return ""
+
+        # F2: before push, verify the remote branch does not already exist.
+        # For a fresh fixer the branch only appears on origin if the model
+        # pushed it in violation of the HARNESS-OWNS-GIT contract (a
+        # model-pushed orphan) - a distinct failure: no PR. fixer_retry
+        # targets an already-open PR's branch, where the remote branch
+        # legitimately pre-exists, so the check is scoped to the fresh case.
+        if not (spec.get("existing_branch") or ""):
+            remote = _git("ls-remote", "--exit-code", "origin", branch)
+            if remote.returncode == 0:
+                print(
+                    f"WARN: local-opencode: remote branch {branch} already "
+                    f"exists on origin (model-pushed orphan) - no PR",
+                    file=sys.stderr,
+                )
+                return ""
+
+        r = _git("push", "origin", f"HEAD:{branch}")
+        if r.returncode != 0:
+            print(f"WARN: local-opencode: git push failed: {r.stderr.strip()}", file=sys.stderr)
+            return ""
+
+        # S4(g): session provenance for the PR body. PRIMARY: the opencode
+        # SQLite DB records the session under the --title the harness passed
+        # (fixer-<task_id>); take the most recent by time_created. FALLBACK:
+        # the first truthy top-level sessionID in the --format json event
+        # stream. DEGRADED: neither -> session_record_unavailable, the PR
+        # still opens. SESSION-EXPORT: on a found sessionID, run
+        # `opencode export <session_id>` and persist its stdout; a WARN-only
+        # failure never blocks the PR.
+        session_id = None
+        try:
+            import sqlite3 as _sqlite3
+
+            _db_path = os.path.expanduser("~/.local/share/opencode/opencode.db")
+            _conn = _sqlite3.connect(_db_path, timeout=5)
+            try:
+                _row = _conn.execute(
+                    "SELECT id FROM session WHERE title=? "
+                    "ORDER BY time_created DESC LIMIT 1",
+                    (f"fixer-{task_id}",),
+                ).fetchone()
+            finally:
+                _conn.close()
+            session_id = _row[0] if _row else None
+        except Exception as _exc:
+            print(
+                f"WARN: local-opencode: opencode.db session query failed: {_exc}",
+                file=sys.stderr,
+            )
+        if not session_id:
+            # FALLBACK: parse the event stream line-by-line (each line is a
+            # JSON object) and take the first truthy top-level sessionID.
+            try:
+                with open(events_path, "r", encoding="utf-8", errors="replace") as _ev:
+                    for _line in _ev:
+                        _line = _line.strip()
+                        if not _line:
+                            continue
+                        try:
+                            _obj = json.loads(_line)
+                        except ValueError:
+                            continue
+                        if isinstance(_obj, dict):
+                            _sid = _obj.get("sessionID")
+                            if _sid:
+                                session_id = _sid
+                                break
+            except OSError as _exc:
+                print(
+                    f"WARN: local-opencode: event stream sessionID parse "
+                    f"failed: {_exc}",
+                    file=sys.stderr,
+                )
+        session_record_unavailable = not session_id
+        session_export_path = None
+        if session_id:
+            try:
+                _exp = subprocess.run(
+                    [opencode_bin, "export", session_id],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if _exp.returncode == 0:
+                    _ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+                    session_export_path = (
+                        _ARTIFACT_DIR / f"{task_id}-opencode-session.json"
+                    )
+                    session_export_path.write_text(_exp.stdout)
+                else:
+                    print(
+                        f"WARN: local-opencode: session export failed "
+                        f"(exit={_exp.returncode}): {_exp.stderr.strip()}",
+                        file=sys.stderr,
+                    )
+            except Exception as _exc:
+                print(
+                    f"WARN: local-opencode: session export failed: {_exc}",
+                    file=sys.stderr,
+                )
+
+        # Provenance PR body - factual only.
+        diff_lines = [l for l in final_diff.splitlines()
+                      if l.startswith(("diff --git", "---", "+++", "@@", " ")) or l[:1] in ("+", "-")]
+        diffstat = "\n".join(diff_lines[:40]) or "(no changes)"
+
+        if last_test_outcome:
+            passed_c = int(last_test_outcome.get("passed") or 0)
+            failed_c = int(last_test_outcome.get("failed") or 0)
+            test_summary = f"{passed_c} passed, {failed_c} failed (deterministic targeted run)"
+        else:
+            test_summary = "no test outcome recorded"
+
+        terminal_state = "salvaged (deadline kill)" if salvaged else "concluded"
+        # S4(g): session record section. DEGRADED case carries the explicit
+        # "session record unavailable" text; the export path is shown only
+        # when the export actually succeeded.
+        session_record_line = (
+            "session record unavailable"
+            if session_record_unavailable
+            else f"sessionID: {session_id}"
+        )
+        session_export_line = (
+            f"session export: `{session_export_path}`"
+            if session_export_path
+            else "session export: unavailable"
+        )
+        pr_body = (
+            f"Implemented by the local-opencode fixer harness "
+            f"(opencode tool loop on {opencode_model}), not paid Claude.\n\n"
+            f"## Terminal state\n\n{terminal_state}\n\n"
+            f"## Diff summary\n\n```diff\n{diffstat}\n```\n\n"
+            f"## Test outcome\n\n{test_summary}\n\n"
+            f"## Session record\n\n{session_record_line}\n{session_export_line}\n\n"
+            f"## Logs\n\n`{events_path}` / `{stderr_path}`\n\n"
+            f"<!-- lapis-gpu-id: {task_id} -->\n"
+            f"<!-- lapis-tid: {target_id} -->\n"
+            f"<!-- lapis-engine: local-opencode -->"
+            # S4(e): salvage sign-off marker. A deadline kill can truncate
+            # the final write, so human sign-off is always required -
+            # attached to ALL deadline salvages, never to clean runs.
+            + ("\n<!-- lapis-no-progress-salvage: true -->" if salvaged else "")
+        )
+
+        pr = _forgejo.create_pr(
+            repo=bare_repo,
+            title=f"fix({target_id}): local-opencode",
+            head=branch,
+            base="main",
+            body=pr_body,
+        )
+        return pr.get("html_url", "")
+
+    except Exception as exc:
+        print(f"WARN: local-opencode: unexpected error: {exc}", file=sys.stderr)
+        return ""
+
+    finally:
+        # S4f: kill the opencode process group on EVERY exit path (timeout,
+        # error, early return). opencode is a live, credentialed child
+        # (FORGEJO_TOKEN + the shared parent-clone git creds + full bash);
+        # with start_new_session=True its pid is the pgid, so killpg
+        # reaches the whole tree, not just the direct child. Idempotent: on
+        # the normal path the group is already gone and ProcessLookupError
+        # is swallowed.
+        if opencode_pgid is not None:
+            try:
+                os.killpg(opencode_pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        # Release the supervisor lease (mirrors the _run_local_fixer
+        # finally): released on BOTH the success and failure paths. Soft
+        # fail: a release failure is logged and swallowed - the TTL bounds
+        # the zombie window.
+        if sup_lease_client is not None:
+            try:
+                sup_lease_client.release("gravitywell", sup_lease_id)
+            except Exception as exc:
+                print(
+                    f"WARN: local-opencode: supervisor lease release failed "
+                    f"(work_id={sup_lease_id}): {exc}",
+                    file=sys.stderr,
+                )
+            try:
+                sup_lease_client.close()
+            except Exception:
+                pass
+        # Tear down the own worktree (the :917-921 pattern).
+        if worktree_path is not None:
+            try:
+                teardown_worktree(task_id, effective_cwd)
+            except Exception as exc:
+                print(
+                    f"WARN: local-opencode: worktree teardown failed: {exc}",
+                    file=sys.stderr,
+                )
+
+
 def _run_local_reviewer(spec: dict, base_cwd: str | None) -> str | None:
     """Read-only reviewer runner for local GW agent.
 
@@ -1068,6 +1827,23 @@ def main():
             pass
         print(pr_url)
         return
+    elif engine == "local-opencode":
+        pr_url = _run_local_opencode(spec, base_cwd)
+        try:
+            spec_path.unlink()
+        except OSError:
+            pass
+        print(pr_url)
+        return
+    elif engine not in ("claude", "local-reviewer"):
+        # Fail loud on an unknown engine: a silent call_claude_cli
+        # fall-through would burn a seat on a spec no engine understands.
+        print(
+            f"ERROR: unknown shaped-runner engine {engine!r}; allowed: "
+            "claude, local-fixer, local-opencode, local-reviewer",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     # Per-task git worktree isolation for shaped agents (2026-04-23). When
     # the shaper routes to ClaudeQueue it sets worktree_required=True;
