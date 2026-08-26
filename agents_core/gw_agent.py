@@ -1720,6 +1720,7 @@ def _call_gw_agent_impl(
     handler_max_interventions: int = 2,
     skip_probe: bool = False,
     swarm_payload: bool = False,
+    after_step: Callable[[dict], None] | None = None,
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Run a multi-step read-only tool-loop on GravityWell.
 
@@ -1859,6 +1860,21 @@ def _call_gw_agent_impl(
                     remedy shaped_runner already applies externally via probe_seat_tool_
                     call, now reachable by every other call_gw_agent consumer. A run whose
                     first step makes a tool call never engages this path (lazy, not eager).
+        after_step: Optional callable (dict) -> None. When provided, called once per
+                    completed step - after the tool-execution block (all of the step's
+                    tool calls have been executed and appended to the transcript) and
+                    before the next POST - with a bounded context dict:
+                    {"step_num": int (1-based), "transcript": [the step's transcript
+                    entries (tool_name, tool_call_id, arguments, result, error)],
+                    "cwd": str, "writeable": bool}. Exceptions are caught and logged
+                    (never break the loop). When None (default), never called - behavior
+                    is byte-identical to before this param existed. Distinct from
+                    handler_hook: that one fires at the no-progress threshold and is
+                    occupied by Handler supervision; this one fires on EVERY completed
+                    step (productive or not) and is the local-fixer WIP-commit salvage
+                    seam (agents-core-fixer-budget-compact-salvage-v0, S3). The hook's
+                    side effects are the CALLER's (gw_agent stays model- and
+                    git-agnostic, exactly like cancel_check/before_tool).
 
     Returns:
         - str or None (or (str|None, list) when return_transcript=True).
@@ -1906,6 +1922,29 @@ def _call_gw_agent_impl(
     if no_progress_steps is None:
         no_progress_steps = _resolve_int_env("GW_AGENT_NO_PROGRESS_STEPS", 12, log)
     _max_explore_steps = _resolve_int_env("GW_AGENT_MAX_EXPLORE_STEPS", 20, log)
+
+    # Context-cap calibration (agents-core-fixer-budget-compact-salvage-v0, S1):
+    # the compact guard's cap is env-resolvable per run (GW_AGENT_CTX_CAP),
+    # following the same per-run resolution pattern as the no-progress knobs
+    # above. The module constant GW_AGENT_CTX_CAP (120000) stays the DEFAULT
+    # so other seats/consumers keep today's behavior; the berth queue-runner
+    # units carry a per-unit override (55000) so the compact guard fires
+    # BEFORE the seat's 65536 window wall kills the run. _resolve_int_env has
+    # no positive-value guard, so non-positive values are rejected HERE (at
+    # the call site) and fall back to the default.
+    ctx_cap = _resolve_int_env("GW_AGENT_CTX_CAP", GW_AGENT_CTX_CAP, log)
+    if ctx_cap <= 0:
+        if log:
+            log(
+                f"[gw_agent] invalid GW_AGENT_CTX_CAP={ctx_cap}; "
+                f"falling back to default {GW_AGENT_CTX_CAP}"
+            )
+        else:
+            logger.warning(
+                "[gw_agent] invalid GW_AGENT_CTX_CAP=%d; falling back to default %d",
+                ctx_cap, GW_AGENT_CTX_CAP,
+            )
+        ctx_cap = GW_AGENT_CTX_CAP
 
     messages = []
     if system:
@@ -2392,6 +2431,31 @@ def _call_gw_agent_impl(
                     if _interrupted:
                         break
 
+                    # Per-step after_step seam (agents-core-fixer-budget-
+                    # compact-salvage-v0, S3): invoked once per completed step,
+                    # after the tool-execution block and before the next POST.
+                    # The local-fixer harness passes a WIP-commit hook here
+                    # (shaped_runner.py) that snapshots the worktree's write-
+                    # tool paths onto a SEPARATE ref (refs/wip/<task_id>) via
+                    # write-tree/commit-tree - the worktree's HEAD and index
+                    # are never moved, so the success path (final_diff = index
+                    # vs HEAD, the tail's commit/PR) is byte-identical.
+                    # Exceptions are caught and logged - the hook must never
+                    # break the loop (the 2418-2420 pattern).
+                    if after_step is not None:
+                        try:
+                            _step_entries = [
+                                e for e in transcript if e.get("step") == step_num + 1
+                            ]
+                            after_step({
+                                "step_num": step_num + 1,
+                                "transcript": _step_entries,
+                                "cwd": cwd,
+                                "writeable": writeable,
+                            })
+                        except Exception as _as_exc:
+                            logger.warning(f"[gw_agent] after_step raised: {_as_exc}")
+
                     # No-progress guard: abort if K consecutive steps made no semantic progress,
                     # OR if total exploration steps exceed the hard ceiling (grace can never
                     # mask an infinite loop of "novel" reads).
@@ -2463,9 +2527,11 @@ def _call_gw_agent_impl(
                             )
 
                     # Context-growth guard: truncate oldest tool-result messages if needed.
-                    if ctx_tokens > GW_AGENT_CTX_CAP:
+                    # Uses the per-run resolved ctx_cap (S1) - the module
+                    # constant is only the default.
+                    if ctx_tokens > ctx_cap:
                         if log:
-                            log(f"[gw_agent] context cap exceeded ({ctx_tokens} > {GW_AGENT_CTX_CAP}); truncating")
+                            log(f"[gw_agent] context cap exceeded ({ctx_tokens} > {ctx_cap}); truncating")
                         messages = _truncate_messages(messages)
 
                 elif writeable and finish_reason in ("output_limit", "length"):
@@ -2751,6 +2817,7 @@ def call_gw_agent(
     handler_max_interventions: int = 2,
     skip_probe: bool = False,
     swarm_payload: bool = False,
+    after_step: Callable[[dict], None] | None = None,
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Locality-ledger side-write wrapper around _call_gw_agent_impl().
 
@@ -2783,7 +2850,7 @@ def call_gw_agent(
             reason_out=reason_out, served_model_out=_locality_served,
             model=model, handler_hook=handler_hook, handler_objective=handler_objective,
             handler_max_interventions=handler_max_interventions, skip_probe=skip_probe,
-            swarm_payload=swarm_payload,
+            swarm_payload=swarm_payload, after_step=after_step,
         )
         return _locality_result
     except Exception:
