@@ -1205,6 +1205,23 @@ def _build_fixer_result(
         )
         final_diff = ""
     else:
+        # Local-fixer staging convention: the harness stages the bound spec at
+        # <cwd>/lapis-spec.md before the run and deletes it after. If that
+        # staged copy is UNTRACKED at HEAD (not part of the base commit), unstage
+        # it so the ~37KB spec hunk never pollutes final_diff / diffstat. A repo
+        # that tracks its own lapis-spec.md is protected: cat-file -e succeeds
+        # and we never discard real work.
+        probe = subprocess.run(
+            ["git", "-C", cwd, "cat-file", "-e", "HEAD:lapis-spec.md"],
+            capture_output=True,
+            timeout=10,
+        )
+        if probe.returncode != 0:
+            subprocess.run(
+                ["git", "-C", cwd, "reset", "-q", "--", "lapis-spec.md"],
+                capture_output=True,
+                timeout=10,
+            )
         diff_result = subprocess.run(
             ["git", "-C", cwd, "diff", "--cached"],
             capture_output=True,
@@ -2450,6 +2467,25 @@ def _call_gw_agent_impl(
                         if log:
                             log(f"[gw_agent] context cap exceeded ({ctx_tokens} > {GW_AGENT_CTX_CAP}); truncating")
                         messages = _truncate_messages(messages)
+
+                elif writeable and finish_reason in ("output_limit", "length"):
+                    # Output budget exhausted on a WRITEABLE run: the response was cut
+                    # mid-generation at max_tokens (NInfer: "output_limit", OpenAI-
+                    # compatible: "length"). NOT a voluntary stop - finalize as a
+                    # distinct failure so the harness/PM see a budget blowout instead
+                    # of a silent "concluded". writeable-scoped on purpose: readonly
+                    # json_mode runs keep their existing catch-all path, where the
+                    # grounding guard can nudge a truncated review for one more attempt.
+                    if log:
+                        log(
+                            f"[gw_agent] TRUNCATED at step {step_num + 1}: "
+                            f"finish_reason={finish_reason} (output budget exhausted at "
+                            f"max_tokens) - not a voluntary stop; finalizing as failure"
+                        )
+                    return _finalize_writeable_or_readonly(
+                        messages, content, return_transcript, transcript, writeable, cwd,
+                        concluded=False, stop_reason="output_budget_exhausted",
+                    )
 
                 elif finish_reason == "stop" or finish_reason not in ("tool_calls", "stop"):
                     # Agent concluded voluntarily (finish_reason == "stop", or unknown treated as stop).

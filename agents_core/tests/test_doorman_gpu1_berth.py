@@ -737,3 +737,92 @@ class TestIsSwarmParity:
         sig = inspect.signature(call_gw_agent)
         assert "swarm_payload" in sig.parameters
         assert sig.parameters["swarm_payload"].default is False
+
+
+# ---------------------------------------------------------------------------
+# (i) local-fixer D5 loud output-budget abort + D1/D2 staged-spec lifecycle
+# (agents-core-local-fixer-spec-visibility-and-loud-truncation-v0)
+# ---------------------------------------------------------------------------
+
+class TestLocalFixerTruncationAndSpecStaging:
+    """(6) stop_reason='output_budget_exhausted' short-circuits _run_local_fixer
+    with a DISTINCT stderr WARN (never the generic DoormanUnreachable string)
+    and no PR; (7) the bound spec is staged into the worktree as
+    lapis-spec.md before the agent call and removed after (D1/D2): present
+    DURING the call, absent after, no PR on an empty diff."""
+
+    def test_output_budget_exhausted_distinct_warn_no_pr(self, capsys):
+        from agents_core import shaped_runner
+
+        spec = {
+            "task_id": "task-obx",
+            "target_id": "tgt-obx",
+            "repo": "agents-core",
+            "prompt": "fix it",
+            "timeout_s": 1800,
+        }
+        with patch("agents_core.doorman_client.DoormanClient") as MockClient, \
+             patch("agents_core.worktree.setup_worktree") as mock_setup, \
+             patch("agents_core.worktree.teardown_worktree") as mock_teardown, \
+             patch("agents_core.gw_agent.call_gw_agent",
+                    return_value=({"final_diff": "", "concluded": False,
+                                   "stop_reason": "output_budget_exhausted",
+                                   "max_steps_reached": False,
+                                   "no_progress": False,
+                                   "last_test_outcome": None,
+                                   "steps": []}, [])):
+            MockClient.return_value.acquire.return_value = {
+                "status": "serving", "work_id": "task-obx-berth-sup",
+            }
+            mock_setup.return_value = MagicMock(path="/wt")
+            out = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
+        err = capsys.readouterr().err
+        assert out == ""
+        assert "output budget exhausted" in err
+        assert "DoormanUnreachable" not in err
+
+    def test_spec_staged_and_removed_around_run(self, tmp_path, monkeypatch):
+        from agents_core import shaped_runner
+
+        specs_dir = tmp_path / "planning" / "specs"
+        specs_dir.mkdir(parents=True)
+        (specs_dir / "tgt-staged.md").write_text("bound spec body\n")
+        wt_dir = tmp_path / "wt"
+        wt_dir.mkdir()
+
+        def fake_room_path(key, *parts, write=False):
+            return tmp_path / key.replace(".", "/")
+
+        def fake_call_gw_agent(*args, **kwargs):
+            staged = wt_dir / "lapis-spec.md"
+            assert staged.exists(), "D1: spec must be staged before the agent runs"
+            assert staged.read_text() == "bound spec body\n"
+            return (
+                {"final_diff": "", "concluded": True, "stop_reason": "",
+                 "max_steps_reached": False, "no_progress": False,
+                 "last_test_outcome": None, "steps": []},
+                [],
+            )
+
+        monkeypatch.setattr(shaped_runner, "room_path", fake_room_path)
+        with patch("agents_core.doorman_client.DoormanClient") as MockClient, \
+             patch("agents_core.worktree.setup_worktree") as mock_setup, \
+             patch("agents_core.worktree.teardown_worktree") as mock_teardown, \
+             patch("agents_core.gw_agent.call_gw_agent",
+                    side_effect=fake_call_gw_agent) as mock_cga, \
+             patch("agents_core.forgejo.create_pr") as mock_create_pr:
+            MockClient.return_value.acquire.return_value = {
+                "status": "serving", "work_id": "task-staged-berth-sup",
+            }
+            mock_setup.return_value = MagicMock(path=str(wt_dir))
+            out = shaped_runner._run_local_fixer({
+                "task_id": "task-staged",
+                "target_id": "tgt-staged",
+                "repo": "agents-core",
+                "prompt": "fix it",
+                "timeout_s": 1800,
+            }, base_cwd="/srv/agents")
+        mock_cga.assert_called_once()
+        assert out == ""
+        assert not (wt_dir / "lapis-spec.md").exists()
+        mock_create_pr.assert_not_called()
