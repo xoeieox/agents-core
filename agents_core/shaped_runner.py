@@ -996,12 +996,14 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         # WIP-commit salvage on a non-concluded terminal death (agents-core-
         # fixer-budget-compact-salvage-v0, S3): max_steps_hit / no_progress_hit
         # with >=1 WIP commit pushes the WIP history to a <slug>-salvage branch
-        # and opens an advisory [SALVAGE] PR INSTEAD of the gate_passed
-        # salvage path (the WIP commits are the verified work - compile-gated,
-        # whole-file; the gate_passed path needs the diff + tests clean, which
-        # a dead run cannot have). The run is still LOST.
+        # and opens an advisory [SALVAGE] PR. Ordering rule: the green-salvage
+        # path below takes precedence when it applies (clean diff AND passing
+        # tests) - a dead run CAN have both, and its verified tail is better
+        # than the WIP history. The WIP-salvage PR is for the remainder.
+        # The run is still LOST.
         if (not concluded and (max_steps_hit or no_progress_hit)
-                and wip_commit_count > 0):
+                and wip_commit_count > 0
+                and not (final_diff.strip() and gate_passed)):
             _wip_stop_reason = "max_steps_hit" if max_steps_hit else "no_progress_hit"
             print(
                 f"WARN: local-fixer: run not concluded - {_wip_stop_reason} "

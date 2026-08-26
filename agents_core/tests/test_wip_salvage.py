@@ -37,6 +37,7 @@ Covers:
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -80,6 +81,16 @@ class TestCtxCapEnvResolvable:
         negative, and zero values fall back to 120000."""
         import agents_core.gw_agent as gw
 
+        def _log(msg: str) -> None:
+            # The compact guard logs ONLY through the `log` callable
+            # (gw_agent has no logger fallback); route it to stderr so
+            # capsys can see it.
+            print(msg, file=sys.stderr)
+
+        # A real git repo: the writeable run's tail computes final_diff
+        # via `git add -A` in cwd (rc=128 in a bare temp dir).
+        _init_repo(tmp_path)
+
         # Valid value: the loop uses the env value at the guard.
         monkeypatch.setenv("GW_AGENT_CTX_CAP", "55000")
         with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
@@ -121,6 +132,7 @@ class TestCtxCapEnvResolvable:
                 writeable=True,
                 max_steps=5,
                 backend_url="http://gw-test:8081",
+                log=_log,
             )
         # The run concluded (the truncation did not kill it).
         assert isinstance(result, tuple)
@@ -648,3 +660,98 @@ class TestExecutorsFailClosedOnEmptyArgs:
         assert "error" in result
         # The file is unchanged.
         assert (tmp_path / "existing.py").read_text() == "hello\n"
+
+
+# ---------------------------------------------------------------------------
+# (10) WIP-salvage defers to the green-salvage path (spec rev-3 ordering)
+# ---------------------------------------------------------------------------
+
+class TestWipSalvageDefersToGreenPath:
+    """S3 ordering rule (rev-3): a non-concluded run at the step ceiling
+    that has WIP commits BUT also a clean non-empty diff with passing
+    tests takes the GREEN-salvage path (normal PR branch, no [SALVAGE]
+    title) - the WIP-salvage PR is for the remainder."""
+
+    def test_wip_salvage_defers_to_green_path(self, tmp_path):
+        from agents_core import shaped_runner
+
+        spec = {
+            "task_id": "task-gs",
+            "target_id": "tgt-gs",
+            "repo": "agents-core",
+            "prompt": "fix it",
+            "timeout_s": 1800,
+            "slug": "local",
+        }
+        wt_dir = tmp_path / "wt"
+        _init_repo(wt_dir)
+        # Add a bare origin so the green path's `git push origin
+        # HEAD:<branch>` succeeds (the real worktree has origin from the
+        # parent clone).
+        origin_dir = tmp_path / "origin.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(origin_dir)],
+                       check=True)
+        _git(wt_dir, "remote", "add", "origin", str(origin_dir))
+        _git(wt_dir, "push", "-q", "origin", "HEAD")
+
+        def fake_call_gw_agent(*args, **kwargs):
+            # >=1 WIP commit exists: the after_step hook fires during the
+            # run on a compiling write step (the condition the
+            # WIP-salvage branch needs to be a candidate).
+            after_step = kwargs.get("after_step")
+            if after_step is not None:
+                (wt_dir / "work.py").write_text("z = 3\n")
+                after_step({
+                    "step_num": 1,
+                    "transcript": [{
+                        "step": 1, "tool_name": "write_file",
+                        "tool_call_id": "call_0",
+                        "arguments": {"path": "work.py",
+                                       "content": "z = 3\n"},
+                        "result": "wrote 6 bytes to work.py",
+                        "error": None,
+                    }],
+                    "cwd": str(wt_dir),
+                    "writeable": True,
+                })
+            # Non-concluded at the max_steps ceiling, but the tail is
+            # clean: a non-empty diff, all tests passing, and no test
+            # file in the transcript (the legacy gate applies).
+            return (
+                {"final_diff": "diff --git a/work.py b/work.py\n"
+                               "--- /dev/null\n"
+                               "+++ b/work.py\n"
+                               "+z = 3\n",
+                 "concluded": False, "stop_reason": "",
+                 "max_steps_reached": True, "no_progress": False,
+                 "last_test_outcome": {"passed": 2, "failed": 0,
+                                       "errors": 0},
+                 "steps": [{"step": 1, "tool_name": "write_file"}]},
+                [{"step": 1, "tool_name": "write_file",
+                  "arguments": {"path": "work.py"}, "error": None}],
+            )
+
+        with patch("agents_core.doorman_client.DoormanClient") as MockClient, \
+             patch("agents_core.worktree.setup_worktree") as mock_setup, \
+             patch("agents_core.worktree.teardown_worktree") as mock_teardown, \
+             patch("agents_core.gw_agent.call_gw_agent",
+                    side_effect=fake_call_gw_agent), \
+             patch("agents_core.forgejo.create_pr") as mock_create_pr:
+            MockClient.return_value.acquire.return_value = {
+                "status": "serving", "work_id": "task-gs-berth-sup",
+            }
+            mock_setup.return_value = MagicMock(path=str(wt_dir))
+            mock_create_pr.return_value = {
+                "html_url": "http://forgejo/agents-core/pulls/1001",
+            }
+            out = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
+
+        # The GREEN-salvage path was taken, not the WIP-salvage path:
+        # exactly one PR, on the NORMAL branch (no -salvage suffix),
+        # with a NORMAL title (no [SALVAGE]).
+        mock_create_pr.assert_called_once()
+        call_kwargs = mock_create_pr.call_args.kwargs
+        assert call_kwargs["head"] == "lapis/tgt-gs/local"
+        assert "[SALVAGE]" not in call_kwargs["title"]
+        assert call_kwargs["base"] == "main"
+        assert out == "http://forgejo/agents-core/pulls/1001"
