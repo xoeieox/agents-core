@@ -123,6 +123,9 @@ class ShapedAgent:
     notify: bool = False
     notify_policy: str = "always"
     engine: str = "claude"
+    opencode_model: str = "gravitywell/gravitywell-slot1"
+    opencode_bin: str = "/home/user/.opencode/bin/opencode"
+    test_command: str | None = None
     backend_url: str | None = None
     acquire_lease: bool = True
     swarm_payload: bool = False
@@ -200,6 +203,15 @@ class Shaper:
                 notify=bool(body.get("notify", False)),
                 notify_policy=str(body.get("notify_policy", "always")),
                 engine=str(body.get("engine", "claude")),
+                opencode_model=str(
+                    body.get("opencode_model", "gravitywell/gravitywell-slot1")
+                ),
+                opencode_bin=str(
+                    body.get("opencode_bin")
+                    or os.getenv("OPENCODE_BIN")
+                    or "/home/user/.opencode/bin/opencode"
+                ),
+                test_command=body.get("test_command"),
                 backend_url=backend_url,
                 acquire_lease=acquire_lease,
                 swarm_payload=swarm_payload,
@@ -280,6 +292,9 @@ class Shaper:
             "target_id": target_id,
             "repo": vars_.get("repo", ""),
             "engine": agent.engine,
+            "opencode_model": agent.opencode_model,
+            "opencode_bin": agent.opencode_bin,
+            "test_command": agent.test_command,
             "model": agent.model,
             "backend_url": agent.backend_url,
             "acquire_lease": agent.acquire_lease,
@@ -361,10 +376,14 @@ class Shaper:
             # don't need it in their spec.
             if agent_type in ("fixer_retry", "reviewer", "reviewer_fresh"):
                 spec["existing_branch"] = vars_.get("existing_branch", "")
-            # local-fixer manages its own worktree inside _run_local_fixer;
-            # setting worktree_required=True would cause the runner to set up a
+            # local-fixer and local-opencode each manage their OWN worktree inside
+            # their engine (_run_local_fixer / _run_local_opencode); setting
+            # worktree_required=True would cause the runner to set up a
             # competing worktree before the engine even starts.
-            spec["worktree_required"] = agent.engine != "local-fixer"
+            spec["worktree_required"] = agent.engine not in (
+                "local-fixer",
+                "local-opencode",
+            )
             spec_path.write_text(json.dumps(spec, ensure_ascii=False))
             generated_task_id = task_id
             task_id = queue.submit({
