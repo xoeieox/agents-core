@@ -473,6 +473,102 @@ def _write_friction_entry(
             print(f"WARN: friction entry write failed for {key}: {exc}", file=sys.stderr)
 
 
+def _open_wip_salvage_pr(
+    worktree_path: str | None,
+    wip_ref: str,
+    wip_head_sha: str,
+    wip_steps: list,
+    *,
+    stop_reason: str,
+    task_id: str,
+    target_id: str,
+    bare_repo: str,
+    branch: str,
+    slug: str,
+    step_count: int,
+    transcript_path: Path,
+) -> str:
+    """Push refs/wip/<task_id> to a <slug>-salvage branch and open an advisory
+    [SALVAGE] PR (agents-core-fixer-budget-compact-salvage-v0, S3).
+
+    The worktree's HEAD is still at the base (detached origin/<base>); the WIP
+    history lives ONLY on the separate ref. Pushing to <slug>-salvage keeps a
+    later clean run's <branch> unconflicted. The PR is advisory (never
+    auto-merged); the run is still LOST (this returns the PR URL or "").
+    """
+    import subprocess
+
+    import agents_core.forgejo as _forgejo
+
+    salvage_branch = f"{branch}-salvage"
+
+    def _git(*args: str) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                ["git", "-C", worktree_path, *args],
+                capture_output=True, text=True, timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"WARN: wip-salvage: git {args[0]} timed out", file=sys.stderr)
+            return subprocess.CompletedProcess(["git", "-C", worktree_path, *args], 1, "", "timeout")
+
+    if not worktree_path or not wip_head_sha:
+        print("WARN: wip-salvage: no WIP head sha - no PR", file=sys.stderr)
+        return ""
+
+    # Push the WIP history to the salvage branch.
+    r = _git("push", "origin", f"{wip_ref}:refs/heads/{salvage_branch}")
+    if r.returncode != 0:
+        print(f"WARN: wip-salvage: git push failed: {r.stderr.strip()}", file=sys.stderr)
+        return ""
+
+    # PR body: task id, stop_reason + wall time, WIP head sha, the steps
+    # included, and what remains per the spec.
+    steps_included = ", ".join(str(s) for s in wip_steps) if wip_steps else "n/a"
+    pr_body = (
+        f"**[SALVAGE] advisory PR - the run is LOST (not concluded, no gate_passed).**\n\n"
+        f"## Task\n\n"
+        f"- task_id: `{task_id}`\n"
+        f"- target_id: `{target_id}`\n"
+        f"- stop_reason: `{stop_reason}`\n"
+        f"- wall time: {datetime.now(timezone.utc).isoformat()}\n"
+        f"- WIP head sha: `{wip_head_sha}`\n"
+        f"- steps included: {steps_included}\n"
+        f"- total steps executed: {step_count}\n\n"
+        f"## What remains\n\n"
+        f"Per the bound spec (staged as `lapis-spec.md` during the run, removed "
+        f"after): the spec's remaining work items are NOT in this salvage. The "
+        f"WIP commits are a compile-gated snapshot of the whole-file writes "
+        f"made up to the death - a partial implementation at best.\n\n"
+        f"## Recovery\n\n"
+        f"`lapis-pm rebind --force --adopt-pr <n>` + fixer_retry (proven "
+        f"2026-08-25 on PR #258).\n\n"
+        f"## Transcript\n\n"
+        f"`{transcript_path}`\n\n"
+        f"<!-- lapis-gpu-id: {task_id} -->\n"
+        f"<!-- lapis-tid: {target_id} -->\n"
+        f"<!-- lapis-salvage: true -->\n"
+    )
+
+    try:
+        pr = _forgejo.create_pr(
+            repo=bare_repo,
+            title=f"[SALVAGE] fix({target_id}): {stop_reason} at step {step_count}",
+            head=salvage_branch,
+            base="main",
+            body=pr_body,
+        )
+        print(
+            f"INFO: wip-salvage: [SALVAGE] PR opened: {pr.get('html_url', '')} "
+            f"(branch={salvage_branch}, WIP head={wip_head_sha})",
+            file=sys.stderr,
+        )
+        return pr.get("html_url", "")
+    except Exception as exc:
+        print(f"WARN: wip-salvage: create_pr failed: {exc}", file=sys.stderr)
+        return ""
+
+
 def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
     """Deterministic git/PR tail for the local-fixer engine.
 
@@ -495,6 +591,114 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
     transcript_path = _ARTIFACT_DIR / f"{task_id}-gw-transcript.json"
 
     worktree_path = None
+
+    # ------------------------------------------------------------------
+    # WIP-commit salvage state (agents-core-fixer-budget-compact-salvage-
+    # v0, S3). The after_step hook snapshots the step's write-tool paths
+    # onto a SEPARATE ref (refs/wip/<task_id>) via write-tree/commit-tree:
+    # the worktree's HEAD and index are never moved, so the success path
+    # (final_diff = index vs HEAD, the tail's commit/PR) is byte-identical
+    # to pre-spec. On a non-concluded terminal death with >=1 WIP commit,
+    # the ref is pushed to a <slug>-salvage branch and an advisory
+    # [SALVAGE] PR is opened (never auto-merged; the run is still LOST).
+    # ------------------------------------------------------------------
+    wip_ref = f"refs/wip/{task_id}"
+    wip_commit_count = 0
+    wip_head_sha = ""
+    wip_steps: list[int] = []
+
+    def _wip_git(*args: str) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                ["git", "-C", worktree_path, *args],
+                capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"WARN: wip-commit: git {args[0]} timed out", file=sys.stderr)
+            return subprocess.CompletedProcess(["git", "-C", worktree_path, *args], 1, "", "timeout")
+
+    def _wip_commit_hook(ctx: dict) -> None:
+        """One WIP commit per step that wrote a file. Never raises."""
+        nonlocal wip_commit_count, wip_head_sha
+        import py_compile
+
+        step_num = ctx.get("step_num")
+        cwd = ctx.get("cwd")
+        if not ctx.get("writeable") or not cwd or not step_num:
+            return
+        # Paths from this step's write-tool args only - the staged
+        # lapis-spec.md and any stray files are never touched (explicit
+        # pathspec, invariant 5).
+        paths: list[str] = []
+        for entry in ctx.get("transcript") or []:
+            if entry.get("tool_name") not in ("write_file", "apply_edit"):
+                continue
+            p = (entry.get("arguments") or {}).get("path")
+            if isinstance(p, str) and p and p not in paths:
+                paths.append(p)
+        if not paths:
+            return
+        try:
+            # py_compile floor: every touched .py must compile with the
+            # process interpreter, or the commit is skipped (the previous
+            # WIP commit stays the safe floor).
+            for p in paths:
+                if not p.endswith(".py"):
+                    continue
+                full = Path(cwd) / p
+                if not full.is_file():
+                    continue
+                try:
+                    py_compile.compile(str(full), doraise=True)
+                except (py_compile.PyCompileError, OSError) as exc:
+                    print(
+                        f"WARN: wip-commit: {p} does not py_compile "
+                        f"({exc}) - skipping WIP commit for step {step_num} "
+                        f"(previous WIP commit stays the floor)",
+                        file=sys.stderr,
+                    )
+                    return
+            parent = _wip_git("rev-parse", "--verify", wip_ref)
+            if parent.returncode != 0:
+                parent = _wip_git("rev-parse", "HEAD")
+                if parent.returncode != 0:
+                    return
+            add = _wip_git("add", "--", *paths)
+            if add.returncode != 0:
+                print(f"WARN: wip-commit: git add failed: {add.stderr.strip()}", file=sys.stderr)
+                return
+            tree = _wip_git("write-tree")
+            if tree.returncode != 0:
+                print(f"WARN: wip-commit: git write-tree failed: {tree.stderr.strip()}", file=sys.stderr)
+                _wip_git("reset")
+                return
+            commit = _wip_git(
+                "commit-tree", tree.stdout.strip(), "-p", parent.stdout.strip(),
+                "-m", f"wip: {task_id} step {step_num} [auto]",
+            )
+            if commit.returncode != 0:
+                print(f"WARN: wip-commit: git commit-tree failed: {commit.stderr.strip()}", file=sys.stderr)
+                _wip_git("reset")
+                return
+            upd = _wip_git("update-ref", wip_ref, commit.stdout.strip())
+            # Unstage: restore the index (and the worktree's HEAD) exactly as found.
+            _wip_git("reset")
+            if upd.returncode != 0:
+                print(f"WARN: wip-commit: git update-ref failed: {upd.stderr.strip()}", file=sys.stderr)
+                return
+            wip_commit_count += 1
+            wip_head_sha = commit.stdout.strip()
+            wip_steps.append(int(step_num))
+            print(
+                f"INFO: wip-commit: {wip_ref} -> {wip_head_sha} "
+                f"(step {step_num}, {len(paths)} path(s))",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            # Never break the loop: a WIP-commit failure degrades to "no
+            # salvage for this step", exactly like today's no-salvage
+            # behavior.
+            print(f"WARN: wip-commit: unexpected error: {exc}", file=sys.stderr)
 
     # ------------------------------------------------------------------
     # Supervisor lease (gw-gpu1-berth-standing-seat-v0, leg 2, Doorman B).
@@ -680,6 +884,10 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             handler_hook=_handler_hook,
             handler_objective=_handler_objective,
             handler_max_interventions=_handler_max_interventions,
+            # WIP-commit salvage seam (agents-core-fixer-budget-compact-
+            # salvage-v0, S3): one WIP commit per write step onto the
+            # separate refs/wip/<task_id> ref. Local-fixer runs only.
+            after_step=_wip_commit_hook,
         )
 
         # Remove the staged spec before the deterministic git tail so it is
@@ -793,17 +1001,65 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             return ""
 
         # Output-budget exhaustion is a distinct failure mode: the response was
-        # cut at max_tokens; work (if any) may be incomplete and a truncated
-        # write_file can leave a half-written file. Do NOT salvage or PR - log
-        # the distinct stop_reason and return "".
+        # cut at max_tokens. Verified-state salvage (agents-core-fixer-
+        # budget-compact-salvage-v0, S3 - the D5 policy flip): when >=1 WIP
+        # commit exists on refs/wip/<task_id> (each a compile-gated snapshot
+        # of a whole-file write - the safety premise is that a truncated
+        # response can never leave a partial file: the fail-closed default
+        # executors reject empty-args calls, and valid args JSON implies a
+        # complete whole-file write), push the WIP history to a
+        # <slug>-salvage branch and open an advisory [SALVAGE] PR. The run
+        # is still LOST (this returns "" - no concluded/gate_passed).
         if stop_reason == "output_budget_exhausted":
+            if wip_commit_count > 0:
+                print(
+                    f"WARN: local-fixer: run aborted - output budget exhausted "
+                    f"(finish_reason=output_limit/length; response truncated at "
+                    f"max_tokens) - WIP commits exist; "
+                    f"opening advisory [SALVAGE] PR",
+                    file=sys.stderr,
+                )
+                return _open_wip_salvage_pr(
+                    worktree_path, wip_ref, wip_head_sha, wip_steps,
+                    stop_reason=stop_reason, task_id=task_id,
+                    target_id=target_id, bare_repo=bare_repo,
+                    branch=branch, slug=slug,
+                    step_count=len(fixer_result.get("steps") or []),
+                    transcript_path=transcript_path,
+                )
             print(
                 "WARN: local-fixer: run aborted - output budget exhausted "
                 "(finish_reason=output_limit/length; response truncated at "
-                "max_tokens - work may be incomplete, no PR)",
+                "max_tokens - no WIP commits, no PR)",
                 file=sys.stderr,
             )
             return ""
+
+        # WIP-commit salvage on a non-concluded terminal death (agents-core-
+        # fixer-budget-compact-salvage-v0, S3): max_steps_hit / no_progress_hit
+        # with >=1 WIP commit pushes the WIP history to a <slug>-salvage branch
+        # and opens an advisory [SALVAGE] PR. Ordering rule: the green-salvage
+        # path below takes precedence when it applies (clean diff AND passing
+        # tests) - a dead run CAN have both, and its verified tail is better
+        # than the WIP history. The WIP-salvage PR is for the remainder.
+        # The run is still LOST.
+        if (not concluded and (max_steps_hit or no_progress_hit)
+                and wip_commit_count > 0
+                and not (final_diff.strip() and gate_passed)):
+            _wip_stop_reason = "max_steps_hit" if max_steps_hit else "no_progress_hit"
+            print(
+                f"WARN: local-fixer: run not concluded - {_wip_stop_reason} "
+                f"- opening advisory [SALVAGE] PR",
+                file=sys.stderr,
+            )
+            return _open_wip_salvage_pr(
+                worktree_path, wip_ref, wip_head_sha, wip_steps,
+                stop_reason=_wip_stop_reason, task_id=task_id,
+                target_id=target_id, bare_repo=bare_repo,
+                branch=branch, slug=slug,
+                step_count=len(fixer_result.get("steps") or []),
+                transcript_path=transcript_path,
+            )
 
         salvaged = False
         if not concluded:
