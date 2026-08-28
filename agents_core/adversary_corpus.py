@@ -20,6 +20,8 @@ v0 invariants:
 from __future__ import annotations
 
 import hashlib
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -177,7 +179,24 @@ def _process_source_kind(
         if not dry_run:
             try:
                 fragment = _render_fragment(source_key, source_kind, body, captured_at)
-                out_path.write_text(fragment, encoding="utf-8")
+                # Atomic write (same pattern as target YAML / GPU queue task
+                # persistence): mkstemp in the destination dir + os.replace,
+                # with best-effort temp cleanup on any failure.
+                fd, tmp = tempfile.mkstemp(
+                    dir=str(out_path.parent),
+                    prefix="." + out_path.name + ".",
+                    suffix=".tmp",
+                )
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(fragment)
+                    os.replace(tmp, out_path)
+                except BaseException:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
             except Exception as exc:
                 errors.append(f"{source_kind}/{sid}: {exc}")
                 continue
