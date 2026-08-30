@@ -569,6 +569,93 @@ def _open_wip_salvage_pr(
         return ""
 
 
+# ---------------------------------------------------------------------------
+# agents-core-local-fixer-gate-nonpython-v0: repo-aware D1 gate + tail log.
+# ---------------------------------------------------------------------------
+
+def _has_python_test_infra(cwd) -> bool:
+    """Does this worktree have Python test infrastructure (pytest-detectable)?
+
+    agents-core-local-fixer-gate-nonpython-v0 Deliverable 1: True when ANY of:
+    a root pyproject.toml / setup.py / pytest.ini / conftest.py exists; a root
+    setup.cfg contains a [tool:pytest] section (a packaging-only setup.cfg is
+    NOT pytest infra); at least one test_*.py / *_test.py at depth <= 2 below
+    cwd; or a tests/ / *_tests/ directory (at depth <= 2) containing at least
+    one .py file. Bounded scan: depth cap 2 (no deeper recursion; no per-dir
+    file-count cap - a count cap would risk the bypass-direction false
+    negative, which is the dangerous direction). Any OSError returns True
+    (fail-safe: treat as infra present - the gate behaves as today; the
+    bypass can never be caused by a filesystem surprise).
+    """
+    root = Path(cwd)
+
+    def _scan(d: Path, depth: int) -> bool:
+        # depth: levels below root (root itself = 0). Files are in scope at
+        # depth <= 2; prune descent beyond depth 2.
+        if depth > 2:
+            return False
+        try:
+            entries = sorted(d.iterdir())
+        except OSError:
+            return True  # fail-safe: unexpected filesystem = infra present
+        for e in entries:
+            try:
+                if e.is_file():
+                    if e.name.endswith(".py") and (
+                            e.name.startswith("test_") or e.name.endswith("_test.py")):
+                        return True
+                elif e.is_dir():
+                    if e.name == "tests" or e.name.endswith("_tests"):
+                        try:
+                            if any(f.is_file() and f.suffix == ".py"
+                                   for f in e.iterdir()):
+                                return True
+                        except OSError:
+                            return True
+                    if _scan(e, depth + 1):
+                        return True
+            except OSError:
+                return True  # fail-safe (entry-level stat surprise)
+        return False
+
+    try:
+        for name in ("pyproject.toml", "setup.py", "pytest.ini", "conftest.py"):
+            if (root / name).is_file():
+                return True
+        cfg = root / "setup.cfg"
+        if cfg.is_file():
+            try:
+                if "[tool:pytest]" in cfg.read_text(errors="replace"):
+                    return True
+            except OSError:
+                return True
+        return _scan(root, 0)
+    except OSError:
+        return True
+
+
+def _tail_log(task_id: str, message: str) -> None:
+    """Append one timestamped line to <shaped-dir>/<task_id>-tail.log.
+
+    agents-core-local-fixer-gate-nonpython-v0 Deliverable 4: the tail's phase
+    log was captured nowhere (the systemd scope journal has no entries; the
+    queue-runner logs only claim/done lines), so a lost run's reason was
+    undiagnosable after the fact. Best-effort: any OSError is swallowed -
+    logging must never fail a run. Additive to the existing stderr prints,
+    not a replacement. Reason strings, returncodes and URLs only: no
+    secrets, no tokens, no diff content (callers truncate git stderr to
+    <= 500 chars).
+    """
+    try:
+        shaped_dir = room_path("gpu_queue.shaped")
+        shaped_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(shaped_dir / f"{task_id}-tail.log", "a", encoding="utf-8") as f:
+            f.write(f"{ts} {message}\n")
+    except OSError:
+        pass
+
+
 def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
     """Deterministic git/PR tail for the local-fixer engine.
 
@@ -938,7 +1025,33 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         # to write tests.
         model_touched_tests = _collect_model_touched_tests(transcript, cwd)
         gate_passed = False
-        if model_touched_tests:
+        gate_bypassed = None
+        py_infra = _has_python_test_infra(Path(cwd))
+        if not py_infra:
+            # agents-core-local-fixer-gate-nonpython-v0 Deliverable 2: the
+            # worktree has no Python test infrastructure - the pytest-only
+            # in-dispatch gate can never pass here (claude-view class:
+            # Rust+TS repos). Bypass loudly instead of failing closed
+            # forever and silently discarding completed work.
+            gate_passed = True
+            gate_bypassed = "no-python-test-infra"
+            print(
+                "WARN: local-fixer: test gate BYPASSED - no Python test "
+                "infrastructure detected in repo; in-dispatch test "
+                "verification unavailable; verification rests on the "
+                "reviewer gate and post-merge local gates",
+                file=sys.stderr,
+            )
+            _tail_log(task_id, "gate BYPASSED - no-python-test-infra")
+            _write_friction_entry(
+                repo=bare_repo,
+                node_id="test-gate-bypassed-no-python-test-infra",
+                error_signature="gate-bypassed:no-python-test-infra",
+                task_id=task_id,
+                today=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                log=lambda m: print(m, file=sys.stderr),
+            )
+        elif model_touched_tests:
             # Positive-only gate: every test the model touched must pass.
             # A touched test "fails" if a FAILED/ERROR node ID refers to it.
             # A node ID "refers to" a touched test file if the node's file
@@ -962,6 +1075,22 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         else:
             # Fail-closed fallback: no tests touched -> legacy gate.
             gate_passed = _tests_passed(last_test_outcome)
+
+        if gate_bypassed is None:
+            if gate_passed:
+                _tail_log(
+                    task_id,
+                    "gate PASSED "
+                    f"(model_touched_tests={sorted(model_touched_tests) if model_touched_tests else '[] (legacy)'})",
+                )
+            else:
+                _tail_log(
+                    task_id,
+                    "gate FAILED "
+                    f"(model_touched_tests={sorted(model_touched_tests) if model_touched_tests else '[] (legacy)'}; "
+                    f"last_test_outcome passed={int((last_test_outcome or {}).get('passed') or 0)} "
+                    f"failed={int((last_test_outcome or {}).get('failed') or 0)})",
+                )
 
         # D6 (agents-core-local-fixer-harness-fix-v0): witness pre-existing
         # failures via a friction mem entry so a future daemon-side follow-up
@@ -998,6 +1127,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                 "(redundant mem searches; no edits made)",
                 file=sys.stderr,
             )
+            _tail_log(task_id, "run aborted - mem_search_loop (redundant mem searches; no edits made)")
             return ""
 
         # Output-budget exhaustion is a distinct failure mode: the response was
@@ -1019,6 +1149,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                     f"opening advisory [SALVAGE] PR",
                     file=sys.stderr,
                 )
+                _tail_log(task_id, "run aborted - output_budget_exhausted - opening advisory [SALVAGE] PR")
                 return _open_wip_salvage_pr(
                     worktree_path, wip_ref, wip_head_sha, wip_steps,
                     stop_reason=stop_reason, task_id=task_id,
@@ -1033,6 +1164,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                 "max_tokens - no WIP commits, no PR)",
                 file=sys.stderr,
             )
+            _tail_log(task_id, "run aborted - output_budget_exhausted (no WIP commits) - no PR")
             return ""
 
         # WIP-commit salvage on a non-concluded terminal death (agents-core-
@@ -1052,6 +1184,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                 f"- opening advisory [SALVAGE] PR",
                 file=sys.stderr,
             )
+            _tail_log(task_id, f"run not concluded - {_wip_stop_reason} - opening advisory [SALVAGE] PR")
             return _open_wip_salvage_pr(
                 worktree_path, wip_ref, wip_head_sha, wip_steps,
                 stop_reason=_wip_stop_reason, task_id=task_id,
@@ -1073,23 +1206,27 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                     "WARN: local-fixer: run aborted - no semantic progress after consecutive idle steps (spinning wheels)",
                     file=sys.stderr,
                 )
+                _tail_log(task_id, "run aborted - no semantic progress (spinning wheels)")
                 return ""
             elif max_steps_hit:
                 print(
                     "WARN: local-fixer: run not concluded - max_steps ceiling reached (no passing tests or empty diff)",
                     file=sys.stderr,
                 )
+                _tail_log(task_id, "run not concluded - max_steps ceiling reached (no passing tests or empty diff)")
                 return ""
             else:
                 print(
                     "WARN: local-fixer: run not concluded - DoormanUnreachable or wake timeout",
                     file=sys.stderr,
                 )
+                _tail_log(task_id, "run not concluded - DoormanUnreachable or wake timeout")
                 return ""
 
         if not salvaged:
             if not final_diff.strip():
                 print("WARN: local-fixer: empty diff — no PR", file=sys.stderr)
+                _tail_log(task_id, "empty diff - no PR")
                 return ""
             if not gate_passed:
                 # D1 (agents-core-local-fixer-harness-fix-v0): the positive-only
@@ -1119,18 +1256,22 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         r = _git("checkout", "-B", branch)
         if r.returncode != 0:
             print(f"WARN: local-fixer: git checkout -b failed: {r.stderr.strip()}", file=sys.stderr)
+            _tail_log(task_id, f"git checkout -b failed rc={r.returncode}: {r.stderr.strip()[:500]}")
             return ""
         r = _git("add", "-A")
         if r.returncode != 0:
             print(f"WARN: local-fixer: git add failed: {r.stderr.strip()}", file=sys.stderr)
+            _tail_log(task_id, f"git add failed rc={r.returncode}: {r.stderr.strip()[:500]}")
             return ""
         r = _git("commit", "-m", f"fix({target_id}): local-fixer harness")
         if r.returncode != 0:
             print(f"WARN: local-fixer: git commit failed: {r.stderr.strip()}", file=sys.stderr)
+            _tail_log(task_id, f"git commit failed rc={r.returncode}: {r.stderr.strip()[:500]}")
             return ""
         r = _git("push", "origin", f"HEAD:{branch}")
         if r.returncode != 0:
             print(f"WARN: local-fixer: git push failed: {r.stderr.strip()}", file=sys.stderr)
+            _tail_log(task_id, f"git push failed rc={r.returncode}: {r.stderr.strip()[:500]}")
             return ""
 
         # Provenance PR body — factual only
@@ -1146,6 +1287,16 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             test_summary = "no test outcome recorded"
 
         step_count = len(fixer_result.get("steps") or [])
+        test_gate_section = (
+            "## Test gate\n\n"
+            "bypassed - no Python test infrastructure in this repo; "
+            "NO in-dispatch test run was performed (the harness test tool "
+            "is pytest-only). Verification for this PR rests on the "
+            "reviewer gate and post-merge local gates. This marker exists "
+            "so the skipped verification cannot be read as routine.\n\n"
+            "<!-- lapis-test-gate: bypassed-no-python-test-infra -->\n\n"
+            if gate_bypassed else ""
+        )
         salvage_kind = "no_progress" if no_progress_hit else "max_steps_reached"
         salvage_note = (
             f"**harness-salvaged: {salvage_kind}** - "
@@ -1174,23 +1325,31 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             f"{signoff_marker}"
             f"## Diff summary\n\n```diff\n{diffstat}\n```\n\n"
             f"## Test outcome\n\n{test_summary}\n\n"
+            f"{test_gate_section}"
             f"## Steps\n\n{step_count} tool-call step(s) executed.\n\n"
             f"## Transcript\n\n`{transcript_path}`\n\n"
             f"<!-- lapis-gpu-id: {task_id} -->\n"
             f"<!-- lapis-tid: {target_id} -->"
         )
 
-        pr = _forgejo.create_pr(
-            repo=bare_repo,
-            title=f"fix({target_id}): local-fixer",
-            head=branch,
-            base="main",
-            body=pr_body,
-        )
+        try:
+            pr = _forgejo.create_pr(
+                repo=bare_repo,
+                title=f"fix({target_id}): local-fixer",
+                head=branch,
+                base="main",
+                body=pr_body,
+            )
+        except Exception as exc:
+            print(f"WARN: local-fixer: create_pr failed: {exc}", file=sys.stderr)
+            _tail_log(task_id, f"create_pr FAILED: {exc}")
+            return ""
+        _tail_log(task_id, f"create_pr OK url={pr.get('html_url', '')}")
         return pr.get("html_url", "")
 
     except Exception as exc:
         print(f"WARN: local-fixer: unexpected error: {exc}", file=sys.stderr)
+        _tail_log(task_id, f"unexpected error: {exc}")
         return ""
 
     finally:
