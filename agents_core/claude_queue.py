@@ -21,6 +21,14 @@ Storage:
       history.jsonl     Append-only event log
       state.json        Snapshot: in-flight list, queue depth
 
+Seat serialization: claim() defers a pending candidate when its seat is
+already occupied by an active task. Seats are the explicit set from env
+CLAUDE_QUEUE_SERIAL_SEATS (comma-separated; a bare `model` matches any
+backend_url, a `backend_url|model` entry matches the exact seat); unset or
+empty falls back to the safe default {gravitywell-122b, ninfer-27b}. A
+deferred serialized-seat candidate may be overtaken by a lower-priority
+other-seat candidate claimed in the same call (candidate-skip semantics).
+
 Usage:
     from agents_core.claude_queue import ClaudeQueue
     q = ClaudeQueue()
@@ -180,6 +188,110 @@ TASK_DEFAULTS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Seat serialization guard (per-seat admission cap, claim-time deferral).
+#
+# Generalizes the former hard-coded gravitywell-122b "Defect 3" guard to an
+# explicit set of serialized seats keyed on (backend_url, model), read from
+# env CLAUDE_QUEUE_SERIAL_SEATS on every claim() call (never cached).
+# See the module docstring's "Seat serialization" note.
+# ---------------------------------------------------------------------------
+
+# Grace beyond a job's timeout_seconds before its active YAML is treated as a
+# stale orphan (runner restarted mid-job) and stops pinning its seat. Mirrors
+# startup_sweep's staleness arithmetic in claude_queue_runner.py online: the
+# runner kills a job at its wall-clock timeout, so a genuinely live job can
+# never outlive timeout + this grace.
+SEAT_STALE_GRACE_S = 120
+
+_DEFAULT_SERIAL_SEATS = ("gravitywell-122b", "ninfer-27b")
+
+
+def _serial_seat_entries() -> list[tuple[str, str | None, str]]:
+    """Parse CLAUDE_QUEUE_SERIAL_SEATS fresh on each call.
+
+    Returns a list of (kind, url, model) tuples: ("exact", url, model) for a
+    `backend_url|model` entry (the LAST pipe is the separator — the URL side
+    may contain pipes, the model side may not) or ("model", None, model) for
+    a bare-model entry. Whitespace stripped; duplicate entries collapse.
+    Unset OR empty value -> the default bare-model set (a stray env edit
+    cannot silently disable serialization).
+    """
+    raw = os.environ.get("CLAUDE_QUEUE_SERIAL_SEATS")
+    if raw is None or raw.strip() == "":
+        return [("model", None, m) for m in _DEFAULT_SERIAL_SEATS]
+    seen: set[tuple[str, str | None, str]] = set()
+    entries: list[tuple[str, str | None, str]] = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "|" in tok:
+            url, model = tok.rsplit("|", 1)
+            url, model = url.strip(), model.strip()
+            if not url or not model:
+                continue
+            e = ("exact", url, model)
+        else:
+            if not tok:
+                continue
+            e = ("model", None, tok)
+        if e not in seen:
+            seen.add(e)
+            entries.append(e)
+    return entries
+
+
+def _task_backend_url(task: dict) -> str | None:
+    """Read backend_url from the task's spec JSON (payload.spec_path).
+
+    Fail-open contract: ANY failure shape (missing field, unreadable file,
+    JSON parse error, non-dict top level, missing/non-string backend_url)
+    returns None. The catch is deliberately broad (`except Exception`) so no
+    malformed spec can ever escape claim() into the runner's claim-loop
+    catch-all (which pages and exits the whole daemon).
+    """
+    try:
+        payload = task.get("payload") or {}
+        spec_path = payload.get("spec_path")
+        if not spec_path:
+            raise ValueError("no payload.spec_path")
+        data = json.loads(Path(spec_path).read_text())
+        if not isinstance(data, dict):
+            raise ValueError("spec top level is not a dict")
+        url = data["backend_url"]
+        if not isinstance(url, str):
+            raise ValueError("backend_url is not a string")
+        return url
+    except Exception:
+        return None
+
+
+def _active_occupies(active_task: dict, now_dt: datetime) -> bool:
+    """Does an active task still occupy its seat?
+
+    A task occupies only while `now - started_at < timeout_seconds +
+    SEAT_STALE_GRACE_S`. If started_at is absent or unparseable the task is
+    treated as FRESH (occupying) — the conservative default for the guard,
+    deliberately the OPPOSITE of startup_sweep's eviction direction (which
+    treats missing as stale). Normal claims always stamp started_at before
+    the atomic active write, so this pin covers hand-placed or partial-state
+    YAMLs only.
+    """
+    started_raw = active_task.get("started_at")
+    if not started_raw:
+        return True
+    try:
+        started_dt = datetime.fromisoformat(started_raw)
+    except (TypeError, ValueError):
+        return True
+    timeout = active_task.get("timeout_seconds")
+    if not isinstance(timeout, (int, float)) or timeout <= 0:
+        # No usable timeout bound: treat as fresh (conservative).
+        return True
+    return (now_dt - started_dt).total_seconds() < timeout + SEAT_STALE_GRACE_S
+
+
 class ClaudeQueue:
     """File-based queue for `claude -p` subprocess tasks."""
 
@@ -191,6 +303,12 @@ class ClaudeQueue:
         self.failed_dir = self.queue_dir / "failed"
         self.history_path = self.queue_dir / "history.jsonl"
         self.state_path = self.queue_dir / "state.json"
+        # In-memory log-dedup sets for the seat-serialization guard: ids of
+        # tasks already logged at INFO (deferral) or WARN (unreadable spec).
+        # Pruned to pending stems at the top of each claim() scan and dropped
+        # on successful claim, so they stay bounded in a long-lived daemon.
+        self._logged_deferrals: set[str] = set()
+        self._warned_spec_ids: set[str] = set()
         self._ensure_dirs()
 
     def _ensure_dirs(self):
@@ -363,6 +481,68 @@ class ClaudeQueue:
 
         return task["id"]
 
+    def _seat_key(self, task: dict, need_url: bool = False) -> tuple[str | None, object]:
+        """Return (backend_url, model) for a task.
+
+        backend_url is resolved LAZILY: it stays None unless an exact
+        url|model serial entry forces resolution (need_url=True), in which
+        case the spec JSON is read via _task_backend_url's fail-open
+        contract. The default bare-model set therefore performs zero added
+        spec-file I/O. Any failure degrades to (None, model) and logs one
+        WARN per task id (never file content or parsed values — the spec
+        JSON carries system/prompt instruction text).
+        """
+        model = task.get("model")
+        if not need_url:
+            return (None, model)
+        tid = task.get("id", "<unknown>")
+        url = _task_backend_url(task)
+        if url is None and tid not in self._warned_spec_ids:
+            self._warned_spec_ids.add(tid)
+            payload = task.get("payload") or {}
+            spec_path = payload.get("spec_path")
+            try:
+                # Classify the failure for the WARN without touching content.
+                data = json.loads(Path(spec_path).read_text())
+                if not isinstance(data, dict):
+                    cls = "non-dict-spec"
+                elif not isinstance(data.get("backend_url"), str):
+                    cls = "bad-backend-url"
+                else:
+                    cls = "unexpected"
+            except Exception as e:  # noqa: BLE001 - classification only
+                cls = type(e).__name__
+            _coord_log.warning(
+                "claude-queue: unreadable spec for %s (spec_path=%s, "
+                "failure=%s); seat key degrades to (None, %s)",
+                tid, spec_path, cls, model)
+        return (url, model)
+
+    def _entry_matches(self, entry: tuple, task: dict) -> bool:
+        """Does a serial-seat entry match this task?
+
+        Bare ("model", None, m): matches on model alone. Exact
+        ("exact", url, m): matches on model AND the task's spec backend_url
+        (fail-open: an unreadable spec has url None and matches no exact
+        entry, but still matches its bare entries).
+        """
+        kind, entry_url, entry_model = entry
+        if task.get("model") != entry_model:
+            return False
+        if kind == "model":
+            return True
+        url = _task_backend_url(task)
+        if url is None:
+            tid = task.get("id", "<unknown>")
+            if tid not in self._warned_spec_ids:
+                self._warned_spec_ids.add(tid)
+                _coord_log.warning(
+                    "claude-queue: unreadable spec for %s; exact seat "
+                    "entry %s|%s cannot match (degraded to model-only)",
+                    tid, entry_url[:120], entry_model[:120])
+            return False
+        return url == entry_url
+
     def claim(self) -> dict | None:
         """Claim the highest-priority pending task. Returns task dict or None.
 
@@ -372,11 +552,21 @@ class ClaudeQueue:
         losers find a missing source file and try the next task.
 
         No model-affinity tiebreak (Qwen-specific), no preempt. Priority ASC,
-        then submitted_at ASC.
+        then submitted_at ASC — with one serialized-seat exception: a
+        deferred high-priority candidate on a busy serialized seat may be
+        overtaken by a lower-priority other-seat candidate claimed in the
+        same call (candidate-skip semantics; see the module docstring's
+        "Seat serialization" note).
         """
         pending_files = sorted(self.pending_dir.glob("*.yaml"))
         if not pending_files:
             return None
+
+        # Prune the log-dedup sets to ids whose YAML is still in pending/ so
+        # they neither re-log INFO every poll nor grow unbounded.
+        pending_stems = {p.stem for p in pending_files}
+        self._logged_deferrals &= pending_stems
+        self._warned_spec_ids &= pending_stems
 
         tasks = []
         for p in pending_files:
@@ -396,18 +586,58 @@ class ClaudeQueue:
 
         tasks.sort(key=sort_key)
 
+        serial_entries = _serial_seat_entries()
+        now_dt = datetime.fromisoformat(_now_iso())
+        active_tasks: list[dict] = []
+        for ap in self.active_dir.glob("*.yaml"):
+            at = self._read_task(ap)
+            if at:
+                active_tasks.append(at)
+
         for chosen in tasks:
-            # Defect 3: gravitywell-122b serves --parallel 1, so only one task may be
-            # active at a time. If one is already running, defer the next claim.
-            if chosen.get("model") == "gravitywell-122b":
-                gw122b_active = False
-                for ap in self.active_dir.glob("*.yaml"):
-                    at = self._read_task(ap)
-                    if at and at.get("model") == "gravitywell-122b":
-                        gw122b_active = True
-                        break
-                if gw122b_active:
+            # Seat-serialization guard (generalized from the former
+            # hard-coded gravitywell-122b "Defect 3" block): a candidate is
+            # deferred iff any serial seat it matches has an active task that
+            # also matches the same entry and still occupies its seat.
+            # Deferral is a candidate skip — other seats claim normally, so
+            # a busy serialized seat never starves them.
+            needs_url = any(
+                e[0] == "exact" and chosen.get("model") == e[2]
+                for e in serial_entries
+            )
+            # Lazy seat-key resolution: the spec JSON is read only when an
+            # exact url|model entry forces it (default bare set -> zero I/O).
+            self._seat_key(chosen, need_url=needs_url)
+            deferred_entry = None
+            deferred_active = None
+            for entry in serial_entries:
+                if not self._entry_matches(entry, chosen):
                     continue
+                for at in active_tasks:
+                    if not self._entry_matches(entry, at):
+                        continue
+                    if not _active_occupies(at, now_dt):
+                        continue  # stale orphan YAML: does not pin the seat
+                    deferred_entry = entry
+                    deferred_active = at
+                    break
+                if deferred_entry is not None:
+                    break
+            if deferred_entry is not None:
+                _, d_url, d_model = deferred_entry
+                tid = chosen.get("id", "<unknown>")
+                active_id = deferred_active.get("id", "<unknown>")
+                log_line = (
+                    "claude-queue: deferring %s - serialized seat %s|%s "
+                    "busy (active: %s)"
+                    % (tid, (d_url or "-")[:120], d_model[:120], active_id)
+                )
+                if tid in self._logged_deferrals:
+                    _coord_log.debug(log_line)
+                else:
+                    self._logged_deferrals.add(tid)
+                    _coord_log.info(log_line)
+                continue
 
             src_path = Path(chosen.pop("_path"))
             chosen["status"] = "running"
@@ -428,6 +658,9 @@ class ClaudeQueue:
                 "priority": chosen["priority"],
                 "model": chosen.get("model"),
             })
+            # The claimed task leaves pending/: drop its dedup entries.
+            self._logged_deferrals.discard(chosen["id"])
+            self._warned_spec_ids.discard(chosen["id"])
 
             state = self._read_state()
             self._refresh_state(state)
