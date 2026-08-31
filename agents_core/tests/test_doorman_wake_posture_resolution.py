@@ -70,6 +70,16 @@ class _FakeTopologyErrors:
     class TopologyReachFailed(Exception):
         pass
 
+    # Post-2026-08-30: the _wake_generic_posture except chain also evaluates
+    # PairingApplyError + TopologyHelperIncompatible (spec
+    # agents-core-doorman-drift-refusal-500-v0); the fake module must expose
+    # all eight names or the error-path tests AttributeError.
+    class PairingApplyError(Exception):
+        pass
+
+    class TopologyHelperIncompatible(Exception):
+        pass
+
 
 @pytest.fixture
 def fake_gw_topology(monkeypatch):
@@ -83,6 +93,7 @@ def fake_gw_topology(monkeypatch):
     for name in (
         "TopologyUnknown", "TopologyNotProven", "TopologyOverCeiling",
         "ForceUnprovenReasonRequired", "TopologyReachBusy", "TopologyReachFailed",
+        "PairingApplyError", "TopologyHelperIncompatible",
     ):
         setattr(fake_module, name, getattr(_FakeTopologyErrors, name))
     fake_module.load_topology = MagicMock(return_value=MagicMock())
