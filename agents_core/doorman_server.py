@@ -2180,6 +2180,32 @@ class _NodeState:
             # The road is barred — reach() answered, this specific posture
             # is refused. Zero side effects per reach()'s own contract.
             return self._refuse_wake("POSTURE_INVALID", str(e))
+        except gw_topology.PairingApplyError as e:
+            # Live-config drift (or apply refused/failed): the posture is
+            # VALID; the live /etc/default/gw-dual drifted or the apply
+            # refused. reach() raised pre-apply or during apply - per
+            # PairingApplyError's own contract the live file is left
+            # untouched in every case. This is the confirmed 2026-08-30
+            # incident (finding/night-dag-20260830-partial-source-gw-drift-
+            # doorman-500-2026-08-30): an uncaught PairingApplyError here
+            # propagated out of the handler as an unhandled 500, which the
+            # runner read as reason class UNHANDLED - not in the retry
+            # allowlist - and silently skipped the night's GW work with no
+            # operator-facing reason. A distinct token (not
+            # POSTURE_INVALID) so the operator reads "reconcile the seat
+            # config", not "posture invalid". Deliberately NOT retried by
+            # the runner (never enters the allowlist): a hand-edit drift
+            # does not self-heal.
+            return self._refuse_wake("DRIFT_REFUSED", str(e))
+        except gw_topology.TopologyHelperIncompatible as e:
+            # Deployed convergence helper self-hash mismatch (pre-host-touch,
+            # zero side effects - the check runs before reach() touches the
+            # host). Same 500 class as the drift case if left uncaught
+            # (verified reachable through the same reach() call); the
+            # operator remediation is re-deploying the helper, so the token
+            # says so. Never retried by the runner (not in the allowlist):
+            # a helper hash mismatch does not self-heal.
+            return self._refuse_wake("HELPER_INCOMPATIBLE", str(e))
         except gw_topology.TopologyReachBusy as e:
             return self._fail_wake("REACH_BUSY", str(e))
         except gw_topology.TopologyReachFailed as e:
