@@ -898,6 +898,23 @@ def run_staged_mission(
             final_state="persona_card_invalid",
             report_path=path,
         )
+    except Exception as exc:
+        # A card escape (resolve_under_cards_root raises on a symlink or
+        # absolute-path escape) or a loader crash is the same fail-loud
+        # class: abort before any GPU spend.
+        if log:
+            log(f"[fixer_stages] stage persona load failed - aborting before GPU spend: {exc}")
+        report = {
+            "final_state": "persona_load_failed",
+            "stop_reason": "persona_load_failed",
+            "error": str(exc),
+        }
+        path = write_mission_report(task_id, _empty_mission(), report)
+        return StagedOutcome(
+            stop_reason="persona_load_failed",
+            final_state="persona_load_failed",
+            report_path=path,
+        )
 
     mission_start = time.monotonic()
     stage_transcripts: list[dict] = []
