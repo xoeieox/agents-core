@@ -103,7 +103,23 @@ def _enumerate_mem_source(
     mem_tag: str,
     store: MemoryStore,
 ) -> list[tuple[str, str]]:
-    """Enumerate mem entries for a tag. Raises RuntimeError if limit is hit."""
+    """Enumerate mem entries for a tag. Raises RuntimeError if the TOTAL
+    number of matching entries exceeds _MEM_LIMIT (not just when one paged
+    result happens to equal it).
+
+    The true count is probed with an explicit limit of _MEM_LIMIT + 1: if the
+    probe returns more than _MEM_LIMIT rows, the source genuinely exceeds the
+    ceiling. (MemoryStore.list_all() has a default limit of 50 and no count()
+    method, so a default-limit probe can never exceed _MEM_LIMIT=1000 and the
+    guard would be dead code.)
+    """
+    probe = store.list_all(tag=mem_tag, limit=_MEM_LIMIT + 1)
+    if len(probe) > _MEM_LIMIT:
+        raise RuntimeError(
+            f"adversary_corpus: mem source '{source_kind}' (tag={mem_tag!r}) "
+            f"has {len(probe)} entries — exceeds _MEM_LIMIT ({_MEM_LIMIT}), corpus "
+            f"would silently truncate. Raise _MEM_LIMIT or prune the source tag."
+        )
     rows = store.list_all(tag=mem_tag, limit=_MEM_LIMIT)
     if len(rows) == _MEM_LIMIT:
         raise RuntimeError(
