@@ -1182,6 +1182,7 @@ def _build_fixer_result(
     interrupted: bool = False,
     interrupt_reason: str = "",
     stop_reason: str = "",
+    result_text: str = "",
 ) -> dict:
     """Build a FixerResult dict from the completed writeable run.
 
