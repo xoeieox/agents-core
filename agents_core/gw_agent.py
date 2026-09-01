@@ -3097,6 +3097,7 @@ def _finalize_writeable_or_readonly(
     reason_out: list[str] | None = None,
     reason: str | None = None,
     stop_reason: str = "",
+    result_text: str = "",
 ) -> str | None | tuple:
     """Route to FixerResult or plain result based on writeable flag.
 
@@ -3105,6 +3106,13 @@ def _finalize_writeable_or_readonly(
     stop_reason (D5, agents-core-local-fixer-harness-fix-v0) is a distinct
     machine-readable abort reason carried on the FixerResult (e.g.
     "mem_search_loop" when the mem-search loop detector aborted the run).
+    result_text (fixers-harness-staged-v0, S0 - one additive change): the model's
+    final message content, carried through to the FixerResult's new `result_text`
+    key (default ""). Every writeable exit path funnels through this tuple, so the
+    staged harness can read a stage's fenced artifact from the final message - the
+    place a stage emits its artifact - which the pre-S0 FixerResult structurally
+    discarded. Existing consumers ignore the unknown key (parity pinned by the
+    unmodified existing suite).
     """
     if writeable:
         fixer = _build_fixer_result(
@@ -3116,6 +3124,7 @@ def _finalize_writeable_or_readonly(
             interrupted=interrupted,
             interrupt_reason=interrupt_reason,
             stop_reason=stop_reason,
+            result_text=result_text,
         )
         return (fixer, transcript)
     return _finalize_result(
