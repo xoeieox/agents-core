@@ -1133,17 +1133,29 @@ def run_staged_mission(
 
     # ------------------------------------------------------------------
     # Tail (the shared helper - push / PR / salvage).
+    #
+    # S2 seam: `tail_finalize` is the shaped_runner.tail_finalize full-seam
+    # helper (S6) - its signature carries EVERY value the legacy tail
+    # region consumes (task_id / target_id / bare_repo / gate_rerun_fired
+    # named explicitly). The staged runner (_run_local_fixer_staged)
+    # passes the legacy-shaped values; this keyword set is the S1-side
+    # contract.
     # ------------------------------------------------------------------
     if tail_finalize is not None:
         outcome.pr_url = tail_finalize(
             task_id=task_id,
             target_id=target_id,
+            bare_repo=spec.get("bare_repo", ""),
+            branch=spec.get("branch", ""),
+            slug=spec.get("slug", "local"),
             cwd=cwd,
-            gate_passed=True,
-            gate_outcome=outcome.gate_outcome,
-            gate_rerun_fired=True,
+            worktree_path=spec.get("worktree_path"),
             final_diff=_git_diff(cwd),
+            concluded=True,
             last_test_outcome=outcome.gate_outcome,
+            max_steps_hit=False,
+            no_progress_hit=False,
+            stop_reason="",
             step_count=sum(
                 len(s.get("transcript") or [])
                 for s in stage_transcripts
@@ -1151,7 +1163,11 @@ def run_staged_mission(
             transcript_path=write_staged_transcript(
                 task_id, stage_transcripts
             ),
-            stop_reason="",
+            gate_passed=True,
+            gate_bypassed=None,
+            model_touched_tests=set(mission.tests),
+            gate_rerun_fired=True,
+            _wip_git=None,
         )
     outcome.final_state = "completed"
     path = _write_report(

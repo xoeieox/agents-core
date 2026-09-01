@@ -1337,6 +1337,262 @@ def tail_finalize(
     return pr.get("html_url", "")
 
 
+def _run_local_fixer_staged(spec: dict, base_cwd: str | None) -> str:
+    """Deterministic git/PR tail for the local-fixer-staged engine.
+
+    fixers-harness-staged-v0 (S2): the staged fixer harness - 2 LLM stages
+    (READER -> AIMER) + 1 deterministic stage (FIRE), orchestrated by
+    agents_core.fixer_stages.run_staged_mission. The worktree is selected
+    the same way the legacy path selects it (verified existing_branch ->
+    PR head; otherwise base_branch), and the tail is the shared
+    tail_finalize helper (S6) called with the SAME value set as the
+    legacy call site.
+
+    Returns a PR URL on success, "" on any failure - never raises.
+    """
+    import json as _json
+    import subprocess
+
+    task_id = spec.get("task_id") or spec.get("slot_id") or "staged-unknown"
+    target_id = spec.get("target_id", "unknown")
+    repo = spec.get("repo", "")
+    base_branch = spec.get("base_branch", "main")
+    slug = spec.get("slug", "local")
+    branch = f"lapis/{target_id}/{slug}"
+    bare_repo = repo.rsplit("/", 1)[-1] if repo else "agents-core"
+    effective_cwd = base_cwd or "/srv/agents"
+
+    _ARTIFACT_DIR = room_path("gpu_queue.shaped")
+    # The consolidated staged transcript (all stage runs, in stage order -
+    # the legacy per-run pattern writes <task_id>-gw-transcript.json; the
+    # staged runner persists ONE file, named in the resume protocol).
+    transcript_path = _ARTIFACT_DIR / f"{task_id}-staged-transcript.json"
+
+    worktree_path = None
+
+    def _log(msg: str) -> None:
+        print(msg, file=sys.stderr)
+
+    # ------------------------------------------------------------------
+    # Worktree selection (rev 3.3 - correctness lens 4th pass): select
+    # `existing_branch` ONLY when verified on origin (the legacy
+    # ls-remote pattern, generalized from the fixer_retry-only gate).
+    # Otherwise - including the initial-dispatch case where
+    # pm_core.py:3170 defaults existing_branch to the nonexistent
+    # lapis/<target_id>/forced (the Phase 2 no-parked-PR case) - the
+    # worktree is at base_branch and the tail creates
+    # lapis/<target_id>/<slug> and opens the PR (the legacy initial-
+    # fixer mechanics). The PR-head precondition (the pre-aimed match
+    # diagnostic) applies to pre-aimed missions, which always resolve
+    # existing_branch to the parked PR's ref via the open-PR scan.
+    # ------------------------------------------------------------------
+    existing_branch = spec.get("existing_branch") or ""
+    worktree_ref = base_branch
+    if existing_branch:
+        try:
+            verify = subprocess.run(
+                ["git", "-C", effective_cwd, "ls-remote", "--exit-code", "origin", existing_branch],
+                capture_output=True, text=True, timeout=30,
+            )
+            verified = verify.returncode == 0
+        except subprocess.TimeoutExpired:
+            verified = False
+        if not verified:
+            print(
+                f"WARN: staged: existing_branch {existing_branch} not verified on origin "
+                f"- worktree at base_branch {base_branch} (the legacy initial-fixer "
+                f"mechanics: the tail creates {branch} and opens the PR)",
+                file=sys.stderr,
+            )
+            _tail_log(
+                task_id,
+                f"worktree: existing_branch {existing_branch} not verified on origin "
+                f"- worktree at base_branch {base_branch}",
+            )
+        else:
+            worktree_ref = existing_branch
+            print(
+                f"INFO: staged: worktree at verified existing_branch {existing_branch} "
+                f"(PR head - the pre-aimed match diagnostic precondition holds)",
+                file=sys.stderr,
+            )
+            _tail_log(
+                task_id,
+                f"worktree: existing_branch {existing_branch} verified on origin (PR head)",
+            )
+
+    # The steer directive (the mission fence is the only task input that
+    # carries defect detail). The shaper renders it into the spec's
+    # prompt via {steer_directive_block}; a spec that carries the
+    # directive under a separate key wins.
+    directive = spec.get("steer_directive") or spec.get("prompt") or ""
+
+    # Mission parse (fail-loud before any GPU spend - same class as the
+    # card-validation errors). run_staged_mission re-parses (cheap,
+    # deterministic) and writes the mission report on the failure branch;
+    # this pre-parse is the dispatch-side loud abort.
+    from agents_core import fixer_stages
+    try:
+        mission = fixer_stages.parse_mission(directive)
+    except fixer_stages.MissionError as exc:
+        print(f"ERROR: staged: mission parse failed - aborting before GPU spend: {exc}",
+              file=sys.stderr)
+        _tail_log(task_id, f"mission parse failed - aborting before GPU spend: {exc}")
+        return ""
+    _tail_log(
+        task_id,
+        f"mission parsed: pre_aimed={mission.pre_aimed} "
+        f"scope_files={mission.scope_files} tests={mission.tests} "
+        f"tests_timeout_s={mission.tests_timeout_s}",
+    )
+
+    # The explore cap env (the process-scoped env is safe: the runner is a
+    # per-dispatch subprocess). run_stage also sets it before each stage
+    # call; setting it here covers the pre-stage phase.
+    os.environ["GW_AGENT_MAX_EXPLORE_STEPS"] = str(fixer_stages.STAGE_MAX_EXPLORE_STEPS)
+
+    try:
+        from agents_core.worktree import setup_worktree
+        handle = setup_worktree(task_id, effective_cwd, worktree_ref)
+        worktree_path = handle.path
+        cwd = str(worktree_path)
+    except Exception as exc:
+        print(f"ERROR: staged: worktree setup failed: {exc}", file=sys.stderr)
+        _tail_log(task_id, f"worktree setup failed: {exc}")
+        return ""
+
+    # Stage the bound spec into the worktree so the mission report's
+    # provenance can page it (best-effort, mirror the legacy staging).
+    spec_src = room_path("planning.specs") / f"{target_id}.md"
+    spec_dst = Path(cwd) / "lapis-spec.md"
+    try:
+        if spec_src.exists() and spec_src.stat().st_size > 0 and not spec_dst.exists():
+            spec_dst.write_text(spec_src.read_text())
+    except OSError as exc:
+        print(f"WARN: staged: spec staging failed: {exc}", file=sys.stderr)
+
+    # The gate re-run (the staged tail calls _gate_targeted_rerun directly
+    # with the mission's tests_timeout_s - the legacy 180s cap is BELOW
+    # the measured 189s runtime of the D2a acceptance test file).
+    def _staged_gate_rerun(cwd_: str, touched, timeout_s: int) -> dict | None:
+        return _gate_targeted_rerun(cwd_, touched, timeout_s=timeout_s)
+
+    # The shared deterministic tail (S6) - the SAME value set as the
+    # legacy call site (task_id / target_id / bare_repo / gate_rerun_fired
+    # named explicitly; the full seam).
+    def _staged_tail_finalize(**kwargs) -> str:
+        # Fill the full-seam defaults the S1 call site does not carry
+        # (the staged path has no WIP ref / budget flags / no-progress
+        # aborts - the stages are read-only and the fire is deterministic).
+        kwargs.setdefault("task_id", task_id)
+        kwargs.setdefault("target_id", target_id)
+        kwargs.setdefault("bare_repo", bare_repo)
+        kwargs.setdefault("branch", branch)
+        kwargs.setdefault("slug", slug)
+        kwargs.setdefault("worktree_path", worktree_path)
+        kwargs.setdefault("max_steps_hit", False)
+        kwargs.setdefault("no_progress_hit", False)
+        kwargs.setdefault("stop_reason", "")
+        kwargs.setdefault("transcript_path", transcript_path)
+        kwargs.setdefault("gate_bypassed", None)
+        kwargs.setdefault("model_touched_tests", set())
+        kwargs.setdefault("gate_rerun_fired", True)
+        return tail_finalize(**kwargs)
+
+    # Remove the staged spec before the deterministic tail so it is never
+    # committed/pushed into the PR branch (the legacy tail's guard).
+    def _pre_tail() -> None:
+        try:
+            spec_dst.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"WARN: staged: staged spec remove failed: {exc}", file=sys.stderr)
+
+    # ------------------------------------------------------------------
+    # Stage orchestration (fixer_stages.run_staged_mission): the
+    # MISSION_DEADLINE_S=2400 monotonic pre-check runs between stages
+    # inside the orchestration; the mission report is written on every
+    # terminal branch, before the return.
+    # ------------------------------------------------------------------
+    try:
+        outcome = fixer_stages.run_staged_mission(
+            spec=spec,
+            cwd=cwd,
+            directive=directive,
+            log=_log,
+            gate_rerun=_staged_gate_rerun,
+            tail_finalize=_staged_tail_finalize,
+        )
+    except Exception as exc:
+        print(f"ERROR: staged: run_staged_mission raised: {exc}", file=sys.stderr)
+        _tail_log(task_id, f"run_staged_mission raised: {exc}")
+        return ""
+    finally:
+        _pre_tail()
+
+    _tail_log(
+        task_id,
+        f"staged mission terminal: final_state={outcome.final_state} "
+        f"stop_reason={outcome.stop_reason} all_applied={outcome.all_applied} "
+        f"gate_passed={outcome.gate_passed} pr_url={outcome.pr_url!r} "
+        f"report={outcome.report_path}",
+    )
+
+    # Persist the consolidated staged transcript (the resume protocol's
+    # evidence list names it next to the report and tail.log).
+    try:
+        _ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+        if not transcript_path.exists():
+            transcript_path.write_text(
+                _json.dumps([], ensure_ascii=False, default=str)
+            )
+    except OSError as exc:
+        print(f"WARN: staged: transcript write failed: {exc}", file=sys.stderr)
+
+    # Terminal partition (one explicit tail line per branch):
+    #  - completed + gate passed: the tail already pushed the PR (the
+    #    tail_finalize call inside run_staged_mission) - return its URL.
+    #  - gate rejected / unusable (all entries applied): worktree salvage
+    #    (the concluded, gate-rejected partition - the same salvage the
+    #    legacy tail opens for a concluded run the gate rejected).
+    #  - aim failed (partial apply): the gate was skipped; salvage the
+    #    worktree directly (stop_reason=staged_aim_failed).
+    #  - any other terminal state (stage failure, deadline stop,
+    #    pre-aimed rejection, parse failure): the report is the
+    #    provenance; return "" (no fire, no gate, no PR).
+    if outcome.final_state == "completed":
+        if outcome.pr_url:
+            _tail_log(task_id, f"staged mission completed - PR {outcome.pr_url}")
+            return outcome.pr_url
+        # The tail was called but returned "" (a push/PR failure): the
+        # report + tail.log carry the provenance.
+        _tail_log(task_id, "staged mission completed but the tail returned no PR URL")
+        return ""
+    if outcome.all_applied and not outcome.gate_passed:
+        # Gate rejected or unusable on a fully applied aim set: worktree
+        # salvage (the concluded, gate-rejected partition).
+        _tail_log(
+            task_id,
+            f"staged mission gate {outcome.stop_reason} - opening advisory "
+            f"[SALVAGE] PR (concluded, gate rejected, worktree salvage)",
+        )
+        return _staged_tail_finalize(
+            cwd=cwd,
+            final_diff=fixer_stages._git_diff(cwd),
+            concluded=True,
+            last_test_outcome=outcome.gate_outcome,
+            step_count=0,
+            gate_passed=False,
+            gate_rerun_fired=True,
+            stop_reason=outcome.stop_reason,
+        )
+    _tail_log(
+        task_id,
+        f"staged mission terminal without a PR: final_state={outcome.final_state} "
+        f"stop_reason={outcome.stop_reason} (report at {outcome.report_path})",
+    )
+    return ""
+
+
 def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
     """Deterministic git/PR tail for the local-fixer engine.
 
@@ -1714,7 +1970,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         # staged engine reuses the exact same mechanics. The legacy path
         # calls it with its existing values (behavior-pinned by the
         # existing tail tests, test_wip_salvage).
-        return tail_finalize(
+        _legacy_tail_result = tail_finalize(
             task_id=task_id,
             target_id=target_id,
             bare_repo=bare_repo,
@@ -1740,6 +1996,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             wip_steps=wip_steps,
             _wip_git=_wip_git,
         )
+        return _legacy_tail_result
 
         def _tests_passed(outcome: dict | None) -> bool:
             if not outcome:
@@ -3176,6 +3433,16 @@ def main():
             pass
         print(pr_url)
         return
+    elif engine == "local-fixer-staged":
+        # fixers-harness-staged-v0 (S2): the staged fixer harness
+        # (READER -> AIMER -> FIRE) - mirrors the local-fixer block.
+        pr_url = _run_local_fixer_staged(spec, base_cwd)
+        try:
+            spec_path.unlink()
+        except OSError:
+            pass
+        print(pr_url)
+        return
     elif engine == "local-opencode":
         pr_url = _run_local_opencode(spec, base_cwd)
         try:
@@ -3189,7 +3456,7 @@ def main():
         # fall-through would burn a seat on a spec no engine understands.
         print(
             f"ERROR: unknown shaped-runner engine {engine!r}; allowed: "
-            "claude, local-fixer, local-opencode, local-reviewer",
+            "claude, local-fixer, local-fixer-staged, local-opencode, local-reviewer",
             file=sys.stderr,
         )
         sys.exit(2)
