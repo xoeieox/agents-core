@@ -1680,6 +1680,66 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         max_steps_hit = fixer_result.get("max_steps_reached", False)
         no_progress_hit = fixer_result.get("no_progress", False)
         stop_reason = fixer_result.get("stop_reason", "")
+        model_touched_tests = _collect_model_touched_tests(transcript, cwd)
+        gate_passed = False
+        gate_bypassed = None
+        py_infra = _has_python_test_infra(Path(cwd))
+        if not py_infra:
+            # agents-core-local-fixer-gate-nonpython-v0 Deliverable 2: the
+            # worktree has no Python test infrastructure - the pytest-only
+            # in-dispatch gate can never pass here (claude-view class:
+            # Rust+TS repos). Bypass loudly instead of failing closed
+            # forever and silently discarding completed work.
+            gate_passed = True
+            gate_bypassed = "no-python-test-infra"
+            print(
+                "WARN: local-fixer: test gate BYPASSED - no Python test "
+                "infrastructure detected in repo; in-dispatch test "
+                "verification unavailable; verification rests on the "
+                "reviewer gate and post-merge local gates",
+                file=sys.stderr,
+            )
+            _tail_log(task_id, "gate BYPASSED - no-python-test-infra")
+            _write_friction_entry(
+                repo=bare_repo,
+                node_id="test-gate-bypassed-no-python-test-infra",
+                error_signature="gate-bypassed:no-python-test-infra",
+                task_id=task_id,
+                today=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                log=lambda m: print(m, file=sys.stderr),
+            )
+
+        # S6 (fixers-harness-staged-v0): the shared deterministic tail
+        # (gate decision, salvage partitions, push/PR) - extracted so the
+        # staged engine reuses the exact same mechanics. The legacy path
+        # calls it with its existing values (behavior-pinned by the
+        # existing tail tests, test_wip_salvage).
+        return tail_finalize(
+            task_id=task_id,
+            target_id=target_id,
+            bare_repo=bare_repo,
+            branch=branch,
+            slug=slug,
+            cwd=cwd,
+            worktree_path=worktree_path,
+            final_diff=final_diff,
+            concluded=concluded,
+            last_test_outcome=last_test_outcome,
+            max_steps_hit=max_steps_hit,
+            no_progress_hit=no_progress_hit,
+            stop_reason=stop_reason,
+            step_count=len(fixer_result.get("steps") or []),
+            transcript_path=transcript_path,
+            gate_passed=gate_passed,
+            gate_bypassed=gate_bypassed,
+            model_touched_tests=model_touched_tests,
+            gate_rerun_fired=False,
+            wip_ref=wip_ref,
+            wip_commit_count=wip_commit_count,
+            wip_head_sha=wip_head_sha,
+            wip_steps=wip_steps,
+            _wip_git=_wip_git,
+        )
 
         def _tests_passed(outcome: dict | None) -> bool:
             if not outcome:
