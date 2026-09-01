@@ -364,7 +364,7 @@ def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str],
         r = subprocess.run(
             cmd,
             capture_output=True, text=True,
-            timeout=180,  # parity with run_tests' own cap (gw_agent.py:1074)
+            timeout=timeout_s,  # legacy parity: run_tests' own cap (gw_agent.py:1074)
             cwd=cwd,
             shell=False,
         )
@@ -375,7 +375,7 @@ def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str],
         # F4's TimeoutExpired branch only tags the output; this helper ADDS
         # the WARN so an unusable re-run is visible, not a silent 0/0.
         print(
-            f"WARN: local-fixer: gate targeted re-run timed out after 180s "
+            f"WARN: local-fixer: gate targeted re-run timed out after {timeout_s}s "
             f"(touched={sorted(model_touched_tests)})",
             file=sys.stderr,
         )
