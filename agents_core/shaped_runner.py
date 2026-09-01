@@ -2296,158 +2296,6 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
 # bound, not a guarantee (Invariant 8).
 TAIL_BUDGET = 300
 
-
-def _run_local_fixer_staged(spec: dict, base_cwd: str | None) -> str:
-    """Deterministic git/PR tail for the local-fixer-staged engine
-    (fixers-harness-staged-v0, S2).
-
-    Manages its own worktree (shaper sets worktree_required=False for
-    local-fixer-staged, S0). Worktree selection rule (rev 3.3):
-    `existing_branch` is used ONLY when verified on origin (the legacy
-    ls-remote pattern); otherwise - including the initial-dispatch case
-    where the daemon defaults `existing_branch` to a nonexistent
-    `lapis/<target_id>/forced` - the worktree is at `base_branch` and the
-    tail creates `lapis/<target_id>/<slug>` and opens the PR (the legacy
-    initial-fixer mechanics). A no-PR dispatch must NOT die at worktree
-    setup.
-
-    The mission is the ```mission fence in spec["prompt"] (the steer
-    directive). The S1 module (agents_core.fixer_stages) runs the READER
-    -> AIMER stages + the deterministic FIRE and returns a StagedOutcome;
-    the gate re-run uses the mission's tests_timeout_s (S2 parameter) and
-    the shared tail_finalize (S6) does push/PR/salvage.
-
-    Returns a PR URL on success, "" on any failure — never raises.
-    """
-    import json as _json
-    import subprocess
-
-    from agents_core import fixer_stages
-    from agents_core.worktree import setup_worktree, teardown_worktree
-
-    task_id = spec.get("task_id") or spec.get("slot_id") or "lfs-unknown"
-    target_id = spec.get("target_id", "unknown")
-    repo = spec.get("repo", "")
-    base_branch = spec.get("base_branch", "main")
-    slug = spec.get("slug", "staged")
-    branch = f"lapis/{target_id}/{slug}"
-    bare_repo = repo.rsplit("/", 1)[-1] if repo else "agents-core"
-    effective_cwd = base_cwd or "/srv/agents"
-
-    _ARTIFACT_DIR = room_path("gpu_queue.shaped")
-    _ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-
-    worktree_path = None
-
-    def _log(msg: str) -> None:
-        print(f"[local-fixer-staged] {msg}", file=sys.stderr)
-        _tail_log(task_id, msg)
-
-    try:
-        # Worktree selection (rev 3.3): existing_branch ONLY when verified
-        # on origin; otherwise base_branch (the legacy initial-fixer tail
-        # creates lapis/<target_id>/<slug> and opens the PR).
-        existing_branch = spec.get("existing_branch") or ""
-        worktree_ref = base_branch
-        if existing_branch:
-            try:
-                verify = subprocess.run(
-                    ["git", "-C", effective_cwd, "ls-remote", "--exit-code",
-                     "origin", existing_branch],
-                    capture_output=True, text=True, timeout=30,
-                )
-                verified = verify.returncode == 0
-            except subprocess.TimeoutExpired:
-                verified = False
-            if verified:
-                worktree_ref = existing_branch
-            else:
-                _log(
-                    f"worktree: existing_branch {existing_branch} not on "
-                    f"origin - using base_branch {base_branch} (initial-fixer "
-                    f"tail will create {branch})"
-                )
-
-        handle = setup_worktree(task_id, effective_cwd, worktree_ref)
-        worktree_path = handle.path
-        cwd = str(worktree_path)
-
-        # The directive (the steer overlay) carries the ```mission fence.
-        # spec["prompt"] is the registry template with
-        # {steer_directive_block} rendered into it; the fence is found
-        # anywhere in the directive text.
-        directive = spec.get("prompt", "")
-
-        # The gate re-run closure: the staged tail calls
-        # _gate_targeted_rerun DIRECTLY with the mission's tests_timeout_s
-        # (S2 parameter; legacy default 180 pinned by the existing tests).
-        def _gate_rerun(gate_cwd, touched, timeout_s):
-            return _gate_targeted_rerun(
-                gate_cwd, list(touched), timeout_s=int(timeout_s),
-            )
-
-        def _staged_tail(**kwargs) -> str:
-            # The shared tail (S6) with the staged values. The staged run's
-            # model_touched_tests is structurally empty (the stages are
-            # read-only), so the positive-only gate block does not apply;
-            # the gate decision is the mission gate's outcome, passed in.
-            return tail_finalize(
-                task_id=task_id,
-                target_id=target_id,
-                bare_repo=bare_repo,
-                branch=branch,
-                slug=slug,
-                cwd=kwargs.get("cwd", cwd),
-                worktree_path=worktree_path,
-                final_diff=kwargs.get("final_diff", ""),
-                concluded=True,
-                last_test_outcome=kwargs.get("last_test_outcome"),
-                max_steps_hit=False,
-                no_progress_hit=False,
-                stop_reason=kwargs.get("stop_reason", ""),
-                step_count=kwargs.get("step_count", 0),
-                transcript_path=kwargs.get("transcript_path") or
-                    (_ARTIFACT_DIR / f"{task_id}-staged-transcript.json"),
-                gate_passed=kwargs.get("gate_passed", True),
-                gate_bypassed=None,
-                model_touched_tests=[],
-                gate_rerun_fired=kwargs.get("gate_rerun_fired", False),
-                wip_ref="",
-                wip_commit_count=0,
-                wip_head_sha="",
-                wip_steps=[],
-            )
-
-        outcome = fixer_stages.run_staged_mission(
-            spec=spec,
-            cwd=cwd,
-            directive=directive,
-            log=_log,
-            gate_rerun=_gate_rerun,
-            tail_finalize=_staged_tail,
-        )
-
-        pr_url = outcome.pr_url or ""
-        if pr_url:
-            _log(f"staged mission completed - PR {pr_url}")
-        else:
-            _log(
-                f"staged mission terminal: stop_reason="
-                f"{outcome.stop_reason or 'unknown'} "
-                f"final_state={outcome.final_state or 'unknown'}"
-            )
-        return pr_url
-    except Exception as exc:
-        # Never raises: a staged-engine crash is a lost run with a log line.
-        _log(f"staged engine crashed: {exc}")
-        return ""
-    finally:
-        if worktree_path is not None:
-            try:
-                teardown_worktree(task_id, effective_cwd)
-            except Exception as exc:
-                _log(f"worktree teardown failed: {exc}")
-
 # HARNESS-OWNS-GIT contract preamble (S4a / Invariant 3). Composed by the
 # engine and prepended to the bound intent. spec["system"] is deliberately NOT
 # passed to opencode: it carries the registry's model-side git protocol
@@ -3328,16 +3176,6 @@ def main():
             pass
         print(pr_url)
         return
-    elif engine == "local-fixer-staged":
-        # S2 (fixers-harness-staged-v0): the staged fixer engine
-        # (READER -> AIMER LLM stages + deterministic FIRE + shared tail).
-        pr_url = _run_local_fixer_staged(spec, base_cwd)
-        try:
-            spec_path.unlink()
-        except OSError:
-            pass
-        print(pr_url)
-        return
     elif engine == "local-opencode":
         pr_url = _run_local_opencode(spec, base_cwd)
         try:
@@ -3351,7 +3189,7 @@ def main():
         # fall-through would burn a seat on a spec no engine understands.
         print(
             f"ERROR: unknown shaped-runner engine {engine!r}; allowed: "
-            "claude, local-fixer, local-fixer-staged, local-opencode, local-reviewer",
+            "claude, local-fixer, local-opencode, local-reviewer",
             file=sys.stderr,
         )
         sys.exit(2)

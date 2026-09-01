@@ -571,6 +571,7 @@ def run_stage(
             timeout=STAGE_TIMEOUT_S,
             max_steps=max_steps,
             no_progress_steps=STAGE_NO_PROGRESS_STEPS,
+            return_transcript=True,
             tools=stage_tools_schema(),
             tool_executors=stage_tool_executors(cwd),
             before_tool=_scope_gate(mission, cwd),
