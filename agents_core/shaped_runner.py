@@ -797,6 +797,875 @@ def _tail_log(task_id: str, message: str) -> None:
         pass
 
 
+def tail_finalize(
+    *,
+    task_id: str,
+    target_id: str,
+    bare_repo: str,
+    branch: str,
+    slug: str,
+    cwd: str,
+    worktree_path: str | None,
+    final_diff: str,
+    concluded: bool,
+    last_test_outcome: dict | None,
+    max_steps_hit: bool,
+    no_progress_hit: bool,
+    stop_reason: str,
+    step_count: int,
+    transcript_path: Path,
+    gate_passed: bool,
+    gate_bypassed,
+    model_touched_tests,
+    gate_rerun_fired: bool,
+    wip_ref: str = "",
+    wip_commit_count: int = 0,
+    wip_head_sha: str = "",
+    wip_steps: list = None,
+    _wip_git=None,
+) -> str:
+    """The shared deterministic git/PR tail (fixers-harness-staged-v0, S6).
+
+    Extracted from the `_run_local_fixer` tail so the staged engine
+    (`_run_local_fixer_staged`) reuses the exact same tail mechanics
+    (gate decision, salvage partitions, push/PR). The signature carries
+    EVERY value the legacy tail region consumes (the full seam - not a
+    pinned count): task_id / target_id / bare_repo / gate_rerun_fired are
+    named explicitly; the legacy path calls it with its existing values
+    (behavior-pinned by the existing tail tests, test_wip_salvage).
+
+    Returns a PR URL on success, "" on any failure — never raises.
+    """
+    import subprocess
+
+    import agents_core.forgejo as _forgejo
+
+    if wip_steps is None:
+        wip_steps = []
+
+    def _tests_passed(outcome: dict | None) -> bool:
+        if not outcome:
+            return False
+        return (
+            int(outcome.get("passed") or 0) > 0
+            and int(outcome.get("failed") or 0) == 0
+            and int(outcome.get("errors") or 0) == 0
+        )
+
+    # D1 (agents-core-local-fixer-harness-fix-v0): positive-only test gate.
+    # The legacy gate used the model's LAST run_tests outcome; a pre-existing
+    # failure (or a non-existent test file) as the last outcome discarded a
+    # 207-passing-test diff. The positive-only gate instead checks that
+    # every test the model CREATED OR EDITED in this run passes.
+    #
+    # Paths are resolved against cwd before comparison (D1 mandated
+    # amendment) so a relative write_file target and an absolute run_tests
+    # target both match.
+    #
+    # Fail-closed: when the model touched no tests at all (production-code-
+    # only fix), the gate falls back to the legacy _tests_passed behavior
+    # so a fixer cannot merge untested production code by simply refusing
+    # to write tests.
+    if model_touched_tests:
+        # Positive-only gate: every test the model touched must pass.
+        # A touched test "fails" if a FAILED/ERROR node ID refers to it.
+        # A node ID "refers" to a touched test file if the node's file
+        # part equals the touched path (file-level failure) OR the node
+        # is a specific test within that file (node-level failure).
+        #
+        # The run must also have at least one passing test (a 0-passed
+        # run is never a pass, even if the model's tests were not the
+        # ones that failed).
+        failed_node_ids = _extract_failed_node_ids(last_test_outcome)
+        touched_failures = [
+            t for t in model_touched_tests
+            if any(
+                n.split("::")[0] == t or n == t
+                for n in failed_node_ids
+            )
+        ]
+        if last_test_outcome is not None and "passed" in last_test_outcome:
+            passed_c = int(last_test_outcome.get("passed") or 0)
+            if passed_c > 0 and not touched_failures:
+                gate_passed = True
+    else:
+        # Fail-closed fallback: no tests touched -> legacy gate.
+        # D3 (agents-core-local-fixer-gate-perception-v0): an error-dict
+        # outcome (no "passed" key, the {"error": ...} class from
+        # gw_agent.py:1085) is a no-valid-last-result here - it stays
+        # fail-closed (the _tests_passed False return) but is logged as
+        # no-valid-last-result, not as a spurious passed=0 failed=0.
+        if last_test_outcome is not None and "passed" not in last_test_outcome:
+            _tail_log(task_id, "gate: no-valid-last-result (error-dict outcome)")
+        gate_passed = _tests_passed(last_test_outcome)
+
+    # D1 (agents-core-local-fixer-gate-perception-v0): targeted re-run
+    # when the touched branch would fail closed. STRICTLY MORE PERMISSIVE:
+    # the re-run only fires when the gate would otherwise fail closed -
+    # it can flip fail->pass, never pass->fail. The re-run re-tests the
+    # CURRENT worktree state, so a fix made after the model's last
+    # run_tests is picked up (the v2-retry shape). The re-run outcome
+    # REPLACES the model's last outcome as the DECIDING outcome for the
+    # gate and the D2/D5 surfaces when it fires (the re-run is the
+    # authoritative tail - the local-fixer path adopts the opencode
+    # tail's doctrine by analogy). Decision rule: returncode == 0
+    # (rc=1 failures, rc=2 collection error, rc=4 usage/path error,
+    # rc=5 no tests collected - an empty touched file correctly fails
+    # closed). A None (unusable) re-run keeps the fail-closed verdict.
+    if (
+        gate_bypassed is None
+        and not gate_passed
+        and model_touched_tests
+        and (
+            last_test_outcome is None
+            or "passed" not in last_test_outcome
+            or int(last_test_outcome.get("passed") or 0) == 0
+            or touched_failures
+        )
+    ):
+        # cwd pinning: pass the gate's own cwd (the worktree root - the
+        # same variable _collect_model_touched_tests used above); a wrong
+        # cwd would make every touched path rc=4 (a silent no-op that
+        # voids the strictly-more-permissive invariant in production).
+        gate_rerun_fired = True
+        rerun_outcome = _gate_targeted_rerun(cwd, model_touched_tests)
+        if rerun_outcome is not None:
+            last_test_outcome = rerun_outcome
+            gate_passed = (rerun_outcome.get("returncode") == 0)
+            _write_friction_entry(
+                repo=bare_repo,
+                node_id=task_id,
+                error_signature="gate-rerun:fired",
+                task_id=task_id,
+                today=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                log=lambda m: print(m, file=sys.stderr),
+            )
+
+    def _outcome_diag(outcome: dict | None) -> str:
+        """D2 disambiguation: the deciding outcome's errors/rc/summary
+        (single-line by construction, truncated to 200 chars)."""
+        if outcome is None:
+            return "last_test_outcome=None"
+        if "passed" not in outcome:
+            return "no-valid-last-result (error-dict outcome)"
+        summary = str(outcome.get("summary") or "").replace("\n", " ")[:200]
+        return (
+            f"passed={int(outcome.get('passed') or 0)} "
+            f"failed={int(outcome.get('failed') or 0)} "
+            f"errors={int(outcome.get('errors') or 0)} "
+            f"rc={outcome.get('returncode')} summary={summary!r}"
+        )
+
+    def _rerun_diag() -> str:
+        if not gate_rerun_fired:
+            return ""
+        # D4: name the unusable re-run shape explicitly - a touched
+        # path that vanished between the model's writes and the
+        # re-run is an event, not a silent 0/0 (rc=4/5 are the
+        # pytest-path shapes; rc=2/3 cover the re-run's own
+        # collection/internal errors).
+        rerun_rc = (last_test_outcome or {}).get("returncode")
+        if rerun_rc in (4, 5):
+            name = (
+                "rerun-rc=4 touched-path-missing"
+                if rerun_rc == 4
+                else "rerun-rc=5 no-tests-ran"
+            )
+            return f"; {name}"
+        if last_test_outcome is None:
+            # The re-run fired but was unusable (timeout/spawn error):
+            # the fail-closed verdict is kept and the re-run's
+            # non-participation is named, not folded into the model's
+            # last outcome.
+            return "; rerun=fired-but-unusable (timeout/spawn error)"
+        return (
+            "; rerun=true (last: "
+            f"passed={int((last_test_outcome or {}).get('passed') or 0)} "
+            f"failed={int((last_test_outcome or {}).get('failed') or 0)} "
+            f"errors={int((last_test_outcome or {}).get('errors') or 0)} "
+            f"rc={last_test_outcome.get('returncode')})"
+        )
+
+    if gate_bypassed is None:
+        if gate_passed:
+            _tail_log(
+                task_id,
+                "gate PASSED "
+                f"(model_touched_tests={sorted(model_touched_tests) if model_touched_tests else '[] (legacy)'}"
+                f"{_rerun_diag()} "
+                f"{_outcome_diag(last_test_outcome)})",
+            )
+        else:
+            _tail_log(
+                task_id,
+                "gate FAILED "
+                f"(model_touched_tests={sorted(model_touched_tests) if model_touched_tests else '[] (legacy)'}; "
+                f"{_outcome_diag(last_test_outcome)}"
+                f"{_rerun_diag()})",
+            )
+
+    # D6 (agents-core-local-fixer-harness-fix-v0): witness pre-existing
+    # failures via a friction mem entry so a future daemon-side follow-up
+    # can pick them up autonomously. Pre-existing = a failed node ID whose
+    # file the model did NOT touch. Logged but never blocks the gate.
+    if last_test_outcome is not None:
+        failed_node_ids = _extract_failed_node_ids(last_test_outcome)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        for node in failed_node_ids:
+            node_file = node.split("::")[0]
+            if node_file in model_touched_tests:
+                continue  # the model's own test failed — that's the gate's concern
+            sig = _error_signature(node, last_test_outcome)
+            _write_friction_entry(
+                repo=bare_repo,
+                node_id=node,
+                error_signature=sig,
+                task_id=task_id,
+                today=today,
+                log=lambda m: print(m, file=sys.stderr),
+            )
+            print(
+                f"INFO: local-fixer: pre-existing test failure witnessed "
+                f"(friction entry written): {node}",
+                file=sys.stderr,
+            )
+
+    # A mem-search-loop abort (D5) is a distinct failure mode: the model
+    # burned the budget on redundant searches and made no edits. Do not
+    # salvage or PR — log the distinct stop_reason and return "".
+    if stop_reason == "mem_search_loop":
+        print(
+            "WARN: local-fixer: run aborted - mem_search_loop "
+            "(redundant mem searches; no edits made)",
+            file=sys.stderr,
+        )
+        _tail_log(task_id, "run aborted - mem_search_loop (redundant mem searches; no edits made)")
+        return ""
+
+    # Output-budget exhaustion is a distinct failure mode: the response was
+    # cut at max_tokens. Verified-state salvage (agents-core-fixer-
+    # budget-compact-salvage-v0, S3 - the D5 policy flip): when >=1 WIP
+    # commit exists on refs/wip/<task_id> (each a compile-gated snapshot
+    # of a whole-file write - the safety premise is that a truncated
+    # response can never leave a partial file: the fail-closed default
+    # executors reject empty-args calls, and valid args JSON implies a
+    # complete whole-file write), push the WIP history to a
+    # <slug>-salvage branch and open an advisory [SALVAGE] PR. The run
+    # is still LOST (this returns "" - no concluded/gate_passed).
+    if stop_reason == "output_budget_exhausted":
+        if wip_commit_count > 0:
+            print(
+                f"WARN: local-fixer: run aborted - output budget exhausted "
+                f"(finish_reason=output_limit/length; response truncated at "
+                f"max_tokens) - WIP commits exist; "
+                f"opening advisory [SALVAGE] PR",
+                file=sys.stderr,
+            )
+            _tail_log(task_id, "run aborted - output_budget_exhausted - opening advisory [SALVAGE] PR")
+            return _open_wip_salvage_pr(
+                worktree_path, wip_ref, wip_head_sha, wip_steps,
+                stop_reason=stop_reason, task_id=task_id,
+                target_id=target_id, bare_repo=bare_repo,
+                branch=branch, slug=slug,
+                step_count=step_count,
+                transcript_path=transcript_path,
+            )
+        print(
+            "WARN: local-fixer: run aborted - output budget exhausted "
+            "(finish_reason=output_limit/length; response truncated at "
+            "max_tokens - no WIP commits, no PR)",
+            file=sys.stderr,
+        )
+        _tail_log(task_id, "run aborted - output_budget_exhausted (no WIP commits) - no PR")
+        return ""
+
+    # WIP-commit salvage on a non-concluded terminal death (agents-core-
+    # fixer-budget-compact-salvage-v0, S3): max_steps_hit / no_progress_hit
+    # with >=1 WIP commit pushes the WIP history to a <slug>-salvage branch
+    # and opens an advisory [SALVAGE] PR. Ordering rule: the green-salvage
+    # path below takes precedence when it applies (clean diff AND passing
+    # tests) - a dead run CAN have both, and its verified tail is better
+    # than the WIP history. The WIP-salvage PR is for the remainder.
+    # The run is still LOST.
+    # S2 (agents-core-local-fixer-salvage-on-discard-v0): the trigger no
+    # longer requires a budget flag. Partition: budget+green -> both
+    # disjuncts false -> Block B's green path (UNCHANGED); budget+non-green
+    # -> second disjunct -> WIP-salvage (as today); ANY non-budget death
+    # with >=1 WIP commit (seat loss, mid-run POST failure, no-choices,
+    # budget-forced, interrupted/cancelled - any gate/diff state) -> first
+    # disjunct -> WIP-salvage. A non-budget GREEN death gets an advisory
+    # [SALVAGE] PR, not the green path's normal PR (the green path stays
+    # budget-gated).
+    if (not concluded
+            and wip_commit_count > 0
+            and (not (max_steps_hit or no_progress_hit)
+                 or not (final_diff.strip() and gate_passed))):
+        _wip_stop_reason = (
+            "max_steps_hit" if max_steps_hit
+            else "no_progress_hit" if no_progress_hit
+            else "run_not_concluded"
+        )
+        print(
+            f"WARN: local-fixer: run not concluded - {_wip_stop_reason} "
+            f"- opening advisory [SALVAGE] PR",
+            file=sys.stderr,
+        )
+        _tail_log(task_id, f"run not concluded - {_wip_stop_reason} - opening advisory [SALVAGE] PR")
+        return _open_wip_salvage_pr(
+            worktree_path, wip_ref, wip_head_sha, wip_steps,
+            stop_reason=_wip_stop_reason, task_id=task_id,
+            target_id=target_id, bare_repo=bare_repo,
+            branch=branch, slug=slug,
+            step_count=step_count,
+            transcript_path=transcript_path,
+        )
+
+    salvaged = False
+    if not concluded:
+        if (max_steps_hit or no_progress_hit) and final_diff.strip() and gate_passed:
+            # Budget ceiling OR no-progress abort, but the diff is clean and
+            # the model's own tests pass — salvage the verified work as a
+            # PR rather than discard.
+            salvaged = True
+        elif no_progress_hit:
+            print(
+                "WARN: local-fixer: run aborted - no semantic progress after consecutive idle steps (spinning wheels)",
+                file=sys.stderr,
+            )
+            _tail_log(task_id, "run aborted - no semantic progress (spinning wheels)")
+            return ""
+        elif max_steps_hit:
+            print(
+                "WARN: local-fixer: run not concluded - max_steps ceiling reached (no passing tests or empty diff)",
+                file=sys.stderr,
+            )
+            _tail_log(task_id, "run not concluded - max_steps ceiling reached (no passing tests or empty diff)")
+            return ""
+        else:
+            print(
+                "WARN: local-fixer: run not concluded - DoormanUnreachable or wake timeout",
+                file=sys.stderr,
+            )
+            _tail_log(task_id, "run not concluded - DoormanUnreachable or wake timeout")
+            return ""
+
+    if not salvaged:
+        if not final_diff.strip():
+            print("WARN: local-fixer: empty diff — no PR", file=sys.stderr)
+            _tail_log(task_id, "empty diff - no PR")
+            return ""
+        if not gate_passed:
+            # D1 (agents-core-local-fixer-harness-fix-v0): the positive-only
+            # gate (or its fail-closed legacy fallback) rejected this run.
+            # S3 (agents-core-local-fixer-salvage-on-discard-v0): salvage
+            # the WORKTREE's final state (not the WIP ref) - a concluded
+            # run's final state is exactly what the gate tested, and it is
+            # at least as complete as any WIP snapshot. Fail closed: any
+            # git failure below falls through to the original return "".
+            print(
+                "WARN: local-fixer: test gate failed "
+                f"(model_touched_tests={sorted(model_touched_tests) if model_touched_tests else '[] (legacy gate)'}; "
+                f"deciding outcome {_outcome_diag(last_test_outcome)}"
+                f"{_rerun_diag()}) - opening advisory [SALVAGE] PR "
+                f"(concluded, gate rejected, worktree salvage)",
+                file=sys.stderr,
+            )
+            _tail_log(task_id, "test gate failed - opening advisory [SALVAGE] PR (concluded, gate rejected)")
+            _salvage_commit_sha = ""
+            _salvage_git = _wip_git if _wip_git is not None else (
+                lambda *a: subprocess.run(
+                    ["git", "-C", cwd, *a],
+                    capture_output=True, text=True, timeout=30,
+                )
+            )
+            _salvage_add = _salvage_git("add", "-A")
+            if _salvage_add.returncode != 0:
+                print(
+                    f"WARN: local-fixer: worktree salvage git add failed "
+                    f"({_salvage_add.stderr.strip()[:500]}) - no PR",
+                    file=sys.stderr,
+                )
+                return ""
+            _salvage_commit = _salvage_git(
+                "commit", "-q", "-m",
+                f"salvage: {task_id} (concluded, gate rejected)",
+            )
+            if _salvage_commit.returncode != 0:
+                print(
+                    f"WARN: local-fixer: worktree salvage git commit failed "
+                    f"({_salvage_commit.stderr.strip()[:500]}) - no PR",
+                    file=sys.stderr,
+                )
+                return ""
+            _salvage_rev = _salvage_git("rev-parse", "HEAD")
+            if _salvage_rev.returncode != 0:
+                print(
+                    f"WARN: local-fixer: worktree salvage git rev-parse failed "
+                    f"({_salvage_rev.stderr.strip()[:500]}) - no PR",
+                    file=sys.stderr,
+                )
+                return ""
+            _salvage_commit_sha = _salvage_rev.stdout.strip()
+            if not _salvage_commit_sha:
+                print(
+                    "WARN: local-fixer: worktree salvage rev-parse returned "
+                    "empty sha - no PR",
+                    file=sys.stderr,
+                )
+                return ""
+            return _open_wip_salvage_pr(
+                worktree_path, "HEAD", _salvage_commit_sha, [],
+                stop_reason="concluded_gate_rejected",
+                concluded=True, task_id=task_id,
+                target_id=target_id, bare_repo=bare_repo,
+                branch=branch, slug=slug,
+                step_count=step_count,
+                transcript_path=transcript_path,
+            )
+
+    # Deterministic git (model never touches git)
+    def _git(*args: str) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                ["git", "-C", cwd, *args],
+                capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"WARN: local-fixer: git {args[0]} timed out", file=sys.stderr)
+            return subprocess.CompletedProcess(["git", "-C", cwd, *args], 1, "", "timeout")
+
+    r = _git("checkout", "-B", branch)
+    if r.returncode != 0:
+        print(f"WARN: local-fixer: git checkout -b failed: {r.stderr.strip()}", file=sys.stderr)
+        _tail_log(task_id, f"git checkout -b failed rc={r.returncode}: {r.stderr.strip()[:500]}")
+        return ""
+    r = _git("add", "-A")
+    if r.returncode != 0:
+        print(f"WARN: local-fixer: git add failed: {r.stderr.strip()}", file=sys.stderr)
+        _tail_log(task_id, f"git add failed rc={r.returncode}: {r.stderr.strip()[:500]}")
+        return ""
+    r = _git("commit", "-m", f"fix({target_id}): local-fixer harness")
+    if r.returncode != 0:
+        print(f"WARN: local-fixer: git commit failed: {r.stderr.strip()}", file=sys.stderr)
+        _tail_log(task_id, f"git commit failed rc={r.returncode}: {r.stderr.strip()[:500]}")
+        return ""
+    r = _git("push", "origin", f"HEAD:{branch}")
+    if r.returncode != 0:
+        print(f"WARN: local-fixer: git push failed: {r.stderr.strip()}", file=sys.stderr)
+        _tail_log(task_id, f"git push failed rc={r.returncode}: {r.stderr.strip()[:500]}")
+        return ""
+
+    # Provenance PR body — factual only
+    diff_lines = [l for l in final_diff.splitlines()
+                  if l.startswith(("diff --git", "---", "+++", "@@", " ")) or l[:1] in ("+", "-")]
+    diffstat = "\n".join(diff_lines[:40]) or "(no changes)"
+
+    # D5 (agents-core-local-fixer-gate-perception-v0): the PR body's
+    # "## Test outcome" reads the DECIDING outcome (the model's last
+    # outcome, or the D1 re-run when it fired - last_test_outcome was
+    # replaced in place) and carries the rerun=true annotation. A
+    # merged PR whose stated test outcome contradicts its own gate
+    # ("0 passed, 0 failed" under a passed gate) is the provenance
+    # defect this closes.
+    if last_test_outcome:
+        passed_c = int(last_test_outcome.get("passed") or 0)
+        failed_c = int(last_test_outcome.get("failed") or 0)
+        test_summary = f"{passed_c} passed, {failed_c} failed"
+        if gate_rerun_fired:
+            test_summary += " (rerun=true - harness targeted re-run of model-touched tests)"
+    else:
+        test_summary = "no test outcome recorded"
+
+    test_gate_section = (
+        "## Test gate\n\n"
+        "bypassed - no Python test infrastructure in this repo; "
+        "NO in-dispatch test run was performed (the harness test tool "
+        "is pytest-only). Verification for this PR rests on the "
+        "reviewer gate and post-merge local gates. This marker exists "
+        "so the skipped verification cannot be read as routine.\n\n"
+        "<!-- lapis-test-gate: bypassed-no-python-test-infra -->\n\n"
+        if gate_bypassed else ""
+    )
+    salvage_kind = "no_progress" if no_progress_hit else "max_steps_reached"
+    salvage_note = (
+        f"**harness-salvaged: {salvage_kind}** - "
+        "loop aborted before an explicit conclusion but the diff and tests were clean.\n\n"
+        if salvaged else ""
+    )
+    # Machine-readable marker so the lapis-pm daemon can refuse to auto-merge a
+    # no_progress salvage (a model-admitted stall requires human sign-off). A
+    # max_steps salvage carries no such marker and follows normal authority rules.
+    signoff_marker = (
+        "**Requires human sign-off** (model-admitted stall — not auto-merge-eligible).\n\n"
+        "<!-- lapis-no-progress-salvage: true -->\n\n"
+        if (salvaged and no_progress_hit) else ""
+    )
+
+    if salvaged:
+        print(
+            f"INFO: local-fixer: harness-salvaged green diff on {salvage_kind} "
+            f"abort (target={target_id}, task={task_id})",
+            file=sys.stderr,
+        )
+
+    pr_body = (
+        f"Implemented by the local 122B fixer harness, not paid Claude.\n\n"
+        f"{salvage_note}"
+        f"{signoff_marker}"
+        f"## Diff summary\n\n```diff\n{diffstat}\n```\n\n"
+        f"## Test outcome\n\n{test_summary}\n\n"
+        f"{test_gate_section}"
+        f"## Steps\n\n{step_count} tool-call step(s) executed.\n\n"
+        f"## Transcript\n\n`{transcript_path}`\n\n"
+        f"<!-- lapis-gpu-id: {task_id} -->\n"
+        f"<!-- lapis-tid: {target_id} -->"
+    )
+
+    try:
+        pr = _forgejo.create_pr(
+            repo=bare_repo,
+            title=f"fix({target_id}): local-fixer",
+            head=branch,
+            base="main",
+            body=pr_body,
+        )
+    except Exception as exc:
+        print(f"WARN: local-fixer: create_pr failed: {exc}", file=sys.stderr)
+        _tail_log(task_id, f"create_pr FAILED: {exc}")
+        return ""
+    _tail_log(task_id, f"create_pr OK url={pr.get('html_url', '')}")
+    return pr.get("html_url", "")
+
+
+def _run_local_fixer_staged(spec: dict, base_cwd: str | None) -> str:
+    """Deterministic git/PR tail for the local-fixer-staged engine.
+
+    fixers-harness-staged-v0 (S2): the staged fixer harness - 2 LLM stages
+    (READER -> AIMER) + 1 deterministic stage (FIRE), orchestrated by
+    agents_core.fixer_stages.run_staged_mission. The worktree is selected
+    the same way the legacy path selects it (verified existing_branch ->
+    PR head; otherwise base_branch), and the tail is the shared
+    tail_finalize helper (S6) called with the SAME value set as the
+    legacy call site.
+
+    Returns a PR URL on success, "" on any failure - never raises.
+    """
+    import json as _json
+    import subprocess
+
+    task_id = spec.get("task_id") or spec.get("slot_id") or "staged-unknown"
+    target_id = spec.get("target_id", "unknown")
+    repo = spec.get("repo", "")
+    base_branch = spec.get("base_branch", "main")
+    slug = spec.get("slug", "local")
+    branch = f"lapis/{target_id}/{slug}"
+    bare_repo = repo.rsplit("/", 1)[-1] if repo else "agents-core"
+    effective_cwd = base_cwd or "/srv/agents"
+
+    _ARTIFACT_DIR = room_path("gpu_queue.shaped")
+    # The consolidated staged transcript (all stage runs, in stage order -
+    # the legacy per-run pattern writes <task_id>-gw-transcript.json; the
+    # staged runner persists ONE file, named in the resume protocol).
+    transcript_path = _ARTIFACT_DIR / f"{task_id}-staged-transcript.json"
+
+    worktree_path = None
+
+    def _log(msg: str) -> None:
+        print(msg, file=sys.stderr)
+
+    # ------------------------------------------------------------------
+    # Supervisor lease (gw-gpu1-berth-standing-seat-v0, leg 2, Doorman B) -
+    # the same pattern as _run_local_fixer: a doorman lease held for the
+    # WHOLE staged job (entry acquire, finally release) so the doorman's
+    # mid-job stop machinery cannot stop the seat out from under an
+    # in-flight staged mission. work_id=f"{task_id}-berth-sup",
+    # principal="fixer-supervisor", role="worker", lease_class="deferrable".
+    # TTL = timeout_s + 60 (the queue's hard cap). SOFT FAIL: acquire
+    # failure is logged and the job proceeds un-supervised.
+    # ------------------------------------------------------------------
+    sup_lease_client = None
+    sup_lease_id = f"{task_id}-berth-sup"
+    try:
+        from agents_core.doorman_client import DoormanClient
+
+        sup_lease_client = DoormanClient()
+        acq = sup_lease_client.acquire(
+            "gravitywell",
+            sup_lease_id,
+            int(spec.get("timeout_s", 1800)) + 60,
+            "fixer-job-supervisor",
+            role="worker",
+            principal="fixer-supervisor",
+            lease_class="deferrable",
+        )
+        if not isinstance(acq, dict) or acq.get("status") != "serving":
+            _status = acq.get("status") if isinstance(acq, dict) else type(acq).__name__
+            print(
+                f"WARN: staged: supervisor lease acquire soft-failed "
+                f"(work_id={sup_lease_id}, status={_status}) - job proceeds "
+                f"un-supervised",
+                file=sys.stderr,
+            )
+            sup_lease_client = None
+    except Exception as exc:
+        print(
+            f"WARN: staged: supervisor lease acquire soft-failed "
+            f"(work_id={sup_lease_id}): {exc}",
+            file=sys.stderr,
+        )
+        sup_lease_client = None
+
+    # ------------------------------------------------------------------
+    # Worktree selection (rev 3.3 - correctness lens 4th pass): select
+    # `existing_branch` ONLY when verified on origin (the legacy
+    # ls-remote pattern, generalized from the fixer_retry-only gate).
+    # Otherwise - including the initial-dispatch case where
+    # pm_core.py:3170 defaults existing_branch to the nonexistent
+    # lapis/<target_id>/forced (the Phase 2 no-parked-PR case) - the
+    # worktree is at base_branch and the tail creates
+    # lapis/<target_id>/<slug> and opens the PR (the legacy initial-
+    # fixer mechanics). The PR-head precondition (the pre-aimed match
+    # diagnostic) applies to pre-aimed missions, which always resolve
+    # existing_branch to the parked PR's ref via the open-PR scan.
+    # ------------------------------------------------------------------
+    existing_branch = spec.get("existing_branch") or ""
+    worktree_ref = base_branch
+    if existing_branch:
+        try:
+            verify = subprocess.run(
+                ["git", "-C", effective_cwd, "ls-remote", "--exit-code", "origin", existing_branch],
+                capture_output=True, text=True, timeout=30,
+            )
+            verified = verify.returncode == 0
+        except subprocess.TimeoutExpired:
+            verified = False
+        if not verified:
+            print(
+                f"WARN: staged: existing_branch {existing_branch} not verified on origin "
+                f"- worktree at base_branch {base_branch} (the legacy initial-fixer "
+                f"mechanics: the tail creates {branch} and opens the PR)",
+                file=sys.stderr,
+            )
+            _tail_log(
+                task_id,
+                f"worktree: existing_branch {existing_branch} not verified on origin "
+                f"- worktree at base_branch {base_branch}",
+            )
+        else:
+            worktree_ref = existing_branch
+            print(
+                f"INFO: staged: worktree at verified existing_branch {existing_branch} "
+                f"(PR head - the pre-aimed match diagnostic precondition holds)",
+                file=sys.stderr,
+            )
+            _tail_log(
+                task_id,
+                f"worktree: existing_branch {existing_branch} verified on origin (PR head)",
+            )
+
+    # The steer directive (the mission fence is the only task input that
+    # carries defect detail). The shaper renders it into the spec's
+    # prompt via {steer_directive_block}; a spec that carries the
+    # directive under a separate key wins.
+    directive = spec.get("steer_directive") or spec.get("prompt") or ""
+
+    # Mission parse (fail-loud before any GPU spend - same class as the
+    # card-validation errors). run_staged_mission re-parses (cheap,
+    # deterministic) and writes the mission report on the failure branch;
+    # this pre-parse is the dispatch-side loud abort.
+    from agents_core import fixer_stages
+    try:
+        mission = fixer_stages.parse_mission(directive)
+    except fixer_stages.MissionError as exc:
+        print(f"ERROR: staged: mission parse failed - aborting before GPU spend: {exc}",
+              file=sys.stderr)
+        _tail_log(task_id, f"mission parse failed - aborting before GPU spend: {exc}")
+        return ""
+    _tail_log(
+        task_id,
+        f"mission parsed: pre_aimed={mission.pre_aimed} "
+        f"scope_files={mission.scope_files} tests={mission.tests} "
+        f"tests_timeout_s={mission.tests_timeout_s}",
+    )
+
+    # The explore cap env (the process-scoped env is safe: the runner is a
+    # per-dispatch subprocess). run_stage also sets it before each stage
+    # call; setting it here covers the pre-stage phase.
+    os.environ["GW_AGENT_MAX_EXPLORE_STEPS"] = str(fixer_stages.STAGE_MAX_EXPLORE_STEPS)
+
+    try:
+        from agents_core.worktree import setup_worktree, teardown_worktree
+        handle = setup_worktree(task_id, effective_cwd, worktree_ref)
+        worktree_path = handle.path
+        cwd = str(worktree_path)
+    except Exception as exc:
+        print(f"ERROR: staged: worktree setup failed: {exc}", file=sys.stderr)
+        _tail_log(task_id, f"worktree setup failed: {exc}")
+        return ""
+
+    try:
+        # Stage the bound spec into the worktree so the mission report's
+        # provenance can page it (best-effort, mirror the legacy staging).
+        spec_src = room_path("planning.specs") / f"{target_id}.md"
+        spec_dst = Path(cwd) / "lapis-spec.md"
+        try:
+            if spec_src.exists() and spec_src.stat().st_size > 0 and not spec_dst.exists():
+                spec_dst.write_text(spec_src.read_text())
+        except OSError as exc:
+            print(f"WARN: staged: spec staging failed: {exc}", file=sys.stderr)
+
+        # The gate re-run (the staged tail calls _gate_targeted_rerun
+        # directly with the mission's tests_timeout_s - the legacy 180s
+        # cap is BELOW the measured 189s runtime of the D2a acceptance
+        # test file).
+        def _staged_gate_rerun(cwd_: str, touched, timeout_s: int) -> dict | None:
+            return _gate_targeted_rerun(cwd_, touched, timeout_s=timeout_s)
+
+        # The shared deterministic tail (S6) - the SAME value set as the
+        # legacy call site (task_id / target_id / bare_repo /
+        # gate_rerun_fired named explicitly; the full seam).
+        def _staged_tail_finalize(**kwargs) -> str:
+            # Fill the full-seam defaults the S1 call site does not carry
+            # (the staged path has no WIP ref / budget flags / no-progress
+            # aborts - the stages are read-only and the fire is
+            # deterministic).
+            kwargs.setdefault("task_id", task_id)
+            kwargs.setdefault("target_id", target_id)
+            kwargs.setdefault("bare_repo", bare_repo)
+            kwargs.setdefault("branch", branch)
+            kwargs.setdefault("slug", slug)
+            kwargs.setdefault("worktree_path", worktree_path)
+            kwargs.setdefault("max_steps_hit", False)
+            kwargs.setdefault("no_progress_hit", False)
+            kwargs.setdefault("stop_reason", "")
+            kwargs.setdefault("transcript_path", transcript_path)
+            kwargs.setdefault("gate_bypassed", None)
+            kwargs.setdefault("model_touched_tests", set())
+            kwargs.setdefault("gate_rerun_fired", True)
+            return tail_finalize(**kwargs)
+
+        # Remove the staged spec before the deterministic tail so it is
+        # never committed/pushed into the PR branch (the legacy tail's
+        # guard).
+        def _pre_tail() -> None:
+            try:
+                spec_dst.unlink(missing_ok=True)
+            except OSError as exc:
+                print(f"WARN: staged: staged spec remove failed: {exc}", file=sys.stderr)
+
+        # ------------------------------------------------------------------
+        # Stage orchestration (fixer_stages.run_staged_mission): the
+        # MISSION_DEADLINE_S=2400 monotonic pre-check runs between stages
+        # inside the orchestration; the mission report is written on every
+        # terminal branch, before the return.
+        # ------------------------------------------------------------------
+        try:
+            outcome = fixer_stages.run_staged_mission(
+                spec=spec,
+                cwd=cwd,
+                directive=directive,
+                log=_log,
+                gate_rerun=_staged_gate_rerun,
+                tail_finalize=_staged_tail_finalize,
+            )
+        except Exception as exc:
+            print(f"ERROR: staged: run_staged_mission raised: {exc}", file=sys.stderr)
+            _tail_log(task_id, f"run_staged_mission raised: {exc}")
+            return ""
+        finally:
+            _pre_tail()
+
+        _tail_log(
+            task_id,
+            f"staged mission terminal: final_state={outcome.final_state} "
+            f"stop_reason={outcome.stop_reason} all_applied={outcome.all_applied} "
+            f"gate_passed={outcome.gate_passed} pr_url={outcome.pr_url!r} "
+            f"report={outcome.report_path}",
+        )
+
+        # Persist the consolidated staged transcript (the resume
+        # protocol's evidence list names it next to the report and
+        # tail.log).
+        try:
+            _ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+            if not transcript_path.exists():
+                transcript_path.write_text(
+                    _json.dumps([], ensure_ascii=False, default=str)
+                )
+        except OSError as exc:
+            print(f"WARN: staged: transcript write failed: {exc}", file=sys.stderr)
+
+        # Terminal partition (one explicit tail line per branch):
+        #  - completed + gate passed: the tail already pushed the PR (the
+        #    tail_finalize call inside run_staged_mission) - return its URL.
+        #  - gate rejected / unusable (all entries applied): worktree
+        #    salvage (the concluded, gate-rejected partition - the same
+        #    salvage the legacy tail opens for a concluded run the gate
+        #    rejected).
+        #  - aim failed (partial apply): the gate was skipped; salvage the
+        #    worktree directly (stop_reason=staged_aim_failed).
+        #  - any other terminal state (stage failure, deadline stop,
+        #    pre-aimed rejection, parse failure): the report is the
+        #    provenance; return "" (no fire, no gate, no PR).
+        if outcome.final_state == "completed":
+            if outcome.pr_url:
+                _tail_log(task_id, f"staged mission completed - PR {outcome.pr_url}")
+                return outcome.pr_url
+            # The tail was called but returned "" (a push/PR failure): the
+            # report + tail.log carry the provenance.
+            _tail_log(task_id, "staged mission completed but the tail returned no PR URL")
+            return ""
+        if outcome.all_applied and not outcome.gate_passed:
+            # Gate rejected or unusable on a fully applied aim set: worktree
+            # salvage (the concluded, gate-rejected partition).
+            _tail_log(
+                task_id,
+                f"staged mission gate {outcome.stop_reason} - opening advisory "
+                f"[SALVAGE] PR (concluded, gate rejected, worktree salvage)",
+            )
+            return _staged_tail_finalize(
+                cwd=cwd,
+                final_diff=fixer_stages._git_diff(cwd),
+                concluded=True,
+                last_test_outcome=outcome.gate_outcome,
+                step_count=outcome.stage_steps,
+                gate_passed=False,
+                gate_rerun_fired=True,
+                stop_reason=outcome.stop_reason,
+            )
+        _tail_log(
+            task_id,
+            f"staged mission terminal without a PR: final_state={outcome.final_state} "
+            f"stop_reason={outcome.stop_reason} (report at {outcome.report_path})",
+        )
+        return ""
+    finally:
+        # Release the supervisor lease (gw-gpu1-berth-standing-seat-v0,
+        # leg 2, Doorman B) and tear down the worktree - mirrors the
+        # _run_local_fixer finally-block: released on BOTH the success and
+        # failure paths (including the early-return error paths after
+        # worktree setup). Soft fail: a release failure is logged and
+        # swallowed - the TTL bounds the zombie window if it is lost.
+        if sup_lease_client is not None:
+            try:
+                sup_lease_client.release("gravitywell", sup_lease_id)
+            except Exception as exc:
+                print(
+                    f"WARN: staged: supervisor lease release failed "
+                    f"(work_id={sup_lease_id}): {exc}",
+                    file=sys.stderr,
+                )
+            try:
+                sup_lease_client.close()
+            except Exception:
+                pass
+        if worktree_path is not None:
+            try:
+                teardown_worktree(task_id, effective_cwd)
+            except Exception as exc:
+                print(f"WARN: staged: worktree teardown failed: {exc}", file=sys.stderr)
+
+
 def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
     """Deterministic git/PR tail for the local-fixer engine.
 
@@ -1140,30 +2009,6 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         max_steps_hit = fixer_result.get("max_steps_reached", False)
         no_progress_hit = fixer_result.get("no_progress", False)
         stop_reason = fixer_result.get("stop_reason", "")
-
-        def _tests_passed(outcome: dict | None) -> bool:
-            if not outcome:
-                return False
-            return (
-                int(outcome.get("passed") or 0) > 0
-                and int(outcome.get("failed") or 0) == 0
-                and int(outcome.get("errors") or 0) == 0
-            )
-
-        # D1 (agents-core-local-fixer-harness-fix-v0): positive-only test gate.
-        # The legacy gate used the model's LAST run_tests outcome; a pre-existing
-        # failure (or a non-existent test file) as the last outcome discarded a
-        # 207-passing-test diff. The positive-only gate instead checks that
-        # every test the model CREATED OR EDITED in this run passes.
-        #
-        # Paths are resolved against cwd before comparison (D1 mandated
-        # amendment) so a relative write_file target and an absolute run_tests
-        # target both match.
-        #
-        # Fail-closed: when the model touched no tests at all (production-code-
-        # only fix), the gate falls back to the legacy _tests_passed behavior
-        # so a fixer cannot merge untested production code by simply refusing
-        # to write tests.
         model_touched_tests = _collect_model_touched_tests(transcript, cwd)
         gate_passed = False
         gate_bypassed = None
@@ -1192,471 +2037,39 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                 today=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
                 log=lambda m: print(m, file=sys.stderr),
             )
-        elif model_touched_tests:
-            # Positive-only gate: every test the model touched must pass.
-            # A touched test "fails" if a FAILED/ERROR node ID refers to it.
-            # A node ID "refers to" a touched test file if the node's file
-            # part equals the touched path (file-level failure) OR the node
-            # is a specific test within that file (node-level failure).
-            # The run must also have at least one passing test (a 0-passed
-            # run is never a pass, even if the model's tests were not the
-            # ones that failed).
-            failed_node_ids = _extract_failed_node_ids(last_test_outcome)
-            touched_failures = [
-                t for t in model_touched_tests
-                if any(
-                    n.split("::")[0] == t or n == t
-                    for n in failed_node_ids
-                )
-            ]
-            if last_test_outcome is not None and "passed" in last_test_outcome:
-                passed_c = int(last_test_outcome.get("passed") or 0)
-                if passed_c > 0 and not touched_failures:
-                    gate_passed = True
-        else:
-            # Fail-closed fallback: no tests touched -> legacy gate.
-            # D3 (agents-core-local-fixer-gate-perception-v0): an error-dict
-            # outcome (no "passed" key, the {"error": ...} class from
-            # gw_agent.py:1085) is a no-valid-last-result here - it stays
-            # fail-closed (the _tests_passed False return) but is logged as
-            # no-valid-last-result, not as a spurious passed=0 failed=0.
-            if last_test_outcome is not None and "passed" not in last_test_outcome:
-                _tail_log(task_id, "gate: no-valid-last-result (error-dict outcome)")
-            gate_passed = _tests_passed(last_test_outcome)
 
-        # D1 (agents-core-local-fixer-gate-perception-v0): targeted re-run
-        # when the touched branch would fail closed. STRICTLY MORE PERMISSIVE:
-        # the re-run only fires when the gate would otherwise fail closed -
-        # it can flip fail->pass, never pass->fail. The re-run re-tests the
-        # CURRENT worktree state, so a fix made after the model's last
-        # run_tests is picked up (the v2-retry shape). The re-run outcome
-        # REPLACES the model's last outcome as the DECIDING outcome for the
-        # gate and the D2/D5 surfaces when it fires (the re-run is the
-        # authoritative tail - the local-fixer path adopts the opencode
-        # tail's doctrine by analogy). Decision rule: returncode == 0
-        # (rc=1 failures, rc=2 collection error, rc=4 usage/path error,
-        # rc=5 no tests collected - an empty touched file correctly fails
-        # closed). A None (unusable) re-run keeps the fail-closed verdict.
-        gate_rerun_fired = False
-        if (
-            gate_bypassed is None
-            and not gate_passed
-            and model_touched_tests
-            and (
-                last_test_outcome is None
-                or "passed" not in last_test_outcome
-                or int(last_test_outcome.get("passed") or 0) == 0
-                or touched_failures
-            )
-        ):
-            # cwd pinning: pass the gate's own cwd (the worktree root - the
-            # same variable _collect_model_touched_tests used above); a wrong
-            # cwd would make every touched path rc=4 (a silent no-op that
-            # voids the strictly-more-permissive invariant in production).
-            gate_rerun_fired = True
-            rerun_outcome = _gate_targeted_rerun(cwd, model_touched_tests)
-            if rerun_outcome is not None:
-                last_test_outcome = rerun_outcome
-                gate_passed = (rerun_outcome.get("returncode") == 0)
-                _write_friction_entry(
-                    repo=bare_repo,
-                    node_id=task_id,
-                    error_signature="gate-rerun:fired",
-                    task_id=task_id,
-                    today=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                    log=lambda m: print(m, file=sys.stderr),
-                )
-
-        def _outcome_diag(outcome: dict | None) -> str:
-            """D2 disambiguation: the deciding outcome's errors/rc/summary
-            (single-line by construction, truncated to 200 chars)."""
-            if outcome is None:
-                return "last_test_outcome=None"
-            if "passed" not in outcome:
-                return "no-valid-last-result (error-dict outcome)"
-            summary = str(outcome.get("summary") or "").replace("\n", " ")[:200]
-            return (
-                f"passed={int(outcome.get('passed') or 0)} "
-                f"failed={int(outcome.get('failed') or 0)} "
-                f"errors={int(outcome.get('errors') or 0)} "
-                f"rc={outcome.get('returncode')} summary={summary!r}"
-            )
-
-        def _rerun_diag() -> str:
-            if not gate_rerun_fired:
-                return ""
-            # D4: name the unusable re-run shape explicitly - a touched
-            # path that vanished between the model's writes and the
-            # re-run is an event, not a silent 0/0 (rc=4/5 are the
-            # pytest-path shapes; rc=2/3 cover the re-run's own
-            # collection/internal errors).
-            rerun_rc = (last_test_outcome or {}).get("returncode")
-            if rerun_rc in (4, 5):
-                name = (
-                    "rerun-rc=4 touched-path-missing"
-                    if rerun_rc == 4
-                    else "rerun-rc=5 no-tests-ran"
-                )
-                return f"; {name}"
-            if last_test_outcome is None:
-                # The re-run fired but was unusable (timeout/spawn error):
-                # the fail-closed verdict is kept and the re-run's
-                # non-participation is named, not folded into the model's
-                # last outcome.
-                return "; rerun=fired-but-unusable (timeout/spawn error)"
-            return (
-                "; rerun=true (last: "
-                f"passed={int((last_test_outcome or {}).get('passed') or 0)} "
-                f"failed={int((last_test_outcome or {}).get('failed') or 0)} "
-                f"errors={int((last_test_outcome or {}).get('errors') or 0)} "
-                f"rc={last_test_outcome.get('returncode')})"
-            )
-
-        if gate_bypassed is None:
-            if gate_passed:
-                _tail_log(
-                    task_id,
-                    "gate PASSED "
-                    f"(model_touched_tests={sorted(model_touched_tests) if model_touched_tests else '[] (legacy)'}"
-                    f"{_rerun_diag()} "
-                    f"{_outcome_diag(last_test_outcome)})",
-                )
-            else:
-                _tail_log(
-                    task_id,
-                    "gate FAILED "
-                    f"(model_touched_tests={sorted(model_touched_tests) if model_touched_tests else '[] (legacy)'}; "
-                    f"{_outcome_diag(last_test_outcome)}"
-                    f"{_rerun_diag()})",
-                )
-
-        # D6 (agents-core-local-fixer-harness-fix-v0): witness pre-existing
-        # failures via a friction mem entry so a future daemon-side follow-up
-        # can pick them up autonomously. Pre-existing = a failed node ID whose
-        # file the model did NOT touch. Logged but never blocks the gate.
-        if last_test_outcome is not None:
-            failed_node_ids = _extract_failed_node_ids(last_test_outcome)
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            for node in failed_node_ids:
-                node_file = node.split("::")[0]
-                if node_file in model_touched_tests:
-                    continue  # the model's own test failed — that's the gate's concern
-                sig = _error_signature(node, last_test_outcome)
-                _write_friction_entry(
-                    repo=bare_repo,
-                    node_id=node,
-                    error_signature=sig,
-                    task_id=task_id,
-                    today=today,
-                    log=lambda m: print(m, file=sys.stderr),
-                )
-                print(
-                    f"INFO: local-fixer: pre-existing test failure witnessed "
-                    f"(friction entry written): {node}",
-                    file=sys.stderr,
-                )
-
-        # A mem-search-loop abort (D5) is a distinct failure mode: the model
-        # burned the budget on redundant searches and made no edits. Do not
-        # salvage or PR — log the distinct stop_reason and return "".
-        if stop_reason == "mem_search_loop":
-            print(
-                "WARN: local-fixer: run aborted - mem_search_loop "
-                "(redundant mem searches; no edits made)",
-                file=sys.stderr,
-            )
-            _tail_log(task_id, "run aborted - mem_search_loop (redundant mem searches; no edits made)")
-            return ""
-
-        # Output-budget exhaustion is a distinct failure mode: the response was
-        # cut at max_tokens. Verified-state salvage (agents-core-fixer-
-        # budget-compact-salvage-v0, S3 - the D5 policy flip): when >=1 WIP
-        # commit exists on refs/wip/<task_id> (each a compile-gated snapshot
-        # of a whole-file write - the safety premise is that a truncated
-        # response can never leave a partial file: the fail-closed default
-        # executors reject empty-args calls, and valid args JSON implies a
-        # complete whole-file write), push the WIP history to a
-        # <slug>-salvage branch and open an advisory [SALVAGE] PR. The run
-        # is still LOST (this returns "" - no concluded/gate_passed).
-        if stop_reason == "output_budget_exhausted":
-            if wip_commit_count > 0:
-                print(
-                    f"WARN: local-fixer: run aborted - output budget exhausted "
-                    f"(finish_reason=output_limit/length; response truncated at "
-                    f"max_tokens) - WIP commits exist; "
-                    f"opening advisory [SALVAGE] PR",
-                    file=sys.stderr,
-                )
-                _tail_log(task_id, "run aborted - output_budget_exhausted - opening advisory [SALVAGE] PR")
-                return _open_wip_salvage_pr(
-                    worktree_path, wip_ref, wip_head_sha, wip_steps,
-                    stop_reason=stop_reason, task_id=task_id,
-                    target_id=target_id, bare_repo=bare_repo,
-                    branch=branch, slug=slug,
-                    step_count=len(fixer_result.get("steps") or []),
-                    transcript_path=transcript_path,
-                )
-            print(
-                "WARN: local-fixer: run aborted - output budget exhausted "
-                "(finish_reason=output_limit/length; response truncated at "
-                "max_tokens - no WIP commits, no PR)",
-                file=sys.stderr,
-            )
-            _tail_log(task_id, "run aborted - output_budget_exhausted (no WIP commits) - no PR")
-            return ""
-
-        # WIP-commit salvage on a non-concluded terminal death (agents-core-
-        # fixer-budget-compact-salvage-v0, S3): max_steps_hit / no_progress_hit
-        # with >=1 WIP commit pushes the WIP history to a <slug>-salvage branch
-        # and opens an advisory [SALVAGE] PR. Ordering rule: the green-salvage
-        # path below takes precedence when it applies (clean diff AND passing
-        # tests) - a dead run CAN have both, and its verified tail is better
-        # than the WIP history. The WIP-salvage PR is for the remainder.
-        # The run is still LOST.
-        # S2 (agents-core-local-fixer-salvage-on-discard-v0): the trigger no
-        # longer requires a budget flag. Partition: budget+green -> both
-        # disjuncts false -> Block B's green path (UNCHANGED); budget+non-green
-        # -> second disjunct -> WIP-salvage (as today); ANY non-budget death
-        # with >=1 WIP commit (seat loss, mid-run POST failure, no-choices,
-        # budget-forced, interrupted/cancelled - any gate/diff state) -> first
-        # disjunct -> WIP-salvage. A non-budget GREEN death gets an advisory
-        # [SALVAGE] PR, not the green path's normal PR (the green path stays
-        # budget-gated).
-        if (not concluded
-                and wip_commit_count > 0
-                and (not (max_steps_hit or no_progress_hit)
-                     or not (final_diff.strip() and gate_passed))):
-            _wip_stop_reason = (
-                "max_steps_hit" if max_steps_hit
-                else "no_progress_hit" if no_progress_hit
-                else "run_not_concluded"
-            )
-            print(
-                f"WARN: local-fixer: run not concluded - {_wip_stop_reason} "
-                f"- opening advisory [SALVAGE] PR",
-                file=sys.stderr,
-            )
-            _tail_log(task_id, f"run not concluded - {_wip_stop_reason} - opening advisory [SALVAGE] PR")
-            return _open_wip_salvage_pr(
-                worktree_path, wip_ref, wip_head_sha, wip_steps,
-                stop_reason=_wip_stop_reason, task_id=task_id,
-                target_id=target_id, bare_repo=bare_repo,
-                branch=branch, slug=slug,
-                step_count=len(fixer_result.get("steps") or []),
-                transcript_path=transcript_path,
-            )
-
-        salvaged = False
-        if not concluded:
-            if (max_steps_hit or no_progress_hit) and final_diff.strip() and gate_passed:
-                # Budget ceiling OR no-progress abort, but the diff is clean and
-                # the model's own tests pass — salvage the verified work as a
-                # PR rather than discard.
-                salvaged = True
-            elif no_progress_hit:
-                print(
-                    "WARN: local-fixer: run aborted - no semantic progress after consecutive idle steps (spinning wheels)",
-                    file=sys.stderr,
-                )
-                _tail_log(task_id, "run aborted - no semantic progress (spinning wheels)")
-                return ""
-            elif max_steps_hit:
-                print(
-                    "WARN: local-fixer: run not concluded - max_steps ceiling reached (no passing tests or empty diff)",
-                    file=sys.stderr,
-                )
-                _tail_log(task_id, "run not concluded - max_steps ceiling reached (no passing tests or empty diff)")
-                return ""
-            else:
-                print(
-                    "WARN: local-fixer: run not concluded - DoormanUnreachable or wake timeout",
-                    file=sys.stderr,
-                )
-                _tail_log(task_id, "run not concluded - DoormanUnreachable or wake timeout")
-                return ""
-
-        if not salvaged:
-            if not final_diff.strip():
-                print("WARN: local-fixer: empty diff — no PR", file=sys.stderr)
-                _tail_log(task_id, "empty diff - no PR")
-                return ""
-            if not gate_passed:
-                # D1 (agents-core-local-fixer-harness-fix-v0): the positive-only
-                # gate (or its fail-closed legacy fallback) rejected this run.
-                # S3 (agents-core-local-fixer-salvage-on-discard-v0): salvage
-                # the WORKTREE's final state (not the WIP ref) - a concluded
-                # run's final state is exactly what the gate tested, and it is
-                # at least as complete as any WIP snapshot. Fail closed: any
-                # git failure below falls through to the original return "".
-                print(
-                    "WARN: local-fixer: test gate failed "
-                    f"(model_touched_tests={sorted(model_touched_tests) if model_touched_tests else '[] (legacy gate)'}; "
-                    f"deciding outcome {_outcome_diag(last_test_outcome)}"
-                    f"{_rerun_diag()}) - opening advisory [SALVAGE] PR "
-                    f"(concluded, gate rejected, worktree salvage)",
-                    file=sys.stderr,
-                )
-                _tail_log(task_id, "test gate failed - opening advisory [SALVAGE] PR (concluded, gate rejected)")
-                _salvage_commit_sha = ""
-                _salvage_add = _wip_git("add", "-A")
-                if _salvage_add.returncode != 0:
-                    print(
-                        f"WARN: local-fixer: worktree salvage git add failed "
-                        f"({_salvage_add.stderr.strip()[:500]}) - no PR",
-                        file=sys.stderr,
-                    )
-                    return ""
-                _salvage_commit = _wip_git(
-                    "commit", "-q", "-m",
-                    f"salvage: {task_id} (concluded, gate rejected)",
-                )
-                if _salvage_commit.returncode != 0:
-                    print(
-                        f"WARN: local-fixer: worktree salvage git commit failed "
-                        f"({_salvage_commit.stderr.strip()[:500]}) - no PR",
-                        file=sys.stderr,
-                    )
-                    return ""
-                _salvage_rev = _wip_git("rev-parse", "HEAD")
-                if _salvage_rev.returncode != 0:
-                    print(
-                        f"WARN: local-fixer: worktree salvage git rev-parse failed "
-                        f"({_salvage_rev.stderr.strip()[:500]}) - no PR",
-                        file=sys.stderr,
-                    )
-                    return ""
-                _salvage_commit_sha = _salvage_rev.stdout.strip()
-                if not _salvage_commit_sha:
-                    print(
-                        "WARN: local-fixer: worktree salvage rev-parse returned "
-                        "empty sha - no PR",
-                        file=sys.stderr,
-                    )
-                    return ""
-                return _open_wip_salvage_pr(
-                    worktree_path, "HEAD", _salvage_commit_sha, [],
-                    stop_reason="concluded_gate_rejected",
-                    concluded=True, task_id=task_id,
-                    target_id=target_id, bare_repo=bare_repo,
-                    branch=branch, slug=slug,
-                    step_count=len(fixer_result.get("steps") or []),
-                    transcript_path=transcript_path,
-                )
-
-        # Deterministic git (model never touches git)
-        def _git(*args: str) -> subprocess.CompletedProcess:
-            try:
-                return subprocess.run(
-                    ["git", "-C", cwd, *args],
-                    capture_output=True, text=True, timeout=30,
-                )
-            except subprocess.TimeoutExpired:
-                print(f"WARN: local-fixer: git {args[0]} timed out", file=sys.stderr)
-                return subprocess.CompletedProcess(["git", "-C", cwd, *args], 1, "", "timeout")
-
-        r = _git("checkout", "-B", branch)
-        if r.returncode != 0:
-            print(f"WARN: local-fixer: git checkout -b failed: {r.stderr.strip()}", file=sys.stderr)
-            _tail_log(task_id, f"git checkout -b failed rc={r.returncode}: {r.stderr.strip()[:500]}")
-            return ""
-        r = _git("add", "-A")
-        if r.returncode != 0:
-            print(f"WARN: local-fixer: git add failed: {r.stderr.strip()}", file=sys.stderr)
-            _tail_log(task_id, f"git add failed rc={r.returncode}: {r.stderr.strip()[:500]}")
-            return ""
-        r = _git("commit", "-m", f"fix({target_id}): local-fixer harness")
-        if r.returncode != 0:
-            print(f"WARN: local-fixer: git commit failed: {r.stderr.strip()}", file=sys.stderr)
-            _tail_log(task_id, f"git commit failed rc={r.returncode}: {r.stderr.strip()[:500]}")
-            return ""
-        r = _git("push", "origin", f"HEAD:{branch}")
-        if r.returncode != 0:
-            print(f"WARN: local-fixer: git push failed: {r.stderr.strip()}", file=sys.stderr)
-            _tail_log(task_id, f"git push failed rc={r.returncode}: {r.stderr.strip()[:500]}")
-            return ""
-
-        # Provenance PR body — factual only
-        diff_lines = [l for l in final_diff.splitlines()
-                      if l.startswith(("diff --git", "---", "+++", "@@", " ")) or l[:1] in ("+", "-")]
-        diffstat = "\n".join(diff_lines[:40]) or "(no changes)"
-
-        # D5 (agents-core-local-fixer-gate-perception-v0): the PR body's
-        # "## Test outcome" reads the DECIDING outcome (the model's last
-        # outcome, or the D1 re-run when it fired - last_test_outcome was
-        # replaced in place) and carries the rerun=true annotation. A
-        # merged PR whose stated test outcome contradicts its own gate
-        # ("0 passed, 0 failed" under a passed gate) is the provenance
-        # defect this closes.
-        if last_test_outcome:
-            passed_c = int(last_test_outcome.get("passed") or 0)
-            failed_c = int(last_test_outcome.get("failed") or 0)
-            test_summary = f"{passed_c} passed, {failed_c} failed"
-            if gate_rerun_fired:
-                test_summary += " (rerun=true - harness targeted re-run of model-touched tests)"
-        else:
-            test_summary = "no test outcome recorded"
-
-        step_count = len(fixer_result.get("steps") or [])
-        test_gate_section = (
-            "## Test gate\n\n"
-            "bypassed - no Python test infrastructure in this repo; "
-            "NO in-dispatch test run was performed (the harness test tool "
-            "is pytest-only). Verification for this PR rests on the "
-            "reviewer gate and post-merge local gates. This marker exists "
-            "so the skipped verification cannot be read as routine.\n\n"
-            "<!-- lapis-test-gate: bypassed-no-python-test-infra -->\n\n"
-            if gate_bypassed else ""
+        # S6 (fixers-harness-staged-v0): the shared deterministic tail
+        # (gate decision, salvage partitions, push/PR) - extracted so the
+        # staged engine reuses the exact same mechanics. The legacy path
+        # calls it with its existing values (behavior-pinned by the
+        # existing tail tests, test_wip_salvage).
+        _legacy_tail_result = tail_finalize(
+            task_id=task_id,
+            target_id=target_id,
+            bare_repo=bare_repo,
+            branch=branch,
+            slug=slug,
+            cwd=cwd,
+            worktree_path=worktree_path,
+            final_diff=final_diff,
+            concluded=concluded,
+            last_test_outcome=last_test_outcome,
+            max_steps_hit=max_steps_hit,
+            no_progress_hit=no_progress_hit,
+            stop_reason=stop_reason,
+            step_count=len(fixer_result.get("steps") or []),
+            transcript_path=transcript_path,
+            gate_passed=gate_passed,
+            gate_bypassed=gate_bypassed,
+            model_touched_tests=model_touched_tests,
+            gate_rerun_fired=False,
+            wip_ref=wip_ref,
+            wip_commit_count=wip_commit_count,
+            wip_head_sha=wip_head_sha,
+            wip_steps=wip_steps,
+            _wip_git=_wip_git,
         )
-        salvage_kind = "no_progress" if no_progress_hit else "max_steps_reached"
-        salvage_note = (
-            f"**harness-salvaged: {salvage_kind}** - "
-            "loop aborted before an explicit conclusion but the diff and tests were clean.\n\n"
-            if salvaged else ""
-        )
-        # Machine-readable marker so the lapis-pm daemon can refuse to auto-merge a
-        # no_progress salvage (a model-admitted stall requires human sign-off). A
-        # max_steps salvage carries no such marker and follows normal authority rules.
-        signoff_marker = (
-            "**Requires human sign-off** (model-admitted stall — not auto-merge-eligible).\n\n"
-            "<!-- lapis-no-progress-salvage: true -->\n"
-            if (salvaged and no_progress_hit) else ""
-        )
-
-        if salvaged:
-            print(
-                f"INFO: local-fixer: harness-salvaged green diff on {salvage_kind} "
-                f"abort (target={target_id}, task={task_id})",
-                file=sys.stderr,
-            )
-
-        pr_body = (
-            f"Implemented by the local 122B fixer harness, not paid Claude.\n\n"
-            f"{salvage_note}"
-            f"{signoff_marker}"
-            f"## Diff summary\n\n```diff\n{diffstat}\n```\n\n"
-            f"## Test outcome\n\n{test_summary}\n\n"
-            f"{test_gate_section}"
-            f"## Steps\n\n{step_count} tool-call step(s) executed.\n\n"
-            f"## Transcript\n\n`{transcript_path}`\n\n"
-            f"<!-- lapis-gpu-id: {task_id} -->\n"
-            f"<!-- lapis-tid: {target_id} -->"
-        )
-
-        try:
-            pr = _forgejo.create_pr(
-                repo=bare_repo,
-                title=f"fix({target_id}): local-fixer",
-                head=branch,
-                base="main",
-                body=pr_body,
-            )
-        except Exception as exc:
-            print(f"WARN: local-fixer: create_pr failed: {exc}", file=sys.stderr)
-            _tail_log(task_id, f"create_pr FAILED: {exc}")
-            return ""
-        _tail_log(task_id, f"create_pr OK url={pr.get('html_url', '')}")
-        return pr.get("html_url", "")
-
+        return _legacy_tail_result
     except Exception as exc:
         print(f"WARN: local-fixer: unexpected error: {exc}", file=sys.stderr)
         _tail_log(task_id, f"unexpected error: {exc}")
@@ -2576,6 +2989,16 @@ def main():
             pass
         print(pr_url)
         return
+    elif engine == "local-fixer-staged":
+        # fixers-harness-staged-v0 (S2): the staged fixer harness
+        # (READER -> AIMER -> FIRE) - mirrors the local-fixer block.
+        pr_url = _run_local_fixer_staged(spec, base_cwd)
+        try:
+            spec_path.unlink()
+        except OSError:
+            pass
+        print(pr_url)
+        return
     elif engine == "local-opencode":
         pr_url = _run_local_opencode(spec, base_cwd)
         try:
@@ -2589,7 +3012,7 @@ def main():
         # fall-through would burn a seat on a spec no engine understands.
         print(
             f"ERROR: unknown shaped-runner engine {engine!r}; allowed: "
-            "claude, local-fixer, local-opencode, local-reviewer",
+            "claude, local-fixer, local-fixer-staged, local-opencode, local-reviewer",
             file=sys.stderr,
         )
         sys.exit(2)
