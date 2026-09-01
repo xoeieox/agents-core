@@ -2147,6 +2147,7 @@ def _call_gw_agent_impl(
                             budget_forced=True,
                             budget_forced_suffix=_budget_suffix,
                             reason_out=reason_out,
+                            result_text=_forced_content,
                         )
                     return _finalize_writeable_or_readonly(
                         messages, "", return_transcript, transcript,
@@ -2154,6 +2155,7 @@ def _call_gw_agent_impl(
                         budget_forced=True,
                         budget_forced_suffix=_budget_suffix,
                         reason_out=reason_out,
+                        result_text="",
                     )
 
                 if log:
