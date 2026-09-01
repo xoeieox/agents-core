@@ -1162,16 +1162,17 @@ def run_staged_mission(
 
 
 def _git_diff(cwd: str) -> str:
-    """The staged diff (git add -A + diff --cached) for the tail."""
+    """The staged diff (uncommitted worktree state vs HEAD) for the tail.
+
+    Read-only: NO `git add` - the tail's own `git add -A` stages the
+    worktree (the same doctrine as the legacy tail, which derives
+    final_diff from the uncommitted state).
+    """
     import subprocess
 
     try:
-        subprocess.run(
-            ["git", "-C", cwd, "add", "-A"],
-            capture_output=True, text=True, timeout=15,
-        )
         r = subprocess.run(
-            ["git", "-C", cwd, "diff", "--cached"],
+            ["git", "-C", cwd, "diff", "HEAD"],
             capture_output=True, text=True, timeout=15,
         )
         return r.stdout if r.returncode == 0 else ""
