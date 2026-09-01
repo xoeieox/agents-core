@@ -19,12 +19,14 @@ fixers that produced prose without using tools.
 Invoked as: python3 -m agents_core.shaped_runner <spec.json>
 """
 
+import hashlib
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -569,20 +571,39 @@ def _open_wip_salvage_pr(
     slug: str,
     step_count: int,
     transcript_path: Path,
+    concluded: bool = False,
 ) -> str:
-    """Push refs/wip/<task_id> to a <slug>-salvage branch and open an advisory
-    [SALVAGE] PR (agents-core-fixer-budget-compact-salvage-v0, S3).
+    """Push the WIP ref (or HEAD for concluded worktree salvage) to a
+    per-task-unique <slug>-salvage branch and open an advisory [SALVAGE] PR
+    (agents-core-fixer-budget-compact-salvage-v0, S3; branch uniqueness per
+    agents-core-local-fixer-salvage-on-discard-v0, S1).
 
     The worktree's HEAD is still at the base (detached origin/<base>); the WIP
-    history lives ONLY on the separate ref. Pushing to <slug>-salvage keeps a
-    later clean run's <branch> unconflicted. The PR is advisory (never
-    auto-merged); the run is still LOST (this returns the PR URL or "").
+    history lives ONLY on the separate ref. Pushing to the per-task-unique
+    <slug>-salvage branch keeps a later clean run's <branch> unconflicted and
+    a second salvage of the same target from clobbering the first's branch.
+    The PR is advisory (never auto-merged); the run is still LOST (or
+    concluded-but-gate-rejected - this returns the PR URL or "").
     """
     import subprocess
 
     import agents_core.forgejo as _forgejo
 
-    salvage_branch = f"{branch}-salvage"
+    # S1: per-task-unique salvage branch (deterministic hash of the full
+    # task_id). The `lf-unknown` fallback (no task_id/slot_id in the spec)
+    # gets a timestamp suffix so even that degenerate case is per-run-unique
+    # instead of a constant-hash collision. The in-scope `task_id` is NOT
+    # modified (it is used by the WIP ref, the tail log, and the commit
+    # message) - only the branch name derives from task_id_for_hash.
+    task_id_for_hash = (
+        f"lf-unknown-{int(time.time())}"
+        if task_id == "lf-unknown"
+        else task_id
+    )
+    salvage_branch = (
+        f"{branch}-salvage-"
+        f"{hashlib.sha1(task_id_for_hash.encode()).hexdigest()[:8]}"
+    )
 
     def _git(*args: str) -> subprocess.CompletedProcess:
         try:
@@ -598,33 +619,57 @@ def _open_wip_salvage_pr(
         print("WARN: wip-salvage: no WIP head sha - no PR", file=sys.stderr)
         return ""
 
-    # Push the WIP history to the salvage branch.
+    # Push the WIP history (or the concluded salvage commit at HEAD) to the
+    # salvage branch.
     r = _git("push", "origin", f"{wip_ref}:refs/heads/{salvage_branch}")
     if r.returncode != 0:
         print(f"WARN: wip-salvage: git push failed: {r.stderr.strip()}", file=sys.stderr)
+        _tail_log(task_id, "wip-salvage push failed - no PR")
         return ""
 
     # PR body: task id, stop_reason + wall time, WIP head sha, the steps
-    # included, and what remains per the spec.
+    # included, and what remains per the spec. S4: the body's first line and
+    # the "## What remains" section branch on the concluded flag - the title
+    # holds the cause (stop_reason), the body holds the state.
     steps_included = ", ".join(str(s) for s in wip_steps) if wip_steps else "n/a"
+    sha_field_label = (
+        "salvage commit sha" if concluded else "WIP head sha"
+    )
+    if not concluded:
+        what_remains = (
+            f"Per the bound spec (staged as `lapis-spec.md` during the run, removed "
+            f"after): the spec's remaining work items are NOT in this salvage. The "
+            f"WIP commits are a compile-gated snapshot of the whole-file writes "
+            f"made up to the death - a partial implementation at best.\n\n"
+            f"Note: the WIP floor is non-cumulative - the branch HEAD's tree holds only the "
+            f"files written by the LAST write step; earlier steps' writes live in the branch's "
+            f"commit history (the WIP hook resets the index to HEAD between steps). Review the "
+            f"history (git log), not just the head, to reconstruct the run's work.\n"
+        )
+    else:
+        what_remains = (
+            f"This PR carries the worktree's FINAL state - the exact state the test "
+            f"gate tested - not a WIP snapshot. The model's final test run failed; "
+            f"see the transcript for the gate's failures. The remaining work is "
+            f"making that final state pass the test gate.\n"
+        )
     pr_body = (
-        f"**[SALVAGE] advisory PR - the run is LOST (not concluded, no gate_passed).**\n\n"
+        f"**[SALVAGE] advisory PR - the run is LOST "
+        f"({'not concluded, no gate_passed' if not concluded else 'concluded, test gate rejected the work'})."
+        f" stop_reason: {stop_reason}.\n\n"
         f"## Task\n\n"
         f"- task_id: `{task_id}`\n"
         f"- target_id: `{target_id}`\n"
         f"- stop_reason: `{stop_reason}`\n"
         f"- wall time: {datetime.now(timezone.utc).isoformat()}\n"
-        f"- WIP head sha: `{wip_head_sha}`\n"
+        f"- {sha_field_label}: `{wip_head_sha}`\n"
         f"- steps included: {steps_included}\n"
         f"- total steps executed: {step_count}\n\n"
         f"## What remains\n\n"
-        f"Per the bound spec (staged as `lapis-spec.md` during the run, removed "
-        f"after): the spec's remaining work items are NOT in this salvage. The "
-        f"WIP commits are a compile-gated snapshot of the whole-file writes "
-        f"made up to the death - a partial implementation at best.\n\n"
+        f"{what_remains}\n\n"
         f"## Recovery\n\n"
-        f"`lapis-pm rebind --force --adopt-pr <n>` + fixer_retry (proven "
-        f"2026-08-25 on PR #258).\n\n"
+        f"`lapis-pm bind {target_id} --force --adopt-pr <n>` + fixer_retry "
+        f"(proven 2026-08-25 on PR #258).\n\n"
         f"## Transcript\n\n"
         f"`{transcript_path}`\n\n"
         f"<!-- lapis-gpu-id: {task_id} -->\n"
@@ -645,9 +690,11 @@ def _open_wip_salvage_pr(
             f"(branch={salvage_branch}, WIP head={wip_head_sha})",
             file=sys.stderr,
         )
+        _tail_log(task_id, f"[SALVAGE] PR opened url={pr.get('html_url', '')}")
         return pr.get("html_url", "")
     except Exception as exc:
         print(f"WARN: wip-salvage: create_pr failed: {exc}", file=sys.stderr)
+        _tail_log(task_id, "wip-salvage create_pr failed - no PR")
         return ""
 
 
@@ -1358,10 +1405,24 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         # tests) - a dead run CAN have both, and its verified tail is better
         # than the WIP history. The WIP-salvage PR is for the remainder.
         # The run is still LOST.
-        if (not concluded and (max_steps_hit or no_progress_hit)
+        # S2 (agents-core-local-fixer-salvage-on-discard-v0): the trigger no
+        # longer requires a budget flag. Partition: budget+green -> both
+        # disjuncts false -> Block B's green path (UNCHANGED); budget+non-green
+        # -> second disjunct -> WIP-salvage (as today); ANY non-budget death
+        # with >=1 WIP commit (seat loss, mid-run POST failure, no-choices,
+        # budget-forced, interrupted/cancelled - any gate/diff state) -> first
+        # disjunct -> WIP-salvage. A non-budget GREEN death gets an advisory
+        # [SALVAGE] PR, not the green path's normal PR (the green path stays
+        # budget-gated).
+        if (not concluded
                 and wip_commit_count > 0
-                and not (final_diff.strip() and gate_passed)):
-            _wip_stop_reason = "max_steps_hit" if max_steps_hit else "no_progress_hit"
+                and (not (max_steps_hit or no_progress_hit)
+                     or not (final_diff.strip() and gate_passed))):
+            _wip_stop_reason = (
+                "max_steps_hit" if max_steps_hit
+                else "no_progress_hit" if no_progress_hit
+                else "run_not_concluded"
+            )
             print(
                 f"WARN: local-fixer: run not concluded - {_wip_stop_reason} "
                 f"- opening advisory [SALVAGE] PR",
@@ -1413,17 +1474,66 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                 return ""
             if not gate_passed:
                 # D1 (agents-core-local-fixer-harness-fix-v0): the positive-only
-                # gate (or its fail-closed legacy fallback) rejected this run —
-                # do not PR. The model's own tests did not all pass (or no
-                # tests were touched and the legacy gate failed).
+                # gate (or its fail-closed legacy fallback) rejected this run.
+                # S3 (agents-core-local-fixer-salvage-on-discard-v0): salvage
+                # the WORKTREE's final state (not the WIP ref) - a concluded
+                # run's final state is exactly what the gate tested, and it is
+                # at least as complete as any WIP snapshot. Fail closed: any
+                # git failure below falls through to the original return "".
                 print(
                     "WARN: local-fixer: test gate failed "
                     f"(model_touched_tests={sorted(model_touched_tests) if model_touched_tests else '[] (legacy gate)'}; "
                     f"deciding outcome {_outcome_diag(last_test_outcome)}"
-                    f"{_rerun_diag()}) — no PR",
+                    f"{_rerun_diag()}) - opening advisory [SALVAGE] PR "
+                    f"(concluded, gate rejected, worktree salvage)",
                     file=sys.stderr,
                 )
-                return ""
+                _tail_log(task_id, "test gate failed - opening advisory [SALVAGE] PR (concluded, gate rejected)")
+                _salvage_commit_sha = ""
+                _salvage_add = _wip_git("add", "-A")
+                if _salvage_add.returncode != 0:
+                    print(
+                        f"WARN: local-fixer: worktree salvage git add failed "
+                        f"({_salvage_add.stderr.strip()[:500]}) - no PR",
+                        file=sys.stderr,
+                    )
+                    return ""
+                _salvage_commit = _wip_git(
+                    "commit", "-q", "-m",
+                    f"salvage: {task_id} (concluded, gate rejected)",
+                )
+                if _salvage_commit.returncode != 0:
+                    print(
+                        f"WARN: local-fixer: worktree salvage git commit failed "
+                        f"({_salvage_commit.stderr.strip()[:500]}) - no PR",
+                        file=sys.stderr,
+                    )
+                    return ""
+                _salvage_rev = _wip_git("rev-parse", "HEAD")
+                if _salvage_rev.returncode != 0:
+                    print(
+                        f"WARN: local-fixer: worktree salvage git rev-parse failed "
+                        f"({_salvage_rev.stderr.strip()[:500]}) - no PR",
+                        file=sys.stderr,
+                    )
+                    return ""
+                _salvage_commit_sha = _salvage_rev.stdout.strip()
+                if not _salvage_commit_sha:
+                    print(
+                        "WARN: local-fixer: worktree salvage rev-parse returned "
+                        "empty sha - no PR",
+                        file=sys.stderr,
+                    )
+                    return ""
+                return _open_wip_salvage_pr(
+                    worktree_path, "HEAD", _salvage_commit_sha, [],
+                    stop_reason="concluded_gate_rejected",
+                    concluded=True, task_id=task_id,
+                    target_id=target_id, bare_repo=bare_repo,
+                    branch=branch, slug=slug,
+                    step_count=len(fixer_result.get("steps") or []),
+                    transcript_path=transcript_path,
+                )
 
         # Deterministic git (model never touches git)
         def _git(*args: str) -> subprocess.CompletedProcess:
