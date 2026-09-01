@@ -711,8 +711,19 @@ class GrepExecutor(ToolExecutor):
             path_glob = self._sanitize_glob(arguments.get("path_glob", "**/*"))
 
             # Build ripgrep command - search under cwd for the glob pattern
-            # Use -l (files only), -m 100 (max 100 matches)
-            cmd = ["rg", pattern, "-l", "-m", "100"]
+            # Use -l (files only), -m 100 (max 100 matches).
+            # fixers-harness-staged-v0 (S3): the pattern is pinned behind -e so a
+            # pattern starting with "-" can never be parsed as a ripgrep flag
+            # (value position). Additive: the legacy rg -l path is unchanged for
+            # non-staged runs (the staged stage toolset passes the new param).
+            use_line_numbers = bool(arguments.get("line_numbers"))
+            if use_line_numbers:
+                # file:line:content matches (the staged stage toolset - a
+                # stage's grep must let the model jump to a line, not just a
+                # file name).
+                cmd = ["rg", "-n", "-m", "100", "-e", pattern]
+            else:
+                cmd = ["rg", pattern, "-l", "-m", "100"]
             if path_glob != "**/*":
                 cmd += ["--glob", path_glob]
             result = subprocess.run(
