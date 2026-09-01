@@ -636,7 +636,19 @@ class ToolExecutor:
 
 
 class ReadFileExecutor(ToolExecutor):
-    """Execute read_file(path, start_line?, end_line?)."""
+    """Execute read_file(path, start_line?, end_line?).
+
+    fixers-harness-staged-v0 (S4): an empty read slice is no longer a bare
+    `""` - it returns a readable `(empty slice: ...)` marker (or `(file is
+    empty: ...)` for a zero-byte file) so the 27B's "read past EOF" pattern
+    becomes a signal instead of an unexplained blank. The marker interpolates
+    INTEGERS ONLY (never the file path or file content) and is a plain `str`
+    return (an *answer*, not an error - `error` stays `None`, so
+    novelty/repeat-call/salvage are unaffected). Single-line reads are
+    untouched (only `start > end` is inverted). The truncation marker is
+    enriched with the file's line count + the shown range so a model can page
+    to the end in one jump.
+    """
 
     def __init__(self, cwd: str | None = None):
         self.cwd = Path(cwd or "/srv/agents").resolve()
@@ -658,16 +670,61 @@ class ReadFileExecutor(ToolExecutor):
             end_line = arguments.get("end_line")
 
             lines = content.splitlines()
+            total = len(lines)
+
+            # Zero-byte file (no content at all): a distinct readable marker.
+            # Interpolates integers only - never the path or content.
+            if total == 0:
+                return (
+                    f"(file is empty: the file has 0 lines; "
+                    f"there is nothing to read)"
+                )
+
+            # Single-line reads are untouched (the v1 contract): only a
+            # `start > end` inversion is normalized, not a no-op range.
             if start_line < 1:
                 start_line = 1
-            start_idx = max(0, start_line - 1)
-            end_idx = len(lines) if end_line is None else min(end_line, len(lines))
+            if end_line is not None and start_line > end_line:
+                start_line, end_line = end_line, start_line
+                if start_line < 1:
+                    start_line = 1
+
+            # Empty-slice detection: the requested range yields no lines.
+            # start_idx == end_idx is the single condition that covers both
+            # "range entirely past EOF" and "in-range but all-blank slice".
+            start_idx = start_line - 1
+            end_idx = total if end_line is None else min(end_line, total)
+            if start_idx >= end_idx:
+                # Name the requested range (integers only). "is outside it"
+                # only when the range does not intersect [1, total]; an
+                # in-range all-blank slice says the range is blank.
+                req_start = start_line
+                req_end = end_line if end_line is not None else total
+                if req_start > total:
+                    detail = (
+                        f"requested range {req_start}-{req_end} is outside it"
+                    )
+                else:
+                    detail = (
+                        f"requested range {req_start}-{req_end} is blank"
+                    )
+                return (
+                    f"(empty slice: file has {total} lines; {detail})"
+                )
 
             output_lines = lines[start_idx:end_idx]
             result = "\n".join(output_lines)
 
             if len(result) > GW_AGENT_TOOL_OUTPUT_CAP:
-                result = result[:GW_AGENT_TOOL_OUTPUT_CAP] + "\n…[truncated]"
+                # Enriched truncation marker (S4): the file's total line count
+                # + the shown range let a model page to the end in one jump.
+                shown_end = start_idx + len(output_lines)
+                result = (
+                    result[:GW_AGENT_TOOL_OUTPUT_CAP]
+                    + f"\n…[truncated at {GW_AGENT_TOOL_OUTPUT_CAP} chars; "
+                    + f"file has {total} lines, "
+                    + f"showing lines {start_line}-{shown_end}]"
+                )
 
             return result
         except Exception as e:
@@ -675,10 +732,22 @@ class ReadFileExecutor(ToolExecutor):
 
 
 class GrepExecutor(ToolExecutor):
-    """Execute grep(pattern, path_glob?)."""
+    """Execute grep(pattern, path_glob?).
 
-    def __init__(self, cwd: str | None = None):
+    line_numbers (fixers-harness-staged-v0, S3): when True the ripgrep argv
+    carries `-n` (output `file:line:content`) instead of `-l` (file names only).
+    Additive - the legacy default (`line_numbers=False`) is the exact `rg -l`
+    path, unchanged for non-staged runs. The staged harness (S1, next cycle)
+    passes its own restricted tool_executors with `GrepExecutor(cwd,
+    line_numbers=True)` so the 27B can jump to a function instead of re-reading
+    a large file linearly in chunks (the D4/D2a failure class). The pattern is
+    pinned behind `-e` so a pattern starting with `-` can never be parsed as a
+    flag.
+    """
+
+    def __init__(self, cwd: str | None = None, line_numbers: bool = False):
         self.cwd = Path(cwd or "/srv/agents").resolve()
+        self.line_numbers = line_numbers
 
     def _sanitize_glob(self, path_glob: str) -> str:
         """Sanitize a model-supplied path_glob into a CWD-relative ripgrep glob.
@@ -711,8 +780,11 @@ class GrepExecutor(ToolExecutor):
             path_glob = self._sanitize_glob(arguments.get("path_glob", "**/*"))
 
             # Build ripgrep command - search under cwd for the glob pattern
-            # Use -l (files only), -m 100 (max 100 matches)
-            cmd = ["rg", pattern, "-l", "-m", "100"]
+            # Use -l (files only) or -n (file:line:content, line_numbers=True),
+            # -m 100 (max 100 matches). The pattern is pinned behind `-e` so a
+            # pattern starting with `-` can never be parsed as a flag.
+            _match_flag = "-n" if self.line_numbers else "-l"
+            cmd = ["rg", _match_flag, "-m", "100", "-e", pattern]
             if path_glob != "**/*":
                 cmd += ["--glob", path_glob]
             result = subprocess.run(
@@ -1182,6 +1254,7 @@ def _build_fixer_result(
     interrupted: bool = False,
     interrupt_reason: str = "",
     stop_reason: str = "",
+    result_text: str = "",
 ) -> dict:
     """Build a FixerResult dict from the completed writeable run.
 
@@ -1255,6 +1328,13 @@ def _build_fixer_result(
         # detector.
         "stop_reason": stop_reason,
         "steps": transcript,
+        # fixers-harness-staged-v0 (S0): the model's final message text, carried
+        # through from the loop's finalize tuple. Additive - default "" and
+        # ignored by existing consumers (parity pinned by the unmodified
+        # existing suite). The staged harness reads its fenced stage artifact
+        # JSON from here; a writeable run previously discarded the model's
+        # final content at finalize, so the artifact had no source.
+        "result_text": result_text,
     }
 
 
@@ -3105,6 +3185,11 @@ def _finalize_writeable_or_readonly(
     stop_reason (D5, agents-core-local-fixer-harness-fix-v0) is a distinct
     machine-readable abort reason carried on the FixerResult (e.g.
     "mem_search_loop" when the mem-search loop detector aborted the run).
+
+    fixers-harness-staged-v0 (S0): the model's final `content` is forwarded to
+    the FixerResult as `result_text` (default "" on the content="" exits -
+    POST failure, no-choices, interruption, no-progress abort). Additive and
+    behavior-neutral for existing consumers, which ignore the new key.
     """
     if writeable:
         fixer = _build_fixer_result(
@@ -3116,6 +3201,7 @@ def _finalize_writeable_or_readonly(
             interrupted=interrupted,
             interrupt_reason=interrupt_reason,
             stop_reason=stop_reason,
+            result_text=content,
         )
         return (fixer, transcript)
     return _finalize_result(

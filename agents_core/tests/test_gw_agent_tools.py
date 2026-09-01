@@ -75,17 +75,27 @@ class TestReadFileExecutor:
             assert "outside cwd" in result["error"]
 
     def test_read_file_output_capped(self):
+        # fixers-harness-staged-v0 (S4): the truncation marker is enriched to
+        # `…[truncated at {cap} chars; file has {N} lines, showing lines
+        # {start}-{end}]` so a model can page to the end in one jump.
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
             test_file = tmpdir_path / "large.txt"
+            # One long line (no embedded newlines) so the slice is a single
+            # line and the marker's "showing lines 1-1" range is deterministic.
             large_content = "x" * (GW_AGENT_TOOL_OUTPUT_CAP + 1000)
             test_file.write_text(large_content)
 
             executor = ReadFileExecutor(tmpdir)
             result = executor.execute({"path": "large.txt"})
             assert isinstance(result, str)
-            assert len(result) <= GW_AGENT_TOOL_OUTPUT_CAP + len("\n…[truncated]")
-            assert "…[truncated]" in result
+            assert "…[truncated at " in result
+            assert f"{GW_AGENT_TOOL_OUTPUT_CAP} chars" in result
+            assert "file has 1 lines" in result
+            assert "showing lines 1-1" in result
+            # The body is capped at the tool output cap (the marker is the only
+            # excess).
+            assert len(result) <= GW_AGENT_TOOL_OUTPUT_CAP + 200
 
 
 class TestGitExecutor:
