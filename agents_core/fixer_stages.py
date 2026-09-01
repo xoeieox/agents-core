@@ -550,6 +550,7 @@ def run_stage(
     cwd: str,
     persona: dict,
     re_hunt_reasons: list[str] | None = None,
+    model: str | None = None,
     log=None,
 ) -> tuple[dict, list[dict], StageLedger]:
     """Run one LLM stage (reader/aimer) with the closed toolset.
@@ -585,6 +586,7 @@ def run_stage(
             handler_objective=f"{stage} stage: output the fenced artifact",
             handler_max_interventions=2,
             after_step=_after_step(ledger),
+            model=model,
             log=log,
         )
     except Exception as exc:  # never-raises: a stage crash is a stage failure
@@ -839,6 +841,10 @@ class StagedOutcome:
     pre_aimed_match_diagnostic: list[dict] | None = None
     report_path: Path | None = None
     pr_url: str = ""
+    # The total stage transcript step count (sum of len(transcript) over
+    # all stage runs) - the PR body's "## Steps" line in the engine's
+    # salvage partition must report the real count, not 0.
+    stage_steps: int = 0
 
 
 def run_staged_mission(
@@ -865,6 +871,7 @@ def run_staged_mission(
     """
     task_id = spec.get("task_id") or spec.get("slot_id") or "staged-unknown"
     target_id = spec.get("target_id", "unknown")
+    model = spec.get("model")
 
     # Mission parse (fail-loud before any GPU spend).
     try:
@@ -925,6 +932,10 @@ def run_staged_mission(
     mission_start = time.monotonic()
     stage_transcripts: list[dict] = []
     stages_report: list[dict] = []
+    # The total stage transcript step count (sum of len(transcript) over
+    # all stage runs), kept in sync with stage_transcripts so the engine's
+    # salvage partition can thread the real step count into the PR body.
+    outcome.stage_steps = 0
     map_artifact: dict | None = None
     aim_artifact: dict | None = None
     rejections = 0
@@ -947,12 +958,13 @@ def run_staged_mission(
         try:
             fixer, transcript, ledger = run_stage(
                 stage="reader", mission=mission, cwd=cwd,
-                persona=reader_persona, log=log,
+                persona=reader_persona, model=model, log=log,
             )
         except Exception as exc:
             return _stage_failure(task_id, mission, "reader", str(exc),
                                   stages_report, stage_transcripts, outcome)
         stage_transcripts.append({"stage": "reader", "transcript": transcript})
+        outcome.stage_steps += len(transcript or [])
         artifact, reasoning = parse_stage_artifact(
             fixer.get("result_text", ""), "reader"
         )
@@ -996,12 +1008,14 @@ def run_staged_mission(
         try:
             fixer, transcript, ledger = run_stage(
                 stage="aimer", mission=mission, cwd=cwd,
-                persona=aimer_persona, re_hunt_reasons=re_hunt, log=log,
+                persona=aimer_persona, re_hunt_reasons=re_hunt,
+                model=model, log=log,
             )
         except Exception as exc:
             return _stage_failure(task_id, mission, "aimer", str(exc),
                                   stages_report, stage_transcripts, outcome)
         stage_transcripts.append({"stage": "aimer", "transcript": transcript})
+        outcome.stage_steps += len(transcript or [])
         artifact, reasoning = parse_stage_artifact(
             fixer.get("result_text", ""), "aimer"
         )
@@ -1059,12 +1073,13 @@ def run_staged_mission(
             fixer, transcript, ledger = run_stage(
                 stage="reader", mission=mission, cwd=cwd,
                 persona=reader_persona, re_hunt_reasons=rejection_reasons,
-                log=log,
+                model=model, log=log,
             )
         except Exception as exc:
             return _stage_failure(task_id, mission, "reader", str(exc),
                                   stages_report, stage_transcripts, outcome)
         stage_transcripts.append({"stage": "reader", "transcript": transcript})
+        outcome.stage_steps += len(transcript or [])
         artifact, reasoning = parse_stage_artifact(
             fixer.get("result_text", ""), "reader"
         )
