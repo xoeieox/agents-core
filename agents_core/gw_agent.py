@@ -2562,6 +2562,7 @@ def _call_gw_agent_impl(
                     return _finalize_writeable_or_readonly(
                         messages, content, return_transcript, transcript, writeable, cwd,
                         concluded=False, stop_reason="output_budget_exhausted",
+                        result_text=content,
                     )
 
                 elif finish_reason == "stop" or finish_reason not in ("tool_calls", "stop"):
