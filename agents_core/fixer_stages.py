@@ -881,8 +881,23 @@ def run_staged_mission(
         )
 
     # Persona load (fail-loud before any GPU spend).
-    reader_persona = load_stage_persona("decks/fixer/reader.yaml")
-    aimer_persona = load_stage_persona("decks/fixer/aimer.yaml")
+    try:
+        reader_persona = load_stage_persona("decks/fixer/reader.yaml")
+        aimer_persona = load_stage_persona("decks/fixer/aimer.yaml")
+    except MissionError as exc:
+        if log:
+            log(f"[fixer_stages] stage persona card invalid - aborting before GPU spend: {exc}")
+        report = {
+            "final_state": "persona_card_invalid",
+            "stop_reason": "persona_card_invalid",
+            "error": str(exc),
+        }
+        path = write_mission_report(task_id, _empty_mission(), report)
+        return StagedOutcome(
+            stop_reason="persona_card_invalid",
+            final_state="persona_card_invalid",
+            report_path=path,
+        )
 
     mission_start = time.monotonic()
     stage_transcripts: list[dict] = []
