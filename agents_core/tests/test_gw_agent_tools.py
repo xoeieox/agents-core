@@ -75,17 +75,90 @@ class TestReadFileExecutor:
             assert "outside cwd" in result["error"]
 
     def test_read_file_output_capped(self):
+        # fixers-harness-staged-v0 (S4): the truncation marker is enriched to
+        # `…[truncated at {cap} chars; file has {N} lines, showing lines
+        # {start}-{end}]` so a model can page to the end in one jump.
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
             test_file = tmpdir_path / "large.txt"
+            # One long line (no embedded newlines) so the slice is a single
+            # line and the marker's "showing lines 1-1" range is deterministic.
             large_content = "x" * (GW_AGENT_TOOL_OUTPUT_CAP + 1000)
             test_file.write_text(large_content)
 
             executor = ReadFileExecutor(tmpdir)
             result = executor.execute({"path": "large.txt"})
             assert isinstance(result, str)
-            assert len(result) <= GW_AGENT_TOOL_OUTPUT_CAP + len("\n…[truncated]")
-            assert "…[truncated]" in result
+            assert "…[truncated at " in result
+            assert f"{GW_AGENT_TOOL_OUTPUT_CAP} chars" in result
+            assert "file has 1 lines" in result
+            assert "showing lines 1-1" in result
+            # The body is capped at the tool output cap (the marker is the only
+            # excess).
+            assert len(result) <= GW_AGENT_TOOL_OUTPUT_CAP + 200
+
+    def test_empty_slice_past_eof(self):
+        # fixers-harness-staged-v0 (S4): reading past EOF returns an explicit
+        # `(empty slice: ...)` marker naming the file's line count, not "".
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            test_file = tmpdir_path / "small.txt"
+            test_file.write_text("l1\nl2\nl3\nl4\nl5\n")
+
+            executor = ReadFileExecutor(tmpdir)
+            result = executor.execute(
+                {"path": "small.txt", "start_line": 100, "end_line": 200}
+            )
+            assert isinstance(result, str)
+            assert result.startswith("(empty slice:")
+            assert "file has 5 lines" in result
+            assert "is outside it" in result
+
+    def test_zero_byte_file_marker(self):
+        # fixers-harness-staged-v0 (S4): a zero-byte file returns a distinct
+        # `(file is empty: ...)` marker.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "zero.txt").write_text("")
+
+            executor = ReadFileExecutor(tmpdir)
+            result = executor.execute({"path": "zero.txt"})
+            assert isinstance(result, str)
+            assert result.startswith("(file is empty")
+
+    def test_empty_slice_marker_no_path(self):
+        # fixers-harness-staged-v0 (S4): the empty-slice marker interpolates
+        # INTEGERS ONLY - never the file path (or file content).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            test_file = tmpdir_path / "small.txt"
+            test_file.write_text("l1\nl2\nl3\nl4\nl5\n")
+
+            executor = ReadFileExecutor(tmpdir)
+            result = executor.execute(
+                {"path": "small.txt", "start_line": 100, "end_line": 200}
+            )
+            assert isinstance(result, str)
+            assert str(tmpdir) not in result
+
+    def test_start_gt_end_inverted(self):
+        # fixers-harness-staged-v0 (S4): a `start > end` range is inverted
+        # (single-line-read contract), not treated as an empty slice.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            test_file = tmpdir_path / "small.txt"
+            test_file.write_text("l1\nl2\nl3\nl4\nl5\n")
+
+            executor = ReadFileExecutor(tmpdir)
+            result = executor.execute(
+                {"path": "small.txt", "start_line": 5, "end_line": 2}
+            )
+            assert isinstance(result, str)
+            assert not result.startswith("(empty slice:")
+            # Inverted range 5..2 -> 2..5: the file's lines 2 through 5.
+            for line in ("l2", "l3", "l4", "l5"):
+                assert line in result
+            assert "l1" not in result
 
 
 class TestGitExecutor:
@@ -250,3 +323,53 @@ class TestGrepExecutor:
             assert result != "(no matches)"
             assert "config/nested/deep.yaml" in result
             assert "sibling.txt" not in result
+
+    @pytest.mark.skipif(not _has_ripgrep(), reason="ripgrep not installed")
+    def test_grep_line_numbers_emits_file_line_content(self):
+        # fixers-harness-staged-v0 (S3): line_numbers=True carries `-n` -
+        # output is `file:line:content` so a model can jump to a function.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "file.txt").write_text("a\nb\nneedle\n")
+
+            executor = GrepExecutor(tmpdir, line_numbers=True)
+            result = executor.execute({"pattern": "needle"})
+            assert isinstance(result, str)
+            assert "file.txt:3:" in result
+
+    @pytest.mark.skipif(not _has_ripgrep(), reason="ripgrep not installed")
+    def test_grep_legacy_path_no_line_numbers(self):
+        # fixers-harness-staged-v0 (S3): the legacy default (`line_numbers=False`)
+        # stays the exact `rg -l` path - file names only, no line numbers.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "file.txt").write_text("a\nb\nneedle\n")
+
+            executor = GrepExecutor(tmpdir)
+            result = executor.execute({"pattern": "needle"})
+            assert isinstance(result, str)
+            assert "file.txt" in result
+            assert ":3:" not in result
+
+    @pytest.mark.skipif(not _has_ripgrep(), reason="ripgrep not installed")
+    def test_grep_pattern_leading_dash_after_e(self):
+        # fixers-harness-staged-v0 (S3): the pattern is pinned behind `-e`, so
+        # a pattern starting with `-` is never parsed as a flag.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "file.txt").write_text("x\n-leading-dash\n")
+
+            executor = GrepExecutor(tmpdir)
+            result = executor.execute({"pattern": "-leading-dash"})
+            assert isinstance(result, str)
+            assert result != "(no matches)"
+            assert "file.txt" in result
+
+
+def test_fixer_result_result_text_default():
+    # fixers-harness-staged-v0 (S0): the additive `result_text` key on the
+    # FixerResult dict defaults to "" and is ignored by existing consumers.
+    from agents_core.gw_agent import _build_fixer_result
+
+    r = _build_fixer_result(cwd=".", transcript=[], concluded=True)
+    assert r["result_text"] == ""

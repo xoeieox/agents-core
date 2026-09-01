@@ -314,7 +314,8 @@ def _collect_model_touched_tests(transcript: list[dict], cwd: str) -> set[str]:
     return touched
 
 
-def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str]) -> dict | None:
+def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str],
+                         timeout_s: int = 180) -> dict | None:
     """Deterministic targeted re-run of model-touched tests (local-fixer gate
     perception). Mirrors the fixer's own run_tests invocation
     (gw_agent.py:1098-1116): same interpreter (sys.executable), same env
@@ -328,6 +329,13 @@ def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str]) -> dict | None
     last run_tests outcome (the 0/0 last-call-wins shape). The re-run
     structurally bypasses the 8192-char tool output cap: it parses subprocess
     output directly, as the opencode F4 re-run does.
+
+    fixers-harness-staged-v0 (S2): `timeout_s` (default 180 - legacy parity,
+    pinned by the existing gate tests) is the re-run wall clock. The staged
+    tail passes the mission's `tests_timeout_s` (capped [60, 240] at
+    parse_mission time) because the legacy 180s cap is BELOW the measured
+    189s runtime of the D2a acceptance test file - the acceptance mission
+    would fail deterministically at the gate otherwise.
     """
     if not Path(cwd).is_dir():
         # A missing worktree is an unusable re-run, never a crash: the gate
@@ -356,7 +364,7 @@ def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str]) -> dict | None
         r = subprocess.run(
             cmd,
             capture_output=True, text=True,
-            timeout=180,  # parity with run_tests' own cap (gw_agent.py:1074)
+            timeout=timeout_s,  # legacy parity: run_tests' own cap (gw_agent.py:1074)
             cwd=cwd,
             shell=False,
         )
@@ -367,7 +375,7 @@ def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str]) -> dict | None
         # F4's TimeoutExpired branch only tags the output; this helper ADDS
         # the WARN so an unusable re-run is visible, not a silent 0/0.
         print(
-            f"WARN: local-fixer: gate targeted re-run timed out after 180s "
+            f"WARN: local-fixer: gate targeted re-run timed out after {timeout_s}s "
             f"(touched={sorted(model_touched_tests)})",
             file=sys.stderr,
         )
