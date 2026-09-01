@@ -121,6 +121,56 @@ class TestGuardRails:
                 _mem_store=store,
             )
 
+    def test_mem_limit_plus_one_probe_raises(self, tmp_path):
+        """Probe path: _MEM_LIMIT+1 matching entries -> RuntimeError.
+
+        The guard must probe with an explicit limit of _MEM_LIMIT+1 (the real
+        MemoryStore.list_all() defaults to limit=50, so a default-limit probe
+        can never exceed _MEM_LIMIT and the guard would be dead code).
+        """
+        entries = {
+            "feedback": [
+                (f"feedback/item-{i}", f"body {i}") for i in range(_MEM_LIMIT + 1)
+            ],
+            "ratify:correct": [],
+            "ratify:override": [],
+        }
+        store = _make_mem_store(entries)
+        with pytest.raises(RuntimeError, match="feedback"):
+            build_adversary_corpus(
+                _TECH_KAMI_EXPERT_ID,
+                _corpus_root=tmp_path / "corpus",
+                _arc_dir=tmp_path / "arc",
+                _mem_store=store,
+            )
+        # The probe must have been issued with an explicit limit of _MEM_LIMIT+1
+        # (not the default 50), otherwise it could never return > _MEM_LIMIT rows.
+        probe_limits = [
+            kw.get("limit")
+            for (_, kw) in store.list_all.call_args_list
+            if kw.get("limit") == _MEM_LIMIT + 1
+        ]
+        assert probe_limits, "no list_all() probe with limit=_MEM_LIMIT+1 was issued"
+
+    def test_mem_limit_minus_one_no_raise(self, tmp_path):
+        """_MEM_LIMIT-1 matching entries -> probe passes, no RuntimeError."""
+        entries = {
+            "feedback": [
+                (f"feedback/item-{i}", f"body {i}") for i in range(_MEM_LIMIT - 1)
+            ],
+            "ratify:correct": [],
+            "ratify:override": [],
+        }
+        store = _make_mem_store(entries)
+        result = build_adversary_corpus(
+            _TECH_KAMI_EXPERT_ID,
+            _corpus_root=tmp_path / "corpus",
+            _arc_dir=tmp_path / "arc",
+            _mem_store=store,
+        )
+        assert result["errors"] == []
+        assert result["written"] == _MEM_LIMIT - 1
+
 
 # ---------------------------------------------------------------------------
 # build_adversary_corpus() — dry_run

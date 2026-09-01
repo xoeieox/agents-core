@@ -98,34 +98,6 @@ def _parse_source_sha256(fragment_text: str) -> str | None:
 # Source enumerators
 # ---------------------------------------------------------------------------
 
-def _mem_source_total_count(
-    mem_tag: str,
-    tags: list[str] | None,
-    store: MemoryStore,
-) -> int | None:
-    """Best-effort true total count of matching mem entries.
-
-    Prefers an explicit count API on the store (count/has_more signal);
-    falls back to a single unbounded list_all() probe. Returns None when the
-    store exposes no usable count signal (defensive; a real MemoryStore
-    always supports the probe).
-    """
-    count = getattr(store, "count", None)
-    if callable(count):
-        try:
-            return int(count(tag=mem_tag, tags=tags))
-        except TypeError:
-            pass
-        try:
-            return int(count(mem_tag))
-        except Exception:
-            pass
-    try:
-        return len(store.list_all(tag=mem_tag, tags=tags))
-    except Exception:
-        return None
-
-
 def _enumerate_mem_source(
     source_kind: str,
     mem_tag: str,
@@ -133,12 +105,19 @@ def _enumerate_mem_source(
 ) -> list[tuple[str, str]]:
     """Enumerate mem entries for a tag. Raises RuntimeError if the TOTAL
     number of matching entries exceeds _MEM_LIMIT (not just when one paged
-    result happens to equal it)."""
-    total = _mem_source_total_count(mem_tag, None, store)
-    if total is not None and total > _MEM_LIMIT:
+    result happens to equal it).
+
+    The true count is probed with an explicit limit of _MEM_LIMIT + 1: if the
+    probe returns more than _MEM_LIMIT rows, the source genuinely exceeds the
+    ceiling. (MemoryStore.list_all() has a default limit of 50 and no count()
+    method, so a default-limit probe can never exceed _MEM_LIMIT=1000 and the
+    guard would be dead code.)
+    """
+    probe = store.list_all(tag=mem_tag, limit=_MEM_LIMIT + 1)
+    if len(probe) > _MEM_LIMIT:
         raise RuntimeError(
             f"adversary_corpus: mem source '{source_kind}' (tag={mem_tag!r}) "
-            f"has {total} entries — exceeds _MEM_LIMIT ({_MEM_LIMIT}), corpus "
+            f"has {len(probe)} entries — exceeds _MEM_LIMIT ({_MEM_LIMIT}), corpus "
             f"would silently truncate. Raise _MEM_LIMIT or prune the source tag."
         )
     rows = store.list_all(tag=mem_tag, limit=_MEM_LIMIT)
