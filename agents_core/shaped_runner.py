@@ -3199,7 +3199,7 @@ def main():
         # fall-through would burn a seat on a spec no engine understands.
         print(
             f"ERROR: unknown shaped-runner engine {engine!r}; allowed: "
-            "claude, local-fixer, local-opencode, local-reviewer",
+            "claude, local-fixer, local-fixer-staged, local-opencode, local-reviewer",
             file=sys.stderr,
         )
         sys.exit(2)
