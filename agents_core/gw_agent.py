@@ -2066,9 +2066,9 @@ def _call_gw_agent_impl(
                 else:
                     raise ValueError(f"unknown on_wake_fail: {on_wake_fail}")
 
-            if res is None or res.get("status") != "serving":
+            if res.get("status") != "serving":
                 if log:
-                    log(f"[gw_agent] GW not serving: {res.get('status') if isinstance(res, dict) else res}")
+                    log(f"[gw_agent] GW not serving: {res.get('status')}")
                 if on_wake_fail == "skip":
                     if writeable:
                         return (_build_fixer_result(cwd, transcript, concluded=False), transcript)
