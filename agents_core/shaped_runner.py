@@ -312,6 +312,88 @@ def _collect_model_touched_tests(transcript: list[dict], cwd: str) -> set[str]:
     return touched
 
 
+def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str]) -> dict | None:
+    """Deterministic targeted re-run of model-touched tests (local-fixer gate
+    perception). Mirrors the fixer's own run_tests invocation
+    (gw_agent.py:1098-1116): same interpreter (sys.executable), same env
+    (inherited, no env override), cwd=worktree, shell=False, -q. Returns the
+    _parse_pytest_outcome dict, or None when the re-run itself is unusable
+    (timeout or spawn error).
+
+    agents-core-local-fixer-gate-perception-v0 D1: the harness re-runs the
+    tests the model touched (transcript-derived, _collect_model_touched_tests)
+    so the gate decides on the CURRENT worktree state instead of the model's
+    last run_tests outcome (the 0/0 last-call-wins shape). The re-run
+    structurally bypasses the 8192-char tool output cap: it parses subprocess
+    output directly, as the opencode F4 re-run does.
+    """
+    if not Path(cwd).is_dir():
+        # A missing worktree is an unusable re-run, never a crash: the gate
+        # stays fail-closed (the caller keeps its verdict) with this WARN.
+        print(
+            f"WARN: local-fixer: gate targeted re-run unusable - cwd {cwd!r} "
+            f"is not an existing directory (touched={sorted(model_touched_tests)})",
+            file=sys.stderr,
+        )
+        return None
+    # Function-level import mirrors the F4 precedent (the opencode re-run
+    # imports _parse_pytest_outcome inside the tail) so requests/
+    # doorman_client stay out of shaped_runner's module import graph.
+    from agents_core.gw_agent import _parse_pytest_outcome
+
+    # argparse option-injection guard: a model-authored path starting with
+    # '-' (e.g. '-kfoo/tests/test_x.py') would otherwise be consumed as a
+    # pytest option and its file never run, silently skipping a red touched
+    # test. shell=False makes the run_tests shell-metachar guard unnecessary.
+    argv_paths = [
+        ("./" + p) if p.startswith("-") else p
+        for p in sorted(set(model_touched_tests))
+    ]
+    cmd = [sys.executable, "-m", "pytest", *argv_paths, "-q"]
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True, text=True,
+            timeout=180,  # parity with run_tests' own cap (gw_agent.py:1074)
+            cwd=cwd,
+            shell=False,
+        )
+        output = r.stdout + r.stderr
+        returncode = r.returncode
+        timed_out = False
+    except subprocess.TimeoutExpired as e:
+        # F4's TimeoutExpired branch only tags the output; this helper ADDS
+        # the WARN so an unusable re-run is visible, not a silent 0/0.
+        print(
+            f"WARN: local-fixer: gate targeted re-run timed out after 180s "
+            f"(touched={sorted(model_touched_tests)})",
+            file=sys.stderr,
+        )
+        return None
+    except Exception as exc:
+        # Spawn error (OSError/E2BIG, ...): an unusable re-run must never
+        # propagate out of the gate into _run_local_fixer (never-raises
+        # contract) - WARN + None keeps the fail-closed verdict.
+        print(
+            f"WARN: local-fixer: gate targeted re-run spawn error "
+            f"(touched={sorted(model_touched_tests)}): {exc}",
+            file=sys.stderr,
+        )
+        return None
+    # The no-"passed"-key guard below is defensive only: _parse_pytest_outcome
+    # always returns the key; the error-dict class is produced by
+    # RunToolsExecutor.execute, which this helper does not call.
+    outcome = _parse_pytest_outcome(output, returncode, timed_out)
+    if not isinstance(outcome, dict) or "passed" not in outcome:
+        print(
+            f"WARN: local-fixer: gate targeted re-run returned an unusable "
+            f"outcome (rc={returncode}): {outcome!r}",
+            file=sys.stderr,
+        )
+        return None
+    return outcome
+
+
 def _collect_diff_touched_tests(cwd: str) -> set[str]:
     """Collect the CWD-relative paths of test files in the staged diff.
 
@@ -644,7 +726,11 @@ def _tail_log(task_id: str, message: str) -> None:
     logging must never fail a run. Additive to the existing stderr prints,
     not a replacement. Reason strings, returncodes and URLs only: no
     secrets, no tokens, no diff content (callers truncate git stderr to
-    <= 500 chars).
+    <= 500 chars). Admitted content class added by
+    agents-core-local-fixer-gate-perception-v0 D2: the deciding test
+    outcome's pytest summary line (single-line by construction, truncated
+    to 200 chars by the caller) - no diff content, no env values except
+    what a test itself prints.
     """
     try:
         shaped_dir = room_path("gpu_queue.shaped")
@@ -1068,28 +1154,125 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                     for n in failed_node_ids
                 )
             ]
-            if last_test_outcome is not None:
+            if last_test_outcome is not None and "passed" in last_test_outcome:
                 passed_c = int(last_test_outcome.get("passed") or 0)
                 if passed_c > 0 and not touched_failures:
                     gate_passed = True
         else:
             # Fail-closed fallback: no tests touched -> legacy gate.
+            # D3 (agents-core-local-fixer-gate-perception-v0): an error-dict
+            # outcome (no "passed" key, the {"error": ...} class from
+            # gw_agent.py:1085) is a no-valid-last-result here - it stays
+            # fail-closed (the _tests_passed False return) but is logged as
+            # no-valid-last-result, not as a spurious passed=0 failed=0.
+            if last_test_outcome is not None and "passed" not in last_test_outcome:
+                _tail_log(task_id, "gate: no-valid-last-result (error-dict outcome)")
             gate_passed = _tests_passed(last_test_outcome)
+
+        # D1 (agents-core-local-fixer-gate-perception-v0): targeted re-run
+        # when the touched branch would fail closed. STRICTLY MORE PERMISSIVE:
+        # the re-run only fires when the gate would otherwise fail closed -
+        # it can flip fail->pass, never pass->fail. The re-run re-tests the
+        # CURRENT worktree state, so a fix made after the model's last
+        # run_tests is picked up (the v2-retry shape). The re-run outcome
+        # REPLACES the model's last outcome as the DECIDING outcome for the
+        # gate and the D2/D5 surfaces when it fires (the re-run is the
+        # authoritative tail - the local-fixer path adopts the opencode
+        # tail's doctrine by analogy). Decision rule: returncode == 0
+        # (rc=1 failures, rc=2 collection error, rc=4 usage/path error,
+        # rc=5 no tests collected - an empty touched file correctly fails
+        # closed). A None (unusable) re-run keeps the fail-closed verdict.
+        gate_rerun_fired = False
+        if (
+            gate_bypassed is None
+            and not gate_passed
+            and model_touched_tests
+            and (
+                last_test_outcome is None
+                or "passed" not in last_test_outcome
+                or int(last_test_outcome.get("passed") or 0) == 0
+                or touched_failures
+            )
+        ):
+            # cwd pinning: pass the gate's own cwd (the worktree root - the
+            # same variable _collect_model_touched_tests used above); a wrong
+            # cwd would make every touched path rc=4 (a silent no-op that
+            # voids the strictly-more-permissive invariant in production).
+            gate_rerun_fired = True
+            rerun_outcome = _gate_targeted_rerun(cwd, model_touched_tests)
+            if rerun_outcome is not None:
+                last_test_outcome = rerun_outcome
+                gate_passed = (rerun_outcome.get("returncode") == 0)
+                _write_friction_entry(
+                    repo=bare_repo,
+                    node_id=task_id,
+                    error_signature="gate-rerun:fired",
+                    task_id=task_id,
+                    today=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    log=lambda m: print(m, file=sys.stderr),
+                )
+
+        def _outcome_diag(outcome: dict | None) -> str:
+            """D2 disambiguation: the deciding outcome's errors/rc/summary
+            (single-line by construction, truncated to 200 chars)."""
+            if outcome is None:
+                return "last_test_outcome=None"
+            if "passed" not in outcome:
+                return "no-valid-last-result (error-dict outcome)"
+            summary = str(outcome.get("summary") or "").replace("\n", " ")[:200]
+            return (
+                f"passed={int(outcome.get('passed') or 0)} "
+                f"failed={int(outcome.get('failed') or 0)} "
+                f"errors={int(outcome.get('errors') or 0)} "
+                f"rc={outcome.get('returncode')} summary={summary!r}"
+            )
+
+        def _rerun_diag() -> str:
+            if not gate_rerun_fired:
+                return ""
+            # D4: name the unusable re-run shape explicitly - a touched
+            # path that vanished between the model's writes and the
+            # re-run is an event, not a silent 0/0 (rc=4/5 are the
+            # pytest-path shapes; rc=2/3 cover the re-run's own
+            # collection/internal errors).
+            rerun_rc = (last_test_outcome or {}).get("returncode")
+            if rerun_rc in (4, 5):
+                name = (
+                    "rerun-rc=4 touched-path-missing"
+                    if rerun_rc == 4
+                    else "rerun-rc=5 no-tests-ran"
+                )
+                return f"; {name}"
+            if last_test_outcome is None:
+                # The re-run fired but was unusable (timeout/spawn error):
+                # the fail-closed verdict is kept and the re-run's
+                # non-participation is named, not folded into the model's
+                # last outcome.
+                return "; rerun=fired-but-unusable (timeout/spawn error)"
+            return (
+                "; rerun=true (last: "
+                f"passed={int((last_test_outcome or {}).get('passed') or 0)} "
+                f"failed={int((last_test_outcome or {}).get('failed') or 0)} "
+                f"errors={int((last_test_outcome or {}).get('errors') or 0)} "
+                f"rc={last_test_outcome.get('returncode')})"
+            )
 
         if gate_bypassed is None:
             if gate_passed:
                 _tail_log(
                     task_id,
                     "gate PASSED "
-                    f"(model_touched_tests={sorted(model_touched_tests) if model_touched_tests else '[] (legacy)'})",
+                    f"(model_touched_tests={sorted(model_touched_tests) if model_touched_tests else '[] (legacy)'}"
+                    f"{_rerun_diag()} "
+                    f"{_outcome_diag(last_test_outcome)})",
                 )
             else:
                 _tail_log(
                     task_id,
                     "gate FAILED "
                     f"(model_touched_tests={sorted(model_touched_tests) if model_touched_tests else '[] (legacy)'}; "
-                    f"last_test_outcome passed={int((last_test_outcome or {}).get('passed') or 0)} "
-                    f"failed={int((last_test_outcome or {}).get('failed') or 0)})",
+                    f"{_outcome_diag(last_test_outcome)}"
+                    f"{_rerun_diag()})",
                 )
 
         # D6 (agents-core-local-fixer-harness-fix-v0): witness pre-existing
@@ -1236,8 +1419,8 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                 print(
                     "WARN: local-fixer: test gate failed "
                     f"(model_touched_tests={sorted(model_touched_tests) if model_touched_tests else '[] (legacy gate)'}; "
-                    f"last_test_outcome passed={int((last_test_outcome or {}).get('passed') or 0)} "
-                    f"failed={int((last_test_outcome or {}).get('failed') or 0)}) — no PR",
+                    f"deciding outcome {_outcome_diag(last_test_outcome)}"
+                    f"{_rerun_diag()}) — no PR",
                     file=sys.stderr,
                 )
                 return ""
@@ -1279,10 +1462,19 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                       if l.startswith(("diff --git", "---", "+++", "@@", " ")) or l[:1] in ("+", "-")]
         diffstat = "\n".join(diff_lines[:40]) or "(no changes)"
 
+        # D5 (agents-core-local-fixer-gate-perception-v0): the PR body's
+        # "## Test outcome" reads the DECIDING outcome (the model's last
+        # outcome, or the D1 re-run when it fired - last_test_outcome was
+        # replaced in place) and carries the rerun=true annotation. A
+        # merged PR whose stated test outcome contradicts its own gate
+        # ("0 passed, 0 failed" under a passed gate) is the provenance
+        # defect this closes.
         if last_test_outcome:
             passed_c = int(last_test_outcome.get("passed") or 0)
             failed_c = int(last_test_outcome.get("failed") or 0)
             test_summary = f"{passed_c} passed, {failed_c} failed"
+            if gate_rerun_fired:
+                test_summary += " (rerun=true - harness targeted re-run of model-touched tests)"
         else:
             test_summary = "no test outcome recorded"
 
@@ -1774,6 +1966,21 @@ def _run_local_opencode(spec: dict, base_cwd: str | None) -> str:
             _pytest_output, _pytest_rc, _pytest_timed_out
         )
 
+        # D4 (agents-core-local-fixer-gate-perception-v0): name the
+        # unusable F4 re-run shape explicitly instead of folding it into a
+        # bare 0/0. Ground truth: rc=4 output ends with "no tests ran in
+        # 0.00s" (the "ERROR: file or directory not found:" line is NOT
+        # last), so both rc=4 and rc=5 parse to 0/0/0 via the last-line
+        # regex - log-only, no behavior change (the gate already
+        # fail-closes on both).
+        _f4_rc_name = ""
+        if _pytest_rc in (4, 5):
+            _f4_rc_name = (
+                "f4-rc=4 touched-path-missing"
+                if _pytest_rc == 4
+                else "f4-rc=5 no-tests-ran"
+            )
+
         # D1 decision block (the _run_local_fixer :690-714 pattern,
         # duplicated inline with opencode adaptation): positive-only -
         # every test the diff touched passes, and the run has at least one
@@ -1863,12 +2070,21 @@ def _run_local_opencode(spec: dict, base_cwd: str | None) -> str:
                 )
                 return ""
             if not gate_passed:
+                # D2 (agents-core-local-fixer-gate-perception-v0): the
+                # opencode engine has NO tail log (all _tail_log call sites
+                # are in _run_local_fixer) - this stderr WARN is the
+                # queue-runner-journal surface; it gains rc=/summary=
+                # (errors= was already printed) + the D4 rc=4/5 naming.
+                _oc_summary = str((last_test_outcome or {}).get("summary") or "").replace("\n", " ")[:200]
                 print(
                     "WARN: local-opencode: test gate failed "
                     f"(touched_tests={sorted(touched_tests) if touched_tests else '[] (targeted baseline run)'}; "
                     f"passed={int((last_test_outcome or {}).get('passed') or 0)} "
                     f"failed={int((last_test_outcome or {}).get('failed') or 0)} "
-                    f"errors={int((last_test_outcome or {}).get('errors') or 0)}) - no PR",
+                    f"errors={int((last_test_outcome or {}).get('errors') or 0)} "
+                    f"rc={_pytest_rc} summary={_oc_summary!r}"
+                    + (f" {_f4_rc_name}" if _f4_rc_name else "")
+                    + ") - no PR",
                     file=sys.stderr,
                 )
                 return ""
