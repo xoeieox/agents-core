@@ -1276,7 +1276,6 @@ def tail_finalize(
     else:
         test_summary = "no test outcome recorded"
 
-    step_count = step_count
     test_gate_section = (
         "## Test gate\n\n"
         "bypassed - no Python test infrastructure in this repo; "
