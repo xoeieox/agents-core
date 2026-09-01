@@ -3176,6 +3176,16 @@ def main():
             pass
         print(pr_url)
         return
+    elif engine == "local-fixer-staged":
+        # S2 (fixers-harness-staged-v0): the staged fixer engine
+        # (READER -> AIMER LLM stages + deterministic FIRE + shared tail).
+        pr_url = _run_local_fixer_staged(spec, base_cwd)
+        try:
+            spec_path.unlink()
+        except OSError:
+            pass
+        print(pr_url)
+        return
     elif engine == "local-opencode":
         pr_url = _run_local_opencode(spec, base_cwd)
         try:
