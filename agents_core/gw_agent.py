@@ -2733,12 +2733,14 @@ def _call_gw_agent_impl(
                 return _finalize_writeable_or_readonly(
                     messages, forced_content, return_transcript, transcript, writeable, cwd, concluded=False,
                     reason_out=reason_out,
+                    result_text=forced_content,
                 )
             # Forced conclusion failed; fall back to exhaustion marker.
             return _finalize_writeable_or_readonly(
                 messages, last_content, return_transcript, transcript,
                 writeable, cwd, concluded=False, max_steps_reached=True,
                 reason_out=reason_out,
+                result_text=last_content,
             )
 
     finally:
