@@ -664,12 +664,9 @@ class ReadFileExecutor(ToolExecutor):
             # not an error - `error` stays None, so novelty/repeat-call/salvage
             # are unaffected) and interpolates INTEGERS ONLY (never the file
             # path or file content - a test pins no path component).
-            if not lines:
-                return (
-                    f"(file is empty: {path.name} has 0 lines; nothing to read)"
-                )
-
             lines = content.splitlines()
+            if not lines:
+                return "(file is empty: file has 0 lines; nothing to read)"
             if start_line < 1:
                 start_line = 1
             start_idx = max(0, start_line - 1)
