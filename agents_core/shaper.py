@@ -374,15 +374,23 @@ class Shaper:
             # PR's head ref) and reviewer/reviewer_fresh (the PR's head branch to
             # review); other agent types (e.g. spec_reviewer, which has no PR)
             # don't need it in their spec.
-            if agent_type in ("fixer_retry", "reviewer", "reviewer_fresh"):
+            # fixer_staged (the staged fixer harness) also carries
+            # existing_branch: a pre-aimed mission dispatches against a parked
+            # PR's head ref (the open-PR scan resolves it), and the staged
+            # runner's worktree-selection rule (verified on origin, else
+            # base_branch) needs it in the spec.
+            if agent_type in ("fixer_retry", "reviewer", "reviewer_fresh", "fixer_staged"):
                 spec["existing_branch"] = vars_.get("existing_branch", "")
-            # local-fixer and local-opencode each manage their OWN worktree inside
-            # their engine (_run_local_fixer / _run_local_opencode); setting
+            # local-fixer, local-opencode and local-fixer-staged each manage
+            # their OWN worktree inside their engine (_run_local_fixer /
+            # _run_local_opencode / _run_local_fixer_staged); setting
             # worktree_required=True would cause the runner to set up a
             # competing worktree before the engine even starts.
             spec["worktree_required"] = agent.engine not in (
                 "local-fixer",
                 "local-opencode",
+                "local-fixer-staged",
+                "local-opencode-staged",
             )
             spec_path.write_text(json.dumps(spec, ensure_ascii=False))
             generated_task_id = task_id

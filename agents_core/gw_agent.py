@@ -657,16 +657,7 @@ class ReadFileExecutor(ToolExecutor):
             start_line = arguments.get("start_line", 1)
             end_line = arguments.get("end_line")
 
-            # fixers-harness-staged-v0 (S4): the empty-slice signal. The 27B's
-            # "read past EOF" pattern (120-line chunks from line 1 of a 3600-line
-            # file) returned bare "" before - an ANSWER with no information, so
-            # the model kept paging. The marker below is a plain str (an answer,
-            # not an error - `error` stays None, so novelty/repeat-call/salvage
-            # are unaffected) and interpolates INTEGERS ONLY (never the file
-            # path or file content - a test pins no path component).
             lines = content.splitlines()
-            if not lines:
-                return "(file is empty: file has 0 lines; nothing to read)"
             if start_line < 1:
                 start_line = 1
             start_idx = max(0, start_line - 1)
@@ -675,37 +666,8 @@ class ReadFileExecutor(ToolExecutor):
             output_lines = lines[start_idx:end_idx]
             result = "\n".join(output_lines)
 
-            if not result:
-                # Empty slice: the requested range produced no content. Name the
-                # file's actual line count and the requested range so the model
-                # can page to the right place in one jump instead of re-reading
-                # linearly. "is outside it" only when the range does not
-                # intersect [1, len(lines)]; in-range all-blank slices say the
-                # range is blank.
-                total = len(lines)
-                req_start = start_line
-                req_end = end_line if end_line is not None else total
-                if req_start > req_end:
-                    req_start, req_end = req_end, req_start
-                if req_start > total or req_end < 1:
-                    return (
-                        f"(empty slice: file has {total} lines; "
-                        f"requested range {req_start}-{req_end} is outside it)"
-                    )
-                return (
-                    f"(empty slice: file has {total} lines; "
-                    f"requested range {req_start}-{req_end} is blank)"
-                )
-
             if len(result) > GW_AGENT_TOOL_OUTPUT_CAP:
-                # Truncation marker enriched with the file's line count and the
-                # window shown, so a model can page to the end in one jump.
-                result = (
-                    result[:GW_AGENT_TOOL_OUTPUT_CAP]
-                    + f"\n…[truncated at {GW_AGENT_TOOL_OUTPUT_CAP} chars; "
-                      f"file has {len(lines)} lines, showing lines "
-                      f"{start_line}-{end_idx}]"
-                )
+                result = result[:GW_AGENT_TOOL_OUTPUT_CAP] + "\n…[truncated]"
 
             return result
         except Exception as e:
@@ -749,19 +711,8 @@ class GrepExecutor(ToolExecutor):
             path_glob = self._sanitize_glob(arguments.get("path_glob", "**/*"))
 
             # Build ripgrep command - search under cwd for the glob pattern
-            # Use -l (files only), -m 100 (max 100 matches).
-            # fixers-harness-staged-v0 (S3): the pattern is pinned behind -e so a
-            # pattern starting with "-" can never be parsed as a ripgrep flag
-            # (value position). Additive: the legacy rg -l path is unchanged for
-            # non-staged runs (the staged stage toolset passes the new param).
-            use_line_numbers = bool(arguments.get("line_numbers"))
-            if use_line_numbers:
-                # file:line:content matches (the staged stage toolset - a
-                # stage's grep must let the model jump to a line, not just a
-                # file name).
-                cmd = ["rg", "-n", "-m", "100", "-e", pattern]
-            else:
-                cmd = ["rg", pattern, "-l", "-m", "100"]
+            # Use -l (files only), -m 100 (max 100 matches)
+            cmd = ["rg", pattern, "-l", "-m", "100"]
             if path_glob != "**/*":
                 cmd += ["--glob", path_glob]
             result = subprocess.run(
@@ -1231,7 +1182,6 @@ def _build_fixer_result(
     interrupted: bool = False,
     interrupt_reason: str = "",
     stop_reason: str = "",
-    result_text: str = "",
 ) -> dict:
     """Build a FixerResult dict from the completed writeable run.
 
@@ -1305,10 +1255,6 @@ def _build_fixer_result(
         # detector.
         "stop_reason": stop_reason,
         "steps": transcript,
-        # fixers-harness-staged-v0 (S0): the model's final message content,
-        # carried through from _finalize_writeable_or_readonly. Additive key -
-        # existing consumers ignore unknown FixerResult keys.
-        "result_text": result_text,
     }
 
 
@@ -1320,10 +1266,7 @@ DEFAULT_READONLY_TOOLS: dict[str, dict[str, Any]] = {
             "description": (
                 "Read a file from the repository, optionally within a line range. "
                 "Path is resolved and confined to cwd. Returns up to 8192 bytes per read; "
-                "for larger files, use start_line/end_line to page through. "
-                "An out-of-range or blank slice returns a '(empty slice: ...)' marker "
-                "naming the file's line count and the requested range; an over-cap "
-                "read is truncated with the file's line count and the window shown."
+                "for larger files, use start_line/end_line to page through."
             ),
             "parameters": {
                 "type": "object",
@@ -2199,7 +2142,6 @@ def _call_gw_agent_impl(
                             budget_forced=True,
                             budget_forced_suffix=_budget_suffix,
                             reason_out=reason_out,
-                            result_text=_forced_content,
                         )
                     return _finalize_writeable_or_readonly(
                         messages, "", return_transcript, transcript,
@@ -2207,7 +2149,6 @@ def _call_gw_agent_impl(
                         budget_forced=True,
                         budget_forced_suffix=_budget_suffix,
                         reason_out=reason_out,
-                        result_text="",
                     )
 
                 if log:
@@ -2254,7 +2195,6 @@ def _call_gw_agent_impl(
                     return _finalize_writeable_or_readonly(
                         messages, "", return_transcript, transcript, writeable, cwd, concluded=False,
                         reason_out=reason_out, reason=_post_fail_reason,
-                        result_text="",
                     )
                 if served_model_out is not None and "model" in data and data["model"] is not None:
                     served_model_out.append(data["model"])
@@ -2266,7 +2206,6 @@ def _call_gw_agent_impl(
                     return _finalize_writeable_or_readonly(
                         messages, "", return_transcript, transcript, writeable, cwd, concluded=False,
                         reason_out=reason_out, reason=GW_REASON_NO_CHOICES,
-                        result_text="",
                     )
 
                 choice = data["choices"][0]
@@ -2324,14 +2263,12 @@ def _call_gw_agent_impl(
                                     messages, forced_content, return_transcript, transcript,
                                     writeable, cwd, concluded=True,
                                     reason_out=reason_out,
-                                    result_text=forced_content,
                                 )
                             # Forced conclusion failed; fall back to exhaustion marker.
                             return _finalize_writeable_or_readonly(
                                 messages, content, return_transcript, transcript,
                                 writeable, cwd, concluded=False, max_steps_reached=True,
                                 reason_out=reason_out,
-                                result_text=content,
                             )
 
                         # Pre-tool cancel check (fail-safe: raising halts the loop)
@@ -2587,7 +2524,6 @@ def _call_gw_agent_impl(
                             return _finalize_writeable_or_readonly(
                                 messages, "", return_transcript, transcript, writeable, cwd,
                                 concluded=False, no_progress=True,
-                                result_text="",
                             )
 
                     # Context-growth guard: truncate oldest tool-result messages if needed.
@@ -2615,7 +2551,6 @@ def _call_gw_agent_impl(
                     return _finalize_writeable_or_readonly(
                         messages, content, return_transcript, transcript, writeable, cwd,
                         concluded=False, stop_reason="output_budget_exhausted",
-                        result_text=content,
                     )
 
                 elif finish_reason == "stop" or finish_reason not in ("tool_calls", "stop"):
@@ -2693,7 +2628,6 @@ def _call_gw_agent_impl(
                                 messages, "", return_transcript, transcript, writeable, cwd,
                                 concluded=False,
                                 reason_out=reason_out, reason="grounding_failed",
-                                result_text="",
                             )
 
                     # §1b: Validate JSON on voluntary stop for json_mode runs.
@@ -2728,7 +2662,6 @@ def _call_gw_agent_impl(
                                 messages, _re_emitted if _re_emitted else content,
                                 return_transcript, transcript, writeable, cwd, concluded=True,
                                 reason_out=reason_out, reason="no_choices",
-                                result_text=_re_emitted if _re_emitted else content,
                             )
 
                     # Non-json_mode or writeable: byte-identical to previous behavior.
@@ -2738,7 +2671,6 @@ def _call_gw_agent_impl(
                     return _finalize_writeable_or_readonly(
                         messages, content, return_transcript, transcript, writeable, cwd, concluded=True,
                         reason_out=reason_out, reason="no_choices",
-                        result_text=content,
                     )
 
             # Grounding-retry-parity: the guard below armed a perturbed-tool-order retry and
@@ -2765,7 +2697,6 @@ def _call_gw_agent_impl(
                     # the FixerResult so the harness can log it and the daemon
                     # can see it as a distinct failure mode.
                     stop_reason=_mem_loop_stop_reason,
-                    result_text="",
                 )
 
             # Exhausted max_steps without conclusion; try forced conclusion.
@@ -2786,14 +2717,12 @@ def _call_gw_agent_impl(
                 return _finalize_writeable_or_readonly(
                     messages, forced_content, return_transcript, transcript, writeable, cwd, concluded=False,
                     reason_out=reason_out,
-                    result_text=forced_content,
                 )
             # Forced conclusion failed; fall back to exhaustion marker.
             return _finalize_writeable_or_readonly(
                 messages, last_content, return_transcript, transcript,
                 writeable, cwd, concluded=False, max_steps_reached=True,
                 reason_out=reason_out,
-                result_text=last_content,
             )
 
     finally:
@@ -3168,7 +3097,6 @@ def _finalize_writeable_or_readonly(
     reason_out: list[str] | None = None,
     reason: str | None = None,
     stop_reason: str = "",
-    result_text: str = "",
 ) -> str | None | tuple:
     """Route to FixerResult or plain result based on writeable flag.
 
@@ -3177,13 +3105,6 @@ def _finalize_writeable_or_readonly(
     stop_reason (D5, agents-core-local-fixer-harness-fix-v0) is a distinct
     machine-readable abort reason carried on the FixerResult (e.g.
     "mem_search_loop" when the mem-search loop detector aborted the run).
-    result_text (fixers-harness-staged-v0, S0 - one additive change): the model's
-    final message content, carried through to the FixerResult's new `result_text`
-    key (default ""). Every writeable exit path funnels through this tuple, so the
-    staged harness can read a stage's fenced artifact from the final message - the
-    place a stage emits its artifact - which the pre-S0 FixerResult structurally
-    discarded. Existing consumers ignore the unknown key (parity pinned by the
-    unmodified existing suite).
     """
     if writeable:
         fixer = _build_fixer_result(
@@ -3195,7 +3116,6 @@ def _finalize_writeable_or_readonly(
             interrupted=interrupted,
             interrupt_reason=interrupt_reason,
             stop_reason=stop_reason,
-            result_text=result_text,
         )
         return (fixer, transcript)
     return _finalize_result(
