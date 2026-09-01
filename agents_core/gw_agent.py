@@ -2272,12 +2272,14 @@ def _call_gw_agent_impl(
                                     messages, forced_content, return_transcript, transcript,
                                     writeable, cwd, concluded=True,
                                     reason_out=reason_out,
+                                    result_text=forced_content,
                                 )
                             # Forced conclusion failed; fall back to exhaustion marker.
                             return _finalize_writeable_or_readonly(
                                 messages, content, return_transcript, transcript,
                                 writeable, cwd, concluded=False, max_steps_reached=True,
                                 reason_out=reason_out,
+                                result_text=content,
                             )
 
                         # Pre-tool cancel check (fail-safe: raising halts the loop)
