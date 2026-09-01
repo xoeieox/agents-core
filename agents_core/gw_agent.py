@@ -2712,6 +2712,7 @@ def _call_gw_agent_impl(
                     # the FixerResult so the harness can log it and the daemon
                     # can see it as a distinct failure mode.
                     stop_reason=_mem_loop_stop_reason,
+                    result_text="",
                 )
 
             # Exhausted max_steps without conclusion; try forced conclusion.
