@@ -1320,7 +1320,10 @@ DEFAULT_READONLY_TOOLS: dict[str, dict[str, Any]] = {
             "description": (
                 "Read a file from the repository, optionally within a line range. "
                 "Path is resolved and confined to cwd. Returns up to 8192 bytes per read; "
-                "for larger files, use start_line/end_line to page through."
+                "for larger files, use start_line/end_line to page through. "
+                "An out-of-range or blank slice returns a '(empty slice: ...)' marker "
+                "naming the file's line count and the requested range; an over-cap "
+                "read is truncated with the file's line count and the window shown."
             ),
             "parameters": {
                 "type": "object",
