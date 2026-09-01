@@ -2674,6 +2674,7 @@ def _call_gw_agent_impl(
                                 messages, _re_emitted if _re_emitted else content,
                                 return_transcript, transcript, writeable, cwd, concluded=True,
                                 reason_out=reason_out, reason="no_choices",
+                                result_text=_re_emitted if _re_emitted else content,
                             )
 
                     # Non-json_mode or writeable: byte-identical to previous behavior.
@@ -2683,6 +2684,7 @@ def _call_gw_agent_impl(
                     return _finalize_writeable_or_readonly(
                         messages, content, return_transcript, transcript, writeable, cwd, concluded=True,
                         reason_out=reason_out, reason="no_choices",
+                        result_text=content,
                     )
 
             # Grounding-retry-parity: the guard below armed a perturbed-tool-order retry and
