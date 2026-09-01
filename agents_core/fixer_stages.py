@@ -450,6 +450,7 @@ def _scope_gate(mission: Mission, cwd: str):
             normed = None
         if normed is not None and normed in scope_set:
             return {"decision": "proceed"}
+        ledger.scope_rejects += 1
         scope_note = (
             "The mission scope_files (worktree-relative) are: "
             + ", ".join(sorted(scope_set))
