@@ -314,7 +314,8 @@ def _collect_model_touched_tests(transcript: list[dict], cwd: str) -> set[str]:
     return touched
 
 
-def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str]) -> dict | None:
+def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str],
+                         timeout_s: int = 180) -> dict | None:
     """Deterministic targeted re-run of model-touched tests (local-fixer gate
     perception). Mirrors the fixer's own run_tests invocation
     (gw_agent.py:1098-1116): same interpreter (sys.executable), same env
@@ -328,6 +329,13 @@ def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str]) -> dict | None
     last run_tests outcome (the 0/0 last-call-wins shape). The re-run
     structurally bypasses the 8192-char tool output cap: it parses subprocess
     output directly, as the opencode F4 re-run does.
+
+    fixers-harness-staged-v0 (S2): `timeout_s` (default 180 - legacy parity,
+    pinned by the existing gate tests) is the re-run wall clock. The staged
+    tail passes the mission's `tests_timeout_s` (capped [60, 240] at
+    parse_mission time) because the legacy 180s cap is BELOW the measured
+    189s runtime of the D2a acceptance test file - the acceptance mission
+    would fail deterministically at the gate otherwise.
     """
     if not Path(cwd).is_dir():
         # A missing worktree is an unusable re-run, never a crash: the gate
