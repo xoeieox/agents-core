@@ -1172,7 +1172,13 @@ def tail_finalize(
             )
             _tail_log(task_id, "test gate failed - opening advisory [SALVAGE] PR (concluded, gate rejected)")
             _salvage_commit_sha = ""
-            _salvage_add = _wip_git("add", "-A") if _wip_git is not None else _git_add(cwd)
+            _salvage_git = _wip_git if _wip_git is not None else (
+                lambda *a: subprocess.run(
+                    ["git", "-C", cwd, *a],
+                    capture_output=True, text=True, timeout=30,
+                )
+            )
+            _salvage_add = _salvage_git("add", "-A")
             if _salvage_add.returncode != 0:
                 print(
                     f"WARN: local-fixer: worktree salvage git add failed "
@@ -1180,10 +1186,10 @@ def tail_finalize(
                     file=sys.stderr,
                 )
                 return ""
-            _salvage_commit = _wip_git(
+            _salvage_commit = _salvage_git(
                 "commit", "-q", "-m",
                 f"salvage: {task_id} (concluded, gate rejected)",
-            ) if _wip_git is not None else _git_commit(cwd, f"salvage: {task_id} (concluded, gate rejected)")
+            )
             if _salvage_commit.returncode != 0:
                 print(
                     f"WARN: local-fixer: worktree salvage git commit failed "
@@ -1191,7 +1197,7 @@ def tail_finalize(
                     file=sys.stderr,
                 )
                 return ""
-            _salvage_rev = _wip_git("rev-parse", "HEAD") if _wip_git is not None else _git_rev_parse(cwd)
+            _salvage_rev = _salvage_git("rev-parse", "HEAD")
             if _salvage_rev.returncode != 0:
                 print(
                     f"WARN: local-fixer: worktree salvage git rev-parse failed "
