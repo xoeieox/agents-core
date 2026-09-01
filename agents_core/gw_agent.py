@@ -1256,6 +1256,10 @@ def _build_fixer_result(
         # detector.
         "stop_reason": stop_reason,
         "steps": transcript,
+        # fixers-harness-staged-v0 (S0): the model's final message content,
+        # carried through from _finalize_writeable_or_readonly. Additive key -
+        # existing consumers ignore unknown FixerResult keys.
+        "result_text": result_text,
     }
 
 
