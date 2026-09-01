@@ -390,7 +390,6 @@ class Shaper:
                 "local-fixer",
                 "local-opencode",
                 "local-fixer-staged",
-                "local-opencode-staged",
             )
             spec_path.write_text(json.dumps(spec, ensure_ascii=False))
             generated_task_id = task_id
