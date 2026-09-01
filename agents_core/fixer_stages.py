@@ -486,6 +486,11 @@ def _handler_hook(ledger: StageLedger, mission: Mission, stage: str,
         if ledger.interventions_used >= max_interventions:
             # Budget exhausted: fall through to the static nudge path
             # (an unrecognized decision - NOT counted against the budget).
+            ledger.redirects.append({
+                "step": ctx.get("step_num"),
+                "decision": "fallthrough",
+                "note": "intervention budget exhausted - static nudge path",
+            })
             return {"decision": "fallthrough"}
         # The named re-aim: the file:line-range the mission says to look
         # at next, or the next unverified site.
