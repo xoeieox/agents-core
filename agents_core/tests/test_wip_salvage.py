@@ -36,6 +36,7 @@ Covers:
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -446,7 +447,16 @@ class TestSalvagePrOnOutputBudgetDeath:
         call_kwargs = mock_create_pr.call_args.kwargs
         assert "[SALVAGE]" in call_kwargs["title"]
         assert "output_budget_exhausted" in call_kwargs["title"]
-        assert call_kwargs["head"] == "lapis/tgt-salv/local-salvage"
+        # S1 (agents-core-local-fixer-salvage-on-discard-v0): the salvage
+        # branch is per-task-unique. Mirror the locked expression exactly
+        # (the `lf-unknown` timestamp branch does not apply here - the
+        # spec carries a real task_id).
+        task_id_for_hash = "task-salv"
+        expected_head = (
+            "lapis/tgt-salv/local-salvage-"
+            + hashlib.sha1(task_id_for_hash.encode()).hexdigest()[:8]
+        )
+        assert call_kwargs["head"] == expected_head
         assert call_kwargs["base"] == "main"
         # The run is classified lost (returns the PR URL, not a success).
         assert out == "http://forgejo/agents-core/pulls/999"
@@ -755,3 +765,370 @@ class TestWipSalvageDefersToGreenPath:
         assert "[SALVAGE]" not in call_kwargs["title"]
         assert call_kwargs["base"] == "main"
         assert out == "http://forgejo/agents-core/pulls/1001"
+
+
+# ---------------------------------------------------------------------------
+# (11) T2-T8 (agents-core-local-fixer-salvage-on-discard-v0, S1-S5): the
+# non-concluded catch-all salvage (gap b), the concluded gate-rejected
+# worktree salvage (gap a), the compile-floor negative, and the regression
+# pins (max_steps WIP-salvage, green normal PR, empty-diff negative, the
+# S2 hole shape).
+# ---------------------------------------------------------------------------
+
+import time  # noqa: E402  (S1 expression mirror uses time.time())
+
+
+def _salvage_head(task_id: str, branch: str) -> str:
+    """Mirror the locked S1 expression (shaped_runner
+    _open_wip_salvage_pr) for an in-test expected-value computation."""
+    task_id_for_hash = (
+        f"lf-unknown-{int(time.time())}"
+        if task_id == "lf-unknown"
+        else task_id
+    )
+    return (
+        f"{branch}-salvage-"
+        f"{hashlib.sha1(task_id_for_hash.encode()).hexdigest()[:8]}"
+    )
+
+
+def _fake_gw_result(wt_dir: Path, *, concluded: bool, stop_reason: str,
+                    max_steps: bool, no_progress: bool, final_diff: str,
+                    last_test_outcome: dict | None,
+                    wip_write: bool = True) -> tuple:
+    """Shared fake call_gw_agent: optionally creates one WIP commit via the
+    after_step seam, then returns the given FixerResult shape."""
+
+    def _fake(*args, **kwargs):
+        after_step = kwargs.get("after_step")
+        if wip_write and after_step is not None:
+            (wt_dir / "work.py").write_text("z = 3\n")
+            after_step({
+                "step_num": 1,
+                "transcript": [{
+                    "step": 1, "tool_name": "write_file",
+                    "tool_call_id": "call_0",
+                    "arguments": {"path": "work.py",
+                                   "content": "z = 3\n"},
+                    "result": "wrote 6 bytes to work.py",
+                    "error": None,
+                }],
+                "cwd": str(wt_dir),
+                "writeable": True,
+            })
+        return (
+            {"final_diff": final_diff, "concluded": concluded,
+             "stop_reason": stop_reason,
+             "max_steps_reached": max_steps, "no_progress": no_progress,
+             "last_test_outcome": last_test_outcome,
+             "steps": [{"step": 1, "tool_name": "write_file"}]},
+            [{"step": 1, "tool_name": "write_file",
+              "arguments": {"path": "work.py"}, "error": None}],
+        )
+
+    return _fake
+
+
+def _run_fixer_stubbed(spec: dict, wt_dir: Path, fake, create_pr_url: str):
+    """Run _run_local_fixer with the standard stubs; return (out,
+    mock_create_pr)."""
+    from agents_core import shaped_runner
+
+    with patch("agents_core.doorman_client.DoormanClient") as MockClient, \
+         patch("agents_core.worktree.setup_worktree") as mock_setup, \
+         patch("agents_core.worktree.teardown_worktree") as mock_teardown, \
+         patch("agents_core.gw_agent.call_gw_agent",
+               side_effect=fake), \
+         patch("agents_core.forgejo.create_pr") as mock_create_pr:
+        MockClient.return_value.acquire.return_value = {
+            "status": "serving",
+            "work_id": f"{spec['task_id']}-berth-sup",
+        }
+        mock_setup.return_value = MagicMock(path=str(wt_dir))
+        mock_create_pr.return_value = {"html_url": create_pr_url}
+        out = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
+    return out, mock_create_pr
+
+
+def _make_wt(tmp_path: Path, py_infra: bool = True) -> tuple[Path, Path]:
+    """Real git worktree + bare origin (the T1 pattern).
+
+    py_infra=True adds a minimal pytest.ini so _has_python_test_infra
+    returns True (the D1 gate then applies - the tests above drive the
+    positive-only / legacy gate paths, not the no-python-test-infra
+    bypass)."""
+    wt_dir = tmp_path / "wt"
+    _init_repo(wt_dir)
+    if py_infra:
+        (wt_dir / "pytest.ini").write_text("[pytest]\n")
+        _git(wt_dir, "add", "pytest.ini")
+        _git(wt_dir, "commit", "-qm", "pytest.ini")
+    origin_dir = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(origin_dir)],
+                   check=True)
+    _git(wt_dir, "remote", "add", "origin", str(origin_dir))
+    _git(wt_dir, "push", "-q", "origin", "HEAD")
+    return wt_dir, origin_dir
+
+
+_DIFF = ("diff --git a/work.py b/work.py\n"
+         "--- /dev/null\n"
+         "+++ b/work.py\n"
+         "+z = 3\n")
+
+
+class TestSalvageNonConcludedCatchAll:
+    """T2 (gap b): a non-budget non-concluded death (stop_reason="", no
+    budget flags) with >=1 WIP commit and a non-empty diff opens a WIP-
+    salvage PR labelled run_not_concluded."""
+
+    def test_salvage_non_concluded_catch_all(self, tmp_path, capsys):
+        wt_dir, _origin = _make_wt(tmp_path)
+        spec = {
+            "task_id": "task-nc",
+            "target_id": "tgt-nc",
+            "repo": "agents-core",
+            "prompt": "fix it",
+            "timeout_s": 1800,
+            "slug": "local",
+        }
+        fake = _fake_gw_result(
+            wt_dir, concluded=False, stop_reason="",
+            max_steps=False, no_progress=False, final_diff=_DIFF,
+            last_test_outcome={"passed": 1, "failed": 1, "errors": 0},
+        )
+        out, mock_create_pr = _run_fixer_stubbed(
+            spec, wt_dir, fake, "http://forgejo/agents-core/pulls/901")
+
+        mock_create_pr.assert_called_once()
+        call_kwargs = mock_create_pr.call_args.kwargs
+        assert "[SALVAGE]" in call_kwargs["title"]
+        assert "run_not_concluded" in call_kwargs["title"]
+        assert call_kwargs["head"] == _salvage_head(
+            "task-nc", "lapis/tgt-nc/local")
+        # S4: the body's first line is case-correct for the non-concluded
+        # case.
+        assert "not concluded, no gate_passed" in call_kwargs["body"]
+        assert out == "http://forgejo/agents-core/pulls/901"
+        err = capsys.readouterr().err
+        assert "opening advisory [SALVAGE] PR" in err
+
+
+class TestSalvageConcludedGateRejected:
+    """T3 (gap a): a concluded run the gate rejected salvages the
+    WORKTREE's final state: a fresh salvage commit is pushed to the S1
+    unique branch and the PR body names the concluded case."""
+
+    def test_salvage_concluded_gate_rejected(self, tmp_path, capsys):
+        wt_dir, origin_dir = _make_wt(tmp_path)
+        spec = {
+            "task_id": "task-cgr",
+            "target_id": "tgt-cgr",
+            "repo": "agents-core",
+            "prompt": "fix it",
+            "timeout_s": 1800,
+            "slug": "local",
+        }
+        # A modified tracked file so the salvage commit is non-empty.
+        (wt_dir / "hello.txt").write_text("one\nchanged\n")
+        fake = _fake_gw_result(
+            wt_dir, concluded=True, stop_reason="",
+            max_steps=False, no_progress=False, final_diff=_DIFF,
+            last_test_outcome={"passed": 5, "failed": 1, "errors": 0},
+            wip_write=False,
+        )
+        expected_head = _salvage_head("task-cgr", "lapis/tgt-cgr/local")
+        out, mock_create_pr = _run_fixer_stubbed(
+            spec, wt_dir, fake, "http://forgejo/agents-core/pulls/902")
+
+        mock_create_pr.assert_called_once()
+        call_kwargs = mock_create_pr.call_args.kwargs
+        assert "[SALVAGE]" in call_kwargs["title"]
+        assert "concluded_gate_rejected" in call_kwargs["title"]
+        assert call_kwargs["head"] == expected_head
+        # S4: the body's first line is case-correct for the concluded case.
+        assert "concluded, test gate rejected the work" in call_kwargs["body"]
+        assert out == "http://forgejo/agents-core/pulls/902"
+        # The pushed branch's head carries the salvage commit message
+        # (assertable via the bare origin.git).
+        msg = _git(origin_dir, "log", "-1", "--format=%s",
+                   f"refs/heads/{expected_head}").stdout.strip()
+        assert msg == "salvage: task-cgr (concluded, gate rejected)"
+
+
+class TestSalvageNoneWithoutWipCommitsNonConcluded:
+    """T4 (negative): a non-concluded catch-all death with ZERO WIP commits
+    (the only write step failed the py_compile floor) is NOT salvaged from
+    the worktree - the worktree state is unproven; only the WIP floor is
+    trusted for non-concluded runs."""
+
+    def test_salvage_none_without_wip_commits_non_concluded(self, tmp_path, capsys):
+        wt_dir, _origin = _make_wt(tmp_path)
+        spec = {
+            "task_id": "task-nc0",
+            "target_id": "tgt-nc0",
+            "repo": "agents-core",
+            "prompt": "fix it",
+            "timeout_s": 1800,
+            "slug": "local",
+        }
+        fake = _fake_gw_result(
+            wt_dir, concluded=False, stop_reason="",
+            max_steps=False, no_progress=False, final_diff=_DIFF,
+            last_test_outcome={"passed": 1, "failed": 1, "errors": 0},
+            wip_write=False,  # no WIP commit created
+        )
+        out, mock_create_pr = _run_fixer_stubbed(
+            spec, wt_dir, fake, "http://forgejo/agents-core/pulls/903")
+
+        assert out == ""
+        mock_create_pr.assert_not_called()
+
+
+class TestSalvageMaxStepsRegression:
+    """T5 (regression): max_steps_hit + WIP commits + non-empty diff +
+    FAILING tests still fires the WIP-salvage path (S2's superset condition
+    did not change the existing case)."""
+
+    def test_salvage_max_steps_regression(self, tmp_path, capsys):
+        wt_dir, _origin = _make_wt(tmp_path)
+        spec = {
+            "task_id": "task-ms",
+            "target_id": "tgt-ms",
+            "repo": "agents-core",
+            "prompt": "fix it",
+            "timeout_s": 1800,
+            "slug": "local",
+        }
+        fake = _fake_gw_result(
+            wt_dir, concluded=False, stop_reason="max_steps_hit",
+            max_steps=True, no_progress=False, final_diff=_DIFF,
+            last_test_outcome={"passed": 1, "failed": 2, "errors": 0},
+        )
+        out, mock_create_pr = _run_fixer_stubbed(
+            spec, wt_dir, fake, "http://forgejo/agents-core/pulls/904")
+
+        mock_create_pr.assert_called_once()
+        call_kwargs = mock_create_pr.call_args.kwargs
+        assert "[SALVAGE]" in call_kwargs["title"]
+        assert "max_steps_hit" in call_kwargs["title"]
+        assert call_kwargs["head"] == _salvage_head(
+            "task-ms", "lapis/tgt-ms/local")
+        assert out == "http://forgejo/agents-core/pulls/904"
+
+
+class TestConcludedGreenNormalPr:
+    """T6 (regression): concluded + gate PASSED + non-empty diff -> NORMAL
+    PR (no [SALVAGE], normal branch). Drives the positive-only gate path so
+    the S3 insertion point is proven not to fire on green runs."""
+
+    def test_concluded_green_normal_pr(self, tmp_path, capsys):
+        wt_dir, _origin = _make_wt(tmp_path)
+        spec = {
+            "task_id": "task-kg",
+            "target_id": "tgt-kg",
+            "repo": "agents-core",
+            "prompt": "fix it",
+            "timeout_s": 1800,
+            "slug": "local",
+        }
+
+        def fake(*args, **kwargs):
+            # The model wrote + touched a test file that passes: the
+            # positive-only gate passes (no D1 re-run, no legacy fallback).
+            (wt_dir / "fixed.py").write_text("ok = True\n")
+            (wt_dir / "test_fixed.py").write_text(
+                "def test_ok():\n    assert True\n")
+            return (
+                {"final_diff": "diff --git a/fixed.py b/fixed.py\n"
+                               "+ok = True\n",
+                 "concluded": True, "stop_reason": "",
+                 "max_steps_reached": False, "no_progress": False,
+                 "last_test_outcome": {"passed": 1, "failed": 0,
+                                       "errors": 0},
+                 "steps": [{"step": 1, "tool_name": "write_file"}]},
+                [
+                    {"step": 1, "tool_name": "write_file",
+                     "arguments": {"path": "fixed.py"}, "error": None},
+                    {"step": 2, "tool_name": "write_file",
+                     "arguments": {"path": "test_fixed.py"},
+                     "error": None},
+                    {"step": 3, "tool_name": "run_tests",
+                     "arguments": {"target": "test_fixed.py"},
+                     "error": None},
+                ],
+            )
+
+        out, mock_create_pr = _run_fixer_stubbed(
+            spec, wt_dir, fake, "http://forgejo/agents-core/pulls/905")
+
+        mock_create_pr.assert_called_once()
+        call_kwargs = mock_create_pr.call_args.kwargs
+        assert "[SALVAGE]" not in call_kwargs["title"]
+        assert call_kwargs["head"] == "lapis/tgt-kg/local"
+        assert call_kwargs["base"] == "main"
+        assert out == "http://forgejo/agents-core/pulls/905"
+
+
+class TestConcludedGateFailedEmptyDiff:
+    """T7 (negative): concluded + gate-failed + EMPTY final_diff -> "", no
+    PR (the existing "empty diff - no PR" behavior is preserved; S3 must
+    not open a salvage PR for a concluded run with nothing on disk)."""
+
+    def test_concluded_gate_failed_empty_diff(self, tmp_path, capsys):
+        wt_dir, _origin = _make_wt(tmp_path)
+        spec = {
+            "task_id": "task-cgd",
+            "target_id": "tgt-cgd",
+            "repo": "agents-core",
+            "prompt": "fix it",
+            "timeout_s": 1800,
+            "slug": "local",
+        }
+        fake = _fake_gw_result(
+            wt_dir, concluded=True, stop_reason="",
+            max_steps=False, no_progress=False, final_diff="",
+            last_test_outcome={"passed": 1, "failed": 1, "errors": 0},
+            wip_write=False,
+        )
+        out, mock_create_pr = _run_fixer_stubbed(
+            spec, wt_dir, fake, "http://forgejo/agents-core/pulls/906")
+
+        assert out == ""
+        mock_create_pr.assert_not_called()
+        err = capsys.readouterr().err
+        assert "empty diff" in err
+
+
+class TestSalvageNonBudgetGreenHole:
+    """T8 (pins the S2 hole shape): a non-budget death with CLEAN passing
+    work (stop_reason="", no budget flags, WIP commit, non-empty diff,
+    PASSING tests) is the shape the naive S2 condition discarded (deferred
+    by the green clause, missed by the budget-gated green path). It must
+    open an ADVISORY [SALVAGE] PR, not the green path's normal PR."""
+
+    def test_salvage_non_budget_green_hole(self, tmp_path, capsys):
+        wt_dir, _origin = _make_wt(tmp_path)
+        spec = {
+            "task_id": "task-ng",
+            "target_id": "tgt-ng",
+            "repo": "agents-core",
+            "prompt": "fix it",
+            "timeout_s": 1800,
+            "slug": "local",
+        }
+        fake = _fake_gw_result(
+            wt_dir, concluded=False, stop_reason="",
+            max_steps=False, no_progress=False, final_diff=_DIFF,
+            last_test_outcome={"passed": 3, "failed": 0, "errors": 0},
+        )
+        out, mock_create_pr = _run_fixer_stubbed(
+            spec, wt_dir, fake, "http://forgejo/agents-core/pulls/907")
+
+        mock_create_pr.assert_called_once()
+        call_kwargs = mock_create_pr.call_args.kwargs
+        assert "[SALVAGE]" in call_kwargs["title"]
+        assert "run_not_concluded" in call_kwargs["title"]
+        assert call_kwargs["head"] == _salvage_head(
+            "task-ng", "lapis/tgt-ng/local")
+        assert out == "http://forgejo/agents-core/pulls/907"
