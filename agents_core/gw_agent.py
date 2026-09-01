@@ -2535,6 +2535,7 @@ def _call_gw_agent_impl(
                             return _finalize_writeable_or_readonly(
                                 messages, "", return_transcript, transcript, writeable, cwd,
                                 concluded=False, no_progress=True,
+                                result_text="",
                             )
 
                     # Context-growth guard: truncate oldest tool-result messages if needed.
