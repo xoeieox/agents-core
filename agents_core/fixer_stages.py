@@ -580,7 +580,7 @@ def run_stage(
             return_transcript=True,
             tools=stage_tools_schema(),
             tool_executors=stage_tool_executors(cwd),
-            before_tool=_scope_gate(mission, cwd),
+            before_tool=_scope_gate(mission, cwd, ledger),
             handler_hook=_handler_hook(ledger, mission, stage),
             handler_objective=f"{stage} stage: output the fenced artifact",
             handler_max_interventions=2,
