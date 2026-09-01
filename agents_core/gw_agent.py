@@ -1345,8 +1345,13 @@ DEFAULT_READONLY_TOOLS: dict[str, dict[str, Any]] = {
             "name": "read_file",
             "description": (
                 "Read a file from the repository, optionally within a line range. "
-                "Path is resolved and confined to cwd. Returns up to 8192 bytes per read; "
-                "for larger files, use start_line/end_line to page through."
+                "Path is resolved and confined to cwd. Returns up to 8192 chars per read "
+                "(env GW_AGENT_TOOL_OUTPUT_CAP, default 8192); for larger files, use "
+                "start_line/end_line to page through. An out-of-range or blank read returns "
+                "an explicit (empty slice: file has N lines; ...) marker instead of an "
+                "empty string; a zero-byte file returns a (file is empty: ...) marker; "
+                "truncated output ends with [truncated at N chars; file has N lines, "
+                "showing lines start-end]."
             ),
             "parameters": {
                 "type": "object",
