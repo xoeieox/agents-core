@@ -2202,6 +2202,7 @@ def _call_gw_agent_impl(
                     return _finalize_writeable_or_readonly(
                         messages, "", return_transcript, transcript, writeable, cwd, concluded=False,
                         reason_out=reason_out, reason=_post_fail_reason,
+                        result_text="",
                     )
                 if served_model_out is not None and "model" in data and data["model"] is not None:
                     served_model_out.append(data["model"])
