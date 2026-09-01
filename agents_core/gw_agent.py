@@ -657,6 +657,18 @@ class ReadFileExecutor(ToolExecutor):
             start_line = arguments.get("start_line", 1)
             end_line = arguments.get("end_line")
 
+            # fixers-harness-staged-v0 (S4): the empty-slice signal. The 27B's
+            # "read past EOF" pattern (120-line chunks from line 1 of a 3600-line
+            # file) returned bare "" before - an ANSWER with no information, so
+            # the model kept paging. The marker below is a plain str (an answer,
+            # not an error - `error` stays None, so novelty/repeat-call/salvage
+            # are unaffected) and interpolates INTEGERS ONLY (never the file
+            # path or file content - a test pins no path component).
+            if not lines:
+                return (
+                    f"(file is empty: {path.name} has 0 lines; nothing to read)"
+                )
+
             lines = content.splitlines()
             if start_line < 1:
                 start_line = 1
@@ -666,8 +678,37 @@ class ReadFileExecutor(ToolExecutor):
             output_lines = lines[start_idx:end_idx]
             result = "\n".join(output_lines)
 
+            if not result:
+                # Empty slice: the requested range produced no content. Name the
+                # file's actual line count and the requested range so the model
+                # can page to the right place in one jump instead of re-reading
+                # linearly. "is outside it" only when the range does not
+                # intersect [1, len(lines)]; in-range all-blank slices say the
+                # range is blank.
+                total = len(lines)
+                req_start = start_line
+                req_end = end_line if end_line is not None else total
+                if req_start > req_end:
+                    req_start, req_end = req_end, req_start
+                if req_start > total or req_end < 1:
+                    return (
+                        f"(empty slice: file has {total} lines; "
+                        f"requested range {req_start}-{req_end} is outside it)"
+                    )
+                return (
+                    f"(empty slice: file has {total} lines; "
+                    f"requested range {req_start}-{req_end} is blank)"
+                )
+
             if len(result) > GW_AGENT_TOOL_OUTPUT_CAP:
-                result = result[:GW_AGENT_TOOL_OUTPUT_CAP] + "\n…[truncated]"
+                # Truncation marker enriched with the file's line count and the
+                # window shown, so a model can page to the end in one jump.
+                result = (
+                    result[:GW_AGENT_TOOL_OUTPUT_CAP]
+                    + f"\n…[truncated at {GW_AGENT_TOOL_OUTPUT_CAP} chars; "
+                      f"file has {len(lines)} lines, showing lines "
+                      f"{start_line}-{end_idx}]"
+                )
 
             return result
         except Exception as e:
