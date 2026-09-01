@@ -424,7 +424,7 @@ class StageLedger:
     scope_rejects: int = 0
 
 
-def _scope_gate(mission: Mission, cwd: str):
+def _scope_gate(mission: Mission, cwd: str, ledger: "StageLedger"):
     """The deterministic before_tool closure: every read_file call's file
     argument must be in mission.scope_files (normalized per the artifact
     contract). Violation -> {"decision": "reject", "reason": <the scope
