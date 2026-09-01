@@ -2639,6 +2639,7 @@ def _call_gw_agent_impl(
                                 messages, "", return_transcript, transcript, writeable, cwd,
                                 concluded=False,
                                 reason_out=reason_out, reason="grounding_failed",
+                                result_text="",
                             )
 
                     # §1b: Validate JSON on voluntary stop for json_mode runs.
