@@ -589,7 +589,7 @@ def run_stage(
             model=model,
             log=log,
         )
-    except Exception as exc:  # never-raises: a stage crash is a stage failure
+    except Exception as exc:  # log + re-raise: the caller (run_staged_mission) catches and routes to the stage-failure partition
         if log:
             log(f"[fixer_stages] {stage} stage raised: {exc}")
         raise
@@ -935,7 +935,6 @@ def run_staged_mission(
     # The total stage transcript step count (sum of len(transcript) over
     # all stage runs), kept in sync with stage_transcripts so the engine's
     # salvage partition can thread the real step count into the PR body.
-    outcome.stage_steps = 0
     map_artifact: dict | None = None
     aim_artifact: dict | None = None
     rejections = 0
