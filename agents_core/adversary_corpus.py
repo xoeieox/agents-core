@@ -121,7 +121,7 @@ def _mem_source_total_count(
         except Exception:
             pass
     try:
-        return len(store.list_all(tag=mem_tag, tags=tags, limit=None))
+        return len(store.list_all(tag=mem_tag, tags=tags))
     except Exception:
         return None
 
