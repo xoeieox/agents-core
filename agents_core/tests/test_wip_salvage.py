@@ -839,7 +839,8 @@ def _run_fixer_stubbed(spec: dict, wt_dir: Path, fake, create_pr_url: str):
          patch("agents_core.worktree.teardown_worktree") as mock_teardown, \
          patch("agents_core.gw_agent.call_gw_agent",
                side_effect=fake), \
-         patch("agents_core.forgejo.create_pr") as mock_create_pr:
+         patch("agents_core.forgejo.create_pr") as mock_create_pr, \
+         patch("agents_core.forgejo.get_open_prs", return_value=[]):
         MockClient.return_value.acquire.return_value = {
             "status": "serving",
             "work_id": f"{spec['task_id']}-berth-sup",

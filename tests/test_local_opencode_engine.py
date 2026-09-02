@@ -279,7 +279,8 @@ def _run_engine(spec: dict, clone: Path, monkeypatch, tmp_path: Path,
     with patch("agents_core.doorman_client.DoormanClient") as mock_dm, \
          patch("agents_core.forgejo.create_pr",
                return_value={"html_url":
-                             "http://forgejo/Erah/agents-core/pulls/77"}) as mock_pr:
+                             "http://forgejo/Erah/agents-core/pulls/77"}) as mock_pr, \
+         patch("agents_core.forgejo.get_open_prs", return_value=[]):
         mock_dm.return_value.acquire.return_value = {
             "status": "serving", "work_id": f"{spec['task_id']}-berth-sup",
         }
@@ -611,6 +612,7 @@ def test_gw_agent_fixer_untouched(tmp_path, monkeypatch):
         patch("agents_core.worktree.teardown_worktree"),
         patch("agents_core.forgejo.create_pr",
               return_value={"html_url": "http://forgejo/pulls/42"}) as mock_pr,
+        patch("agents_core.forgejo.get_open_prs", return_value=[]),
         patch("subprocess.run",
               return_value=MagicMock(returncode=0, stderr="")),
         patch.object(Path, "mkdir"),
