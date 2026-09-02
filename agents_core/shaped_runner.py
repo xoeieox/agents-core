@@ -1255,6 +1255,28 @@ def tail_finalize(
         _tail_log(task_id, f"git push failed rc={r.returncode}: {r.stderr.strip()[:500]}")
         return ""
 
+    # The pre-aimed / parked-PR case: the branch already has an open PR
+    # and the push just advanced its head. Return the existing PR
+    # instead of create_pr (a duplicate head branch is refused). The
+    # initial-dispatch case (a fresh lapis/<tid>/<slug> branch) has no
+    # open PR on it and falls through to create_pr unchanged.
+    if branch:
+        try:
+            for _pr in _forgejo.get_open_prs(repo=bare_repo):
+                if (_pr.get("head") or {}).get("ref") == branch:
+                    _pr_url = _pr.get("html_url", "")
+                    _tail_log(
+                        task_id,
+                        f"open PR already exists on {branch!r} - head advanced: {_pr_url}",
+                    )
+                    return _pr_url
+        except Exception as exc:
+            print(
+                f"WARN: local-fixer: open-PR scan failed: {exc} - "
+                f"falling through to create_pr",
+                file=sys.stderr,
+            )
+
     # Provenance PR body — factual only
     diff_lines = [l for l in final_diff.splitlines()
                   if l.startswith(("diff --git", "---", "+++", "@@", " ")) or l[:1] in ("+", "-")]
@@ -1463,6 +1485,20 @@ def _run_local_fixer_staged(spec: dict, base_cwd: str | None) -> str:
                 f"worktree: existing_branch {existing_branch} verified on origin (PR head)",
             )
 
+    # S6 seam (the push): the tail pushes HEAD to spec["branch"] and
+    # create_pr's head is the same name. In the pre-aimed / parked-PR
+    # case that is the verified existing branch - the tail advances the
+    # PR head and the tail's open-PR scan returns the existing PR (no
+    # second PR). In the initial-dispatch case it is the legacy
+    # lapis/<target_id>/<slug> new branch (create + PR). An empty
+    # spec["branch"] would make the tail's `git checkout -B ""` fatal.
+    # spec["bare_repo"] is injected the same way: the S2-side tail call
+    # reads spec.get("bare_repo", "") and a present-empty value defeats
+    # the call site's setdefault (the create_pr URL became
+    # repos/Erah//pulls on the D2a acceptance run - 405).
+    spec["branch"] = worktree_ref if worktree_ref != base_branch else branch
+    spec["bare_repo"] = bare_repo
+
     # The steer directive (the mission fence is the only task input that
     # carries defect detail). The shaper renders it into the spec's
     # prompt via {steer_directive_block}; a spec that carries the
@@ -1558,7 +1594,17 @@ def _run_local_fixer_staged(spec: dict, base_cwd: str | None) -> str:
         # MISSION_DEADLINE_S=2400 monotonic pre-check runs between stages
         # inside the orchestration; the mission report is written on every
         # terminal branch, before the return.
-        # ------------------------------------------------------------------
+        #
+        # Pre-tail unlink (ordering fix, D2a acceptance 2026-09-01): the
+        # S2 tail runs INSIDE run_staged_mission (the S6 seam), so the
+        # finally-block _pre_tail ran AFTER the tail's `git add -A` and
+        # the staged lapis-spec.md got committed + pushed into the PR
+        # branch (run 5's push carried it). Nothing in the staged
+        # mission reads the staged spec file (the mission fence is the
+        # only task input; the stages are scope-confined), so unlinking
+        # before the mission is safe. The finally-block unlink stays as
+        # belt-and-braces for the pre-mission failure branches.
+        _pre_tail()
         try:
             outcome = fixer_stages.run_staged_mission(
                 spec=spec,

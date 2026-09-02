@@ -660,7 +660,10 @@ def pre_aimed_match_diagnostic(
     diagnostic = []
     for i, entry in enumerate(entries):
         file = entry.get("file", "")
-        old = entry.get("old", "")
+        # Lenient key read: re-keyed aim entries carry old_string/new_string
+        # (the v1/apply_edit contract); raw mission recipe sites carry
+        # old/new (the fence format).
+        old = entry.get("old_string", entry.get("old", ""))
         line_hint = entry.get("line")
         found = False
         match_count = 0
@@ -722,8 +725,8 @@ def _apply_aim_entry(cwd: str, entry: dict, scope_set: set[str]) -> None:
     executor = ApplyEditExecutor(cwd)
     result = executor.execute({
         "path": normed,
-        "old_string": entry.get("old", ""),
-        "new_string": entry.get("new", ""),
+        "old_string": entry.get("old_string", entry.get("old", "")),
+        "new_string": entry.get("new_string", entry.get("new", "")),
     })
     if isinstance(result, dict) and "error" in result:
         raise AimError(f"apply_edit failed for {normed!r}: {result['error']}")
@@ -990,8 +993,8 @@ def run_staged_mission(
         aim_entries = [
             {
                 "file": e.get("file", ""),
-                "old_string": e.get("old", ""),
-                "new_string": e.get("new", ""),
+                "old_string": e.get("old_string", e.get("old", "")),
+                "new_string": e.get("new_string", e.get("new", "")),
                 "evidence": "pre-aimed recipe entry",
             }
             for e in mission.recipe
