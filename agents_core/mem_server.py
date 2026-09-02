@@ -163,9 +163,13 @@ def create_app(db_path: Path, deposit_recorder: "DepositRecorder | None" = None)
 
         tags_list = _normalize_tags(tags_raw)
 
-        store.set(key, content, tags=tags_list, source=source)
+        created = store.set(key, content, tags=tags_list, source=source)
         row = store.get(key)
-        return _row_response(row)
+        # `created` is PUT-only: the store.set() return is the in-lock
+        # pre-existence check (True = just created, False = updated). A read
+        # cannot know the create/update status of the last write, so the field
+        # is confined to this response and never added to _row_response.
+        return {**_row_response(row), "created": created}
 
     # ------------------------------------------------------------------
     # Delete memory
