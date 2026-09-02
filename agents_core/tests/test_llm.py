@@ -1656,10 +1656,10 @@ def test_gw27b_registry_lookup_round_trips_all_aliases():
     assert by_canonical_id.canonical_id == "gravitywell-27b"
     assert by_canonical_id.mode_alias == "solo"
     assert by_canonical_id.operator_alias == "gravitywell"
-    assert by_canonical_id.display_label == "qwen3.8-27b-nvfp4"
-    assert by_canonical_id.weights_hint == "Qwen3.8-27B-NVFP4"
+    assert by_canonical_id.display_label == "qwen3.8-27b-uncensored-nvfp4"
+    assert by_canonical_id.weights_hint == "Qwen3.8-27B-Uncensored-NVFP4"
 
-    by_display_label = _gw_registry_lookup("qwen3.8-27b-nvfp4")
+    by_display_label = _gw_registry_lookup("qwen3.8-27b-uncensored-nvfp4")
     assert by_display_label == by_canonical_id
 
     by_mode_alias = _gw_registry_lookup("solo")
