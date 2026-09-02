@@ -35,6 +35,14 @@ GW_URL = os.environ.get("GW_URL", "http://203.0.113.11:8081")
 GW_AGENT_TOOL_OUTPUT_CAP = 8192
 GW_AGENT_TOOL_INPUT_CAP = 65536
 GW_AGENT_CTX_CAP = 120000
+# Read-only extra directories (read_file may reach these IN ADDITION to the
+# worktree cwd; writes are NEVER allowed here). Colon-separated absolute paths,
+# overridable via GW_AGENT_READ_EXTRA_DIRS. Empty default = current behavior
+# (reads confined to cwd). Host-op 2026-09-02: unblocks the fixer from reading
+# pull-forward / reference sources that live outside its worktree (e.g. the
+# deploy-pull selfheal file that exists only on a PR head). Durable landing
+# tracked via PR on agents-core.
+GW_AGENT_READ_EXTRA_DIRS: Final[tuple[str, ...]] = ()
 
 logger = logging.getLogger(__name__)
 
@@ -652,13 +660,20 @@ class ReadFileExecutor(ToolExecutor):
 
     def __init__(self, cwd: str | None = None):
         self.cwd = Path(cwd or "/srv/agents").resolve()
+        # Read-only extra directories (host-op 2026-09-02): read_file may reach
+        # these in addition to the worktree cwd. Writes are NEVER allowed here.
+        self.read_extra_dirs = _resolve_read_extra_dirs()
 
     def execute(self, arguments: dict) -> str | dict:
         try:
             path_arg = arguments["path"]
-            # Resolve relative to cwd, then verify it's still under cwd
+            # Resolve relative to cwd, then verify it's still under cwd OR an
+            # allowlisted read-extra dir (host-op 2026-09-02: let the fixer
+            # read pull-forward / reference sources outside its worktree).
             path = (self.cwd / path_arg).resolve()
-            if not path.is_relative_to(self.cwd):
+            _in_cwd = path.is_relative_to(self.cwd)
+            _in_extra = any(path.is_relative_to(_d) for _d in self.read_extra_dirs)
+            if not (_in_cwd or _in_extra):
                 return {"error": f"path outside cwd: {path}"}
 
             try:
@@ -1767,6 +1782,27 @@ def _resolve_int_env(env_name: str, default: int, log: Callable[[str], None] | N
         else:
             logger.warning(_msg)
         return default
+
+
+def _resolve_read_extra_dirs() -> tuple[Path, ...]:
+    """Resolve the read-only extra directories (read_file may reach these).
+
+    Reads GW_AGENT_READ_EXTRA_DIRS (colon-separated absolute paths) on top of
+    the module default GW_AGENT_READ_EXTRA_DIRS. Relative / missing entries are
+    skipped (never a crash). Empty result = reads confined to cwd (default).
+    """
+    raw = os.environ.get("GW_AGENT_READ_EXTRA_DIRS", "")
+    _paths: list[Path] = []
+    for _piece in (raw or "").split(":"):
+        _piece = _piece.strip()
+        if not _piece:
+            continue
+        _p = Path(_piece).resolve()
+        if _p.is_absolute() and _p.is_dir():
+            _paths.append(_p)
+        else:
+            logger.warning(f"[gw_agent] skipping read-extra-dir (not absolute/missing): {_piece!r}")
+    return tuple(_paths)
 
 
 # ---------------------------------------------------------------------------
