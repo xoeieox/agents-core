@@ -133,6 +133,40 @@ def test_put_get_round_trip(client):
 
 
 # ---------------------------------------------------------------------------
+# PUT response `created` field (explicit create/update signal)
+# ---------------------------------------------------------------------------
+
+def test_put_fresh_key_returns_created_true(client):
+    resp = client.put("/v0/memories/created/probe", json={"content": "v1", "tags": "a,b", "source": "pytest"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["created"] is True
+    # all six existing _row_response fields still present and correct
+    assert body["key"] == "created/probe"
+    assert body["content"] == "v1"
+    assert body["tags"] == "a,b"
+    assert body["source"] == "pytest"
+    assert body["created_at"]
+    assert body["updated_at"]
+
+
+def test_put_existing_key_returns_created_false(client):
+    client.put("/v0/memories/created/probe", json={"content": "v1", "tags": "", "source": ""})
+    resp = client.put("/v0/memories/created/probe", json={"content": "v2", "tags": "", "source": ""})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["created"] is False
+    assert body["content"] == "v2"
+
+
+def test_get_response_has_no_created_field(client):
+    client.put("/v0/memories/created/probe", json={"content": "v1", "tags": "", "source": ""})
+    resp = client.get("/v0/memories/created/probe")
+    assert resp.status_code == 200
+    assert "created" not in resp.json()
+
+
+# ---------------------------------------------------------------------------
 # FTS search round-trip
 # ---------------------------------------------------------------------------
 
