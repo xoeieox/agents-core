@@ -21,6 +21,7 @@ from agents_core.gw_agent import (
     DEFAULT_FIXER_TOOLS,
     DEFAULT_READONLY_TOOLS,
     GitExecutor,
+    ReadFileExecutor,
     RunTestsExecutor,
     WriteFileExecutor,
     _build_fixer_result,
@@ -109,6 +110,73 @@ class TestWriteFileExecutor:
         result = ex.execute({"path": "../escape", "content": "x"})
         assert isinstance(result, dict)
         assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# AC1c: ReadFileExecutor read-extra-dirs allowlist (host-op 2026-09-02)
+# The fixer may READ from allowlisted dirs outside its worktree, but may NEVER
+# write there. Default (no GW_AGENT_READ_EXTRA_DIRS) = reads confined to cwd.
+# ---------------------------------------------------------------------------
+
+class TestReadFileExecutorExtraDirs:
+    def test_default_confines_reads_to_cwd(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("GW_AGENT_READ_EXTRA_DIRS", raising=False)
+        # A truly-outside dir (sibling of the worktree, NOT under cwd)
+        outside = tmp_path.parent / "outside-secret"
+        outside.mkdir(exist_ok=True)
+        (outside / "secret.txt").write_text("secret")
+        try:
+            ex = ReadFileExecutor(str(tmp_path))
+            result = ex.execute({"path": str(outside / "secret.txt")})
+            assert isinstance(result, dict) and "error" in result
+            assert "outside" in result["error"]
+        finally:
+            import shutil
+            shutil.rmtree(outside, ignore_errors=True)
+
+    def test_allowlisted_dir_readable(self, tmp_path, monkeypatch):
+        outside = tmp_path.parent / "outside-allow"
+        outside.mkdir(exist_ok=True)
+        (outside / "secret.txt").write_text("secret")
+        monkeypatch.setenv("GW_AGENT_READ_EXTRA_DIRS", str(outside))
+        try:
+            ex = ReadFileExecutor(str(tmp_path))
+            result = ex.execute({"path": str(outside / "secret.txt")})
+            assert result == "secret"
+        finally:
+            import shutil
+            shutil.rmtree(outside, ignore_errors=True)
+
+    def test_allowlist_does_not_extend_write_scope(self, tmp_path, monkeypatch):
+        outside = tmp_path.parent / "outside-write-block"
+        outside.mkdir(exist_ok=True)
+        monkeypatch.setenv("GW_AGENT_READ_EXTRA_DIRS", str(outside))
+        try:
+            # read works
+            (outside / "secret.txt").write_text("secret")
+            rf = ReadFileExecutor(str(tmp_path))
+            assert rf.execute({"path": str(outside / "secret.txt")}) == "secret"
+            # write / apply_edit to the allowlisted dir MUST be rejected
+            wf = WriteFileExecutor(str(tmp_path))
+            assert isinstance(wf.execute({"path": str(outside / "pwned.txt"), "content": "x"}), dict)
+            assert not (outside / "pwned.txt").exists()
+        finally:
+            import shutil
+            shutil.rmtree(outside, ignore_errors=True)
+
+    def test_nonallowlisted_outside_dir_still_blocked(self, tmp_path, monkeypatch):
+        allowed = tmp_path.parent / "outside-allowed"
+        blocked = tmp_path.parent / "outside-blocked"
+        allowed.mkdir(exist_ok=True); blocked.mkdir(exist_ok=True)
+        monkeypatch.setenv("GW_AGENT_READ_EXTRA_DIRS", str(allowed))
+        try:
+            ex = ReadFileExecutor(str(tmp_path))
+            result = ex.execute({"path": str(blocked / "f.txt")})
+            assert isinstance(result, dict) and "error" in result
+        finally:
+            import shutil
+            shutil.rmtree(allowed, ignore_errors=True)
+            shutil.rmtree(blocked, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
