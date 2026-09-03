@@ -221,6 +221,42 @@ def test_filter_limit(corpus):
     assert res[0]["timestamp"] <= res[1]["timestamp"]
 
 
+def test_limit_equivalence(corpus):
+    """Bounded-limit accumulation must equal the unbounded path's output exactly."""
+    total = len(search(limit=None))
+    assert total > 0
+    for k in (0, 1, 2, total // 2, total, total + 3):
+        assert search(limit=k) == (search(limit=None) or [])[:k], f"mismatch at k={k}"
+
+
+def test_limit_tie_break_scan_order(tmp_path, monkeypatch):
+    """Two entries sharing an identical timestamp: limit=1 returns the one
+    encountered first in scan order (dir/file/line order)."""
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    ts = datetime(2026, 5, 5, 12, 0, 0, tzinfo=timezone.utc)
+    # agent-a sorts before agent-b; within a file, line order is scan order
+    record("agent-a", "friction", "ctx", "first-scanned", now=ts)
+    record("agent-b", "friction", "ctx", "second-scanned", now=ts)
+    res = search(limit=1)
+    assert len(res) == 1
+    assert res[0]["content"] == "first-scanned"
+
+
+def test_limit_oldest_selection(tmp_path, monkeypatch):
+    """With >limit matching entries scanned out of timestamp order, limit=1
+    returns the EARLIEST timestamp (not the first-scanned entry)."""
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    base = datetime(2026, 5, 5, 12, 0, 0, tzinfo=timezone.utc)
+    # Scanned in this order, but earliest timestamp is "earliest-ts"
+    record("agent-a", "friction", "ctx", "scanned-first", now=base + timedelta(minutes=2))
+    record("agent-a", "friction", "ctx", "earliest-ts", now=base)
+    record("agent-a", "friction", "ctx", "scanned-last", now=base + timedelta(minutes=5))
+    res = search(limit=1)
+    assert len(res) == 1
+    assert res[0]["content"] == "earliest-ts"
+    assert res[0]["timestamp"] == base.isoformat()
+
+
 def test_filter_combined(corpus):
     res = search(agent_id="lapis-pm", tags_any=["repo-A"], observation_type="decision")
     assert len(res) == 1
