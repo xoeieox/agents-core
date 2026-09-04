@@ -195,8 +195,10 @@ def search(
     limit: int | None = None,
 ) -> list[dict]:
     """Read across observation files matching filters. Iterates JSONL files line by line
-    (files are not slurped whole), but accumulates all matching entries in memory before
-    returning. Returns entries sorted by timestamp ascending."""
+    (files are not slurped whole). With limit=None, accumulates all matching entries in
+    memory before returning; with limit set, retains at most `limit` entries (the
+    smallest by (timestamp_string, scan order) — identical output to the unbounded
+    path's sorted slice). Returns entries sorted by timestamp ascending."""
     obs_root = root()
     if not obs_root.exists():
         return []
