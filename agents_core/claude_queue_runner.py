@@ -10,6 +10,8 @@ Architecture differs from `gpu_queue_runner.py`:
 
 Config env vars:
 - CLAUDE_QUEUE_WORKERS: max concurrent subprocesses (default 2)
+- FIXER_MAX_CONCURRENT: max concurrent fixer/fixer_retry tasks (default 5);
+  subset cap - restricts fixers below CLAUDE_QUEUE_WORKERS, never past it
 - CLAUDE_QUEUE_ENABLED: "0" makes the daemon exit cleanly on next tick
 
 The runner is responsible for capturing `shaped_runner`'s stdout/stderr and
@@ -109,6 +111,39 @@ task to idle-hold a worker slot while waiting — dropping fixer/reviewer
 throughput to zero.  With the outer-first ordering, the second council task
 blocks without holding a worker slot.
 """
+
+FIXER_MAX_CONCURRENT = _parse_concurrency_cap("FIXER_MAX_CONCURRENT", 5)
+_FIXER_SEM = asyncio.Semaphore(FIXER_MAX_CONCURRENT)
+"""Cap: at most FIXER_MAX_CONCURRENT fixer/fixer_retry tasks at a time
+(env FIXER_MAX_CONCURRENT, default 5; invalid/<1 falls back to 1 with a
+WARNING log - see _parse_concurrency_cap). Subset cap: it can RESTRICT
+fixers below CLAUDE_QUEUE_WORKERS but never expand them past the global
+worker cap (same semantics as the council sub-cap). Acquisition order in
+Daemon._worker is load-bearing: _FIXER_SEM is acquired BEFORE self.sem,
+so a claimed fixer task waiting on the sub-cap holds no global slot.
+Default 5 matches the live unit's CLAUDE_QUEUE_WORKERS=5 (raised 2026-09-04),
+so unset env is behavior-neutral. Fixer-family tasks are identified by the
+shaper description prefix (shaper.py:395, f"{agent.name}:{target_id}"):
+"fixer:" and "fixer_retry:"."""
+
+
+def _is_fixer_task(task: dict) -> bool:
+    """Fixer admission predicate.
+
+    Shaped tasks are the generic task_type "subprocess"; the agent family
+    rides in description (shaper.py:395 writes f"{agent.name}:{target_id}").
+    council.run is EXCLUDED at the predicate level: council descriptions are
+    free-form operator decision text (council/cli.py:1986-1993) and can legally
+    start with "fixer:" (e.g. "fixer: merge or hold?"). The exclusion makes the
+    one-directional-interference invariant hold at the predicate level, not only
+    by the _worker branch order.
+    If the shaper's description format ever changes, THIS PREDICATE MUST
+    CHANGE WITH IT (free-form-coupling risk, see Out of scope / known-deferred).
+    """
+    if task.get("task_type") == "council.run":
+        return False
+    desc = str(task.get("description") or "")
+    return desc.startswith("fixer:") or desc.startswith("fixer_retry:")
 
 
 # ---------------------------------------------------------------------------
@@ -1243,24 +1278,29 @@ class Daemon:
         self.council_dir = council_dir if council_dir is not None else _COUNCIL_DIR
 
     async def _worker(self, task: dict):
+        # Branch order is load-bearing: council.run FIRST (council descriptions
+        # are free-form decision text and can start with "fixer:"). Sub-cap
+        # BEFORE self.sem is load-bearing too (a claimed task waiting on the
+        # sub-cap must not hold a global slot; council precedent).
         if task.get("task_type") == "council.run":
-            # _COUNCIL_SEM acquired BEFORE self.sem — order is load-bearing.
             async with _COUNCIL_SEM:
                 async with self.sem:
-                    try:
-                        await _run_task(self.queue, task)
-                    except Exception as e:
-                        log.exception(
-                            f"unhandled error in task {task.get('id')}: {e}"
-                        )
+                    await self._run_guarded(task)
+        elif _is_fixer_task(task):
+            async with _FIXER_SEM:
+                async with self.sem:
+                    await self._run_guarded(task)
         else:
             async with self.sem:
-                try:
-                    await _run_task(self.queue, task)
-                except Exception as e:
-                    log.exception(
-                        f"unhandled error in task {task.get('id')}: {e}"
-                    )
+                await self._run_guarded(task)
+
+    async def _run_guarded(self, task: dict):
+        try:
+            await _run_task(self.queue, task)
+        except Exception as e:
+            log.exception(
+                f"unhandled error in task {task.get('id')}: {e}"
+            )
 
     async def run(self):
         startup_sweep(self.queue, council_dir=self.council_dir)
