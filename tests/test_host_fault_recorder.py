@@ -160,11 +160,19 @@ def _make_event(comm: str = "python3", pid: int = 1234,
 
 
 def test_capture_snapshot_creates_valid_json(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "agents_core.host_fault_recorder.FAULT_EVENT_DIR", tmp_path
-    )
+    from agents_core.host_fault_recorder import FAULT_EVENT_DIR
     ev = _make_event()
-    snap = capture_snapshot(ev)
+    # Explicit output_dir — I/O genuinely lands in tmp_path, not the
+    # production FAULT_EVENT_DIR constant.
+    snap = capture_snapshot(ev, output_dir=tmp_path)
+
+    assert snap.exists()
+    assert str(snap).startswith(str(tmp_path)), f"snapshot not in tmp_path: {snap}"
+    # No writes leaked to the production path.
+    prod_dir = Path(FAULT_EVENT_DIR)
+    if prod_dir.exists():
+        leaked = list(prod_dir.glob(f"{snap.name}"))
+        assert not leaked, f"snapshot leaked to production path: {leaked}"
 
     assert snap.exists()
     data = json.loads(snap.read_text())
@@ -181,9 +189,6 @@ def test_capture_snapshot_creates_valid_json(tmp_path, monkeypatch):
 
 def test_capture_snapshot_atomic_write(tmp_path, monkeypatch):
     """Verify no half-written files: target either doesn't exist or is fully valid JSON."""
-    monkeypatch.setattr(
-        "agents_core.host_fault_recorder.FAULT_EVENT_DIR", tmp_path
-    )
     ev = _make_event(pid=9999)
 
     # Check target doesn't exist before
@@ -191,7 +196,8 @@ def test_capture_snapshot_atomic_write(tmp_path, monkeypatch):
     expected = tmp_path / f"{utc_str}-9999.json"
     assert not expected.exists()
 
-    snap = capture_snapshot(ev)
+    snap = capture_snapshot(ev, output_dir=tmp_path)
+    assert snap == expected, f"snapshot not at tmp_path target: {snap}"
 
     # After write: target exists and is valid JSON (no partial file)
     assert snap.exists()
@@ -203,11 +209,8 @@ def test_capture_snapshot_atomic_write(tmp_path, monkeypatch):
 
 
 def test_capture_snapshot_schema_fields_present(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "agents_core.host_fault_recorder.FAULT_EVENT_DIR", tmp_path
-    )
     ev = _make_event()
-    snap = capture_snapshot(ev)
+    snap = capture_snapshot(ev, output_dir=tmp_path)
     data = json.loads(snap.read_text())
 
     required_top = {
@@ -228,13 +231,10 @@ def test_capture_snapshot_schema_fields_present(tmp_path, monkeypatch):
 def test_capture_snapshot_cmdline_from_live_pid(tmp_path, monkeypatch):
     """Snapshot includes cmdline for the current process (which is always alive)."""
     import os
-    monkeypatch.setattr(
-        "agents_core.host_fault_recorder.FAULT_EVENT_DIR", tmp_path
-    )
     # Use this process's PID — it will have a readable cmdline
     own_pid = os.getpid()
     ev = _make_event(pid=own_pid)
-    snap = capture_snapshot(ev)
+    snap = capture_snapshot(ev, output_dir=tmp_path)
     data = json.loads(snap.read_text())
 
     assert data["process"]["cmdline"] is not None
@@ -246,16 +246,13 @@ def test_capture_snapshot_cmdline_from_live_pid(tmp_path, monkeypatch):
 
 def test_capture_snapshot_cmdline_unavailable_for_dead_pid(tmp_path, monkeypatch):
     """Snapshot records cmdline_unavailable_reason when cmdline is unavailable."""
-    monkeypatch.setattr(
-        "agents_core.host_fault_recorder.FAULT_EVENT_DIR", tmp_path
-    )
     # Mock _read_cmdline to simulate a dead process
     monkeypatch.setattr(
         "agents_core.host_fault_recorder._read_cmdline",
         lambda pid: (None, "no_such_pid")
     )
     ev = _make_event(pid=1)
-    snap = capture_snapshot(ev)
+    snap = capture_snapshot(ev, output_dir=tmp_path)
     data = json.loads(snap.read_text())
 
     assert data["process"]["cmdline"] is None
@@ -312,15 +309,24 @@ def test_top_rss_processes_includes_cmdline(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_append_summary_line_writes_valid_json(tmp_path, monkeypatch):
+    from agents_core.host_fault_recorder import SUMMARY_JSONL
     jsonl = tmp_path / "test-events.jsonl"
-    monkeypatch.setattr("agents_core.host_fault_recorder.SUMMARY_JSONL", jsonl)
     ev = _make_event()
     snap = tmp_path / "snap.json"
     snap.write_text("{}")
 
-    append_summary_line(ev, snap)
+    # Explicit jsonl_path — I/O genuinely lands in tmp_path, not the
+    # production SUMMARY_JSONL constant.
+    append_summary_line(ev, snap, jsonl_path=jsonl)
 
     assert jsonl.exists()
+    # No writes leaked to the production path: the line we just appended
+    # (with our tmp_path snapshot reference) must not be in the production file.
+    prod_jsonl = Path(SUMMARY_JSONL)
+    if prod_jsonl.exists():
+        assert str(tmp_path) not in prod_jsonl.read_text(), (
+            f"summary line leaked to production path: {prod_jsonl}"
+        )
     lines = jsonl.read_text().strip().splitlines()
     assert len(lines) == 1
     data = json.loads(lines[0])
@@ -330,17 +336,17 @@ def test_append_summary_line_writes_valid_json(tmp_path, monkeypatch):
 
 
 def test_append_summary_line_rolls_at_10k(tmp_path, monkeypatch):
+    from agents_core.host_fault_recorder import SUMMARY_JSONL
     jsonl = tmp_path / "test-events.jsonl"
-    monkeypatch.setattr("agents_core.host_fault_recorder.SUMMARY_JSONL", jsonl)
     monkeypatch.setattr("agents_core.host_fault_recorder.SUMMARY_MAX_LINES", 5)
 
     snap = tmp_path / "snap.json"
     snap.write_text("{}")
 
-    # Write 5 lines to hit the limit
+    # Write 5 lines to hit the limit (explicit jsonl_path → tmp_path only)
     for i in range(5):
         ev = _make_event(pid=i + 100)
-        append_summary_line(ev, snap)
+        append_summary_line(ev, snap, jsonl_path=jsonl)
 
     assert jsonl.exists()
     lines = jsonl.read_text().strip().splitlines()
@@ -348,7 +354,7 @@ def test_append_summary_line_rolls_at_10k(tmp_path, monkeypatch):
 
     # One more should trigger a roll
     ev = _make_event(pid=999)
-    append_summary_line(ev, snap)
+    append_summary_line(ev, snap, jsonl_path=jsonl)
 
     # Old file should be renamed to a dated suffix
     dated_files = list(tmp_path.glob("*.jsonl"))
