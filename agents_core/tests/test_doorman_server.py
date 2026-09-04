@@ -2633,12 +2633,19 @@ class TestModeAwareBigPredicate:
         """DoD 6/registry-driven membership: gw_big_seat_members() returns
         every canonical_id whose gw_models.yaml row declares mode_alias:
         big — today that's the stock 122B plus the V4-Flash seat this unit
-        registers — and excludes the dual-mode rows."""
+        registers plus the Flash-Next whole-card seat
+        (flashnext-big-class-cockpit-trigger-v0, Leg 2) — and excludes the
+        dual-mode and solo-mode rows."""
         import agents_core.doorman_server as ds
         members = ds.gw_big_seat_members()
-        assert members == frozenset({"gravitywell-122b", "gravitywell-v4flash"})
+        assert members == frozenset({
+            "gravitywell-122b",
+            "gravitywell-v4flash",
+            "Qwen3.8-Flash-Next-NVFP4-SSD-Stream",
+        })
         assert "gravitywell-a3b-nvfp4" not in members
         assert "gravitywell-a3b-coder" not in members
+        assert "gravitywell-27b" not in members
 
     def test_dod5_fourth_big_model_needs_only_a_registry_row(self):
         """DoD 5: membership is registry-driven end to end — adding a

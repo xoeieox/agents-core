@@ -1721,3 +1721,97 @@ def test_gw_serving_state_27b_resolves_unknown_model_false():
     assert state.canonical is not None
     assert state.canonical.canonical_id == "gravitywell-27b"
     assert state.canonical.mode_alias == "solo"
+
+
+# ---------------------------------------------------------------------------
+# Qwen3.8-Flash-Next-NVFP4-SSD-Stream registry row
+# (flashnext-big-class-cockpit-trigger-v0, Leg 2)
+# ---------------------------------------------------------------------------
+#
+# L2.D1: register the Flash-Next whole-card seat's live served id
+# (canonical_id measured 2026-09-03 from :30000/get_server_info — mem
+# infra/gw-flashnext-seat-served-context-ceiling-2026-09-03) as a
+# mode_alias "big" member. Appended at END OF FILE after the 27B solo row
+# (the :53-55 append-at-end convention); the 122b/v4flash/27b rows are
+# untouched.
+#
+# L2.D2 TEST TRAP (pinned): the new row shares mode_alias "big" and
+# operator_alias "gravitywell" with the existing gravitywell-122b row.
+# _gw_registry_lookup matches in file order and returns the FIRST hit, so
+# lookup("big") and lookup("gravitywell") resolve to the 122b row — NOT the
+# flash-next row. The only aliases unique to the new row are canonical_id and
+# display_label; the round-trip assertion covers exactly those (mirrors the
+# 27b docstring convention) and does NOT assert the big/gravitywell aliases
+# resolve to this row (they will not — existing first-hit behavior, not a
+# regression).
+#
+# L2.D3: the row loads at import (a malformed row raises GwRegistryError) and
+# gw_big_seat_members() returns it alongside the 122b row.
+
+def test_flashnext_registry_lookup_round_trips_unique_aliases():
+    """L2.D2: lookup by the new row's canonical_id and display_label returns
+    the flash-next entry. Only these two aliases are unique to the row —
+    mode_alias "big" and operator_alias "gravitywell" are shared with the
+    122b row and resolve to IT by file-order-first-hit (see the next test),
+    so they are deliberately NOT asserted here."""
+    from agents_core.llm import _gw_registry_lookup
+
+    by_canonical_id = _gw_registry_lookup("Qwen3.8-Flash-Next-NVFP4-SSD-Stream")
+    assert by_canonical_id is not None
+    assert by_canonical_id.canonical_id == "Qwen3.8-Flash-Next-NVFP4-SSD-Stream"
+    assert by_canonical_id.mode_alias == "big"
+    assert by_canonical_id.operator_alias == "gravitywell"
+    assert by_canonical_id.display_label == "Qwen3.8 Flash-Next (NVFP4, SSD-stream)"
+    assert by_canonical_id.weights_hint.startswith(
+        "/data/models/sglang-ssd-stream/"
+    )
+
+    by_display_label = _gw_registry_lookup("Qwen3.8 Flash-Next (NVFP4, SSD-stream)")
+    assert by_display_label == by_canonical_id
+
+
+def test_flashnext_registry_append_preserves_big_first_hit_ordering():
+    """L2.D2: alias-resolution ordering is pinned — lookup("big") and
+    lookup("gravitywell") still resolve to the 122b row (first file-order
+    hit) after the flash-next row is appended. The new row shares both
+    aliases with the 122b row; appending at end-of-file must not shift the
+    first-hit resolution (byte-identical rows alone would not catch an
+    ordering regression)."""
+    from agents_core.llm import _gw_registry_lookup
+
+    big = _gw_registry_lookup("big")
+    assert big is not None
+    assert big.canonical_id == "gravitywell-122b"
+
+    operator = _gw_registry_lookup("gravitywell")
+    assert operator is not None
+    assert operator.canonical_id == "gravitywell-122b"
+
+
+def test_flashnext_registry_row_loads_at_import():
+    """L2.D3: the registry loads at import with the flash-next row present
+    (a malformed row would have raised GwRegistryError at import instead) —
+    the row is in the loaded registry, not just the YAML file."""
+    from agents_core.llm import _GW_MODEL_REGISTRY
+
+    flashnext_rows = [
+        e for e in _GW_MODEL_REGISTRY
+        if e.canonical_id == "Qwen3.8-Flash-Next-NVFP4-SSD-Stream"
+    ]
+    assert len(flashnext_rows) == 1
+    row = flashnext_rows[0]
+    assert row.mode_alias == "big"
+    assert row.operator_alias == "gravitywell"
+    assert row.display_label == "Qwen3.8 Flash-Next (NVFP4, SSD-stream)"
+
+
+def test_flashnext_is_a_big_seat_member_alongside_122b():
+    """L2.D3: gw_big_seat_members() returns the flash-next canonical_id
+    alongside the 122b row (and the v4flash row) — the doorman's big-seat
+    membership probe (doorman_server.py) reads this set live."""
+    from agents_core.doorman_server import gw_big_seat_members
+
+    members = gw_big_seat_members()
+    assert "Qwen3.8-Flash-Next-NVFP4-SSD-Stream" in members
+    assert "gravitywell-122b" in members
+    assert "gravitywell-v4flash" in members

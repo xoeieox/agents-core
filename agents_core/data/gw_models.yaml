@@ -58,3 +58,22 @@ models:
     operator_alias: gravitywell
     display_label: qwen3.8-27b-nvfp4
     weights_hint: "Qwen3.8-27B-NVFP4"
+
+  # Flash-Next whole-card seat (flashnext-big-class-cockpit-trigger-v0, Leg 2) —
+  # the on-demand SGLang ssd-stream seat on :30000 (flashnext-seat start|stop on
+  # GravityWell), registered as a "big"-class member so it is a first-class
+  # member of the big class in the registry (gw_big_seat_members() reads this
+  # live). canonical_id is the live served_model_name measured 2026-09-03 from
+  # :30000/get_server_info (mem infra/gw-flashnext-seat-served-context-ceiling-
+  # 2026-09-03; the SGLang /v1/models id equals the served_model_name).
+  # INERT TODAY: the doorman probes :8081/:8082 only, not :30000 — this row is
+  # classification-only until the doorman/keeper :30000-awareness unit lands
+  # (Known deferred in the spec). Appended at END OF FILE — _gw_registry_lookup
+  # matches in file order and returns the first hit, so lookup("big") and
+  # lookup("gravitywell") still resolve to the 122b row (first hit); only
+  # canonical_id and display_label are unique to this row.
+  - canonical_id: Qwen3.8-Flash-Next-NVFP4-SSD-Stream
+    mode_alias: big
+    operator_alias: gravitywell
+    display_label: "Qwen3.8 Flash-Next (NVFP4, SSD-stream)"
+    weights_hint: "/data/models/sglang-ssd-stream/huggingface/hub/models--garnermccloud--Qwen3.8-Flash-Next-NVFP4-SSD-Stream"
