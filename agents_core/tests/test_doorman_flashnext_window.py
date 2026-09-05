@@ -453,6 +453,47 @@ class TestStopPath:
         # No flashnext events at all on the legacy path.
         assert "card_held_flashnext" not in events
         assert "flashnext_window_closed" not in events
+        # Stop succeeded (rc=0): no stop-failure backoff signal — the
+        # refresh loop must NOT bump backoff on a successful stop.
+        assert state._stop_failed_this_tick is False
+
+    def test_stop_failure_sets_backoff_signal(self):
+        """Regression pin (rev 3 extraction repair): a real stop failure
+        (subprocess rc!=0 with the service still serving) sets
+        _stop_failed_this_tick, which the refresh loop reads to apply
+        origin/main's stop-failure backoff bump. The extraction dropped
+        those two inline bumps; this pins the restored signal on the
+        rc!=0-still-serving outcome."""
+        state = _make_state()
+        state._flashnext_window = "none"
+        state._flashnext_served_id = None
+        state.idle_since = time.time() - 10000  # far past GW_STOP_GRACE_SEC
+        state.leases = {}
+        state.service_stopped = False
+        state._stop_in_flight = False
+        state._probe_indeterminate = False
+
+        stop_proc = MagicMock()
+        stop_proc.returncode = 1
+        stop_proc.stdout = ""
+        stop_proc.stderr = "boom"
+        with patch("agents_core.doorman_server._write_idle_log") as mock_log, \
+             patch("agents_core.doorman_server.subprocess.run") as mock_run, \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", False), \
+             patch.object(state, "_is_serving", return_value=True):  # still serving
+            mock_run.return_value = stop_proc
+            result = state._decide_idle_stop()
+
+        assert result is True  # the idle-node trailing skip
+        assert mock_run.call_count == 1
+        # Real failure (still serving): the stop-failure backoff signal is set.
+        assert state._stop_failed_this_tick is True
+        # And the stop_failed idle-log row landed.
+        assert "stop_failed" in [c[0][1] for c in mock_log.call_args_list]
+        # The in-flight flag was cleared (R8) — the failure is resolved,
+        # not wedged.
+        assert state._stop_in_flight is False
+        assert state.service_stopped is False
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +698,20 @@ class TestRoute409:
         with patch.object(state, "ensure_serving", return_value=FLASHNEXT_OCCUPIED):
             result = state.acquire_lease("test-wid", 300, "test")
             assert result is FLASHNEXT_OCCUPIED
+
+    def test_no_lease_registered_on_sentinel(self):
+        """Spec Tests-section requirement (D4): the FLASHNEXT_OCCUPIED path
+        registers NO lease and leaves idle_since untouched — the refusal
+        mirrors CREATIVE_OCCUPIED, which refuses even the controller's own
+        acquire and holds no clock, so no doorman keepawake hold exists
+        during a window (Invariant 12)."""
+        state = _make_state()
+        idle_before = state.idle_since
+        with patch.object(state, "ensure_serving", return_value=FLASHNEXT_OCCUPIED):
+            result = state.acquire_lease("test-wid", 300, "test")
+        assert result is FLASHNEXT_OCCUPIED
+        assert state.leases == {}
+        assert state.idle_since is idle_before
 
 
 # ---------------------------------------------------------------------------

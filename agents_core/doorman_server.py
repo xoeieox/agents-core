@@ -695,6 +695,16 @@ class _NodeState:
         # taking self.lock never observes one without the other.
         self._stop_in_flight: bool = False
         self._stop_in_flight_since: float | None = None
+        # Per-tick stop-failure signal (agents-core-doorman-flashnext-
+        # handover-v0, rev 3 extraction repair): set by _decide_idle_stop's
+        # two stop-failure outcomes (rc!=0-still-serving real failure and
+        # the generic exception handler) and read by the refresh loop to
+        # apply the stop-failure backoff bump (backoff = min(backoff + 15,
+        # GW_HOLD_REFRESH_SEC)) that origin/main carried inline in the loop.
+        # Reset at the top of every _decide_idle_stop call; read-only in the
+        # loop. Never set on the timeout path (stop_in_progress is not a
+        # failure) or on the rc!=0-but-already-down success path.
+        self._stop_failed_this_tick: bool = False
         # Monotonic ownership token (R8a): incremented under self.lock every
         # time _stop_in_flight transitions to True (a new stop attempt begins,
         # or the reconciler forces a give-up that ends one). The thread that
@@ -2864,10 +2874,16 @@ class _NodeState:
         loop falls through to the keepawake-hold refresh (only when
         idle_since is None or a stop is already in flight).
 
-        The loop's `backoff` variable (bumped on stop failures) is deliberately
-        left in the loop: it only throttles the loop's sleep between ticks
-        and is invisible to the per-node decision itself.
+        Stop-failure backoff: this method sets self._stop_failed_this_tick
+        on its two stop-failure outcomes (the rc!=0-still-serving real
+        failure and the generic exception handler), and the refresh loop
+        bumps its `backoff` variable (backoff = min(backoff + 15,
+        GW_HOLD_REFRESH_SEC)) when it sees that flag set — the same
+        accelerated retry cadence origin/main applied inline in the loop.
+        The flag is reset at the top of every call, so the loop observes it
+        exactly once per failing tick.
         """
+        self._stop_failed_this_tick = False
         # Flash-next window (agents-core-doorman-flashnext-
         # handover-v0, D3): the keeper now KNOWS the nature of
         # the room — the :30000 seat holds GPU 0 whole-card
@@ -3077,6 +3093,11 @@ class _NodeState:
                             self.last_error = err
                             self._stop_in_flight = False
                             self._stop_in_flight_since = None
+                            # Stop-failure backoff signal for the refresh
+                            # loop (origin/main's inline bump, restored on
+                            # extraction): a real stop failure retries on
+                            # the accelerated cadence.
+                            self._stop_failed_this_tick = True
                             _write_idle_log(
                                 self.node_name, "stop_failed", 0,
                                 idle_secs=idle_elapsed,
@@ -3124,6 +3145,9 @@ class _NodeState:
                     self.last_error = err
                     self._stop_in_flight = False
                     self._stop_in_flight_since = None
+                    # Stop-failure backoff signal for the refresh loop
+                    # (origin/main's inline bump, restored on extraction).
+                    self._stop_failed_this_tick = True
                     _write_idle_log(self.node_name, "stop_failed", 0)
             return True
 
@@ -3571,6 +3595,16 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                         # refresh below is skipped for an idle node either
                         # way.
                         if state._decide_idle_stop():
+                            # Stop-failure backoff (origin/main's inline
+                            # bump, restored on extraction): the two stop-
+                            # failure outcomes inside _decide_idle_stop set
+                            # _stop_failed_this_tick, and the loop applies
+                            # the accelerated retry cadence here — a failing
+                            # auto gw-serve stop retries at
+                            # min(backoff + 15, GW_HOLD_REFRESH_SEC)
+                            # instead of the full GW_HOLD_REFRESH_SEC.
+                            if state._stop_failed_this_tick:
+                                backoff = min(backoff + 15, GW_HOLD_REFRESH_SEC)
                             continue  # no hold refresh needed for idle node
 
                     # Leases are active: re-issue the keepawake hold to refresh its TTL
