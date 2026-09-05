@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -318,8 +319,16 @@ def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str],
                          timeout_s: int = 180) -> dict | None:
     """Deterministic targeted re-run of model-touched tests (local-fixer gate
     perception). Mirrors the fixer's own run_tests invocation
-    (gw_agent.py:1098-1116): same interpreter (sys.executable), same env
-    (inherited, no env override), cwd=worktree, shell=False, -q. Returns the
+    (gw_agent.py:1098-1116) in shape (same env - inherited, no env override,
+    cwd=worktree, shell=False, -q), with a repo-env-aware interpreter prefix
+    (agents-core-gate-uv-aware-v0): _test_prefix(cwd) is the uv project venv
+    (`uv run --with pytest python`, bare `python` -> venv python, the
+    uv.lock-present AND uv-resolvable trigger) for uv-managed worktrees and
+    the host interpreter (sys.executable) otherwise - the byte-for-byte
+    legacy command. For uv repos the gate's interpreter/env therefore
+    DELIBERATELY diverges from the model's own run_tests tool (which stays
+    host-Python and cannot import the project deps): the gate is the
+    authority and the model cannot reproduce the gate's env. Returns the
     _parse_pytest_outcome dict, or None when the re-run itself is unusable
     (timeout or spawn error).
 
@@ -359,7 +368,14 @@ def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str],
         ("./" + p) if p.startswith("-") else p
         for p in sorted(set(model_touched_tests))
     ]
-    cmd = [sys.executable, "-m", "pytest", *argv_paths, "-q"]
+    # agents-core-gate-uv-aware-v0: repo-env-aware prefix. Non-uv (or uv
+    # unresolvable): [sys.executable, "-m", "pytest", ...] - byte-identical
+    # to the legacy command. Uv: [uv_bin, "run", "--with", "pytest",
+    # "python", "-m", "pytest", ...] - the project venv, not host Python.
+    # The dash-path guard above still applies to argv_paths; the prefix
+    # sits before the interpreter token, so `uv` passes everything after
+    # the command token verbatim.
+    cmd = [*_test_prefix(cwd), "-m", "pytest", *argv_paths, "-q"]
     try:
         r = subprocess.run(
             cmd,
@@ -771,6 +787,50 @@ def _has_python_test_infra(cwd) -> bool:
         return True
 
 
+def _test_prefix(cwd) -> list[str]:
+    """Interpreter-inclusive command prefix for the deterministic test gate.
+
+    agents-core-gate-uv-aware-v0 (Deliverable 1): returns
+    `[uv_bin, "run", "--with", "pytest", "python"]` iff BOTH
+    (a) `Path(cwd) / "uv.lock"` is a file (the worktree is a uv-managed
+    repo - `uv.lock` discriminates "uv-managed, has a locked env";
+    `pyproject.toml` would NOT - agents-core itself has a pyproject.toml
+    and no uv.lock and must stay on host Python) AND
+    (b) `uv_bin = shutil.which("uv")` is not None (uv is resolvable in
+    THIS process env - on BRIX the claude-queue-runner service PATH does
+    not include /srv/fast/scratch/bin, so without the Deploy-note
+    precondition this is None and the gate degrades to the host-Python
+    fallback: the known failure, not a new spawn error). Otherwise it
+    returns `[sys.executable]` - byte-for-byte today's command.
+
+    The returned list is the interpreter-inclusive prefix: prepending it
+    and then `"-m", "pytest", ...` yields the correct form in both cases
+    (non-uv: `[sys.executable, "-m", "pytest", ...]`; uv:
+    `[uv_bin, "run", "--with", "pytest", "python", "-m", "pytest", ...]`).
+    The interpreter token is deliberately the BARE `python` for uv repos -
+    `uv run` syncs the locked project env and prepends its bin to PATH, so
+    the bare token resolves to the VENV python that imports the project
+    deps, and `--with pytest` adds pytest ephemerally without touching the
+    lockfile. A `sys.executable` token under `uv run` would run the HOST
+    interpreter literally (an absolute interpreter is run as-is; the venv
+    on PATH does not change its sys.path) and re-introduce the exact
+    ModuleNotFoundError false negative this helper exists to eliminate
+    (finding/lapis-fixer-test-gate-host-python-uv-repo-2026-09-05).
+
+    Never raises (mirrors _has_python_test_infra's fail-safe style): a
+    missing/unreadable uv.lock or an unresolvable uv -> `[sys.executable]`.
+    """
+    try:
+        if not (Path(cwd) / "uv.lock").is_file():
+            return [sys.executable]
+        uv_bin = shutil.which("uv")
+        if uv_bin is None:
+            return [sys.executable]
+        return [uv_bin, "run", "--with", "pytest", "python"]
+    except Exception:
+        return [sys.executable]
+
+
 def _tail_log(task_id: str, message: str) -> None:
     """Append one timestamped line to <shaped-dir>/<task_id>-tail.log.
 
@@ -928,6 +988,23 @@ def tail_finalize(
         # cwd would make every touched path rc=4 (a silent no-op that
         # voids the strictly-more-permissive invariant in production).
         gate_rerun_fired = True
+        # agents-core-gate-uv-aware-v0 (Deliverable 4): name the active
+        # interpreter prefix + its trigger - no code path today logs the
+        # gate argv, so this is what makes the Deploy-note verification
+        # observable.
+        _prefix = _test_prefix(cwd)
+        if _prefix[0] != sys.executable:
+            _tail_log(
+                task_id,
+                "gate re-run via uv run --with pytest "
+                "(uv.lock present, uv resolvable)",
+            )
+        else:
+            _tail_log(
+                task_id,
+                "gate re-run via host python "
+                "(no uv.lock or uv not resolvable)",
+            )
         rerun_outcome = _gate_targeted_rerun(cwd, model_touched_tests)
         if rerun_outcome is not None:
             last_test_outcome = rerun_outcome
@@ -2467,10 +2544,18 @@ def _run_local_opencode(spec: dict, base_cwd: str | None) -> str:
             return ""
 
         # F4: the deterministic targeted test step, in the RunTestsExecutor
-        # shape (gw_agent.py:1074-1164): `sys.executable -m pytest`, a 180s
-        # cap (a network-waiting test cannot stall the tail), and
-        # _parse_pytest_outcome. The touched-test source is the STAGED DIFF
-        # (a git-diff source), not a transcript.
+        # shape (gw_agent.py:1074-1164): a repo-env-aware interpreter
+        # prefix (agents-core-gate-uv-aware-v0 - _test_prefix(cwd): the uv
+        # project venv `uv run --with pytest python`, bare `python` ->
+        # venv python, for uv.lock-present AND uv-resolvable worktrees;
+        # the host interpreter sys.executable otherwise - byte-for-byte the
+        # legacy command), then `-m pytest`, a 180s cap (a network-waiting
+        # test cannot stall the tail), and _parse_pytest_outcome. The
+        # prefix is applied ONCE at the base list below (the if/else only
+        # EXTENDS test_cmd) - a second prepend inside a branch body would
+        # double the `uv run` and degrade to a spawn error. The
+        # touched-test source is the STAGED DIFF (a git-diff source), not
+        # a transcript.
         touched_tests = _collect_diff_touched_tests(cwd)
         from agents_core.gw_agent import _parse_pytest_outcome
 
@@ -2481,7 +2566,9 @@ def _run_local_opencode(spec: dict, base_cwd: str | None) -> str:
                 return data.decode(errors="replace")
             return str(data)
 
-        test_cmd = [sys.executable, "-m", "pytest"]
+        # agents-core-gate-uv-aware-v0: ONE pinned edit here (the shared
+        # base list) - the branch bodies below only extend test_cmd.
+        test_cmd = [*_test_prefix(cwd), "-m", "pytest"]
         if touched_tests:
             # The diff touched test files -> run exactly those.
             test_cmd.extend(sorted(touched_tests))
@@ -2515,9 +2602,18 @@ def _run_local_opencode(spec: dict, base_cwd: str | None) -> str:
         _host_usersite = _usersite()
         _f4_env = {**os.environ, **handle.env}
         if _host_usersite and os.path.isdir(_host_usersite):
-            _f4_env["PYTHONPATH"] = os.pathsep.join(
-                p for p in (_host_usersite, os.environ.get("PYTHONPATH")) if p
-            )
+            # agents-core-gate-uv-aware-v0: the PYTHONPATH shim is the
+            # host-python path's fix (host interpreter finding pytest in
+            # the host user site). Under the uv prefix the venv is the
+            # authority - drop PYTHONPATH/PYTHONUSERBASE so the host
+            # user-site shim cannot shadow the venv's packages.
+            if _test_prefix(cwd)[0] != sys.executable:
+                _f4_env.pop("PYTHONPATH", None)
+                _f4_env.pop("PYTHONUSERBASE", None)
+            else:
+                _f4_env["PYTHONPATH"] = os.pathsep.join(
+                    p for p in (_host_usersite, os.environ.get("PYTHONPATH")) if p
+                )
         _pytest_output = ""
         _pytest_rc = -1
         _pytest_timed_out = False

@@ -24,6 +24,8 @@ forgejo.create_pr; subprocess.run for git.
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -220,7 +222,7 @@ def test_ac2_non_python_worktree_bypass_creates_pr_with_marker(tmp_path):
 # AC3: fail-closed preserved (Python worktree, gate math unchanged)
 # ---------------------------------------------------------------------------
 
-def test_ac3_python_worktree_no_tests_touched_last_outcome_zero_no_pr(tmp_path):
+def test_ac3_python_worktree_no_tests_touched_last_outcome_zero_salvage_pr(tmp_path):
     worktree = tmp_path / "wt"
     worktree.mkdir()
     (worktree / "pyproject.toml").write_text("[project]\nname = 'x'\n")
@@ -229,8 +231,13 @@ def test_ac3_python_worktree_no_tests_touched_last_outcome_zero_no_pr(tmp_path):
     pr = MagicMock()
     url, body, shaped_dir, mock_friction = _run(tmp_path, worktree, result, pr)
 
-    assert url == ""
-    pr.assert_not_called()
+    # S3 (agents-core-local-fixer-salvage-on-discard-v0): the gate verdict
+    # is unchanged (fail-closed on passed=0), but a concluded,
+    # gate-rejected run is now SALVAGED as an advisory [SALVAGE] PR
+    # instead of discarded.
+    assert url == "http://x/pulls/1"
+    pr.assert_called_once()
+    assert "[SALVAGE]" in body
     mock_friction.assert_not_called()
     # Tail log carries the gate-failed reason.
     tail = shaped_dir / "abc123-tail.log"
@@ -531,9 +538,14 @@ def test_gate_still_fails_when_rerun_red(tmp_path, capsys):
         return_value=_py_outcome(D3_RED_SUMMARY, 1))
     url, body, shaped_dir, mock_friction, _ = _run_with_rerun(
         tmp_path, worktree, result, MagicMock(), None, mock_rerun=mock_rerun)
-    assert url == ""
-    assert body == ""
-    # Daemon-journal WARN (the "no PR" line) carries rc=1 + errors=.
+    # S3 (agents-core-local-fixer-salvage-on-discard-v0): a concluded,
+    # gate-rejected run is SALVAGED as an advisory [SALVAGE] PR (the
+    # worktree's final state), not discarded - the gate verdict (FAILED)
+    # is unchanged; only the terminal action moved from "no PR" to
+    # "salvage PR".
+    assert url == "http://x/pulls/1"
+    assert "[SALVAGE]" in body
+    # Daemon-journal WARN (the salvage line) carries rc=1 + errors=.
     err = capsys.readouterr().err
     warn_line = next(l for l in err.splitlines()
                      if "WARN: local-fixer: test gate failed" in l)
@@ -595,7 +607,11 @@ def test_rerun_returns_none_on_timeout_and_on_spawn_error(tmp_path, monkeypatch,
         ))
     url, body, shaped_dir, mock_friction, _ = _run_with_rerun(
         tmp_path, worktree, result, MagicMock(), None, mock_rerun=mock_rerun)
-    assert url == ""
+    # S3 (agents-core-local-fixer-salvage-on-discard-v0): the fail-closed
+    # verdict is unchanged; a concluded, gate-rejected run is now
+    # SALVAGED as an advisory [SALVAGE] PR instead of discarded.
+    assert url == "http://x/pulls/1"
+    assert "[SALVAGE]" in body
     lines = _tail_lines(shaped_dir)
     assert any("gate FAILED" in l for l in lines)
     # The fail-closed verdict is now disambiguated (D2): the 0/0 shape is
@@ -632,7 +648,12 @@ def test_legacy_branch_unchanged_no_touched_tests(tmp_path):
     mock_rerun = MagicMock(return_value=_py_outcome(D3_GREEN_SUMMARY, 0))
     url, body, shaped_dir, mock_friction, _ = _run_with_rerun(
         tmp_path, worktree, result, MagicMock(), None, mock_rerun=mock_rerun)
-    assert url == ""
+    # S3 (agents-core-local-fixer-salvage-on-discard-v0): the gate verdict
+    # is unchanged (fail-closed on the legacy no-touched-tests branch, and
+    # the re-run never fires), but a concluded, gate-rejected run is now
+    # SALVAGED as an advisory [SALVAGE] PR instead of discarded.
+    assert url == "http://x/pulls/1"
+    assert "[SALVAGE]" in body
     mock_rerun.assert_not_called()
     assert any("gate FAILED" in l for l in _tail_lines(shaped_dir))
 
@@ -763,3 +784,169 @@ def test_f4_rc4_rc5_logged(tmp_path, monkeypatch, capsys):
     # (d) the D4 change names f4-rc=4 explicitly instead of bare 0/0.
     assert "f4-rc=4 touched-path-missing" in warn_line
     assert "rc=4" in warn_line
+
+
+# ---------------------------------------------------------------------------
+# agents-core-gate-uv-aware-v0: repo-env-aware gate prefix.
+#
+# The gate's deterministic re-run used to be hard-wired to the HOST python
+# (sys.executable -m pytest). For a uv-managed worktree (uv.lock present)
+# whose deps live in the project venv, host python cannot import them ->
+# the gate dies at collection (rc=4 ModuleNotFoundError) and REJECTS a
+# correct fixer run (finding/lapis-fixer-test-gate-host-python-uv-repo-
+# 2026-09-05). The fix: _test_prefix(cwd) returns the uv project-venv
+# prefix `uv run --with pytest python` (bare `python` -> venv python) when
+# uv.lock is present AND uv is resolvable; else [sys.executable]
+# (byte-for-byte the legacy command).
+# ---------------------------------------------------------------------------
+
+
+def _make_uv_stub_uv(tmp_path: Path) -> Path:
+    """A stub `uv` executable on a PATH dir: records its argv to a file,
+    then exits 0 (it is never actually run - subprocess.run is mocked)."""
+    bin_dir = tmp_path / "uvbin"
+    bin_dir.mkdir()
+    uv_stub = bin_dir / "uv"
+    uv_stub.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$@\" > \"$UV_ARGV_FILE\"\n"
+        "exit 0\n"
+    )
+    uv_stub.chmod(0o755)
+    return bin_dir
+
+
+def test_uv_prefix_uv_worktree_uses_uv_run_venv_python(tmp_path, monkeypatch):
+    """AC2/AC3 (uv case): a uv-managed worktree (uv.lock + pyproject.toml)
+    with a resolvable `uv` on PATH runs the gate as
+    `uv run --with pytest python -m pytest <paths> -q` - the BARE `python`
+    token resolves to the venv python under `uv run`, so the touched test
+    runs against the project's real deps instead of host python's
+    ModuleNotFoundError. Pins the exact argv form: fails on a
+    sys.executable-as-command regression (host python under uv run would
+    re-introduce the false negative) and on a double `uv run` prepend."""
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    (worktree / "uv.lock").write_text("[[package]]\nname = 'x'\n")
+    (worktree / "tests").mkdir()
+    (worktree / "tests" / "test_foo.py").write_text("def test_x():\n    pass\n")
+
+    bin_dir = _make_uv_stub_uv(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+
+    fake = MagicMock(returncode=0, stdout=D3_GREEN_SUMMARY, stderr="")
+    mock_run = MagicMock(return_value=fake)
+    monkeypatch.setattr(_subprocess, "run", mock_run)
+
+    out = sr._gate_targeted_rerun(str(worktree), {"tests/test_foo.py"})
+    assert out is not None
+    assert out["passed"] == 54
+    assert out["returncode"] == 0
+
+    argv = mock_run.call_args.args[0]
+    # The command is the resolved uv binary (NOT sys.executable - an
+    # absolute interpreter under `uv run` would run host python literally
+    # and re-introduce the ModuleNotFoundError).
+    assert argv[0] == str(bin_dir / "uv")
+    assert argv[0] != sys.executable
+    # The exact uv-run form: `uv run --with pytest python -m pytest ... -q`.
+    assert argv[1:5] == ["run", "--with", "pytest", "python"]
+    assert argv[5:7] == ["-m", "pytest"]
+    assert "tests/test_foo.py" in argv
+    assert argv[-1] == "-q"
+
+
+def test_uv_prefix_fallback_without_uv_lock(tmp_path, monkeypatch):
+    """AC2 (fallback case, no uv.lock): a pyproject.toml-only worktree -
+    the agents-core shape - runs EXACTLY the legacy command
+    [sys.executable, "-m", "pytest", ...] even when uv IS resolvable.
+    (pyproject.toml is NOT the trigger; uv.lock is - keying on
+    pyproject.toml would flip agents-core onto uv and break the gate.)"""
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    (worktree / "tests").mkdir()
+    (worktree / "tests" / "test_foo.py").write_text("def test_x():\n    pass\n")
+
+    bin_dir = _make_uv_stub_uv(tmp_path)  # uv resolvable, but no uv.lock
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+
+    fake = MagicMock(returncode=0, stdout=D3_GREEN_SUMMARY, stderr="")
+    mock_run = MagicMock(return_value=fake)
+    monkeypatch.setattr(_subprocess, "run", mock_run)
+
+    out = sr._gate_targeted_rerun(str(worktree), {"tests/test_foo.py"})
+    assert out is not None
+    assert out["returncode"] == 0
+
+    argv = mock_run.call_args.args[0]
+    assert argv[0] == sys.executable
+    assert argv[1:3] == ["-m", "pytest"]
+    assert "tests/test_foo.py" in argv
+    assert argv[-1] == "-q"
+
+
+def test_uv_prefix_fallback_when_uv_not_resolvable(tmp_path, monkeypatch):
+    """AC1/AC2 (fallback case, uv unresolvable): a uv-managed worktree
+    (uv.lock present) with `uv` NOT on PATH degrades to the host-Python
+    command - the known failure, not a new spawn error (the Deploy-note
+    precondition: uv must be resolvable in the runner env for the fix to
+    be active)."""
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    (worktree / "uv.lock").write_text("[[package]]\nname = 'x'\n")
+    (worktree / "tests").mkdir()
+    (worktree / "tests" / "test_foo.py").write_text("def test_x():\n    pass\n")
+
+    # PATH with no uv: an empty dir + /usr/bin (no uv there in CI).
+    empty_dir = tmp_path / "emptybin"
+    empty_dir.mkdir()
+    monkeypatch.setenv("PATH", str(empty_dir))
+
+    fake = MagicMock(returncode=0, stdout=D3_GREEN_SUMMARY, stderr="")
+    mock_run = MagicMock(return_value=fake)
+    monkeypatch.setattr(_subprocess, "run", mock_run)
+
+    out = sr._gate_targeted_rerun(str(worktree), {"tests/test_foo.py"})
+    assert out is not None
+    assert out["returncode"] == 0
+
+    argv = mock_run.call_args.args[0]
+    assert argv[0] == sys.executable
+    assert argv[1:3] == ["-m", "pytest"]
+    assert "tests/test_foo.py" in argv
+    assert argv[-1] == "-q"
+
+
+def test_test_prefix_helper_direct(tmp_path, monkeypatch):
+    """AC1: _test_prefix returns the uv prefix iff uv.lock is a file AND
+    shutil.which('uv') resolves; else [sys.executable]; never raises."""
+    import shutil
+
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / "uv.lock").write_text("[[package]]\nname = 'x'\n")
+
+    # uv.lock present, uv unresolvable -> host python.
+    empty_dir = tmp_path / "emptybin"
+    empty_dir.mkdir()
+    monkeypatch.setenv("PATH", str(empty_dir))
+    assert sr._test_prefix(str(worktree)) == [sys.executable]
+
+    # uv.lock present, uv resolvable -> the exact uv-run prefix.
+    bin_dir = _make_uv_stub_uv(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    uv_bin = shutil.which("uv")
+    assert uv_bin is not None
+    assert sr._test_prefix(str(worktree)) == \
+        [uv_bin, "run", "--with", "pytest", "python"]
+
+    # uv.lock absent (even with uv resolvable) -> host python.
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert sr._test_prefix(str(plain)) == [sys.executable]
+
+    # Never raises: a missing cwd degrades to the host-python fallback.
+    assert sr._test_prefix(str(tmp_path / "does-not-exist")) == [sys.executable]

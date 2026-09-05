@@ -630,3 +630,90 @@ def test_gw_agent_fixer_untouched(tmp_path, monkeypatch):
     assert "local 122B fixer harness" in kw["body"]
     assert "local-opencode" not in kw["body"]
     assert "<!-- lapis-gpu-id: task-lf-untouched -->" in kw["body"]
+
+
+# ---------------------------------------------------------------------------
+# 14. agents-core-gate-uv-aware-v0 twin site: the opencode F4 gate re-run is
+#     repo-env-aware too (the same defect as the live _gate_targeted_rerun
+#     site, pinned so it cannot re-emerge if the engine goes live).
+# ---------------------------------------------------------------------------
+
+def test_opencode_f4_uv_worktree_uses_uv_prefix(scratch_repo, tmp_path,
+                                                monkeypatch):
+    """The F4 deterministic re-run in a uv-managed worktree (committed
+    uv.lock + a resolvable `uv` stub on PATH) runs as
+    `uv run --with pytest python -m pytest tests/test_fast.py -q` - the
+    prefix is applied ONCE at the base list (a double `uv run` prepend
+    would degrade to a spawn error and fail closed). The touched test
+    file is the target, and the run is green -> the PR opens (not a
+    salvage)."""
+    from agents_core import shaped_runner, worktree
+
+    # Commit uv.lock into the scratch repo so the worktree (fetched from
+    # origin) is a uv-managed repo.
+    (scratch_repo / "uv.lock").write_text("[[package]]\nname = 'scratch'\n")
+    subprocess.run(["git", "-C", str(scratch_repo), "add", "uv.lock"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(scratch_repo),
+                    "commit", "-qm", "add uv.lock"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(scratch_repo), "push", "-q", "origin",
+                    "main"], check=True, capture_output=True)
+
+    # A stub `uv` on PATH that records its argv (never actually run -
+    # subprocess.run is patched below).
+    bin_dir = tmp_path / "uvbin"
+    bin_dir.mkdir()
+    uv_stub = bin_dir / "uv"
+    uv_stub.write_text("#!/bin/sh\nexit 0\n")
+    uv_stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+
+    # A model-loop stub that touches the seeded test file (F4's touched
+    # source is the staged diff).
+    scenario_file = tmp_path / "scenario.txt"
+    scenario_file.write_text("gate_fail\n")
+    stub = _write_opencode_stub(tmp_path / "bin", scenario_file)
+    monkeypatch.setenv("OPENCODE_BIN", str(stub))
+    monkeypatch.setattr(worktree, "WORKTREE_ROOT", tmp_path / "wtroot")
+    monkeypatch.setattr(shaped_runner, "room_path",
+                        lambda key, *parts, **kw: tmp_path / "artifacts")
+
+    real_run = subprocess.run
+
+    def fake_run(cmd, *a, **kw):
+        argv0 = cmd[0] if isinstance(cmd, (list, tuple)) else str(cmd)
+        if argv0 == "git" or argv0.endswith("/git"):
+            return real_run(list(cmd), *a, **kw)
+        # The F4 re-run: green canned outcome; record the argv for the
+        # assertion.
+        fake_run.f4_argv = list(cmd)
+        return MagicMock(returncode=0, stdout="1 passed in 0.01s\n",
+                         stderr="")
+
+    monkeypatch.setattr(subprocess, "run", side_effect=fake_run)
+
+    spec = _loco_spec("task-uvf4", "tgt-uvf4")
+    with patch("agents_core.doorman_client.DoormanClient") as mock_dm, \
+         patch("agents_core.forgejo.create_pr",
+               return_value={"html_url":
+                             "http://forgejo/Erah/agents-core/pulls/77"}), \
+         patch("agents_core.forgejo.get_open_prs", return_value=[]):
+        mock_dm.return_value.acquire.return_value = {
+            "status": "serving", "work_id": "task-uvf4-berth-sup",
+        }
+        url = shaped_runner._run_local_opencode(spec, str(scratch_repo))
+
+    assert url == "http://forgejo/Erah/agents-core/pulls/77"
+    argv = fake_run.f4_argv
+    # The command is the resolved uv binary (NOT sys.executable).
+    assert argv[0] == str(bin_dir / "uv")
+    assert argv[0] != sys.executable
+    # The exact uv-run form, applied ONCE (a double prepend would show a
+    # second "run" token and fail closed).
+    assert argv[1:5] == ["run", "--with", "pytest", "python"]
+    assert argv[5:7] == ["-m", "pytest"]
+    # The touched test file is the target and -q is last.
+    assert "tests/test_fast.py" in argv
+    assert argv[-1] == "-q"
+    assert argv.count("run") == 1, "double uv-run prepend detected"
