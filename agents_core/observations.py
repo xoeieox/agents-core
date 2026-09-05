@@ -19,6 +19,7 @@ intervention_shape: question | pointer | counter-example | frame-shift | constra
 """
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import os
@@ -194,8 +195,10 @@ def search(
     limit: int | None = None,
 ) -> list[dict]:
     """Read across observation files matching filters. Iterates JSONL files line by line
-    (files are not slurped whole), but accumulates all matching entries in memory before
-    returning. Returns entries sorted by timestamp ascending."""
+    (files are not slurped whole). With limit=None, accumulates all matching entries in
+    memory before returning; with limit set, retains at most `limit` entries (the
+    smallest by (timestamp_string, scan order) — identical output to the unbounded
+    path's sorted slice). Returns entries sorted by timestamp ascending."""
     obs_root = root()
     if not obs_root.exists():
         return []
@@ -221,6 +224,15 @@ def search(
             return []
 
     results: list[dict] = []
+
+    # Bounded accumulation for limit: keep at most `limit` entries — the
+    # smallest by (timestamp_string, scan_seq), where scan_seq is a monotonic
+    # counter over entries that pass the filters. This equals the old
+    # full-scan + stable sort + slice output exactly (stable sort tie-break
+    # == scan order), while capping memory at `limit` entries.
+    bounded = limit is not None
+    kept: list[tuple[str, int, dict]] = []
+    scan_seq = 0
 
     for agent_dir in agent_dirs:
         if not agent_dir.exists():
@@ -314,14 +326,25 @@ def search(
                             if informed_by not in (entry.get("informed_by") or []):
                                 continue
 
-                        results.append(entry)
+                        if bounded:
+                            scan_seq += 1
+                            key = entry.get("timestamp", "")
+                            pos = bisect.bisect_left(kept, (key, scan_seq))
+                            if len(kept) == limit and pos >= limit:
+                                continue  # not smaller than every kept entry
+                            kept.insert(pos, (key, scan_seq, entry))
+                            if len(kept) > limit:
+                                kept.pop()
+                        else:
+                            results.append(entry)
             except OSError:
                 continue
 
-    results.sort(key=lambda e: e.get("timestamp", ""))
+    if bounded:
+        # kept is already ascending by (timestamp_string, scan_seq)
+        return [e for _, _, e in kept]
 
-    if limit is not None:
-        results = results[:limit]
+    results.sort(key=lambda e: e.get("timestamp", ""))
 
     return results
 
