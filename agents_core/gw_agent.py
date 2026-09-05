@@ -27,6 +27,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Final
 
+import httpx
 import requests
 
 from agents_core.doorman_client import DoormanClient, DoormanUnreachable
@@ -2157,6 +2158,33 @@ def _call_gw_agent_impl(
                     )
                 else:
                     raise ValueError(f"unknown on_wake_fail: {on_wake_fail}")
+            except httpx.HTTPStatusError as e:
+                # 409: another seat holds the GPU lane (creative_occupied or
+                # flashnext_occupied). Route through on_wake_fail with the
+                # distinct reason "gw_seat_occupied" — distinguishable from
+                # "gw_unreachable" and "gw_not_serving".
+                # (agents-core-doorman-flashnext-handover-v0, Deliverable 4:
+                # the identical hole exists today for creative_occupied 409s;
+                # this branch repairs both.)
+                if e.response.status_code == 409:
+                    if log:
+                        log(f"[gw_agent] doorman 409 (seat occupied): {e}")
+                    if on_wake_fail == "skip":
+                        if writeable:
+                            return (_build_fixer_result(cwd, transcript, concluded=False), transcript)
+                        if reason_out is not None:
+                            reason_out.append("gw_seat_occupied")
+                        return (None, transcript) if return_transcript else None
+                    elif on_wake_fail == "error":
+                        raise
+                    elif on_wake_fail == "claude":
+                        return _fallback_claude_cli(
+                            prompt, system, cwd, json_mode, log, return_transcript, transcript
+                        )
+                    else:
+                        raise ValueError(f"unknown on_wake_fail: {on_wake_fail}")
+                # Non-409 HTTPStatusError: re-raise (unhandled by this path)
+                raise
 
             if _defer_timed_out:
                 if log:

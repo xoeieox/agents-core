@@ -718,7 +718,7 @@ class _NodeState:
         self._cached_topology_state = None   # GwServingState | None until first refresh with flag ON
         # llama-server /slots activity probe (doorman-probe-llama-activity-v0)
         self._last_probed_task_by_slot: dict[int, int] = {}
-        self._idle_since_source: str | None = None  # 'lease' | 'probe' | None
+        self._idle_since_source: str | None = None  # 'lease' | 'probe' | 'window_close' | None
         # Probe C: llama.cpp /metrics counter snapshot, keyed by url, then by
         # metric-name+labels (agents-core-doorman-class-aware-activity-probe-v0,
         # D1) — the previous tick's values, diffed to detect activity between
@@ -1258,17 +1258,22 @@ class _NodeState:
             log.debug(f"[{self.node_name}] gpu1 glances probe inconclusive: {exc}")
             return None
 
-    def _probe_flashnext_seat(self, sequential: bool = False) -> tuple[str, str | None, bool | None]:
+    def _probe_flashnext_seat(self, sequential: bool = False) -> tuple[str, str | None, bool | None, str | None]:
         """Probe the flash-next seat on :30000 (agents-core-doorman-flashnext-
-        handover-v0, D2/D7). Returns (state, served_id, registered):
+        handover-v0, D2/D7). Returns (state, served_id, registered, error_class):
 
           state:
             "down"          — /health connection refused (host reachable, port
                               closed): no seat listener. Window none.
-            "blind"         — timeout / connection error / unparseable
-                              /health: indeterminate. Window indeterminate
-                              (null); the 27B axis behaves exactly as today
-                              (a missing probe is blindness, never False).
+                              ONLY ConnectionRefusedError classifies as down;
+                              every other ConnectionError (DNS failure,
+                              unreachable host, reset) is "blind" (Invariant 7:
+                              blindness is never a no).
+            "blind"         — timeout / connection error (non-refused) /
+                              unparseable /health: indeterminate. Window
+                              indeterminate (null); the 27B axis behaves
+                              exactly as today (a missing probe is blindness,
+                              never False).
             "up_registered" — /health answered AND /v1/models returned 200
                               with data[0].id == GW_FLASHNEXT_MODEL_ID (EXACT
                               canonical_id match, D2b — never
@@ -1294,6 +1299,11 @@ class _NodeState:
           registered: exact canonical_id match (served_id ==
                       GW_FLASHNEXT_MODEL_ID); None when the models endpoint
                       never answered 200.
+          error_class: the ACTUAL exception class name when the probe failed
+                      (e.g. "Timeout", "ConnectionRefusedError",
+                      "ConnectionError"), or None on success. Carried by the
+                      D4 BLIND-proceed log.warning so the operator sees the
+                      real failure class, not a static placeholder.
 
         D7 placement/shape: the TICK path (sequential=False) runs the two GETs
         concurrently in a 2-worker pool (mirrors the existing pool style); the
@@ -1339,13 +1349,27 @@ class _NodeState:
                 models = fut_models.result()
 
         # /health half: any HTTP response (any status) = a listener exists on
-        # the seat port; a connection-level failure is the DOWN/BLIND split.
+        # the seat port. A connection-level failure is the DOWN/BLIND split:
+        # ONLY ConnectionRefusedError (the host answered RST — no seat
+        # listener) classifies as "down". Every other ConnectionError (DNS
+        # failure, unreachable host, connection reset) and every Timeout is
+        # "blind" (Invariant 7: blindness is never a no).
         if isinstance(health, requests.exceptions.ConnectionError):
-            # Connection refused: the host answered RST — no seat listener.
-            return ("down", None, None)
+            # Walk the exception chain: requests wraps the underlying
+            # ConnectionRefusedError in a ConnectionError. Check both the
+            # exception itself and its __cause__/__context__ chain.
+            _exc = health
+            while _exc is not None:
+                if isinstance(_exc, ConnectionRefusedError):
+                    # Connection refused: the host answered RST — no seat
+                    # listener.
+                    return ("down", None, None, type(health).__name__)
+                _exc = _exc.__cause__ or _exc.__context__
+            # Non-refused ConnectionError (DNS, unreachable, reset): blind.
+            return ("blind", None, None, type(health).__name__)
         if not isinstance(health, requests.Response):
-            # Timeout or any other connection error: indeterminate.
-            return ("blind", None, None)
+            # Timeout or any other non-ConnectionError: indeterminate.
+            return ("blind", None, None, type(health).__name__)
 
         # A listener exists. Identity half — only when the models response is
         # an actual HTTP response (a sequential short-circuit on a refused
@@ -1358,7 +1382,7 @@ class _NodeState:
                     served_id = data[0].get("id")
                     if isinstance(served_id, str) and served_id:
                         if served_id == GW_FLASHNEXT_MODEL_ID:
-                            return ("up_registered", served_id, True)
+                            return ("up_registered", served_id, True, None)
                         # Identifiable non-seat occupant (D2: UP_FOREIGN).
                         log.warning(
                             f"[{self.node_name}] flashnext-seat-foreign-occupant — "
@@ -1366,12 +1390,12 @@ class _NodeState:
                             f"(expected {GW_FLASHNEXT_MODEL_ID!r}); not a window, "
                             f"operator-visible /status state to clear"
                         )
-                        return ("up_foreign", served_id, False)
+                        return ("up_foreign", served_id, False, None)
             except Exception:
                 pass
         # /health answered but /v1/models was non-200 / unparseable / timed
         # out: a listener exists, identity unverified (SGLang mid-load).
-        return ("up_unverified", None, None)
+        return ("up_unverified", None, None, None)
 
     def _probe_slot_activity(self) -> bool | None:
         """Tri-state unmediated-caller activity probe across all signal sources
@@ -1479,7 +1503,7 @@ class _NodeState:
         # the window determination must work regardless of that flag) and
         # never joined to the activity vote lists (Invariant 8: :30000
         # activity is irrelevant to the 27B axis's idle clock).
-        flashnext_state, flashnext_served_id, flashnext_registered = (
+        flashnext_state, flashnext_served_id, flashnext_registered, _fn_err = (
             self._probe_flashnext_seat(sequential=False)
         )
 
@@ -1513,13 +1537,21 @@ class _NodeState:
             self._flashnext_state = flashnext_state
             self._flashnext_served_id = flashnext_served_id
             self._flashnext_registered = flashnext_registered
-            window = (
-                "active"
-                if flashnext_state in ("up_registered", "up_unverified") and not serving
-                else "none"
-                if flashnext_state in ("down", "up_foreign")
-                else None
-            )
+            # Window determination (D2): ACTIVE iff the :30000 probe reports
+            # a seat listener (up_registered OR up_unverified — the safe
+            # direction) AND the :8081 day-seat probe reports down. When the
+            # seat is up but the day seat is ALSO up (hand-back overlap,
+            # both briefly serving), the window is "none" — the day seat is
+            # serving, so no handover is in progress. A blind probe leaves
+            # the window indeterminate (None) — the 27B axis behaves exactly
+            # as today (Invariant 7: blindness is not down on the :30000
+            # axis).
+            if flashnext_state in ("up_registered", "up_unverified"):
+                window = "active" if not serving else "none"
+            elif flashnext_state in ("down", "up_foreign"):
+                window = "none"
+            else:  # "blind"
+                window = None
             if window == "active":
                 if self._flashnext_window != "active":
                     # First active read this window (or re-open after a flap):
@@ -2036,7 +2068,7 @@ class _NodeState:
             # :8081 GET. The probe is FRESH (never the 45s cache): this is the
             # only path that would issue a wake, so the guard must not act on
             # a stale read (Invariant 4).
-            seat_state, seat_served_id, _seat_registered = (
+            seat_state, seat_served_id, _seat_registered, seat_error_class = (
                 self._probe_flashnext_seat(sequential=True)
             )
             if seat_state in ("up_registered", "up_unverified"):
@@ -2060,17 +2092,13 @@ class _NodeState:
                 # a missing probe is blindness, never False; and a BRIX->GW
                 # partition breaks the wake's own ssh first) — but the blind
                 # pass is a log line, not silence (gate binding constraint):
-                # the structured warning carries the probe error class.
+                # the structured warning carries the ACTUAL probe error class
+                # (returned by the probe, not a static placeholder).
                 # (Deliberate asymmetry with the flip-controller guard's
                 # fail-closed BLIND: Invariant 13.)
-                # The probe returns a state string, not the error object, so
-                # the class is named from the probe's own failure mapping:
-                # the two requests exception families that reach BLIND are
-                # Timeout (connect/read timeout) and the ConnectionError
-                # family that is NOT the refused/DOWN split.
                 log.warning(
                     f"[{self.node_name}] flashnext-seat-probe-blind — :30000 probe "
-                    f"indeterminate (error_class=Timeout|ConnectionError), "
+                    f"indeterminate (error_class={seat_error_class}), "
                     f"proceeding with wake exactly as today"
                 )
             elif seat_state == "up_foreign":
@@ -2946,7 +2974,8 @@ class _NodeState:
                 "flashnext": {
                     "seat_health": (
                         None
-                        if self._flashnext_state == "blind"
+                        if self._flashnext_state is None
+                        or self._flashnext_state == "blind"
                         else self._flashnext_state
                         in ("up_registered", "up_unverified", "up_foreign")
                     ),

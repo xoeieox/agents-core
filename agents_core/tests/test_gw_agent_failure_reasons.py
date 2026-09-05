@@ -284,3 +284,100 @@ class TestCallGwAgentIntegrationReasonOut:
             # 1 initial attempt + GW_STEP_MAX_RETRIES retries.
             assert mock_post.call_count == GW_STEP_MAX_RETRIES + 1
             assert mock_sleep.call_count == GW_STEP_MAX_RETRIES
+
+
+class TestDoorman409SeatOccupied:
+    """agents-core-doorman-flashnext-handover-v0, Deliverable 4:
+    a doorman 409 (creative_occupied or flashnext_occupied) is caught in the
+    per-run acquire block and routed through on_wake_fail with the distinct
+    reason "gw_seat_occupied" — distinguishable from "gw_unreachable" and
+    "gw_not_serving". The identical hole existed for creative_occupied 409s;
+    this branch repairs both."""
+
+    def _make_409(self, body: dict) -> "httpx.HTTPStatusError":
+        import httpx
+        resp = httpx.Response(
+            409,
+            json=body,
+            request=httpx.Request("POST", "http://127.0.0.1:8407/lease/acquire"),
+        )
+        return httpx.HTTPStatusError("409", request=resp.request, response=resp)
+
+    def test_409_flashnext_occupied_skip_reason(self):
+        """409 flashnext_occupied + on_wake_fail='skip' -> reason_out gets
+        'gw_seat_occupied', returns None."""
+        import httpx
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post"):
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            # Simulate the 409 from client.acquire via _acquire_with_defer_retry
+            with patch("agents_core.gw_agent._acquire_with_defer_retry",
+                       side_effect=self._make_409(
+                           {"ok": False, "flashnext_occupied": True,
+                            "reason": "flashnext-window-holding-gpu0"})):
+                reason_out = []
+                result = call_gw_agent(
+                    prompt="Review.", reason_out=reason_out, timeout=10,
+                    on_wake_fail="skip",
+                )
+                assert result is None
+                assert reason_out == ["gw_seat_occupied"]
+
+    def test_409_creative_occupied_skip_reason(self):
+        """409 creative_occupied + on_wake_fail='skip' -> same reason
+        'gw_seat_occupied' (both refusal classes are the same 409)."""
+        import httpx
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post"):
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            with patch("agents_core.gw_agent._acquire_with_defer_retry",
+                       side_effect=self._make_409(
+                           {"ok": False, "creative_occupied": True,
+                            "reason": "creative-collider-holding-gpu"})):
+                reason_out = []
+                result = call_gw_agent(
+                    prompt="Review.", reason_out=reason_out, timeout=10,
+                    on_wake_fail="skip",
+                )
+                assert result is None
+                assert reason_out == ["gw_seat_occupied"]
+
+    def test_409_error_policy_raises(self):
+        """409 + on_wake_fail='error' -> raises."""
+        import httpx
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post"):
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            with patch("agents_core.gw_agent._acquire_with_defer_retry",
+                       side_effect=self._make_409(
+                           {"ok": False, "flashnext_occupied": True,
+                            "reason": "flashnext-window-holding-gpu0"})):
+                with pytest.raises(httpx.HTTPStatusError):
+                    call_gw_agent(
+                        prompt="Review.", timeout=10,
+                        on_wake_fail="error",
+                    )
+
+    def test_non_409_http_error_reraises(self):
+        """A non-409 HTTPStatusError is re-raised (not swallowed)."""
+        import httpx
+        resp = httpx.Response(
+            500,
+            json={"error": "internal"},
+            request=httpx.Request("POST", "http://127.0.0.1:8407/lease/acquire"),
+        )
+        err = httpx.HTTPStatusError("500", request=resp.request, response=resp)
+        with patch("agents_core.doorman_client.DoormanClient") as mock_doorman_class, \
+             patch("requests.post"):
+            mock_doorman = MagicMock()
+            mock_doorman_class.return_value = mock_doorman
+            with patch("agents_core.gw_agent._acquire_with_defer_retry",
+                       side_effect=err):
+                with pytest.raises(httpx.HTTPStatusError):
+                    call_gw_agent(
+                        prompt="Review.", timeout=10,
+                        on_wake_fail="skip",
+                    )
