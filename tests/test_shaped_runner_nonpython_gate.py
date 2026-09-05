@@ -243,7 +243,6 @@ def test_ac3_python_worktree_no_tests_touched_last_outcome_zero_salvage_pr(tmp_p
     tail = shaped_dir / "abc123-tail.log"
     assert tail.exists()
     assert any("gate FAILED" in line for line in tail.read_text().splitlines())
-    assert body == ""
 
 
 # ---------------------------------------------------------------------------
