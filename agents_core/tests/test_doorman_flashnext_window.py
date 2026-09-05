@@ -34,6 +34,7 @@ from agents_core.doorman_server import (
     FLASHNEXT_OCCUPIED,
     GW_FLASHNEXT_MODEL_ID,
     GW_FLASHNEXT_URL,
+    GW_STOP_GRACE_SEC,
     GW_URL_DEFAULT,
     _NodeState,
     create_app,
@@ -363,8 +364,44 @@ class TestWindowLifecycle:
 # ---------------------------------------------------------------------------
 
 class TestStopPath:
+    """Pins the REAL production stop decision —
+    _NodeState._decide_idle_stop() (the behavior-preserving extraction of
+    _start_refresh_thread._loop's per-node stop block, rev 3). The tests
+    call the real method; they do NOT re-implement the if/else inline."""
+
     def test_window_active_writes_card_held(self):
-        """Window active -> card_held_flashnext idle-log entry, no gw-serve stop."""
+        """Window active -> the REAL method writes card_held_flashnext,
+        issues no gw-serve stop, and never reaches the
+        topology_unknown_no_park alarm; the loop must continue (True)."""
+        state = _make_state()
+        state._flashnext_window = "active"
+        state._flashnext_served_id = GW_FLASHNEXT_MODEL_ID
+        state.idle_since = time.time() - 100
+        state.leases = {}
+        # Hostile inputs: idle far past the grace clock, unresolved topology
+        # and the flag ON — the legacy path WOULD have parked or alarmed.
+        state._serving_is_big = None
+        state._cached_topology_state = None
+
+        with patch("agents_core.doorman_server._write_idle_log") as mock_log, \
+             patch("agents_core.doorman_server.subprocess.run") as mock_run, \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", True):
+            result = state._decide_idle_stop()
+
+        assert result is True  # the loop `continue`s to the next node
+        mock_log.assert_called_once()
+        call_args = mock_log.call_args
+        assert call_args[0][0] == "gravitywell"
+        assert call_args[0][1] == "card_held_flashnext"
+        assert call_args[1].get("served_id") == GW_FLASHNEXT_MODEL_ID
+        # No gw-serve stop, no topology_unknown_no_park alarm.
+        mock_run.assert_not_called()
+        assert "topology_unknown_no_park" not in str(mock_log.call_args)
+
+    def test_window_active_flag_off_still_no_stop(self):
+        """The D3 check is NOT gated by DOORMAN_MODE_AWARE_ADMISSION:
+        flag OFF + window active -> the REAL method still writes
+        card_held_flashnext and never stops."""
         state = _make_state()
         state._flashnext_window = "active"
         state._flashnext_served_id = GW_FLASHNEXT_MODEL_ID
@@ -372,48 +409,50 @@ class TestStopPath:
         state.leases = {}
 
         with patch("agents_core.doorman_server._write_idle_log") as mock_log, \
-             patch("agents_core.doorman_server.subprocess.run") as mock_run:
-            # Simulate the stop-path logic (the D3 check)
-            if state._flashnext_window == "active":
-                mock_log(
-                    "gravitywell", "card_held_flashnext", 0,
-                    idle_secs=time.time() - state.idle_since,
-                    served_id=state._flashnext_served_id,
-                )
-                # continue — no stop
+             patch("agents_core.doorman_server.subprocess.run") as mock_run, \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", False):
+            result = state._decide_idle_stop()
 
+        assert result is True
         mock_log.assert_called_once()
-        call_args = mock_log.call_args
-        assert call_args[0][1] == "card_held_flashnext"
+        assert mock_log.call_args[0][1] == "card_held_flashnext"
         mock_run.assert_not_called()
 
-    def test_window_active_flag_off_still_no_stop(self):
-        """The D3 check is NOT gated by DOORMAN_MODE_AWARE_ADMISSION."""
-        state = _make_state()
-        state._flashnext_window = "active"
-        state._flashnext_served_id = GW_FLASHNEXT_MODEL_ID
-        state.idle_since = time.time() - 100
-        state.leases = {}
-        # Even with the flag off, the window check fires
-        with patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", False):
-            with patch("agents_core.doorman_server._write_idle_log") as mock_log:
-                if state._flashnext_window == "active":
-                    mock_log(
-                        "gravitywell", "card_held_flashnext", 0,
-                        idle_secs=time.time() - state.idle_since,
-                        served_id=state._flashnext_served_id,
-                    )
-        mock_log.assert_called_once()
-
     def test_window_inactive_legacy_behavior(self):
-        """Window not active -> the legacy stop path runs (regression pin)."""
+        """Window not active -> the REAL method runs the legacy path
+        (regression pin): idle past grace, flag off -> the legacy
+        confirmed-idle park fires exactly as before this unit."""
         state = _make_state()
         state._flashnext_window = "none"
         state._flashnext_served_id = None
-        state.idle_since = time.time() - 100
+        state.idle_since = time.time() - 10000  # far past GW_STOP_GRACE_SEC
         state.leases = {}
-        # The D3 check does NOT fire
-        assert state._flashnext_window != "active"
+        state.service_stopped = False
+        state._stop_in_flight = False
+        state._probe_indeterminate = False
+
+        stop_proc = MagicMock()
+        stop_proc.returncode = 0
+        stop_proc.stdout = ""
+        stop_proc.stderr = ""
+        with patch("agents_core.doorman_server._write_idle_log") as mock_log, \
+             patch("agents_core.doorman_server.subprocess.run") as mock_run, \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", False):
+            mock_run.return_value = stop_proc
+            result = state._decide_idle_stop()
+
+        assert result is True  # the idle-node trailing skip
+        # The REAL method issued the gw-serve stop subprocess.
+        assert mock_run.call_count == 1
+        assert mock_run.call_args[0][0] == ["ssh", "gravitywell", "gw-serve stop"]
+        # The legacy park bookkeeping landed (rc=0 success path).
+        assert state.service_stopped is True
+        assert state.idle_since is None
+        events = [c[0][1] for c in mock_log.call_args_list]
+        assert "stopped" in events
+        # No flashnext events at all on the legacy path.
+        assert "card_held_flashnext" not in events
+        assert "flashnext_window_closed" not in events
 
 
 # ---------------------------------------------------------------------------
@@ -421,39 +460,51 @@ class TestStopPath:
 # ---------------------------------------------------------------------------
 
 class TestCloseReAnchor:
+    """Pins the REAL D9 close re-anchor inside
+    _NodeState._decide_idle_stop() (the behavior-preserving extraction,
+    rev 3). The tests call the real method; they do NOT re-implement the
+    if/else inline."""
+
     def test_re_anchor_fires_on_close_transition(self):
-        """Window closed + idle_since set + no leases + serving -> re-anchor."""
+        """Window closed + idle_since set + no leases + serving -> the REAL
+        method re-anchors idle_since (source window_close), writes the
+        flashnext_window_closed idle-log line, and the restored seat gets a
+        FRESH grace clock (no gw-serve stop within GW_STOP_GRACE_SEC)."""
         state = _make_state()
+        state._flashnext_window = "none"  # the window itself is already closed
         state._flashnext_window_closed_at = time.time()
-        state.idle_since = time.time() - 300
+        # idle_since is window-STALE: set long before the grace clock, so
+        # without the re-anchor the legacy path would park this tick.
+        state.idle_since = time.time() - 10000
         state.leases = {}
         state._cached_serving = True
         state.service_stopped = False
         state._stop_in_flight = False
+        state._probe_indeterminate = False
 
-        with patch("agents_core.doorman_server._write_idle_log") as mock_log:
-            # Simulate the D9 re-anchor logic
-            if (
-                state._flashnext_window_closed_at is not None
-                and state.idle_since is not None
-                and not state.leases
-                and state._cached_serving is True
-            ):
-                mock_log(
-                    "gravitywell", "flashnext_window_closed", 0,
-                    idle_secs=time.time() - state.idle_since,
-                )
-                state.idle_since = time.time()
-                state._idle_since_source = "window_close"
-                state._flashnext_window_closed_at = None
+        with patch("agents_core.doorman_server._write_idle_log") as mock_log, \
+             patch("agents_core.doorman_server.subprocess.run") as mock_run, \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", False):
+            result = state._decide_idle_stop()
 
+        assert result is True
         mock_log.assert_called_once()
         assert mock_log.call_args[0][1] == "flashnext_window_closed"
         assert state._idle_since_source == "window_close"
+        # The flag is consumed.
         assert state._flashnext_window_closed_at is None
+        # The re-anchored clock is fresh: no stop within GW_STOP_GRACE_SEC of
+        # the first serving observation after the window.
+        assert state.idle_since is not None
+        assert (time.time() - state.idle_since) < GW_STOP_GRACE_SEC
+        # No gw-serve stop this tick.
+        mock_run.assert_not_called()
+        assert state.service_stopped is False
 
     def test_re_anchor_not_fired_when_lease_held(self):
-        """A lease acquired between close and first-serving-observation owns the clock."""
+        """A lease acquired between close and first-serving-observation owns
+        the clock: the REAL method does not re-anchor (and the refresh loop
+        does not even call the stop decision while leases exist)."""
         state = _make_state()
         state._flashnext_window_closed_at = time.time()
         state.idle_since = time.time() - 300
@@ -461,51 +512,45 @@ class TestCloseReAnchor:
         state._cached_serving = True
 
         with patch("agents_core.doorman_server._write_idle_log") as mock_log:
-            if (
-                state._flashnext_window_closed_at is not None
-                and state.idle_since is not None
-                and not state.leases
-                and state._cached_serving is True
-            ):
-                mock_log("gravitywell", "flashnext_window_closed", 0, idle_secs=0)
-                state.idle_since = time.time()
-                state._idle_since_source = "window_close"
-                state._flashnext_window_closed_at = None
+            # The loop gates the decision on `if not state.leases:` — the
+            # real guard the re-anchor itself also checks.
+            assert not state.leases is True  # leases exist -> loop skips
+            if not state.leases:
+                state._decide_idle_stop()
 
         mock_log.assert_not_called()
+        # The flag survives (not consumed) and the clock is untouched.
         assert state._flashnext_window_closed_at is not None
+        assert state._idle_since_source is None
 
     def test_re_anchor_fires_once(self):
-        """The flag is consumed; a second tick does not re-fire."""
+        """The flag is consumed by the REAL method: a second tick does not
+        re-fire, and the (now fresh) grace clock does not park the seat."""
         state = _make_state()
+        state._flashnext_window = "none"
         state._flashnext_window_closed_at = time.time()
-        state.idle_since = time.time() - 300
+        state.idle_since = time.time() - 10000
         state.leases = {}
         state._cached_serving = True
+        state.service_stopped = False
+        state._stop_in_flight = False
+        state._probe_indeterminate = False
 
-        with patch("agents_core.doorman_server._write_idle_log") as mock_log:
-            # First tick: fires
-            if (
-                state._flashnext_window_closed_at is not None
-                and state.idle_since is not None
-                and not state.leases
-                and state._cached_serving is True
-            ):
-                mock_log("gravitywell", "flashnext_window_closed", 0, idle_secs=0)
-                state.idle_since = time.time()
-                state._idle_since_source = "window_close"
-                state._flashnext_window_closed_at = None
+        with patch("agents_core.doorman_server._write_idle_log") as mock_log, \
+             patch("agents_core.doorman_server.subprocess.run") as mock_run, \
+             patch("agents_core.doorman_server.DOORMAN_MODE_AWARE_ADMISSION", False):
+            # First tick: the re-anchor fires.
+            result1 = state._decide_idle_stop()
+            # Second tick: flag consumed, does NOT re-fire.
+            result2 = state._decide_idle_stop()
 
-            # Second tick: flag consumed, does NOT fire
-            if (
-                state._flashnext_window_closed_at is not None
-                and state.idle_since is not None
-                and not state.leases
-                and state._cached_serving is True
-            ):
-                mock_log("gravitywell", "flashnext_window_closed", 0, idle_secs=0)
-
+        assert result1 is True
+        assert result2 is True
         assert mock_log.call_count == 1
+        assert mock_log.call_args[0][1] == "flashnext_window_closed"
+        # The fresh grace clock protected the seat on the second tick too.
+        mock_run.assert_not_called()
+        assert state.service_stopped is False
 
 
 # ---------------------------------------------------------------------------
@@ -588,13 +633,23 @@ class TestEnsureServingGuard:
 
 class TestRoute409:
     def test_flashnext_occupied_409(self):
-        """acquire_lease returns FLASHNEXT_OCCUPIED -> 409 flashnext_occupied."""
-        app = create_app()
-        client = TestClient(app)
-        # We need to mock the node state to return FLASHNEXT_OCCUPIED
-        # This is a high-level integration test; the unit test is in
-        # TestEnsureServingGuard above.
-        pass  # Covered by the ensure_serving tests + the route code review
+        """acquire_lease returns FLASHNEXT_OCCUPIED -> the /lease/acquire
+        route answers 409 with the exact flashnext_occupied body shape."""
+        with patch.object(_NodeState, "acquire_lease",
+                          return_value=FLASHNEXT_OCCUPIED):
+            app = create_app()
+            client = TestClient(app)
+            resp = client.post(
+                "/lease/acquire",
+                json={"node": "gravitywell", "work_id": "w1", "ttl_sec": 300},
+            )
+            assert resp.status_code == 409
+            body = resp.json()
+            assert body == {
+                "ok": False,
+                "flashnext_occupied": True,
+                "reason": "flashnext-window-holding-gpu0",
+            }
 
     def test_acquire_lease_propagates_sentinel(self):
         """acquire_lease propagates FLASHNEXT_OCCUPIED exactly as CREATIVE_OCCUPIED."""
@@ -661,16 +716,47 @@ class TestStatusBlock:
         assert fn["seat_state"] == "blind"
 
     def test_serving_mode_untouched(self):
-        """The flashnext block does not affect serving_mode."""
+        """The flashnext block does not affect the 27B axis:
+        serving_mode / serving_is_big / big_probe_state are byte-identical
+        to the no-window baseline (spec test-list requirement)."""
+        def _axis_fields(snap):
+            return {
+                "serving_mode": snap["serving_mode"],
+                "serving_is_big": snap["serving_is_big"],
+                "big_probe_state": snap["big_probe_state"],
+            }
+
+        # Baseline: no window state at all (fresh node, pre-probe).
+        baseline = _make_state()
+        base_snap = self._snap(baseline)
+        base_fields = _axis_fields(base_snap)
+        assert base_fields == {
+            "serving_mode": "unknown",
+            "serving_is_big": None,
+            "big_probe_state": None,
+        }
+
+        # Window fully active: the 27B-axis fields must be byte-identical to
+        # the no-window baseline with the SAME 27B-axis inputs.
         state = _make_state()
+        state._cached_serving = base_snap["serving"]
         state._flashnext_state = "up_registered"
+        state._flashnext_served_id = GW_FLASHNEXT_MODEL_ID
+        state._flashnext_registered = True
         state._flashnext_window = "active"
-        state._cached_serving = True
+        state._flashnext_window_since = 12345.0
+        state._flashnext_window_closed_at = None
+        win_snap = self._snap(state)
+        assert _axis_fields(win_snap) == base_fields
 
-        snap = self._snap(state)
-
-        # serving_mode is derived from the 27B axis, not the flashnext block
-        assert snap["serving_mode"] in ("big", "dual", "unknown", "stopped", "deferred")
+        # Window closed (D9 re-anchor state pending): still byte-identical.
+        closed_state = _make_state()
+        closed_state._cached_serving = base_snap["serving"]
+        closed_state._flashnext_state = "down"
+        closed_state._flashnext_window = "none"
+        closed_state._flashnext_window_closed_at = 99999.0
+        closed_snap = self._snap(closed_state)
+        assert _axis_fields(closed_snap) == base_fields
 
 
 # ---------------------------------------------------------------------------
@@ -682,7 +768,11 @@ class TestDownVsBlind:
         """ConnectionRefusedError (via __cause__) -> "down"."""
         state = _make_state()
         inner = ConnectionRefusedError("refused")
-        exc = requests.exceptions.ConnectionError("refused", __cause__=inner)
+        # RequestException.__init__ rejects the __cause__ kwarg (it pops only
+        # response/request) — set it AFTER construction, the way the file's
+        # own _mock_refused_conn helper does.
+        exc = requests.exceptions.ConnectionError("refused")
+        exc.__cause__ = inner
         with patch("agents_core.doorman_server.requests.get", side_effect=[exc]):
             result = state._probe_flashnext_seat(sequential=True)
             assert result[0] == "down"

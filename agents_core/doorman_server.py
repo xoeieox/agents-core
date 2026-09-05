@@ -2846,6 +2846,289 @@ class _NodeState:
             _write_idle_log(self.node_name, "resumed", lease_count_for_log)
         return CONTENDED if contended else True
 
+    def _decide_idle_stop(self) -> bool:
+        """The per-node idle-stop decision of the refresh loop (rev 3,
+        agents-core-doorman-flashnext-handover-v0): extracted VERBATIM from
+        _start_refresh_thread._loop's `if not state.leases:` block — same
+        order, same behavior, no second lock. The caller runs with
+        self.lock ALREADY held (the refresh loop's critical section); this
+        method takes no lock of its own, so D9's re-anchor remains a single
+        atomic read-modify-write under state.lock (gate binding
+        constraint): read window_closed_at / idle_since / leases / the
+        same-tick cached serving, and write idle_since + clear
+        window_closed_at, in the same critical section.
+
+        Returns True when the refresh loop must `continue` to the next node
+        (a D3 window hold, the topology_unknown_no_park alarm, a
+        blind-bounded pause, or the trailing idle-node skip); False when the
+        loop falls through to the keepawake-hold refresh (only when
+        idle_since is None or a stop is already in flight).
+
+        The loop's `backoff` variable (bumped on stop failures) is deliberately
+        left in the loop: it only throttles the loop's sleep between ticks
+        and is invisible to the per-node decision itself.
+        """
+        # Flash-next window (agents-core-doorman-flashnext-
+        # handover-v0, D3): the keeper now KNOWS the nature of
+        # the room — the :30000 seat holds GPU 0 whole-card
+        # and the 27B is down by design. Never park, never
+        # stop, never alarm: the 2026-08-19 ruling is
+        # satisfied by knowledge, not by continued refusal.
+        # NOT gated by DOORMAN_MODE_AWARE_ADMISSION (D3/
+        # Invariant 9): the window is a property of the seat,
+        # not of the admission policy — a flag-off doorman
+        # must still not park the card the seat holds.
+        if self._flashnext_window == "active":
+            _write_idle_log(
+                self.node_name, "card_held_flashnext", 0,
+                idle_secs=(
+                    time.time() - self.idle_since
+                    if self.idle_since is not None else None
+                ),
+                served_id=self._flashnext_served_id,
+            )
+            return True
+
+        # Flash-next close re-anchor (D9): the stop path's
+        # grace clock reads idle_since, which the last
+        # pre-window lease release (or TTL-GC) set at window
+        # open and nothing refreshes during the window.
+        # Without a re-anchor, the first tick after close
+        # with the restored 27B serving would compute
+        # idle_elapsed = the full window duration >=
+        # GW_STOP_GRACE_SEC and confirmed-idle-park the seat
+        # the launcher just cold-restored. Window-close +
+        # restored serving is an operator-intent activity
+        # boundary (the same class as the lease-acquire and
+        # probe-activity re-anchors): the restored seat
+        # receives a full fresh GW_STOP_GRACE_SEC from the
+        # doorman's first observation of it serving after
+        # the window. Single atomic read-modify-write under
+        # state.lock (gate binding constraint): read
+        # window_closed_at / idle_since / leases / the
+        # same-tick cached serving, and write idle_since +
+        # clear window_closed_at, in the same critical
+        # section (the caller already holds the lock; no
+        # second lock). One-shot (the flag is
+        # consumed); fires only on the close transition — a
+        # normal wake (no window in the history) is
+        # byte-identical to today, and a lease acquired
+        # between close and first-serving-observation already
+        # owns the clock (acquire sets idle_since = None).
+        # NOT gated by DOORMAN_MODE_AWARE_ADMISSION
+        # (Invariant 9).
+        if (
+            self._flashnext_window_closed_at is not None
+            and self.idle_since is not None
+            and not self.leases
+            and self._cached_serving is True
+        ):
+            _write_idle_log(
+                self.node_name, "flashnext_window_closed", 0,
+                idle_secs=time.time() - self.idle_since,
+            )
+            self.idle_since = time.time()
+            self._idle_since_source = "window_close"
+            self._flashnext_window_closed_at = None
+
+        if (
+            self.idle_since is not None
+            and not self.service_stopped
+            # R5: a manual force-stop already owns the single
+            # writer for this node — never launch a second
+            # gw-serve stop, and never block on state.lock
+            # waiting for it (we already hold the lock; simply
+            # skip issuing our own this tick).
+            and not self._stop_in_flight
+        ):
+            idle_elapsed = time.time() - self.idle_since
+
+            # Unknown topology (Erah ruling 2026-08-19, agents-core-
+            # doorman-class-aware-activity-probe-v0 D2/D3): a keeper
+            # who does not know the nature of the room does not close
+            # the door. Never park, never guess a class — grace clock
+            # stays paused with NO bound (unlike the blindness bound
+            # below), and a distinct alarm fires every tick instead of
+            # a stop attempt, carrying the same diagnostic fields as
+            # the topology_resolution_unknown warning. Only applies
+            # when the flag is ON (_serving_is_big is never populated
+            # otherwise, so flag-off transparently falls through to
+            # the unchanged legacy path below).
+            if DOORMAN_MODE_AWARE_ADMISSION and self._serving_is_big is None:
+                topo = self._cached_topology_state
+                _write_idle_log(
+                    self.node_name, "topology_unknown_no_park", 0,
+                    idle_secs=idle_elapsed,
+                    reason="topology_unknown_no_park",
+                    authority_gap=None if topo is None else topo.authority_gap,
+                    models_answered=_topology_models_answered(topo),
+                    served_ids=None if topo is None else topo.served_ids,
+                    unknown_model=None if topo is None else topo.unknown_model,
+                )
+                log.warning(
+                    f"[{self.node_name}] topology_unknown_no_park — idle "
+                    f"{idle_elapsed:.0f}s but serving class unresolved; "
+                    f"refusing to park, alarming instead"
+                )
+                return True
+
+            blindness_deadline = (
+                GW_STOP_GRACE_SEC + DOORMAN_PROBE_BLINDNESS_SEC
+            )
+            if self._probe_indeterminate and idle_elapsed < blindness_deadline:
+                # Probe genuinely ambiguous this tick (gw-doorman-vllm-
+                # activity-probe-v0) — pause the grace clock rather than
+                # advance it, same as if leases were held. Bounded below.
+                return True
+            if self._probe_indeterminate:
+                log.warning(
+                    f"[{self.node_name}] probe blind for {idle_elapsed:.0f}s — "
+                    f"proceeding on stale grace period"
+                )
+            if idle_elapsed >= GW_STOP_GRACE_SEC:
+                # Idle-log reason (D3): distinguishes a genuinely
+                # confirmed-idle park from one taken only because the
+                # blindness bound was exceeded, so the journal line is
+                # diagnosable rather than reading as one undifferentiated
+                # "stopped" event.
+                stop_reason = (
+                    "probe_blind_bound_exceeded"
+                    if self._probe_indeterminate else "confirmed_idle"
+                )
+                indeterminate_sources = [
+                    name for name, v in (self._last_probe_raw or {}).items()
+                    if v is None
+                ]
+                log.warning(
+                    f"[{self.node_name}] idle {idle_elapsed:.0f}s >= grace "
+                    f"{GW_STOP_GRACE_SEC}s — issuing gw-serve stop. "
+                    f"Safety: guard blocks suspend while service active; "
+                    f"doorman stop enables suspend, never forces it."
+                )
+                # Single-writer bookkeeping (R5), shared with
+                # _force_stop: bumping the epoch and setting
+                # _stop_in_flight here means a concurrent
+                # manual force-stop sees this attempt and
+                # defers to it, and — if this call times out
+                # while GW is still shutting down — the next
+                # tick will not re-issue a second gw-serve
+                # stop for the same unload.
+                self._stop_epoch += 1
+                self._stop_in_flight = True
+                self._stop_in_flight_since = time.time()
+                try:
+                    stop_proc = subprocess.run(
+                        ["ssh", "gravitywell", "gw-serve stop"],
+                        capture_output=True, text=True,
+                        timeout=GW_SERVE_STOP_TIMEOUT_SEC,
+                    )
+                    if stop_proc.returncode == 0:
+                        self.service_stopped = True
+                        self.idle_since = None
+                        self._idle_since_source = None
+                        self._cached_serving = False
+                        self._serving_checked_at = time.time()
+                        self._stop_in_flight = False
+                        self._stop_in_flight_since = None
+                        stopped_desc = _describe_stopped_units(
+                            stop_proc.stdout, self.node_name
+                        )
+                        log.warning(
+                            f"[{self.node_name}] gw-serve stop succeeded — "
+                            f"{stopped_desc}, host now "
+                            f"suspend-eligible via guard"
+                        )
+                        _write_idle_log(
+                            self.node_name, "stopped", 0,
+                            idle_secs=idle_elapsed,
+                            reason=stop_reason,
+                            indeterminate_sources=indeterminate_sources,
+                        )
+                    else:
+                        # rc != 0: idempotency guard — check if already down
+                        if not self._is_serving():
+                            # Already stopped — treat as success
+                            self.service_stopped = True
+                            self.idle_since = None
+                            self._idle_since_source = None
+                            self._cached_serving = False
+                            self._serving_checked_at = time.time()
+                            self._stop_in_flight = False
+                            self._stop_in_flight_since = None
+                            log.warning(
+                                f"[{self.node_name}] gw-serve stop "
+                                f"rc={stop_proc.returncode} but service "
+                                f"already down — treating as success"
+                            )
+                            _write_idle_log(
+                                self.node_name, "stopped", 0,
+                                idle_secs=idle_elapsed,
+                                reason=stop_reason,
+                                indeterminate_sources=indeterminate_sources,
+                            )
+                        else:
+                            # Real failure: still serving
+                            err = (
+                                f"gw-serve stop failed "
+                                f"rc={stop_proc.returncode}: "
+                                f"{stop_proc.stderr[:200]}"
+                            )
+                            log.error(f"[{self.node_name}] {err}")
+                            self.last_error = err
+                            self._stop_in_flight = False
+                            self._stop_in_flight_since = None
+                            _write_idle_log(
+                                self.node_name, "stop_failed", 0,
+                                idle_secs=idle_elapsed,
+                                indeterminate_sources=indeterminate_sources,
+                            )
+                except subprocess.TimeoutExpired:
+                    # R2/R5: a timeout is not a failure —
+                    # resolve by observation. Confirmed down
+                    # -> treat as success; still serving ->
+                    # leave service_stopped and
+                    # _stop_in_flight alone (do not write
+                    # stop_failed, do not re-issue next tick)
+                    # so a later tick or the R8 reconciler
+                    # resolves it.
+                    if not self._is_serving():
+                        self.service_stopped = True
+                        self.idle_since = None
+                        self._idle_since_source = None
+                        self._cached_serving = False
+                        self._serving_checked_at = time.time()
+                        self._stop_in_flight = False
+                        self._stop_in_flight_since = None
+                        log.warning(
+                            f"[{self.node_name}] gw-serve stop timed out "
+                            f"after {GW_SERVE_STOP_TIMEOUT_SEC}s but "
+                            f"service already down — treating as "
+                            f"success"
+                        )
+                        _write_idle_log(
+                            self.node_name, "stopped", 0,
+                            idle_secs=idle_elapsed,
+                            reason=stop_reason,
+                            indeterminate_sources=indeterminate_sources,
+                        )
+                    else:
+                        log.info(
+                            f"[{self.node_name}] gw-serve stop still "
+                            f"running after "
+                            f"{GW_SERVE_STOP_TIMEOUT_SEC}s — "
+                            f"deferring to next tick"
+                        )
+                except Exception as exc:
+                    err = f"gw-serve stop exception: {exc}"
+                    log.error(f"[{self.node_name}] {err}")
+                    self.last_error = err
+                    self._stop_in_flight = False
+                    self._stop_in_flight_since = None
+                    _write_idle_log(self.node_name, "stop_failed", 0)
+            return True
+
+        return False
+
     def release_lease(self, work_id: str) -> None:
         """Drop a lease. If it was the last, record idle_since and release the hold."""
         self.leases.pop(work_id, None)
@@ -3277,270 +3560,18 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                             _write_idle_log(node_name, "stop_failed", 0)
 
                     if not state.leases:
-                        # No active leases: check if deferred service stop is due
-
-                        # Flash-next window (agents-core-doorman-flashnext-
-                        # handover-v0, D3): the keeper now KNOWS the nature of
-                        # the room — the :30000 seat holds GPU 0 whole-card
-                        # and the 27B is down by design. Never park, never
-                        # stop, never alarm: the 2026-08-19 ruling is
-                        # satisfied by knowledge, not by continued refusal.
-                        # NOT gated by DOORMAN_MODE_AWARE_ADMISSION (D3/
-                        # Invariant 9): the window is a property of the seat,
-                        # not of the admission policy — a flag-off doorman
-                        # must still not park the card the seat holds.
-                        if state._flashnext_window == "active":
-                            _write_idle_log(
-                                node_name, "card_held_flashnext", 0,
-                                idle_secs=(
-                                    time.time() - state.idle_since
-                                    if state.idle_since is not None else None
-                                ),
-                                served_id=state._flashnext_served_id,
-                            )
-                            continue
-
-                        # Flash-next close re-anchor (D9): the stop path's
-                        # grace clock reads idle_since, which the last
-                        # pre-window lease release (or TTL-GC) set at window
-                        # open and nothing refreshes during the window.
-                        # Without a re-anchor, the first tick after close
-                        # with the restored 27B serving would compute
-                        # idle_elapsed = the full window duration >=
-                        # GW_STOP_GRACE_SEC and confirmed-idle-park the seat
-                        # the launcher just cold-restored. Window-close +
-                        # restored serving is an operator-intent activity
-                        # boundary (the same class as the lease-acquire and
-                        # probe-activity re-anchors): the restored seat
-                        # receives a full fresh GW_STOP_GRACE_SEC from the
-                        # doorman's first observation of it serving after
-                        # the window. Single atomic read-modify-write under
-                        # state.lock (gate binding constraint): read
-                        # window_closed_at / idle_since / leases / the
-                        # same-tick cached serving, and write idle_since +
-                        # clear window_closed_at, in the same critical
-                        # section (this block already runs inside the lock
-                        # section; no second lock). One-shot (the flag is
-                        # consumed); fires only on the close transition — a
-                        # normal wake (no window in the history) is
-                        # byte-identical to today, and a lease acquired
-                        # between close and first-serving-observation already
-                        # owns the clock (acquire sets idle_since = None).
-                        # NOT gated by DOORMAN_MODE_AWARE_ADMISSION
-                        # (Invariant 9).
-                        if (
-                            state._flashnext_window_closed_at is not None
-                            and state.idle_since is not None
-                            and not state.leases
-                            and state._cached_serving is True
-                        ):
-                            _write_idle_log(
-                                node_name, "flashnext_window_closed", 0,
-                                idle_secs=time.time() - state.idle_since,
-                            )
-                            state.idle_since = time.time()
-                            state._idle_since_source = "window_close"
-                            state._flashnext_window_closed_at = None
-
-                        if (
-                            state.idle_since is not None
-                            and not state.service_stopped
-                            # R5: a manual force-stop already owns the single
-                            # writer for this node — never launch a second
-                            # gw-serve stop, and never block on state.lock
-                            # waiting for it (we already hold the lock; simply
-                            # skip issuing our own this tick).
-                            and not state._stop_in_flight
-                        ):
-                            idle_elapsed = time.time() - state.idle_since
-
-                            # Unknown topology (Erah ruling 2026-08-19, agents-core-
-                            # doorman-class-aware-activity-probe-v0 D2/D3): a keeper
-                            # who does not know the nature of the room does not close
-                            # the door. Never park, never guess a class — grace clock
-                            # stays paused with NO bound (unlike the blindness bound
-                            # below), and a distinct alarm fires every tick instead of
-                            # a stop attempt, carrying the same diagnostic fields as
-                            # the topology_resolution_unknown warning. Only applies
-                            # when the flag is ON (_serving_is_big is never populated
-                            # otherwise, so flag-off transparently falls through to
-                            # the unchanged legacy path below).
-                            if DOORMAN_MODE_AWARE_ADMISSION and state._serving_is_big is None:
-                                topo = state._cached_topology_state
-                                _write_idle_log(
-                                    node_name, "topology_unknown_no_park", 0,
-                                    idle_secs=idle_elapsed,
-                                    reason="topology_unknown_no_park",
-                                    authority_gap=None if topo is None else topo.authority_gap,
-                                    models_answered=_topology_models_answered(topo),
-                                    served_ids=None if topo is None else topo.served_ids,
-                                    unknown_model=None if topo is None else topo.unknown_model,
-                                )
-                                log.warning(
-                                    f"[{node_name}] topology_unknown_no_park — idle "
-                                    f"{idle_elapsed:.0f}s but serving class unresolved; "
-                                    f"refusing to park, alarming instead"
-                                )
-                                continue
-
-                            blindness_deadline = (
-                                GW_STOP_GRACE_SEC + DOORMAN_PROBE_BLINDNESS_SEC
-                            )
-                            if state._probe_indeterminate and idle_elapsed < blindness_deadline:
-                                # Probe genuinely ambiguous this tick (gw-doorman-vllm-
-                                # activity-probe-v0) — pause the grace clock rather than
-                                # advance it, same as if leases were held. Bounded below.
-                                continue
-                            if state._probe_indeterminate:
-                                log.warning(
-                                    f"[{node_name}] probe blind for {idle_elapsed:.0f}s — "
-                                    f"proceeding on stale grace period"
-                                )
-                            if idle_elapsed >= GW_STOP_GRACE_SEC:
-                                # Idle-log reason (D3): distinguishes a genuinely
-                                # confirmed-idle park from one taken only because the
-                                # blindness bound was exceeded, so the journal line is
-                                # diagnosable rather than reading as one undifferentiated
-                                # "stopped" event.
-                                stop_reason = (
-                                    "probe_blind_bound_exceeded"
-                                    if state._probe_indeterminate else "confirmed_idle"
-                                )
-                                indeterminate_sources = [
-                                    name for name, v in (state._last_probe_raw or {}).items()
-                                    if v is None
-                                ]
-                                log.warning(
-                                    f"[{node_name}] idle {idle_elapsed:.0f}s >= grace "
-                                    f"{GW_STOP_GRACE_SEC}s — issuing gw-serve stop. "
-                                    f"Safety: guard blocks suspend while service active; "
-                                    f"doorman stop enables suspend, never forces it."
-                                )
-                                # Single-writer bookkeeping (R5), shared with
-                                # _force_stop: bumping the epoch and setting
-                                # _stop_in_flight here means a concurrent
-                                # manual force-stop sees this attempt and
-                                # defers to it, and — if this call times out
-                                # while GW is still shutting down — the next
-                                # tick will not re-issue a second gw-serve
-                                # stop for the same unload.
-                                state._stop_epoch += 1
-                                state._stop_in_flight = True
-                                state._stop_in_flight_since = time.time()
-                                try:
-                                    stop_proc = subprocess.run(
-                                        ["ssh", "gravitywell", "gw-serve stop"],
-                                        capture_output=True, text=True,
-                                        timeout=GW_SERVE_STOP_TIMEOUT_SEC,
-                                    )
-                                    if stop_proc.returncode == 0:
-                                        state.service_stopped = True
-                                        state.idle_since = None
-                                        state._idle_since_source = None
-                                        state._cached_serving = False
-                                        state._serving_checked_at = time.time()
-                                        state._stop_in_flight = False
-                                        state._stop_in_flight_since = None
-                                        stopped_desc = _describe_stopped_units(
-                                            stop_proc.stdout, node_name
-                                        )
-                                        log.warning(
-                                            f"[{node_name}] gw-serve stop succeeded — "
-                                            f"{stopped_desc}, host now "
-                                            f"suspend-eligible via guard"
-                                        )
-                                        _write_idle_log(
-                                            node_name, "stopped", 0,
-                                            idle_secs=idle_elapsed,
-                                            reason=stop_reason,
-                                            indeterminate_sources=indeterminate_sources,
-                                        )
-                                    else:
-                                        # rc != 0: idempotency guard — check if already down
-                                        if not state._is_serving():
-                                            # Already stopped — treat as success
-                                            state.service_stopped = True
-                                            state.idle_since = None
-                                            state._idle_since_source = None
-                                            state._cached_serving = False
-                                            state._serving_checked_at = time.time()
-                                            state._stop_in_flight = False
-                                            state._stop_in_flight_since = None
-                                            log.warning(
-                                                f"[{node_name}] gw-serve stop "
-                                                f"rc={stop_proc.returncode} but service "
-                                                f"already down — treating as success"
-                                            )
-                                            _write_idle_log(
-                                                node_name, "stopped", 0,
-                                                idle_secs=idle_elapsed,
-                                                reason=stop_reason,
-                                                indeterminate_sources=indeterminate_sources,
-                                            )
-                                        else:
-                                            # Real failure: still serving
-                                            err = (
-                                                f"gw-serve stop failed "
-                                                f"rc={stop_proc.returncode}: "
-                                                f"{stop_proc.stderr[:200]}"
-                                            )
-                                            log.error(f"[{node_name}] {err}")
-                                            state.last_error = err
-                                            state._stop_in_flight = False
-                                            state._stop_in_flight_since = None
-                                            backoff = min(
-                                                backoff + 15, GW_HOLD_REFRESH_SEC
-                                            )
-                                            _write_idle_log(
-                                                node_name, "stop_failed", 0,
-                                                idle_secs=idle_elapsed,
-                                                indeterminate_sources=indeterminate_sources,
-                                            )
-                                except subprocess.TimeoutExpired:
-                                    # R2/R5: a timeout is not a failure —
-                                    # resolve by observation. Confirmed down
-                                    # -> treat as success; still serving ->
-                                    # leave service_stopped and
-                                    # _stop_in_flight alone (do not write
-                                    # stop_failed, do not re-issue next tick)
-                                    # so a later tick or the R8 reconciler
-                                    # resolves it.
-                                    if not state._is_serving():
-                                        state.service_stopped = True
-                                        state.idle_since = None
-                                        state._idle_since_source = None
-                                        state._cached_serving = False
-                                        state._serving_checked_at = time.time()
-                                        state._stop_in_flight = False
-                                        state._stop_in_flight_since = None
-                                        log.warning(
-                                            f"[{node_name}] gw-serve stop timed out "
-                                            f"after {GW_SERVE_STOP_TIMEOUT_SEC}s but "
-                                            f"service already down — treating as "
-                                            f"success"
-                                        )
-                                        _write_idle_log(
-                                            node_name, "stopped", 0,
-                                            idle_secs=idle_elapsed,
-                                            reason=stop_reason,
-                                            indeterminate_sources=indeterminate_sources,
-                                        )
-                                    else:
-                                        log.info(
-                                            f"[{node_name}] gw-serve stop still "
-                                            f"running after "
-                                            f"{GW_SERVE_STOP_TIMEOUT_SEC}s — "
-                                            f"deferring to next tick"
-                                        )
-                                except Exception as exc:
-                                    err = f"gw-serve stop exception: {exc}"
-                                    log.error(f"[{node_name}] {err}")
-                                    state.last_error = err
-                                    state._stop_in_flight = False
-                                    state._stop_in_flight_since = None
-                                    backoff = min(backoff + 15, GW_HOLD_REFRESH_SEC)
-                                    _write_idle_log(node_name, "stop_failed", 0)
-                        continue  # no hold refresh needed for idle node
+                        # No active leases: check if deferred service stop is due.
+                        # The per-node stop decision (D3 flash-next window
+                        # check, D9 close re-anchor, and the legacy
+                        # grace/park/stop machinery) is extracted VERBATIM
+                        # into _NodeState._decide_idle_stop (behavior-
+                        # preserving extraction, rev 3): the loop continues
+                        # on its True return, exactly as the inline
+                        # `continue` statements did, and the keepawake-hold
+                        # refresh below is skipped for an idle node either
+                        # way.
+                        if state._decide_idle_stop():
+                            continue  # no hold refresh needed for idle node
 
                     # Leases are active: re-issue the keepawake hold to refresh its TTL
                     try:
