@@ -60,6 +60,19 @@ Environment variables:
                            it at or above the unit's own allowance would hold
                            state.lock (or, for the deferred path, the background
                            loop) for up to ten minutes and freeze /status.
+  GW_FLASHNEXT_URL         — base URL of the flash-next whole-card seat
+                           (default http://203.0.113.11:30000; SGLang on
+                           GravityWell, flashnext-seat start|stop). The
+                           doorman probes /health + /v1/models on this URL to
+                           derive the handover window (agents-core-doorman-
+                           flashnext-handover-v0, D2/D7) — visibility only:
+                           it never starts or stops the seat (D8).
+  GW_FLASHNEXT_MODEL_ID    — the seat's EXACT canonical_id (default
+                           Qwen3.8-Flash-Next-NVFP4-SSD-Stream). Window
+                           admission is identity-exact (D2b): UP_REGISTERED
+                           requires /v1/models data[0].id == this value; an
+                           identifiable foreign occupant never admits a
+                           window (never guess).
   GW_SERVE_STOP_GIVEUP_SEC — seconds a stop may report stop_in_progress before the
                            background reconciler gives up and surfaces a genuine
                            failure (last_error + a stop_failed idle-log row),
@@ -155,6 +168,13 @@ log = logging.getLogger("doorman-server")
 
 GW_URL_DEFAULT = "http://203.0.113.11:8081"
 GW_CREATIVE_URL = os.getenv("GW_CREATIVE_URL", "http://203.0.113.11:8093")
+# Flash-Next whole-card seat (agents-core-doorman-flashnext-handover-v0, D1/D7):
+# the SGLang seat on :30000 (flashnext-seat start|stop on GravityWell). The
+# doorman is this seat's VISIBILITY KEEPER ONLY (D8): it probes the seat, admits
+# the handover window, refuses wakes/leases during the window, and reports the
+# window on /status — it never starts or stops the seat. :30000 is reachable
+# from BRIX over the tailnet (same route the :8081/:8082 probes use).
+GW_FLASHNEXT_URL = os.environ.get("GW_FLASHNEXT_URL", "http://203.0.113.11:30000")
 # Also defined in llm.py; intentionally not imported to avoid a doorman_server → llm dep.
 # GW_WAKE_DEADLINE_SEC coupling: this deadline (default 180s) must be kept in sync
 # with the client-side acquire timeout in agents_core.doorman_client._gw_acquire_timeout(),
@@ -449,6 +469,17 @@ def parse_vllm_capacity_gauges(text: str) -> dict[str, float | None]:
 # in agents_core.llm (verified: llm.py:58).
 GW_BIG_MODEL_ID = "gravitywell-122b"
 
+# The Flash-Next seat's EXACT canonical_id (agents-core-doorman-flashnext-
+# handover-v0, D2b): window admission is identity-EXACT — UP_REGISTERED
+# requires data[0].id == GW_FLASHNEXT_MODEL_ID. Deliberately NOT
+# _gw_registry_lookup(): that resolver matches any alias field of any row
+# (every row shares operator_alias "gravitywell"), so a served id of
+# "big"/"gravitywell" would have admitted a window. Exact canonical_id match
+# closes that; the env override follows the GW_BIG_MODEL_ID constant pattern.
+GW_FLASHNEXT_MODEL_ID = os.environ.get(
+    "GW_FLASHNEXT_MODEL_ID", "Qwen3.8-Flash-Next-NVFP4-SSD-Stream"
+)
+
 
 def gw_big_seat_members() -> frozenset[str]:
     """The registry-declared membership of the "big" seat: every canonical_id
@@ -528,6 +559,14 @@ CONTENDED = object()
 
 # Sentinel for creative-occupied acquire (Llama-3.3-70B on :8093 holds the GPU)
 CREATIVE_OCCUPIED = object()
+
+# Sentinel for flashnext-occupied acquire (agents-core-doorman-flashnext-
+# handover-v0, D4): the flash-next seat holds GPU 0 whole-card during an
+# active handover window. Propagated and answered exactly as CREATIVE_OCCUPIED
+# (acquire_lease passthrough; 409 flashnext_occupied on /lease/acquire) —
+# including for role=mode-controller: during a confirmed window the window
+# guard supersedes the controller-deference machinery and no lease registers.
+FLASHNEXT_OCCUPIED = object()
 
 # Sentinel principal for worker leases acquired without an explicit principal.
 # Never excluded from drain_count — makes a forgotten-principal diagnosable instead of invisible.
@@ -656,6 +695,16 @@ class _NodeState:
         # taking self.lock never observes one without the other.
         self._stop_in_flight: bool = False
         self._stop_in_flight_since: float | None = None
+        # Per-tick stop-failure signal (agents-core-doorman-flashnext-
+        # handover-v0, rev 3 extraction repair): set by _decide_idle_stop's
+        # two stop-failure outcomes (rc!=0-still-serving real failure and
+        # the generic exception handler) and read by the refresh loop to
+        # apply the stop-failure backoff bump (backoff = min(backoff + 15,
+        # GW_HOLD_REFRESH_SEC)) that origin/main carried inline in the loop.
+        # Reset at the top of every _decide_idle_stop call; read-only in the
+        # loop. Never set on the timeout path (stop_in_progress is not a
+        # failure) or on the rc!=0-but-already-down success path.
+        self._stop_failed_this_tick: bool = False
         # Monotonic ownership token (R8a): incremented under self.lock every
         # time _stop_in_flight transitions to True (a new stop attempt begins,
         # or the reconciler forces a give-up that ends one). The thread that
@@ -679,7 +728,7 @@ class _NodeState:
         self._cached_topology_state = None   # GwServingState | None until first refresh with flag ON
         # llama-server /slots activity probe (doorman-probe-llama-activity-v0)
         self._last_probed_task_by_slot: dict[int, int] = {}
-        self._idle_since_source: str | None = None  # 'lease' | 'probe' | None
+        self._idle_since_source: str | None = None  # 'lease' | 'probe' | 'window_close' | None
         # Probe C: llama.cpp /metrics counter snapshot, keyed by url, then by
         # metric-name+labels (agents-core-doorman-class-aware-activity-probe-v0,
         # D1) — the previous tick's values, diffed to detect activity between
@@ -707,6 +756,25 @@ class _NodeState:
         # None = unknown (pre-probe, ssh timeout/error). Never conflated with
         # the seat health.
         self._gpu1_berth_unit: bool | None = None
+        # Flash-next seat (:30000) window bookkeeping (agents-core-doorman-
+        # flashnext-handover-v0, D2/D5): the window is PROBE-DERIVED (D1 — no
+        # external declaration file, host marker, or lease on the host), so a
+        # launcher death cannot leave a stale window; it self-clears when
+        # :30000 stops answering. Populated by _refresh_serving_cache() from
+        # this tick's own probe + this tick's serving read (under the lock);
+        # read by status_snapshot() lock-only (the gpu1 block's precedent) and
+        # by the stop path (D3/D9). _flashnext_window: "active" | "none" |
+        # None (indeterminate — a blind probe is blindness, never False).
+        # _flashnext_window_since: epoch set on the tick the window first
+        # reads active, held while active, cleared on close.
+        # _flashnext_window_closed_at: epoch set on the active->none
+        # transition tick, consumed exactly once by the D9 close re-anchor.
+        self._flashnext_state: str | None = None
+        self._flashnext_served_id: str | None = None
+        self._flashnext_registered: bool | None = None
+        self._flashnext_window: str | None = None
+        self._flashnext_window_since: float | None = None
+        self._flashnext_window_closed_at: float | None = None
         # Tri-state dual-slot activity probe (gw-doorman-vllm-activity-probe-v0):
         # True when the most recent _probe_slot_activity() tick was indeterminate
         # (at least one probe ambiguous, none confirmed activity) — read by the
@@ -1200,6 +1268,145 @@ class _NodeState:
             log.debug(f"[{self.node_name}] gpu1 glances probe inconclusive: {exc}")
             return None
 
+    def _probe_flashnext_seat(self, sequential: bool = False) -> tuple[str, str | None, bool | None, str | None]:
+        """Probe the flash-next seat on :30000 (agents-core-doorman-flashnext-
+        handover-v0, D2/D7). Returns (state, served_id, registered, error_class):
+
+          state:
+            "down"          — /health connection refused (host reachable, port
+                              closed): no seat listener. Window none.
+                              ONLY ConnectionRefusedError classifies as down;
+                              every other ConnectionError (DNS failure,
+                              unreachable host, reset) is "blind" (Invariant 7:
+                              blindness is never a no).
+            "blind"         — timeout / connection error (non-refused) /
+                              unparseable /health: indeterminate. Window
+                              indeterminate (null); the 27B axis behaves
+                              exactly as today (a missing probe is blindness,
+                              never False).
+            "up_registered" — /health answered AND /v1/models returned 200
+                              with data[0].id == GW_FLASHNEXT_MODEL_ID (EXACT
+                              canonical_id match, D2b — never
+                              _gw_registry_lookup). Window active (when the
+                              day seat is down).
+            "up_unverified" — /health answered but /v1/models was non-200 /
+                              unparseable / timed out: a listener exists on
+                              the seat port, identity unverified (SGLang
+                              mid-load answers health before models). Window
+                              ACTIVE — safe direction: the card may be
+                              committed, and a refused acquire for a few
+                              ticks is cheaper than waking the 27B onto a
+                              committed card.
+            "up_foreign"    — /v1/models returned 200 with a DIFFERENT
+                              data[0].id: an identifiable non-seat occupant
+                              on the seat port. Window NONE + structured WARN
+                              (a squatter is an operator-visible /status
+                              state to clear, not a window; the
+                              unregistered-occupant posture of the big-probe
+                              DoD-4a gate amendment — never guess).
+
+          served_id: data[0].id of a 200 models response, else None.
+          registered: exact canonical_id match (served_id ==
+                      GW_FLASHNEXT_MODEL_ID); None when the models endpoint
+                      never answered 200.
+          error_class: the ACTUAL exception class name when the probe failed
+                      (e.g. "Timeout", "ConnectionRefusedError",
+                      "ConnectionError"), or None on success. Carried by the
+                      D4 BLIND-proceed log.warning so the operator sees the
+                      real failure class, not a static placeholder.
+
+        D7 placement/shape: the TICK path (sequential=False) runs the two GETs
+        concurrently in a 2-worker pool (mirrors the existing pool style); the
+        ACQUIRE path (sequential=True) is a sequential short-circuit — GET
+        /health first, and only on an HTTP response GET /v1/models (a refused
+        /health stops after exactly one request; no per-acquire pool churn).
+        Timeouts 2.5s each. No-redirect pinned: a 3xx on the seat port is
+        blindness, not truth (deliberate hardening vs the existing probes).
+        Any error -> BLIND, never False. Never raises. Must be called
+        OUTSIDE self.lock (blocking HTTP).
+        """
+        def _health_call():
+            try:
+                return requests.get(
+                    f"{GW_FLASHNEXT_URL}/health",
+                    timeout=2.5,
+                    allow_redirects=False,
+                )
+            except Exception as exc:
+                return exc
+
+        def _models_call():
+            try:
+                return requests.get(
+                    f"{GW_FLASHNEXT_URL}/v1/models",
+                    timeout=2.5,
+                    allow_redirects=False,
+                )
+            except Exception as exc:
+                return exc
+
+        if sequential:
+            # Acquire path (D4): sequential short-circuit — a refused /health
+            # is exactly one HTTP call.
+            health = _health_call()
+            models = _models_call() if isinstance(health, requests.Response) else None
+        else:
+            # Tick path (D7): 2-worker pool, both GETs issued concurrently.
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_health = pool.submit(_health_call)
+                fut_models = pool.submit(_models_call)
+                health = fut_health.result()
+                models = fut_models.result()
+
+        # /health half: any HTTP response (any status) = a listener exists on
+        # the seat port. A connection-level failure is the DOWN/BLIND split:
+        # ONLY ConnectionRefusedError (the host answered RST — no seat
+        # listener) classifies as "down". Every other ConnectionError (DNS
+        # failure, unreachable host, connection reset) and every Timeout is
+        # "blind" (Invariant 7: blindness is never a no).
+        if isinstance(health, requests.exceptions.ConnectionError):
+            # Walk the exception chain: requests wraps the underlying
+            # ConnectionRefusedError in a ConnectionError. Check both the
+            # exception itself and its __cause__/__context__ chain.
+            _exc = health
+            while _exc is not None:
+                if isinstance(_exc, ConnectionRefusedError):
+                    # Connection refused: the host answered RST — no seat
+                    # listener.
+                    return ("down", None, None, type(health).__name__)
+                _exc = _exc.__cause__ or _exc.__context__
+            # Non-refused ConnectionError (DNS, unreachable, reset): blind.
+            return ("blind", None, None, type(health).__name__)
+        if not isinstance(health, requests.Response):
+            # Timeout or any other non-ConnectionError: indeterminate.
+            return ("blind", None, None, type(health).__name__)
+
+        # A listener exists. Identity half — only when the models response is
+        # an actual HTTP response (a sequential short-circuit on a refused
+        # /health never reaches here; a models timeout/exception is BLIND-
+        # SHAPED: up but unverified, never down).
+        if isinstance(models, requests.Response) and models.status_code == 200:
+            try:
+                data = models.json().get("data")
+                if isinstance(data, list) and data and isinstance(data[0], dict):
+                    served_id = data[0].get("id")
+                    if isinstance(served_id, str) and served_id:
+                        if served_id == GW_FLASHNEXT_MODEL_ID:
+                            return ("up_registered", served_id, True, None)
+                        # Identifiable non-seat occupant (D2: UP_FOREIGN).
+                        log.warning(
+                            f"[{self.node_name}] flashnext-seat-foreign-occupant — "
+                            f":30000 /v1/models serves {served_id!r} "
+                            f"(expected {GW_FLASHNEXT_MODEL_ID!r}); not a window, "
+                            f"operator-visible /status state to clear"
+                        )
+                        return ("up_foreign", served_id, False, None)
+            except Exception:
+                pass
+        # /health answered but /v1/models was non-200 / unparseable / timed
+        # out: a listener exists, identity unverified (SGLang mid-load).
+        return ("up_unverified", None, None, None)
+
     def _probe_slot_activity(self) -> bool | None:
         """Tri-state unmediated-caller activity probe across all signal sources
         (gw-doorman-vllm-activity-probe-v0, extended by agents-core-doorman-
@@ -1299,6 +1506,16 @@ class _NodeState:
         """
         serving = self._is_serving(timeout=2.0)
         creative_serving = self._is_creative_serving()
+        # Flash-next seat probe (agents-core-doorman-flashnext-handover-v0,
+        # D7): runs unconditionally every tick, beside the serving probe and
+        # OUTSIDE the lock. Deliberately NOT in _probe_slot_activity's pool
+        # (that pool runs only when DOORMAN_PROBE_LLAMA_ACTIVITY is on, and
+        # the window determination must work regardless of that flag) and
+        # never joined to the activity vote lists (Invariant 8: :30000
+        # activity is irrelevant to the 27B axis's idle clock).
+        flashnext_state, flashnext_served_id, flashnext_registered, _fn_err = (
+            self._probe_flashnext_seat(sequential=False)
+        )
 
         # Single topology resolution — outside the lock (blocking HTTP).
         topology_state = None
@@ -1316,6 +1533,49 @@ class _NodeState:
             self._cached_serving = serving
             self._cached_creative_serving = creative_serving
             self._serving_checked_at = time.time()
+
+            # Flash-next window bookkeeping (D2/D5): computed under the lock
+            # from THIS tick's probe + THIS tick's serving read. The window is
+            # ACTIVE iff (a) the :30000 probe reports a seat listener
+            # (up_registered OR up_unverified — the safe direction) AND
+            # (b) the :8081 day-seat probe reports down. A blind probe leaves
+            # the window indeterminate (None) — the 27B axis behaves exactly
+            # as today (Invariant 7: blindness is not down on the :30000
+            # axis). window_since is set on the first active read, held while
+            # active, cleared on close; window_closed_at is set on the
+            # active->none transition tick and consumed by the D9 re-anchor.
+            self._flashnext_state = flashnext_state
+            self._flashnext_served_id = flashnext_served_id
+            self._flashnext_registered = flashnext_registered
+            # Window determination (D2): ACTIVE iff the :30000 probe reports
+            # a seat listener (up_registered OR up_unverified — the safe
+            # direction) AND the :8081 day-seat probe reports down. When the
+            # seat is up but the day seat is ALSO up (hand-back overlap,
+            # both briefly serving), the window is "none" — the day seat is
+            # serving, so no handover is in progress. A blind probe leaves
+            # the window indeterminate (None) — the 27B axis behaves exactly
+            # as today (Invariant 7: blindness is not down on the :30000
+            # axis).
+            if flashnext_state in ("up_registered", "up_unverified"):
+                window = "active" if not serving else "none"
+            elif flashnext_state in ("down", "up_foreign"):
+                window = "none"
+            else:  # "blind"
+                window = None
+            if window == "active":
+                if self._flashnext_window != "active":
+                    # First active read this window (or re-open after a flap):
+                    # stamp the open edge.
+                    self._flashnext_window_since = time.time()
+                self._flashnext_window = "active"
+            else:
+                if self._flashnext_window == "active":
+                    # active -> none (or indeterminate) transition tick: the
+                    # D9 close re-anchor consumes this exactly once.
+                    self._flashnext_window_closed_at = time.time()
+                self._flashnext_window = window
+                self._flashnext_window_since = None
+
             if DOORMAN_MODE_AWARE_ADMISSION:
                 self._cached_topology_state = topology_state
                 controller_owns = self._controller_lease_active()
@@ -1805,6 +2065,61 @@ class _NodeState:
                     self.last_error = None
                     self.service_stopped = False
                 return True
+
+            # Flash-next window guard (agents-core-doorman-flashnext-handover-
+            # v0, D4) — the wake collision guard. Placed IMMEDIATELY before the
+            # wake-gravitywell subprocess, after the fast path and the
+            # deference / mode-bearing returns: normal-day acquires (27B up)
+            # return inside the fast path and pay ZERO added probes; only the
+            # already-down path (rare) pays one sequential :30000 probe. The
+            # :8081 half of the window test is the fast path's own fresh
+            # _is_serving() fallthrough above (read milliseconds earlier) —
+            # the guard issues ONLY the fresh seat probe, never a second
+            # :8081 GET. The probe is FRESH (never the 45s cache): this is the
+            # only path that would issue a wake, so the guard must not act on
+            # a stale read (Invariant 4).
+            seat_state, seat_served_id, _seat_registered, seat_error_class = (
+                self._probe_flashnext_seat(sequential=True)
+            )
+            if seat_state in ("up_registered", "up_unverified"):
+                # The seat holds (or is loading onto) GPU 0 whole-card at
+                # --mem-fraction-static 0.985: waking the 27B here would put
+                # two whole-card occupants on one card = OOM, one of them the
+                # drafting session mid-flight. Refuse with the sentinel; no
+                # wake-gravitywell, no _wake_*, no lease, idle_since untouched.
+                # Applies to ALL acquires, including role=mode-controller —
+                # during a confirmed window the window guard supersedes the
+                # controller-deference machinery (mirrors CREATIVE_OCCUPIED,
+                # which refuses even the controller's own acquire).
+                log.info(
+                    f"[{self.node_name}] flashnext-window-holding-gpu0 — seat probe "
+                    f"{seat_state} (served_id={seat_served_id!r}); refusing wake, "
+                    f"no lease registered (FLASHNEXT_OCCUPIED)"
+                )
+                return FLASHNEXT_OCCUPIED
+            if seat_state == "blind":
+                # BLIND proceed is TODAY's behavior per D2 (the B2 contract:
+                # a missing probe is blindness, never False; and a BRIX->GW
+                # partition breaks the wake's own ssh first) — but the blind
+                # pass is a log line, not silence (gate binding constraint):
+                # the structured warning carries the ACTUAL probe error class
+                # (returned by the probe, not a static placeholder).
+                # (Deliberate asymmetry with the flip-controller guard's
+                # fail-closed BLIND: Invariant 13.)
+                log.warning(
+                    f"[{self.node_name}] flashnext-seat-probe-blind — :30000 probe "
+                    f"indeterminate (error_class={seat_error_class}), "
+                    f"proceeding with wake exactly as today"
+                )
+            elif seat_state == "up_foreign":
+                # An identifiable non-seat occupant on the seat port: the
+                # window is none (never guess — the probe already WARNed at
+                # the probe site with the served id), so the wake proceeds.
+                log.warning(
+                    f"[{self.node_name}] flashnext-seat-foreign — :30000 probe "
+                    f"up_foreign (served_id={seat_served_id!r}); no window, "
+                    f"wake proceeds"
+                )
 
             log.info(f"[{self.node_name}] GW not serving — running wake-gravitywell")
             try:
@@ -2456,6 +2771,12 @@ class _NodeState:
         ok = self.ensure_serving(role=role, mode=mode, work_id=work_id)
         if ok is CREATIVE_OCCUPIED:
             return CREATIVE_OCCUPIED
+        if ok is FLASHNEXT_OCCUPIED:
+            # Propagated exactly as CREATIVE_OCCUPIED (D4): the flash-next
+            # window guard refused the wake — no lease registered, no hold
+            # placed, idle_since untouched. Uniform for all acquires,
+            # including role=mode-controller.
+            return FLASHNEXT_OCCUPIED
         if ok is DEFERRED:
             # Controller's own acquire (role="mode-controller") registers the lease and hold
             # even though ensure_serving returns DEFERRED (no gw-serve big was issued).
@@ -2534,6 +2855,303 @@ class _NodeState:
         if was_idle:
             _write_idle_log(self.node_name, "resumed", lease_count_for_log)
         return CONTENDED if contended else True
+
+    def _decide_idle_stop(self) -> bool:
+        """The per-node idle-stop decision of the refresh loop (rev 3,
+        agents-core-doorman-flashnext-handover-v0): extracted VERBATIM from
+        _start_refresh_thread._loop's `if not state.leases:` block — same
+        order, same behavior, no second lock. The caller runs with
+        self.lock ALREADY held (the refresh loop's critical section); this
+        method takes no lock of its own, so D9's re-anchor remains a single
+        atomic read-modify-write under state.lock (gate binding
+        constraint): read window_closed_at / idle_since / leases / the
+        same-tick cached serving, and write idle_since + clear
+        window_closed_at, in the same critical section.
+
+        Returns True when the refresh loop must `continue` to the next node
+        (a D3 window hold, the topology_unknown_no_park alarm, a
+        blind-bounded pause, or the trailing idle-node skip); False when the
+        loop falls through to the keepawake-hold refresh (only when
+        idle_since is None or a stop is already in flight).
+
+        Stop-failure backoff: this method sets self._stop_failed_this_tick
+        on its two stop-failure outcomes (the rc!=0-still-serving real
+        failure and the generic exception handler), and the refresh loop
+        bumps its `backoff` variable (backoff = min(backoff + 15,
+        GW_HOLD_REFRESH_SEC)) when it sees that flag set — the same
+        accelerated retry cadence origin/main applied inline in the loop.
+        The flag is reset at the top of every call, so the loop observes it
+        exactly once per failing tick.
+        """
+        self._stop_failed_this_tick = False
+        # Flash-next window (agents-core-doorman-flashnext-
+        # handover-v0, D3): the keeper now KNOWS the nature of
+        # the room — the :30000 seat holds GPU 0 whole-card
+        # and the 27B is down by design. Never park, never
+        # stop, never alarm: the 2026-08-19 ruling is
+        # satisfied by knowledge, not by continued refusal.
+        # NOT gated by DOORMAN_MODE_AWARE_ADMISSION (D3/
+        # Invariant 9): the window is a property of the seat,
+        # not of the admission policy — a flag-off doorman
+        # must still not park the card the seat holds.
+        if self._flashnext_window == "active":
+            _write_idle_log(
+                self.node_name, "card_held_flashnext", 0,
+                idle_secs=(
+                    time.time() - self.idle_since
+                    if self.idle_since is not None else None
+                ),
+                served_id=self._flashnext_served_id,
+            )
+            return True
+
+        # Flash-next close re-anchor (D9): the stop path's
+        # grace clock reads idle_since, which the last
+        # pre-window lease release (or TTL-GC) set at window
+        # open and nothing refreshes during the window.
+        # Without a re-anchor, the first tick after close
+        # with the restored 27B serving would compute
+        # idle_elapsed = the full window duration >=
+        # GW_STOP_GRACE_SEC and confirmed-idle-park the seat
+        # the launcher just cold-restored. Window-close +
+        # restored serving is an operator-intent activity
+        # boundary (the same class as the lease-acquire and
+        # probe-activity re-anchors): the restored seat
+        # receives a full fresh GW_STOP_GRACE_SEC from the
+        # doorman's first observation of it serving after
+        # the window. Single atomic read-modify-write under
+        # state.lock (gate binding constraint): read
+        # window_closed_at / idle_since / leases / the
+        # same-tick cached serving, and write idle_since +
+        # clear window_closed_at, in the same critical
+        # section (the caller already holds the lock; no
+        # second lock). One-shot (the flag is
+        # consumed); fires only on the close transition — a
+        # normal wake (no window in the history) is
+        # byte-identical to today, and a lease acquired
+        # between close and first-serving-observation already
+        # owns the clock (acquire sets idle_since = None).
+        # NOT gated by DOORMAN_MODE_AWARE_ADMISSION
+        # (Invariant 9).
+        if (
+            self._flashnext_window_closed_at is not None
+            and self.idle_since is not None
+            and not self.leases
+            and self._cached_serving is True
+        ):
+            _write_idle_log(
+                self.node_name, "flashnext_window_closed", 0,
+                idle_secs=time.time() - self.idle_since,
+            )
+            self.idle_since = time.time()
+            self._idle_since_source = "window_close"
+            self._flashnext_window_closed_at = None
+
+        if (
+            self.idle_since is not None
+            and not self.service_stopped
+            # R5: a manual force-stop already owns the single
+            # writer for this node — never launch a second
+            # gw-serve stop, and never block on state.lock
+            # waiting for it (we already hold the lock; simply
+            # skip issuing our own this tick).
+            and not self._stop_in_flight
+        ):
+            idle_elapsed = time.time() - self.idle_since
+
+            # Unknown topology (Erah ruling 2026-08-19, agents-core-
+            # doorman-class-aware-activity-probe-v0 D2/D3): a keeper
+            # who does not know the nature of the room does not close
+            # the door. Never park, never guess a class — grace clock
+            # stays paused with NO bound (unlike the blindness bound
+            # below), and a distinct alarm fires every tick instead of
+            # a stop attempt, carrying the same diagnostic fields as
+            # the topology_resolution_unknown warning. Only applies
+            # when the flag is ON (_serving_is_big is never populated
+            # otherwise, so flag-off transparently falls through to
+            # the unchanged legacy path below).
+            if DOORMAN_MODE_AWARE_ADMISSION and self._serving_is_big is None:
+                topo = self._cached_topology_state
+                _write_idle_log(
+                    self.node_name, "topology_unknown_no_park", 0,
+                    idle_secs=idle_elapsed,
+                    reason="topology_unknown_no_park",
+                    authority_gap=None if topo is None else topo.authority_gap,
+                    models_answered=_topology_models_answered(topo),
+                    served_ids=None if topo is None else topo.served_ids,
+                    unknown_model=None if topo is None else topo.unknown_model,
+                )
+                log.warning(
+                    f"[{self.node_name}] topology_unknown_no_park — idle "
+                    f"{idle_elapsed:.0f}s but serving class unresolved; "
+                    f"refusing to park, alarming instead"
+                )
+                return True
+
+            blindness_deadline = (
+                GW_STOP_GRACE_SEC + DOORMAN_PROBE_BLINDNESS_SEC
+            )
+            if self._probe_indeterminate and idle_elapsed < blindness_deadline:
+                # Probe genuinely ambiguous this tick (gw-doorman-vllm-
+                # activity-probe-v0) — pause the grace clock rather than
+                # advance it, same as if leases were held. Bounded below.
+                return True
+            if self._probe_indeterminate:
+                log.warning(
+                    f"[{self.node_name}] probe blind for {idle_elapsed:.0f}s — "
+                    f"proceeding on stale grace period"
+                )
+            if idle_elapsed >= GW_STOP_GRACE_SEC:
+                # Idle-log reason (D3): distinguishes a genuinely
+                # confirmed-idle park from one taken only because the
+                # blindness bound was exceeded, so the journal line is
+                # diagnosable rather than reading as one undifferentiated
+                # "stopped" event.
+                stop_reason = (
+                    "probe_blind_bound_exceeded"
+                    if self._probe_indeterminate else "confirmed_idle"
+                )
+                indeterminate_sources = [
+                    name for name, v in (self._last_probe_raw or {}).items()
+                    if v is None
+                ]
+                log.warning(
+                    f"[{self.node_name}] idle {idle_elapsed:.0f}s >= grace "
+                    f"{GW_STOP_GRACE_SEC}s — issuing gw-serve stop. "
+                    f"Safety: guard blocks suspend while service active; "
+                    f"doorman stop enables suspend, never forces it."
+                )
+                # Single-writer bookkeeping (R5), shared with
+                # _force_stop: bumping the epoch and setting
+                # _stop_in_flight here means a concurrent
+                # manual force-stop sees this attempt and
+                # defers to it, and — if this call times out
+                # while GW is still shutting down — the next
+                # tick will not re-issue a second gw-serve
+                # stop for the same unload.
+                self._stop_epoch += 1
+                self._stop_in_flight = True
+                self._stop_in_flight_since = time.time()
+                try:
+                    stop_proc = subprocess.run(
+                        ["ssh", "gravitywell", "gw-serve stop"],
+                        capture_output=True, text=True,
+                        timeout=GW_SERVE_STOP_TIMEOUT_SEC,
+                    )
+                    if stop_proc.returncode == 0:
+                        self.service_stopped = True
+                        self.idle_since = None
+                        self._idle_since_source = None
+                        self._cached_serving = False
+                        self._serving_checked_at = time.time()
+                        self._stop_in_flight = False
+                        self._stop_in_flight_since = None
+                        stopped_desc = _describe_stopped_units(
+                            stop_proc.stdout, self.node_name
+                        )
+                        log.warning(
+                            f"[{self.node_name}] gw-serve stop succeeded — "
+                            f"{stopped_desc}, host now "
+                            f"suspend-eligible via guard"
+                        )
+                        _write_idle_log(
+                            self.node_name, "stopped", 0,
+                            idle_secs=idle_elapsed,
+                            reason=stop_reason,
+                            indeterminate_sources=indeterminate_sources,
+                        )
+                    else:
+                        # rc != 0: idempotency guard — check if already down
+                        if not self._is_serving():
+                            # Already stopped — treat as success
+                            self.service_stopped = True
+                            self.idle_since = None
+                            self._idle_since_source = None
+                            self._cached_serving = False
+                            self._serving_checked_at = time.time()
+                            self._stop_in_flight = False
+                            self._stop_in_flight_since = None
+                            log.warning(
+                                f"[{self.node_name}] gw-serve stop "
+                                f"rc={stop_proc.returncode} but service "
+                                f"already down — treating as success"
+                            )
+                            _write_idle_log(
+                                self.node_name, "stopped", 0,
+                                idle_secs=idle_elapsed,
+                                reason=stop_reason,
+                                indeterminate_sources=indeterminate_sources,
+                            )
+                        else:
+                            # Real failure: still serving
+                            err = (
+                                f"gw-serve stop failed "
+                                f"rc={stop_proc.returncode}: "
+                                f"{stop_proc.stderr[:200]}"
+                            )
+                            log.error(f"[{self.node_name}] {err}")
+                            self.last_error = err
+                            self._stop_in_flight = False
+                            self._stop_in_flight_since = None
+                            # Stop-failure backoff signal for the refresh
+                            # loop (origin/main's inline bump, restored on
+                            # extraction): a real stop failure retries on
+                            # the accelerated cadence.
+                            self._stop_failed_this_tick = True
+                            _write_idle_log(
+                                self.node_name, "stop_failed", 0,
+                                idle_secs=idle_elapsed,
+                                indeterminate_sources=indeterminate_sources,
+                            )
+                except subprocess.TimeoutExpired:
+                    # R2/R5: a timeout is not a failure —
+                    # resolve by observation. Confirmed down
+                    # -> treat as success; still serving ->
+                    # leave service_stopped and
+                    # _stop_in_flight alone (do not write
+                    # stop_failed, do not re-issue next tick)
+                    # so a later tick or the R8 reconciler
+                    # resolves it.
+                    if not self._is_serving():
+                        self.service_stopped = True
+                        self.idle_since = None
+                        self._idle_since_source = None
+                        self._cached_serving = False
+                        self._serving_checked_at = time.time()
+                        self._stop_in_flight = False
+                        self._stop_in_flight_since = None
+                        log.warning(
+                            f"[{self.node_name}] gw-serve stop timed out "
+                            f"after {GW_SERVE_STOP_TIMEOUT_SEC}s but "
+                            f"service already down — treating as "
+                            f"success"
+                        )
+                        _write_idle_log(
+                            self.node_name, "stopped", 0,
+                            idle_secs=idle_elapsed,
+                            reason=stop_reason,
+                            indeterminate_sources=indeterminate_sources,
+                        )
+                    else:
+                        log.info(
+                            f"[{self.node_name}] gw-serve stop still "
+                            f"running after "
+                            f"{GW_SERVE_STOP_TIMEOUT_SEC}s — "
+                            f"deferring to next tick"
+                        )
+                except Exception as exc:
+                    err = f"gw-serve stop exception: {exc}"
+                    log.error(f"[{self.node_name}] {err}")
+                    self.last_error = err
+                    self._stop_in_flight = False
+                    self._stop_in_flight_since = None
+                    # Stop-failure backoff signal for the refresh loop
+                    # (origin/main's inline bump, restored on extraction).
+                    self._stop_failed_this_tick = True
+                    _write_idle_log(self.node_name, "stop_failed", 0)
+            return True
+
+        return False
 
     def release_lease(self, work_id: str) -> None:
         """Drop a lease. If it was the last, record idle_since and release the hold."""
@@ -2646,6 +3264,35 @@ class _NodeState:
                     "glances_mem_pct": self._gpu1_glances_mem_pct,
                     "glances_proc": self._gpu1_glances_proc,
                     "last_vote": self._last_probe_raw.get("GPU1"),
+                },
+                # Flash-next (:30000) seat awareness block (agents-core-
+                # doorman-flashnext-handover-v0, D5): the operator surface
+                # for "what does the doorman see on the whole-card seat?".
+                # Reads ONLY cached fields (no network, lock-only — the gpu1
+                # block's precedent). seat_state is the D2 probe state;
+                # window is "active"|"none"|null (null = indeterminate — a
+                # blind probe is blindness, never down). window_since is
+                # epoch|null (set on the tick the window first reads active,
+                # held while active, cleared on close); window_closed_at is
+                # epoch|null (set on the active->none transition tick,
+                # consumed by the D9 close re-anchor). serving_mode's enum
+                # and the 27B-axis fields above are untouched by this block
+                # (Invariant 5).
+                "flashnext": {
+                    "seat_health": (
+                        None
+                        if self._flashnext_state is None
+                        or self._flashnext_state == "blind"
+                        else self._flashnext_state
+                        in ("up_registered", "up_unverified", "up_foreign")
+                    ),
+                    "seat_state": self._flashnext_state,
+                    "served_id": self._flashnext_served_id,
+                    "registered": self._flashnext_registered,
+                    "window": self._flashnext_window,
+                    "window_since": self._flashnext_window_since,
+                    "window_closed_at": self._flashnext_window_closed_at,
+                    "last_vote": self._flashnext_state,
                 },
             }
 
@@ -2937,206 +3584,28 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                             _write_idle_log(node_name, "stop_failed", 0)
 
                     if not state.leases:
-                        # No active leases: check if deferred service stop is due
-                        if (
-                            state.idle_since is not None
-                            and not state.service_stopped
-                            # R5: a manual force-stop already owns the single
-                            # writer for this node — never launch a second
-                            # gw-serve stop, and never block on state.lock
-                            # waiting for it (we already hold the lock; simply
-                            # skip issuing our own this tick).
-                            and not state._stop_in_flight
-                        ):
-                            idle_elapsed = time.time() - state.idle_since
-
-                            # Unknown topology (Erah ruling 2026-08-19, agents-core-
-                            # doorman-class-aware-activity-probe-v0 D2/D3): a keeper
-                            # who does not know the nature of the room does not close
-                            # the door. Never park, never guess a class — grace clock
-                            # stays paused with NO bound (unlike the blindness bound
-                            # below), and a distinct alarm fires every tick instead of
-                            # a stop attempt, carrying the same diagnostic fields as
-                            # the topology_resolution_unknown warning. Only applies
-                            # when the flag is ON (_serving_is_big is never populated
-                            # otherwise, so flag-off transparently falls through to
-                            # the unchanged legacy path below).
-                            if DOORMAN_MODE_AWARE_ADMISSION and state._serving_is_big is None:
-                                topo = state._cached_topology_state
-                                _write_idle_log(
-                                    node_name, "topology_unknown_no_park", 0,
-                                    idle_secs=idle_elapsed,
-                                    reason="topology_unknown_no_park",
-                                    authority_gap=None if topo is None else topo.authority_gap,
-                                    models_answered=_topology_models_answered(topo),
-                                    served_ids=None if topo is None else topo.served_ids,
-                                    unknown_model=None if topo is None else topo.unknown_model,
-                                )
-                                log.warning(
-                                    f"[{node_name}] topology_unknown_no_park — idle "
-                                    f"{idle_elapsed:.0f}s but serving class unresolved; "
-                                    f"refusing to park, alarming instead"
-                                )
-                                continue
-
-                            blindness_deadline = (
-                                GW_STOP_GRACE_SEC + DOORMAN_PROBE_BLINDNESS_SEC
-                            )
-                            if state._probe_indeterminate and idle_elapsed < blindness_deadline:
-                                # Probe genuinely ambiguous this tick (gw-doorman-vllm-
-                                # activity-probe-v0) — pause the grace clock rather than
-                                # advance it, same as if leases were held. Bounded below.
-                                continue
-                            if state._probe_indeterminate:
-                                log.warning(
-                                    f"[{node_name}] probe blind for {idle_elapsed:.0f}s — "
-                                    f"proceeding on stale grace period"
-                                )
-                            if idle_elapsed >= GW_STOP_GRACE_SEC:
-                                # Idle-log reason (D3): distinguishes a genuinely
-                                # confirmed-idle park from one taken only because the
-                                # blindness bound was exceeded, so the journal line is
-                                # diagnosable rather than reading as one undifferentiated
-                                # "stopped" event.
-                                stop_reason = (
-                                    "probe_blind_bound_exceeded"
-                                    if state._probe_indeterminate else "confirmed_idle"
-                                )
-                                indeterminate_sources = [
-                                    name for name, v in (state._last_probe_raw or {}).items()
-                                    if v is None
-                                ]
-                                log.warning(
-                                    f"[{node_name}] idle {idle_elapsed:.0f}s >= grace "
-                                    f"{GW_STOP_GRACE_SEC}s — issuing gw-serve stop. "
-                                    f"Safety: guard blocks suspend while service active; "
-                                    f"doorman stop enables suspend, never forces it."
-                                )
-                                # Single-writer bookkeeping (R5), shared with
-                                # _force_stop: bumping the epoch and setting
-                                # _stop_in_flight here means a concurrent
-                                # manual force-stop sees this attempt and
-                                # defers to it, and — if this call times out
-                                # while GW is still shutting down — the next
-                                # tick will not re-issue a second gw-serve
-                                # stop for the same unload.
-                                state._stop_epoch += 1
-                                state._stop_in_flight = True
-                                state._stop_in_flight_since = time.time()
-                                try:
-                                    stop_proc = subprocess.run(
-                                        ["ssh", "gravitywell", "gw-serve stop"],
-                                        capture_output=True, text=True,
-                                        timeout=GW_SERVE_STOP_TIMEOUT_SEC,
-                                    )
-                                    if stop_proc.returncode == 0:
-                                        state.service_stopped = True
-                                        state.idle_since = None
-                                        state._idle_since_source = None
-                                        state._cached_serving = False
-                                        state._serving_checked_at = time.time()
-                                        state._stop_in_flight = False
-                                        state._stop_in_flight_since = None
-                                        stopped_desc = _describe_stopped_units(
-                                            stop_proc.stdout, node_name
-                                        )
-                                        log.warning(
-                                            f"[{node_name}] gw-serve stop succeeded — "
-                                            f"{stopped_desc}, host now "
-                                            f"suspend-eligible via guard"
-                                        )
-                                        _write_idle_log(
-                                            node_name, "stopped", 0,
-                                            idle_secs=idle_elapsed,
-                                            reason=stop_reason,
-                                            indeterminate_sources=indeterminate_sources,
-                                        )
-                                    else:
-                                        # rc != 0: idempotency guard — check if already down
-                                        if not state._is_serving():
-                                            # Already stopped — treat as success
-                                            state.service_stopped = True
-                                            state.idle_since = None
-                                            state._idle_since_source = None
-                                            state._cached_serving = False
-                                            state._serving_checked_at = time.time()
-                                            state._stop_in_flight = False
-                                            state._stop_in_flight_since = None
-                                            log.warning(
-                                                f"[{node_name}] gw-serve stop "
-                                                f"rc={stop_proc.returncode} but service "
-                                                f"already down — treating as success"
-                                            )
-                                            _write_idle_log(
-                                                node_name, "stopped", 0,
-                                                idle_secs=idle_elapsed,
-                                                reason=stop_reason,
-                                                indeterminate_sources=indeterminate_sources,
-                                            )
-                                        else:
-                                            # Real failure: still serving
-                                            err = (
-                                                f"gw-serve stop failed "
-                                                f"rc={stop_proc.returncode}: "
-                                                f"{stop_proc.stderr[:200]}"
-                                            )
-                                            log.error(f"[{node_name}] {err}")
-                                            state.last_error = err
-                                            state._stop_in_flight = False
-                                            state._stop_in_flight_since = None
-                                            backoff = min(
-                                                backoff + 15, GW_HOLD_REFRESH_SEC
-                                            )
-                                            _write_idle_log(
-                                                node_name, "stop_failed", 0,
-                                                idle_secs=idle_elapsed,
-                                                indeterminate_sources=indeterminate_sources,
-                                            )
-                                except subprocess.TimeoutExpired:
-                                    # R2/R5: a timeout is not a failure —
-                                    # resolve by observation. Confirmed down
-                                    # -> treat as success; still serving ->
-                                    # leave service_stopped and
-                                    # _stop_in_flight alone (do not write
-                                    # stop_failed, do not re-issue next tick)
-                                    # so a later tick or the R8 reconciler
-                                    # resolves it.
-                                    if not state._is_serving():
-                                        state.service_stopped = True
-                                        state.idle_since = None
-                                        state._idle_since_source = None
-                                        state._cached_serving = False
-                                        state._serving_checked_at = time.time()
-                                        state._stop_in_flight = False
-                                        state._stop_in_flight_since = None
-                                        log.warning(
-                                            f"[{node_name}] gw-serve stop timed out "
-                                            f"after {GW_SERVE_STOP_TIMEOUT_SEC}s but "
-                                            f"service already down — treating as "
-                                            f"success"
-                                        )
-                                        _write_idle_log(
-                                            node_name, "stopped", 0,
-                                            idle_secs=idle_elapsed,
-                                            reason=stop_reason,
-                                            indeterminate_sources=indeterminate_sources,
-                                        )
-                                    else:
-                                        log.info(
-                                            f"[{node_name}] gw-serve stop still "
-                                            f"running after "
-                                            f"{GW_SERVE_STOP_TIMEOUT_SEC}s — "
-                                            f"deferring to next tick"
-                                        )
-                                except Exception as exc:
-                                    err = f"gw-serve stop exception: {exc}"
-                                    log.error(f"[{node_name}] {err}")
-                                    state.last_error = err
-                                    state._stop_in_flight = False
-                                    state._stop_in_flight_since = None
-                                    backoff = min(backoff + 15, GW_HOLD_REFRESH_SEC)
-                                    _write_idle_log(node_name, "stop_failed", 0)
-                        continue  # no hold refresh needed for idle node
+                        # No active leases: check if deferred service stop is due.
+                        # The per-node stop decision (D3 flash-next window
+                        # check, D9 close re-anchor, and the legacy
+                        # grace/park/stop machinery) is extracted VERBATIM
+                        # into _NodeState._decide_idle_stop (behavior-
+                        # preserving extraction, rev 3): the loop continues
+                        # on its True return, exactly as the inline
+                        # `continue` statements did, and the keepawake-hold
+                        # refresh below is skipped for an idle node either
+                        # way.
+                        if state._decide_idle_stop():
+                            # Stop-failure backoff (origin/main's inline
+                            # bump, restored on extraction): the two stop-
+                            # failure outcomes inside _decide_idle_stop set
+                            # _stop_failed_this_tick, and the loop applies
+                            # the accelerated retry cadence here — a failing
+                            # auto gw-serve stop retries at
+                            # min(backoff + 15, GW_HOLD_REFRESH_SEC)
+                            # instead of the full GW_HOLD_REFRESH_SEC.
+                            if state._stop_failed_this_tick:
+                                backoff = min(backoff + 15, GW_HOLD_REFRESH_SEC)
+                            continue  # no hold refresh needed for idle node
 
                     # Leases are active: re-issue the keepawake hold to refresh its TTL
                     try:
@@ -3373,6 +3842,16 @@ def create_app(gw_url: str | None = None) -> FastAPI:
             return JSONResponse(
                 {"ok": False, "creative_occupied": True,
                  "reason": "creative-collider-holding-gpu"},
+                status_code=409,
+            )
+        if ok is FLASHNEXT_OCCUPIED:
+            # D4: the flash-next window guard refused the wake — the seat
+            # holds GPU 0 whole-card and no lease registered. Mirrors the
+            # creative_occupied 409 (same refusal class: another seat holds
+            # the lane).
+            return JSONResponse(
+                {"ok": False, "flashnext_occupied": True,
+                 "reason": "flashnext-window-holding-gpu0"},
                 status_code=409,
             )
         if ok is CONTENDED:
