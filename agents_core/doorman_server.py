@@ -60,6 +60,19 @@ Environment variables:
                            it at or above the unit's own allowance would hold
                            state.lock (or, for the deferred path, the background
                            loop) for up to ten minutes and freeze /status.
+  GW_FLASHNEXT_URL         — base URL of the flash-next whole-card seat
+                           (default http://203.0.113.11:30000; SGLang on
+                           GravityWell, flashnext-seat start|stop). The
+                           doorman probes /health + /v1/models on this URL to
+                           derive the handover window (agents-core-doorman-
+                           flashnext-handover-v0, D2/D7) — visibility only:
+                           it never starts or stops the seat (D8).
+  GW_FLASHNEXT_MODEL_ID    — the seat's EXACT canonical_id (default
+                           Qwen3.8-Flash-Next-NVFP4-SSD-Stream). Window
+                           admission is identity-exact (D2b): UP_REGISTERED
+                           requires /v1/models data[0].id == this value; an
+                           identifiable foreign occupant never admits a
+                           window (never guess).
   GW_SERVE_STOP_GIVEUP_SEC — seconds a stop may report stop_in_progress before the
                            background reconciler gives up and surfaces a genuine
                            failure (last_error + a stop_failed idle-log row),
@@ -155,6 +168,13 @@ log = logging.getLogger("doorman-server")
 
 GW_URL_DEFAULT = "http://203.0.113.11:8081"
 GW_CREATIVE_URL = os.getenv("GW_CREATIVE_URL", "http://203.0.113.11:8093")
+# Flash-Next whole-card seat (agents-core-doorman-flashnext-handover-v0, D1/D7):
+# the SGLang seat on :30000 (flashnext-seat start|stop on GravityWell). The
+# doorman is this seat's VISIBILITY KEEPER ONLY (D8): it probes the seat, admits
+# the handover window, refuses wakes/leases during the window, and reports the
+# window on /status — it never starts or stops the seat. :30000 is reachable
+# from BRIX over the tailnet (same route the :8081/:8082 probes use).
+GW_FLASHNEXT_URL = os.environ.get("GW_FLASHNEXT_URL", "http://203.0.113.11:30000")
 # Also defined in llm.py; intentionally not imported to avoid a doorman_server → llm dep.
 # GW_WAKE_DEADLINE_SEC coupling: this deadline (default 180s) must be kept in sync
 # with the client-side acquire timeout in agents_core.doorman_client._gw_acquire_timeout(),
@@ -449,6 +469,17 @@ def parse_vllm_capacity_gauges(text: str) -> dict[str, float | None]:
 # in agents_core.llm (verified: llm.py:58).
 GW_BIG_MODEL_ID = "gravitywell-122b"
 
+# The Flash-Next seat's EXACT canonical_id (agents-core-doorman-flashnext-
+# handover-v0, D2b): window admission is identity-EXACT — UP_REGISTERED
+# requires data[0].id == GW_FLASHNEXT_MODEL_ID. Deliberately NOT
+# _gw_registry_lookup(): that resolver matches any alias field of any row
+# (every row shares operator_alias "gravitywell"), so a served id of
+# "big"/"gravitywell" would have admitted a window. Exact canonical_id match
+# closes that; the env override follows the GW_BIG_MODEL_ID constant pattern.
+GW_FLASHNEXT_MODEL_ID = os.environ.get(
+    "GW_FLASHNEXT_MODEL_ID", "Qwen3.8-Flash-Next-NVFP4-SSD-Stream"
+)
+
 
 def gw_big_seat_members() -> frozenset[str]:
     """The registry-declared membership of the "big" seat: every canonical_id
@@ -528,6 +559,14 @@ CONTENDED = object()
 
 # Sentinel for creative-occupied acquire (Llama-3.3-70B on :8093 holds the GPU)
 CREATIVE_OCCUPIED = object()
+
+# Sentinel for flashnext-occupied acquire (agents-core-doorman-flashnext-
+# handover-v0, D4): the flash-next seat holds GPU 0 whole-card during an
+# active handover window. Propagated and answered exactly as CREATIVE_OCCUPIED
+# (acquire_lease passthrough; 409 flashnext_occupied on /lease/acquire) —
+# including for role=mode-controller: during a confirmed window the window
+# guard supersedes the controller-deference machinery and no lease registers.
+FLASHNEXT_OCCUPIED = object()
 
 # Sentinel principal for worker leases acquired without an explicit principal.
 # Never excluded from drain_count — makes a forgotten-principal diagnosable instead of invisible.
@@ -707,6 +746,25 @@ class _NodeState:
         # None = unknown (pre-probe, ssh timeout/error). Never conflated with
         # the seat health.
         self._gpu1_berth_unit: bool | None = None
+        # Flash-next seat (:30000) window bookkeeping (agents-core-doorman-
+        # flashnext-handover-v0, D2/D5): the window is PROBE-DERIVED (D1 — no
+        # external declaration file, host marker, or lease on the host), so a
+        # launcher death cannot leave a stale window; it self-clears when
+        # :30000 stops answering. Populated by _refresh_serving_cache() from
+        # this tick's own probe + this tick's serving read (under the lock);
+        # read by status_snapshot() lock-only (the gpu1 block's precedent) and
+        # by the stop path (D3/D9). _flashnext_window: "active" | "none" |
+        # None (indeterminate — a blind probe is blindness, never False).
+        # _flashnext_window_since: epoch set on the tick the window first
+        # reads active, held while active, cleared on close.
+        # _flashnext_window_closed_at: epoch set on the active->none
+        # transition tick, consumed exactly once by the D9 close re-anchor.
+        self._flashnext_state: str | None = None
+        self._flashnext_served_id: str | None = None
+        self._flashnext_registered: bool | None = None
+        self._flashnext_window: str | None = None
+        self._flashnext_window_since: float | None = None
+        self._flashnext_window_closed_at: float | None = None
         # Tri-state dual-slot activity probe (gw-doorman-vllm-activity-probe-v0):
         # True when the most recent _probe_slot_activity() tick was indeterminate
         # (at least one probe ambiguous, none confirmed activity) — read by the
@@ -1200,6 +1258,121 @@ class _NodeState:
             log.debug(f"[{self.node_name}] gpu1 glances probe inconclusive: {exc}")
             return None
 
+    def _probe_flashnext_seat(self, sequential: bool = False) -> tuple[str, str | None, bool | None]:
+        """Probe the flash-next seat on :30000 (agents-core-doorman-flashnext-
+        handover-v0, D2/D7). Returns (state, served_id, registered):
+
+          state:
+            "down"          — /health connection refused (host reachable, port
+                              closed): no seat listener. Window none.
+            "blind"         — timeout / connection error / unparseable
+                              /health: indeterminate. Window indeterminate
+                              (null); the 27B axis behaves exactly as today
+                              (a missing probe is blindness, never False).
+            "up_registered" — /health answered AND /v1/models returned 200
+                              with data[0].id == GW_FLASHNEXT_MODEL_ID (EXACT
+                              canonical_id match, D2b — never
+                              _gw_registry_lookup). Window active (when the
+                              day seat is down).
+            "up_unverified" — /health answered but /v1/models was non-200 /
+                              unparseable / timed out: a listener exists on
+                              the seat port, identity unverified (SGLang
+                              mid-load answers health before models). Window
+                              ACTIVE — safe direction: the card may be
+                              committed, and a refused acquire for a few
+                              ticks is cheaper than waking the 27B onto a
+                              committed card.
+            "up_foreign"    — /v1/models returned 200 with a DIFFERENT
+                              data[0].id: an identifiable non-seat occupant
+                              on the seat port. Window NONE + structured WARN
+                              (a squatter is an operator-visible /status
+                              state to clear, not a window; the
+                              unregistered-occupant posture of the big-probe
+                              DoD-4a gate amendment — never guess).
+
+          served_id: data[0].id of a 200 models response, else None.
+          registered: exact canonical_id match (served_id ==
+                      GW_FLASHNEXT_MODEL_ID); None when the models endpoint
+                      never answered 200.
+
+        D7 placement/shape: the TICK path (sequential=False) runs the two GETs
+        concurrently in a 2-worker pool (mirrors the existing pool style); the
+        ACQUIRE path (sequential=True) is a sequential short-circuit — GET
+        /health first, and only on an HTTP response GET /v1/models (a refused
+        /health stops after exactly one request; no per-acquire pool churn).
+        Timeouts 2.5s each. No-redirect pinned: a 3xx on the seat port is
+        blindness, not truth (deliberate hardening vs the existing probes).
+        Any error -> BLIND, never False. Never raises. Must be called
+        OUTSIDE self.lock (blocking HTTP).
+        """
+        def _health_call():
+            try:
+                return requests.get(
+                    f"{GW_FLASHNEXT_URL}/health",
+                    timeout=2.5,
+                    allow_redirects=False,
+                )
+            except Exception as exc:
+                return exc
+
+        def _models_call():
+            try:
+                return requests.get(
+                    f"{GW_FLASHNEXT_URL}/v1/models",
+                    timeout=2.5,
+                    allow_redirects=False,
+                )
+            except Exception as exc:
+                return exc
+
+        if sequential:
+            # Acquire path (D4): sequential short-circuit — a refused /health
+            # is exactly one HTTP call.
+            health = _health_call()
+            models = _models_call() if isinstance(health, requests.Response) else None
+        else:
+            # Tick path (D7): 2-worker pool, both GETs issued concurrently.
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_health = pool.submit(_health_call)
+                fut_models = pool.submit(_models_call)
+                health = fut_health.result()
+                models = fut_models.result()
+
+        # /health half: any HTTP response (any status) = a listener exists on
+        # the seat port; a connection-level failure is the DOWN/BLIND split.
+        if isinstance(health, requests.exceptions.ConnectionError):
+            # Connection refused: the host answered RST — no seat listener.
+            return ("down", None, None)
+        if not isinstance(health, requests.Response):
+            # Timeout or any other connection error: indeterminate.
+            return ("blind", None, None)
+
+        # A listener exists. Identity half — only when the models response is
+        # an actual HTTP response (a sequential short-circuit on a refused
+        # /health never reaches here; a models timeout/exception is BLIND-
+        # SHAPED: up but unverified, never down).
+        if isinstance(models, requests.Response) and models.status_code == 200:
+            try:
+                data = models.json().get("data")
+                if isinstance(data, list) and data and isinstance(data[0], dict):
+                    served_id = data[0].get("id")
+                    if isinstance(served_id, str) and served_id:
+                        if served_id == GW_FLASHNEXT_MODEL_ID:
+                            return ("up_registered", served_id, True)
+                        # Identifiable non-seat occupant (D2: UP_FOREIGN).
+                        log.warning(
+                            f"[{self.node_name}] flashnext-seat-foreign-occupant — "
+                            f":30000 /v1/models serves {served_id!r} "
+                            f"(expected {GW_FLASHNEXT_MODEL_ID!r}); not a window, "
+                            f"operator-visible /status state to clear"
+                        )
+                        return ("up_foreign", served_id, False)
+            except Exception:
+                pass
+        # /health answered but /v1/models was non-200 / unparseable / timed
+        # out: a listener exists, identity unverified (SGLang mid-load).
+        return ("up_unverified", None, None)
+
     def _probe_slot_activity(self) -> bool | None:
         """Tri-state unmediated-caller activity probe across all signal sources
         (gw-doorman-vllm-activity-probe-v0, extended by agents-core-doorman-
@@ -1299,6 +1472,16 @@ class _NodeState:
         """
         serving = self._is_serving(timeout=2.0)
         creative_serving = self._is_creative_serving()
+        # Flash-next seat probe (agents-core-doorman-flashnext-handover-v0,
+        # D7): runs unconditionally every tick, beside the serving probe and
+        # OUTSIDE the lock. Deliberately NOT in _probe_slot_activity's pool
+        # (that pool runs only when DOORMAN_PROBE_LLAMA_ACTIVITY is on, and
+        # the window determination must work regardless of that flag) and
+        # never joined to the activity vote lists (Invariant 8: :30000
+        # activity is irrelevant to the 27B axis's idle clock).
+        flashnext_state, flashnext_served_id, flashnext_registered = (
+            self._probe_flashnext_seat(sequential=False)
+        )
 
         # Single topology resolution — outside the lock (blocking HTTP).
         topology_state = None
@@ -1316,6 +1499,41 @@ class _NodeState:
             self._cached_serving = serving
             self._cached_creative_serving = creative_serving
             self._serving_checked_at = time.time()
+
+            # Flash-next window bookkeeping (D2/D5): computed under the lock
+            # from THIS tick's probe + THIS tick's serving read. The window is
+            # ACTIVE iff (a) the :30000 probe reports a seat listener
+            # (up_registered OR up_unverified — the safe direction) AND
+            # (b) the :8081 day-seat probe reports down. A blind probe leaves
+            # the window indeterminate (None) — the 27B axis behaves exactly
+            # as today (Invariant 7: blindness is not down on the :30000
+            # axis). window_since is set on the first active read, held while
+            # active, cleared on close; window_closed_at is set on the
+            # active->none transition tick and consumed by the D9 re-anchor.
+            self._flashnext_state = flashnext_state
+            self._flashnext_served_id = flashnext_served_id
+            self._flashnext_registered = flashnext_registered
+            window = (
+                "active"
+                if flashnext_state in ("up_registered", "up_unverified") and not serving
+                else "none"
+                if flashnext_state in ("down", "up_foreign")
+                else None
+            )
+            if window == "active":
+                if self._flashnext_window != "active":
+                    # First active read this window (or re-open after a flap):
+                    # stamp the open edge.
+                    self._flashnext_window_since = time.time()
+                self._flashnext_window = "active"
+            else:
+                if self._flashnext_window == "active":
+                    # active -> none (or indeterminate) transition tick: the
+                    # D9 close re-anchor consumes this exactly once.
+                    self._flashnext_window_closed_at = time.time()
+                self._flashnext_window = window
+                self._flashnext_window_since = None
+
             if DOORMAN_MODE_AWARE_ADMISSION:
                 self._cached_topology_state = topology_state
                 controller_owns = self._controller_lease_active()
@@ -1805,6 +2023,65 @@ class _NodeState:
                     self.last_error = None
                     self.service_stopped = False
                 return True
+
+            # Flash-next window guard (agents-core-doorman-flashnext-handover-
+            # v0, D4) — the wake collision guard. Placed IMMEDIATELY before the
+            # wake-gravitywell subprocess, after the fast path and the
+            # deference / mode-bearing returns: normal-day acquires (27B up)
+            # return inside the fast path and pay ZERO added probes; only the
+            # already-down path (rare) pays one sequential :30000 probe. The
+            # :8081 half of the window test is the fast path's own fresh
+            # _is_serving() fallthrough above (read milliseconds earlier) —
+            # the guard issues ONLY the fresh seat probe, never a second
+            # :8081 GET. The probe is FRESH (never the 45s cache): this is the
+            # only path that would issue a wake, so the guard must not act on
+            # a stale read (Invariant 4).
+            seat_state, seat_served_id, _seat_registered = (
+                self._probe_flashnext_seat(sequential=True)
+            )
+            if seat_state in ("up_registered", "up_unverified"):
+                # The seat holds (or is loading onto) GPU 0 whole-card at
+                # --mem-fraction-static 0.985: waking the 27B here would put
+                # two whole-card occupants on one card = OOM, one of them the
+                # drafting session mid-flight. Refuse with the sentinel; no
+                # wake-gravitywell, no _wake_*, no lease, idle_since untouched.
+                # Applies to ALL acquires, including role=mode-controller —
+                # during a confirmed window the window guard supersedes the
+                # controller-deference machinery (mirrors CREATIVE_OCCUPIED,
+                # which refuses even the controller's own acquire).
+                log.info(
+                    f"[{self.node_name}] flashnext-window-holding-gpu0 — seat probe "
+                    f"{seat_state} (served_id={seat_served_id!r}); refusing wake, "
+                    f"no lease registered (FLASHNEXT_OCCUPIED)"
+                )
+                return FLASHNEXT_OCCUPIED
+            if seat_state == "blind":
+                # BLIND proceed is TODAY's behavior per D2 (the B2 contract:
+                # a missing probe is blindness, never False; and a BRIX->GW
+                # partition breaks the wake's own ssh first) — but the blind
+                # pass is a log line, not silence (gate binding constraint):
+                # the structured warning carries the probe error class.
+                # (Deliberate asymmetry with the flip-controller guard's
+                # fail-closed BLIND: Invariant 13.)
+                # The probe returns a state string, not the error object, so
+                # the class is named from the probe's own failure mapping:
+                # the two requests exception families that reach BLIND are
+                # Timeout (connect/read timeout) and the ConnectionError
+                # family that is NOT the refused/DOWN split.
+                log.warning(
+                    f"[{self.node_name}] flashnext-seat-probe-blind — :30000 probe "
+                    f"indeterminate (error_class=Timeout|ConnectionError), "
+                    f"proceeding with wake exactly as today"
+                )
+            elif seat_state == "up_foreign":
+                # An identifiable non-seat occupant on the seat port: the
+                # window is none (never guess — the probe already WARNed at
+                # the probe site with the served id), so the wake proceeds.
+                log.warning(
+                    f"[{self.node_name}] flashnext-seat-foreign — :30000 probe "
+                    f"up_foreign (served_id={seat_served_id!r}); no window, "
+                    f"wake proceeds"
+                )
 
             log.info(f"[{self.node_name}] GW not serving — running wake-gravitywell")
             try:
@@ -2456,6 +2733,12 @@ class _NodeState:
         ok = self.ensure_serving(role=role, mode=mode, work_id=work_id)
         if ok is CREATIVE_OCCUPIED:
             return CREATIVE_OCCUPIED
+        if ok is FLASHNEXT_OCCUPIED:
+            # Propagated exactly as CREATIVE_OCCUPIED (D4): the flash-next
+            # window guard refused the wake — no lease registered, no hold
+            # placed, idle_since untouched. Uniform for all acquires,
+            # including role=mode-controller.
+            return FLASHNEXT_OCCUPIED
         if ok is DEFERRED:
             # Controller's own acquire (role="mode-controller") registers the lease and hold
             # even though ensure_serving returns DEFERRED (no gw-serve big was issued).
@@ -2646,6 +2929,34 @@ class _NodeState:
                     "glances_mem_pct": self._gpu1_glances_mem_pct,
                     "glances_proc": self._gpu1_glances_proc,
                     "last_vote": self._last_probe_raw.get("GPU1"),
+                },
+                # Flash-next (:30000) seat awareness block (agents-core-
+                # doorman-flashnext-handover-v0, D5): the operator surface
+                # for "what does the doorman see on the whole-card seat?".
+                # Reads ONLY cached fields (no network, lock-only — the gpu1
+                # block's precedent). seat_state is the D2 probe state;
+                # window is "active"|"none"|null (null = indeterminate — a
+                # blind probe is blindness, never down). window_since is
+                # epoch|null (set on the tick the window first reads active,
+                # held while active, cleared on close); window_closed_at is
+                # epoch|null (set on the active->none transition tick,
+                # consumed by the D9 close re-anchor). serving_mode's enum
+                # and the 27B-axis fields above are untouched by this block
+                # (Invariant 5).
+                "flashnext": {
+                    "seat_health": (
+                        None
+                        if self._flashnext_state == "blind"
+                        else self._flashnext_state
+                        in ("up_registered", "up_unverified", "up_foreign")
+                    ),
+                    "seat_state": self._flashnext_state,
+                    "served_id": self._flashnext_served_id,
+                    "registered": self._flashnext_registered,
+                    "window": self._flashnext_window,
+                    "window_since": self._flashnext_window_since,
+                    "window_closed_at": self._flashnext_window_closed_at,
+                    "last_vote": self._flashnext_state,
                 },
             }
 
@@ -2938,6 +3249,70 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
 
                     if not state.leases:
                         # No active leases: check if deferred service stop is due
+
+                        # Flash-next window (agents-core-doorman-flashnext-
+                        # handover-v0, D3): the keeper now KNOWS the nature of
+                        # the room — the :30000 seat holds GPU 0 whole-card
+                        # and the 27B is down by design. Never park, never
+                        # stop, never alarm: the 2026-08-19 ruling is
+                        # satisfied by knowledge, not by continued refusal.
+                        # NOT gated by DOORMAN_MODE_AWARE_ADMISSION (D3/
+                        # Invariant 9): the window is a property of the seat,
+                        # not of the admission policy — a flag-off doorman
+                        # must still not park the card the seat holds.
+                        if state._flashnext_window == "active":
+                            _write_idle_log(
+                                node_name, "card_held_flashnext", 0,
+                                idle_secs=(
+                                    time.time() - state.idle_since
+                                    if state.idle_since is not None else None
+                                ),
+                                served_id=state._flashnext_served_id,
+                            )
+                            continue
+
+                        # Flash-next close re-anchor (D9): the stop path's
+                        # grace clock reads idle_since, which the last
+                        # pre-window lease release (or TTL-GC) set at window
+                        # open and nothing refreshes during the window.
+                        # Without a re-anchor, the first tick after close
+                        # with the restored 27B serving would compute
+                        # idle_elapsed = the full window duration >=
+                        # GW_STOP_GRACE_SEC and confirmed-idle-park the seat
+                        # the launcher just cold-restored. Window-close +
+                        # restored serving is an operator-intent activity
+                        # boundary (the same class as the lease-acquire and
+                        # probe-activity re-anchors): the restored seat
+                        # receives a full fresh GW_STOP_GRACE_SEC from the
+                        # doorman's first observation of it serving after
+                        # the window. Single atomic read-modify-write under
+                        # state.lock (gate binding constraint): read
+                        # window_closed_at / idle_since / leases / the
+                        # same-tick cached serving, and write idle_since +
+                        # clear window_closed_at, in the same critical
+                        # section (this block already runs inside the lock
+                        # section; no second lock). One-shot (the flag is
+                        # consumed); fires only on the close transition — a
+                        # normal wake (no window in the history) is
+                        # byte-identical to today, and a lease acquired
+                        # between close and first-serving-observation already
+                        # owns the clock (acquire sets idle_since = None).
+                        # NOT gated by DOORMAN_MODE_AWARE_ADMISSION
+                        # (Invariant 9).
+                        if (
+                            state._flashnext_window_closed_at is not None
+                            and state.idle_since is not None
+                            and not state.leases
+                            and state._cached_serving is True
+                        ):
+                            _write_idle_log(
+                                node_name, "flashnext_window_closed", 0,
+                                idle_secs=time.time() - state.idle_since,
+                            )
+                            state.idle_since = time.time()
+                            state._idle_since_source = "window_close"
+                            state._flashnext_window_closed_at = None
+
                         if (
                             state.idle_since is not None
                             and not state.service_stopped
@@ -3373,6 +3748,16 @@ def create_app(gw_url: str | None = None) -> FastAPI:
             return JSONResponse(
                 {"ok": False, "creative_occupied": True,
                  "reason": "creative-collider-holding-gpu"},
+                status_code=409,
+            )
+        if ok is FLASHNEXT_OCCUPIED:
+            # D4: the flash-next window guard refused the wake — the seat
+            # holds GPU 0 whole-card and no lease registered. Mirrors the
+            # creative_occupied 409 (same refusal class: another seat holds
+            # the lane).
+            return JSONResponse(
+                {"ok": False, "flashnext_occupied": True,
+                 "reason": "flashnext-window-holding-gpu0"},
                 status_code=409,
             )
         if ok is CONTENDED:
