@@ -533,6 +533,48 @@ def _classify_runner_failure(combined: str, rc: int) -> tuple[str, str]:
 # Output-write helpers (extracted for testability)
 # ---------------------------------------------------------------------------
 
+# Served-model echo boundedness (local-reviewer-identity-and-provenance-v0,
+# L1.D3): the PROVENANCE line is machine-parsed on a mixed-stdout channel
+# (the claude engine prints the full model result to stdout), so the parse
+# is line-anchored on the `^PROVENANCE: ` prefix and the served token is
+# bounded exactly as the shaped_runner's own validator (accept only
+# `^[A-Za-z0-9._:/-]+$`, <=200 chars; a violating token is VOID, not a
+# value).
+_PROVENANCE_LINE_RE = re.compile(r"^PROVENANCE: seat=(\S+)(?: served=(\S+))?$")
+_SERVED_MODEL_ECHO_RE = re.compile(r"^[A-Za-z0-9._:/-]+$")
+_SERVED_MODEL_ECHO_MAX_LEN = 200
+
+
+def _parse_provenance_line(combined: str) -> dict | None:
+    """Parse the PROVENANCE line out of a shaped_runner stdout capture.
+
+    Line-anchored on the ``^PROVENANCE: `` prefix (last matching line wins —
+    the same line-anchored contract as the failure-prefix classification
+    above). Returns ``{"seat": ..., "served": ...}`` where ``served`` is
+    None when the echo is void (absent from the line, or a bound-violating
+    token — the seat alias is never substituted). Returns None when no
+    PROVENANCE line is present (absence is a non-error: no crash, no
+    dead-letter).
+    """
+    seat = None
+    served: str | None = None
+    for line in (combined or "").splitlines():
+        m = _PROVENANCE_LINE_RE.match(line)
+        if not m:
+            continue
+        seat = m.group(1)
+        served = m.group(2)
+    if seat is None:
+        return None
+    if served is not None:
+        if (
+            len(served) > _SERVED_MODEL_ECHO_MAX_LEN
+            or not _SERVED_MODEL_ECHO_RE.match(served)
+        ):
+            served = None  # bound-violating token is VOID, not a value
+    return {"seat": seat, "served": served}
+
+
 def _write_success_output(path: Path, combined: str) -> None:
     """Write the full agent payload to *path*. No truncation on the success path."""
     path.write_text(combined if combined else "(no output)")
@@ -700,7 +742,20 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
     # above intentionally tail-slice to bound stderr noise.
     _write_success_output(Path(output_path), combined)
     summary = combined.splitlines()[0][:200] if combined else ""
-    queue.complete(task_id, output_path=output_path, result_summary=summary)
+    # Served-model provenance (local-reviewer-identity-and-provenance-v0,
+    # L1.D3): stamp the served_model field into the completed task yaml
+    # beside the existing `model:` field (requested alias stays as-is). A
+    # void echo (absent PROVENANCE line or bound-violating token) is
+    # explicit None - never the seat alias. Absence is a non-error: no
+    # crash, no dead-letter.
+    prov = _parse_provenance_line(combined)
+    queue.complete(
+        task_id,
+        output_path=output_path,
+        result_summary=summary,
+        served_model=prov.get("served") if prov else None,
+        served_model_provided=prov is not None,
+    )
     _extract_ops_primitives(
         task_id,
         task.get("task_type", "subprocess"),

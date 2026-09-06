@@ -243,7 +243,13 @@ def test_local_fixer_engine_calls_run_local_fixer_not_cli(tmp_path):
 
     with (
         patch.object(sys, "argv", ["sr", str(spec_path)]),
-        patch("agents_core.shaped_runner._run_local_fixer", return_value="http://1.2.3.4:3000/e/r/pulls/5") as mock_lf,
+        patch(
+            "agents_core.shaped_runner._run_local_fixer",
+            return_value=(
+                "http://1.2.3.4:3000/e/r/pulls/5",
+                {"seat": "gravitywell-122b", "served": ""},
+            ),
+        ) as mock_lf,
         patch("agents_core.shaped_runner.call_claude_cli") as mock_cli,
         patch("sys.stdout"),
     ):
@@ -277,9 +283,10 @@ def test_run_local_fixer_happy_path(tmp_path):
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, prov = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == "http://203.0.113.10:3000/Erah/agents-core/pulls/42"
+    assert prov == {"seat": "gravitywell-122b", "served": ""}
     mock_pr.assert_called_once()
     pr_call = mock_pr.call_args
     assert pr_call.kwargs.get("repo") == "agents-core" or pr_call.args[0] == "agents-core"
@@ -345,7 +352,7 @@ def test_run_local_fixer_retry_uses_existing_branch_when_confirmed(tmp_path):
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == "http://x/pulls/1"
     mock_setup.assert_called_once()
@@ -366,7 +373,7 @@ def test_run_local_fixer_retry_aborts_when_branch_not_on_origin(tmp_path, capsys
         patch("agents_core.worktree.teardown_worktree") as mock_teardown,
         patch("subprocess.run", return_value=MagicMock(returncode=1, stderr="branch not found")),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == ""
     mock_gw.assert_not_called()
@@ -394,7 +401,7 @@ def test_run_local_fixer_retry_without_existing_branch_falls_back_to_base_branch
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == "http://x/pulls/1"
     mock_setup.assert_called_once()
@@ -422,7 +429,7 @@ def test_run_local_fixer_local_ignores_existing_branch(tmp_path):
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == "http://x/pulls/1"
     mock_setup.assert_called_once()
@@ -492,7 +499,7 @@ def test_no_pr_when_not_concluded(tmp_path):
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == ""
     mock_pr.assert_not_called()
@@ -516,7 +523,7 @@ def test_no_pr_when_diff_empty(tmp_path):
             patch.object(Path, "mkdir"),
             patch.object(Path, "write_text"),
         ):
-            url = sr._run_local_fixer(spec, str(tmp_path))
+            url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
         assert url == "", f"expected '' for empty_diff={empty_diff!r}"
         mock_pr.assert_not_called()
@@ -544,7 +551,7 @@ def test_no_pr_when_zero_passing_tests(tmp_path):
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == ""
     mock_pr.assert_not_called()
@@ -569,7 +576,7 @@ def test_no_is_none_check_needed_concluded_false_covers_doorman_unreachable(tmp_
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == ""
     mock_pr.assert_not_called()
@@ -607,12 +614,218 @@ def test_pr_body_contains_required_elements(tmp_path):
     assert captured_body, "create_pr was not called"
     body = captured_body[0]
 
-    assert "122B fixer harness" in body, "attribution line missing"
+    assert "local fixer harness" in body, "attribution line missing"
     assert "<!-- lapis-gpu-id: abc123 -->" in body, "lapis-gpu-id marker missing"
     assert "<!-- lapis-tid: my-target-v0 -->" in body, "lapis-tid marker missing"
     assert "passed" in body, "test outcome missing"
     assert "gw-transcript.json" in body, "transcript artifact link missing"
     assert "step" in body.lower(), "step summary missing"
+
+
+# ---------------------------------------------------------------------------
+# local-reviewer-identity-and-provenance-v0 (L1.D1/D2/D3): identity line,
+# engine marker, PROVENANCE stdout line, served_model provenance dict.
+# ---------------------------------------------------------------------------
+
+def _run_local_fixer_capture(
+    tmp_path,
+    *,
+    gw_side_effect=None,
+    gw_return=None,
+):
+    """Run _run_local_fixer with a captured create_pr body; return (url, body, prov, gw_kwargs)."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    captured_body: list[str] = []
+    gw_kwargs: list[dict] = []
+
+    def fake_create_pr(**kwargs):
+        captured_body.append(kwargs.get("body", ""))
+        return {"html_url": "http://x/pulls/7"}
+
+    def fake_gw_agent(**kwargs):
+        gw_kwargs.append(kwargs)
+        if gw_side_effect is not None:
+            return gw_side_effect(**kwargs)
+        return gw_return
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw_agent),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", side_effect=fake_create_pr),
+        patch("agents_core.forgejo.get_open_prs", return_value=[]),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        url, prov = sr._run_local_fixer(spec, str(tmp_path))
+
+    assert captured_body, "create_pr was not called"
+    return url, captured_body[0], prov, gw_kwargs
+
+
+def test_identity_line_carries_seat_and_served_echo(tmp_path):
+    """L1.D4(a): the identity line carries the spec seat alias and the
+    served echo when the echo is provided (served_model_out[-1])."""
+    def fake_gw(**kwargs):
+        # Simulate the gw_agent.py out-param contract: the server-echoed
+        # final model is appended to served_model_out.
+        kwargs["served_model_out"].append("gravitywell-27b")
+        return (_good_fixer_result(), [])
+
+    url, body, prov, gw_kwargs = _run_local_fixer_capture(
+        tmp_path, gw_side_effect=fake_gw
+    )
+
+    # The caller-owned out-param list was passed to call_gw_agent.
+    assert "served_model_out" in gw_kwargs[0]
+    assert isinstance(gw_kwargs[0]["served_model_out"], list)
+
+    identity = body.splitlines()[0]
+    assert identity == (
+        "Implemented by the local fixer harness (seat gravitywell-122b), "
+        "served model: gravitywell-27b. Not paid Claude."
+    ), f"identity line wrong: {identity!r}"
+    assert prov == {"seat": "gravitywell-122b", "served": "gravitywell-27b"}
+
+
+def test_identity_line_void_form_when_echo_absent(tmp_path):
+    """L1.D4(b): the 'not reported' void form renders when the echo is
+    absent (no served_model_out entry) - and the seat alias NEVER appears
+    in the served-model slot."""
+    url, body, prov, _ = _run_local_fixer_capture(
+        tmp_path, gw_return=(_good_fixer_result(), [])
+    )
+
+    identity = body.splitlines()[0]
+    assert identity == (
+        "Implemented by the local fixer harness (seat gravitywell-122b), "
+        "served model: not reported. Not paid Claude."
+    ), f"identity line wrong: {identity!r}"
+    # The seat alias must never occupy the served-model slot.
+    served_slot = identity.split("served model: ", 1)[1].rsplit(". Not paid Claude.", 1)[0]
+    assert served_slot == "not reported"
+    assert "gravitywell-122b" not in served_slot
+    assert prov == {"seat": "gravitywell-122b", "served": ""}
+
+
+def test_identity_line_void_form_when_echo_bound_violating(tmp_path):
+    """L1.D4(b): a bound-violating server echo (charset/length) renders the
+    void form - never the violating string, never the seat alias."""
+    bad_echoes = [
+        "evil model; rm -rf /",       # whitespace + charset violation
+        "x" * 201,                     # length violation
+        "model\nwith-newline",         # charset violation
+        "",                            # empty
+        None,                          # non-str
+    ]
+    for bad in bad_echoes:
+        _bad = bad
+        sub = tmp_path / f"wt-{abs(hash(bad))}"
+        sub.mkdir()
+
+        def fake_gw(**kwargs):
+            kwargs["served_model_out"].append(_bad)
+            return (_good_fixer_result(), [])
+
+        url, body, prov, _ = _run_local_fixer_capture(
+            sub, gw_side_effect=fake_gw
+        )
+
+        identity = body.splitlines()[0]
+        assert identity == (
+            "Implemented by the local fixer harness (seat gravitywell-122b), "
+            "served model: not reported. Not paid Claude."
+        ), f"identity line wrong for echo {bad!r}: {identity!r}"
+        served_slot = identity.split("served model: ", 1)[1].rsplit(". Not paid Claude.", 1)[0]
+        assert served_slot == "not reported"
+        assert "gravitywell-122b" not in served_slot
+        assert prov == {"seat": "gravitywell-122b", "served": ""}
+
+
+def test_identity_line_valid_edge_echo_accepted(tmp_path):
+    """L1.D4(a) edge: a 200-char in-charset echo is accepted (boundary)."""
+    good = "m" * 200
+
+    def fake_gw(**kwargs):
+        kwargs["served_model_out"].append(good)
+        return (_good_fixer_result(), [])
+
+    url, body, prov, _ = _run_local_fixer_capture(tmp_path, gw_side_effect=fake_gw)
+    identity = body.splitlines()[0]
+    assert f"served model: {good}. Not paid Claude." in identity
+    assert prov == {"seat": "gravitywell-122b", "served": good}
+
+
+def test_lapis_engine_marker_present_in_local_fixer_body(tmp_path):
+    """L1.D4(c): the local-fixer PR body carries the lapis-engine marker
+    (parity with the opencode marker)."""
+    url, body, prov, _ = _run_local_fixer_capture(
+        tmp_path, gw_return=(_good_fixer_result(), [])
+    )
+    assert "<!-- lapis-engine: local-fixer -->" in body
+
+
+def test_provenance_line_emitted_on_stdout(tmp_path, capsys):
+    """L1.D3: the shaped run emits a machine-readable PROVENANCE line to
+    stdout (seat + served when the echo is available)."""
+    spec = json.loads(_make_spec(tmp_path).read_text())
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    import agents_core.shaped_runner as sr
+
+    def fake_gw(**kwargs):
+        kwargs["served_model_out"].append("gravitywell-27b")
+        return (_good_fixer_result(), [])
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
+        patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
+        patch("agents_core.worktree.teardown_worktree"),
+        patch("agents_core.forgejo.create_pr", return_value={"html_url": "http://x/p/1"}),
+        patch("agents_core.forgejo.get_open_prs", return_value=[]),
+        patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "write_text"),
+    ):
+        url, prov = sr._run_local_fixer(spec, str(tmp_path))
+        sr._print_provenance_line(prov)
+
+    out = capsys.readouterr().out
+    lines = [l for l in out.splitlines() if l.startswith("PROVENANCE: ")]
+    assert lines == ["PROVENANCE: seat=gravitywell-122b served=gravitywell-27b"]
+
+
+def test_provenance_line_void_omits_served(capsys):
+    """L1.D3: when the echo is void, `served` is ABSENT from the line (not
+    the alias, not 'not reported' - the data surface carries the void as
+    absence; the yaml field carries explicit null)."""
+    import agents_core.shaped_runner as sr
+
+    prov = {"seat": "gravitywell-122b", "served": ""}
+    sr._print_provenance_line(prov)
+    out = capsys.readouterr().out
+    lines = [l for l in out.splitlines() if l.startswith("PROVENANCE: ")]
+    assert lines == ["PROVENANCE: seat=gravitywell-122b"]
+    # The seat alias never appears in a served slot.
+    assert "served=" not in lines[0]
+
+
+def test_print_provenance_line_invalid_prov_is_noop(tmp_path, capsys):
+    """L1.D3: absence is a non-error - a missing/invalid prov dict degrades
+    to no line, never a crash."""
+    import agents_core.shaped_runner as sr
+
+    for bad in (None, {}, {"seat": ""}, "not-a-dict"):
+        sr._print_provenance_line(bad)
+    out = capsys.readouterr().out
+    assert "PROVENANCE:" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +856,7 @@ def test_git_failure_returns_empty_no_pr(tmp_path, fail_on):
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == "", f"expected '' on {fail_on} failure"
     mock_pr.assert_not_called()
@@ -664,7 +877,7 @@ def test_worktree_torn_down_even_on_exception(tmp_path):
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == ""
     mock_teardown.assert_called_once()
@@ -714,7 +927,7 @@ def test_salvage_max_steps_reached_with_passing_tests_opens_pr(tmp_path):
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == "http://203.0.113.10:3000/Erah/agents-core/pulls/99"
     assert captured_body, "create_pr was not called"
@@ -739,7 +952,7 @@ def test_no_pr_max_steps_reached_empty_diff(tmp_path):
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == ""
     mock_pr.assert_not_called()
@@ -763,7 +976,7 @@ def test_no_pr_max_steps_reached_failing_tests(tmp_path):
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == ""
     mock_pr.assert_not_called()
@@ -988,7 +1201,7 @@ def test_salvage_no_progress_with_passing_tests_opens_pr(tmp_path):
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == "http://203.0.113.10:3000/Erah/agents-core/pulls/100"
     assert captured_body, "create_pr was not called"
@@ -1013,7 +1226,7 @@ def test_no_pr_no_progress_empty_diff(tmp_path):
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == ""
     mock_pr.assert_not_called()
@@ -1037,7 +1250,7 @@ def test_no_pr_no_progress_failing_tests(tmp_path):
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == ""
     mock_pr.assert_not_called()
@@ -1061,7 +1274,7 @@ def test_no_pr_no_progress_zero_passing_tests(tmp_path):
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert url == ""
     mock_pr.assert_not_called()
@@ -1085,7 +1298,7 @@ def test_max_steps_salvage_unchanged_green_and_bad(tmp_path):
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
     assert url == "http://x/p/1"
 
     with (
@@ -1096,7 +1309,7 @@ def test_max_steps_salvage_unchanged_green_and_bad(tmp_path):
         patch.object(Path, "mkdir"),
         patch.object(Path, "write_text"),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        url, _ = sr._run_local_fixer(spec, str(tmp_path))
     assert url == ""
     mock_pr.assert_not_called()
 
@@ -1422,7 +1635,7 @@ def test_handler_supervision_unsupported_backend_fails_loud(tmp_path, capsys):
     import agents_core.shaped_runner as sr
 
     with patch("agents_core.gw_agent.call_gw_agent") as mock_gw:
-        result = sr._run_local_fixer(spec, str(tmp_path))
+        result, _ = sr._run_local_fixer(spec, str(tmp_path))
 
     assert result == ""
     mock_gw.assert_not_called()

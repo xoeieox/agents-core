@@ -39,6 +39,35 @@ from agents_core.room_paths import room_path
 # use — room_path() only resolves the Path, it does not create directories.
 STREAM_LOG_DIR = room_path("claude_queue.stream_logs")
 
+# ---------------------------------------------------------------------------
+# Served-model echo boundedness (local-reviewer-identity-and-provenance-v0,
+# L1.D1/L1.D3). The served model is server-echoed (gw_agent.py appends the
+# server-supplied data["model"] into served_model_out) and the PROVENANCE
+# stdout line is machine-parsed on a mixed-stdout channel (the claude engine
+# prints the full model result). Accept only tokens matching the bounded
+# charset; anything else is VOID (never rendered / never stamped) - a
+# bound-violating token is a void echo, not a value.
+# ---------------------------------------------------------------------------
+_SERVED_MODEL_ECHO_RE = re.compile(r"^[A-Za-z0-9._:/-]+$")
+_SERVED_MODEL_ECHO_MAX_LEN = 200
+
+
+def _validate_served_model_echo(value) -> str:
+    """Return the served-model echo if it is a valid, in-bounds token, else "".
+
+    The echo is server-supplied (or parsed from a mixed-stdout channel), so
+    it is untrusted input: accept only `^[A-Za-z0-9._:/-]+$` tokens of at
+    most 200 chars. A violating token is VOID (""), never a value - the
+    caller renders the explicit void form instead.
+    """
+    if not isinstance(value, str):
+        return ""
+    if len(value) > _SERVED_MODEL_ECHO_MAX_LEN:
+        return ""
+    if not _SERVED_MODEL_ECHO_RE.match(value):
+        return ""
+    return value
+
 
 # ---------------------------------------------------------------------------
 # Handler supervision (agents-core-handler-operative-live-supervision-v0)
@@ -823,6 +852,8 @@ def tail_finalize(
     wip_head_sha: str = "",
     wip_steps: list = None,
     _wip_git=None,
+    seat_alias: str = "",
+    served_model: str = "",
 ) -> str:
     """The shared deterministic git/PR tail (fixers-harness-staged-v0, S6).
 
@@ -1330,8 +1361,24 @@ def tail_finalize(
             file=sys.stderr,
         )
 
+    # Identity line (local-reviewer-identity-and-provenance-v0, L1.D1): the
+    # seat is the spec-driven seat alias (registry-sourced); the served model
+    # is the server-echoed final model from the run's served_model_out
+    # out-param (the gw_agent.py:1926-1931 contract - the final/deciding
+    # model is served_model_out[-1]). The seat alias is NEVER written into
+    # the served-model slot: a void echo (unavailable or bound-violating)
+    # renders the explicit "not reported" form (Erah 2026-09-06
+    # explicit-void adjudication) - substituting the role for the substance
+    # would be a lie by omission in the audit record.
+    _served = _validate_served_model_echo(served_model)
+    _seat = seat_alias or "unknown-seat"
+    _served_slot = _served if _served else "not reported"
+    identity_line = (
+        f"Implemented by the local fixer harness (seat {_seat}), "
+        f"served model: {_served_slot}. Not paid Claude."
+    )
     pr_body = (
-        f"Implemented by the local 122B fixer harness, not paid Claude.\n\n"
+        f"{identity_line}\n\n"
         f"{salvage_note}"
         f"{signoff_marker}"
         f"## Diff summary\n\n```diff\n{diffstat}\n```\n\n"
@@ -1340,7 +1387,8 @@ def tail_finalize(
         f"## Steps\n\n{step_count} tool-call step(s) executed.\n\n"
         f"## Transcript\n\n`{transcript_path}`\n\n"
         f"<!-- lapis-gpu-id: {task_id} -->\n"
-        f"<!-- lapis-tid: {target_id} -->"
+        f"<!-- lapis-tid: {target_id} -->\n"
+        f"<!-- lapis-engine: local-fixer -->"
     )
 
     try:
@@ -1712,11 +1760,37 @@ def _run_local_fixer_staged(spec: dict, base_cwd: str | None) -> str:
                 print(f"WARN: staged: worktree teardown failed: {exc}", file=sys.stderr)
 
 
-def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
+def _print_provenance_line(prov) -> None:
+    """Emit the machine-readable PROVENANCE line (L1.D3).
+
+    ``PROVENANCE: seat=<alias> served=<model>`` to stdout; ``served`` is
+    ABSENT from the line when the echo is void (unavailable or
+    bound-violating). Absence is a non-error: a missing/invalid prov dict
+    degrades to no line, never a crash. The claude engine prints the full
+    model result to stdout, so consumers parse line-anchored on the
+    ``^PROVENANCE: `` prefix (last matching line wins).
+    """
+    if not isinstance(prov, dict):
+        return
+    seat = prov.get("seat") or ""
+    if not seat:
+        return
+    served = _validate_served_model_echo(prov.get("served"))
+    line = f"PROVENANCE: seat={seat}"
+    if served:
+        line += f" served={served}"
+    print(line)
+
+
+def _run_local_fixer(spec: dict, base_cwd: str | None) -> tuple[str, dict | None]:
     """Deterministic git/PR tail for the local-fixer engine.
 
     Manages its own worktree (shaper doesn't set worktree_required for GPU-routed
-    agents). Returns a PR URL on success, "" on any failure — never raises.
+    agents). Returns (PR URL, provenance) on success, ("", provenance) on any
+    failure — never raises. The provenance dict (L1.D3) is
+    ``{"seat": <spec seat alias>, "served": <validated served-model echo or
+    "" when void>}`` — the seat alias is never substituted into the served
+    slot.
     """
     import json as _json
     import subprocess
@@ -1909,6 +1983,13 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         )
         sup_lease_client = None
 
+    # L1.D3 provenance dict (local-reviewer-identity-and-provenance-v0): the
+    # seat is the spec-driven seat alias (registry-sourced); the served slot
+    # carries the validated echo or "" when void - the alias is NEVER
+    # substituted into the served slot (Erah 2026-09-06 explicit-void
+    # adjudication).
+    _provenance = {"seat": spec.get("model") or "", "served": ""}
+
     try:
         from agents_core.gw_agent import call_gw_agent
         from agents_core.worktree import setup_worktree, teardown_worktree
@@ -1968,7 +2049,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                     f"ERROR: worktree_setup: existing_branch {existing_branch} not found on origin",
                     file=sys.stderr,
                 )
-                return ""
+                return "", _provenance
             worktree_ref = existing_branch
 
         handle = setup_worktree(task_id, effective_cwd, worktree_ref)
@@ -2009,6 +2090,14 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         else:
             _max_steps = 60
 
+        # Served-model provenance (local-reviewer-identity-and-provenance-v0,
+        # L1.D1/L1.D3): caller-owned out-param list. call_gw_agent appends the
+        # server-echoed "model" field per echoing step (gw_agent.py:1838; the
+        # contract at :1926-1931 documents the final/deciding model as
+        # served_model_out[-1] - the same pattern authority.screen consumes).
+        # No gw_agent.py change is required.
+        _served_model_out: list = []
+
         fixer_result, transcript = call_gw_agent(
             prompt=spec["prompt"],
             system=spec.get("system", ""),
@@ -2031,6 +2120,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             # salvage-v0, S3): one WIP commit per write step onto the
             # separate refs/wip/<task_id> ref. Local-fixer runs only.
             after_step=_wip_commit_hook,
+            served_model_out=_served_model_out,
         )
 
         # Remove the staged spec before the deterministic git tail so it is
@@ -2084,6 +2174,15 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                 log=lambda m: print(m, file=sys.stderr),
             )
 
+        # L1.D3: stamp the validated served-model echo into the provenance
+        # dict. The final/deciding model is served_model_out[-1] (the
+        # gw_agent.py:1926-1931 contract). A bound-violating or absent echo
+        # leaves the served slot "" (void) - the alias is never substituted.
+        if _served_model_out:
+            _provenance["served"] = _validate_served_model_echo(
+                _served_model_out[-1]
+            )
+
         # S6 (fixers-harness-staged-v0): the shared deterministic tail
         # (gate decision, salvage partitions, push/PR) - extracted so the
         # staged engine reuses the exact same mechanics. The legacy path
@@ -2114,12 +2213,16 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             wip_head_sha=wip_head_sha,
             wip_steps=wip_steps,
             _wip_git=_wip_git,
+            seat_alias=spec.get("model") or "",
+            served_model=(
+                _served_model_out[-1] if _served_model_out else ""
+            ),
         )
-        return _legacy_tail_result
+        return _legacy_tail_result, _provenance
     except Exception as exc:
         print(f"WARN: local-fixer: unexpected error: {exc}", file=sys.stderr)
         _tail_log(task_id, f"unexpected error: {exc}")
-        return ""
+        return "", _provenance
 
     finally:
         # Release the supervisor lease (gw-gpu1-berth-standing-seat-v0, leg 2,
@@ -3025,15 +3128,19 @@ def main():
     permission_mode = spec.get("permission_mode") or None
 
     # Engine dispatch — local-fixer bypasses the claude -p path entirely and
-    # runs the deterministic git/PR tail around the GW 122B harness.
+    # runs the deterministic git/PR tail around the local GW fixer harness
+    # (the seat is spec-driven - registry `agent.model`; the served model is
+    # echoed per call via served_model_out, local-reviewer-identity-and-
+    # provenance-v0 L1.D1).
     engine = spec.get("engine", "claude")
     if engine == "local-fixer":
-        pr_url = _run_local_fixer(spec, base_cwd)
+        pr_url, prov = _run_local_fixer(spec, base_cwd)
         try:
             spec_path.unlink()
         except OSError:
             pass
         print(pr_url)
+        _print_provenance_line(prov)
         return
     elif engine == "local-fixer-staged":
         # fixers-harness-staged-v0 (S2): the staged fixer harness

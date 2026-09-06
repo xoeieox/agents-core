@@ -672,7 +672,9 @@ class ClaudeQueue:
         return None
 
     def complete(self, task_id: str, output_path: str | None = None,
-                 result_summary: str | None = None):
+                 result_summary: str | None = None,
+                 served_model: str | None = None,
+                 served_model_provided: bool = False):
         active_path = self.active_dir / f"{task_id}.yaml"
         task = self._read_task(active_path)
         if not task:
@@ -685,6 +687,16 @@ class ClaudeQueue:
             task["output_path"] = output_path
         if result_summary:
             task["result_summary"] = result_summary
+        # Served-model provenance (local-reviewer-identity-and-provenance-v0,
+        # L1.D3): the ACTUAL served model echoed by the run, stamped beside
+        # the existing `model:` field (the requested seat alias, kept as-is).
+        # A void echo is explicit None (never the seat alias - Erah 2026-09-06
+        # explicit-void adjudication). The field is set when the runner
+        # observed a PROVENANCE line (served_model_provided) - explicit null
+        # on a void echo; it stays absent when no PROVENANCE line was emitted
+        # (pre-Leg-1 / non-local engines) - that absence is a non-error.
+        if served_model_provided:
+            task["served_model"] = served_model
 
         if task.get("started_at"):
             try:

@@ -254,3 +254,104 @@ async def test_run_shaped_task_happy_path_still_completes(monkeypatch, tmp_path)
     assert completed_task_id == "local-rev-2"
     output_path = Path(kwargs["output_path"])
     assert '{"verdict": "clean"}' in output_path.read_text()
+
+
+# ---------------------------------------------------------------------------
+# local-reviewer-identity-and-provenance-v0 (L1.D3/L1.D4(d)): the PROVENANCE
+# stdout line is parsed line-anchored and the served_model field is stamped
+# into the completed task yaml - explicit null on a void echo, never the
+# seat alias; absence (no PROVENANCE line) is a non-error.
+# ---------------------------------------------------------------------------
+
+
+async def _run_shaped_task_success(monkeypatch, tmp_path, stdout: bytes):
+    """Drive _run_shaped_task to a successful completion with the given
+    stdout; return the queue.complete() kwargs."""
+    from agents_core import claude_queue_runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(runner_mod, "_cage_buildable", lambda: (True, ""))
+    monkeypatch.setattr(runner_mod, "_check_slice_has_cpu_quota", lambda: True)
+    monkeypatch.setattr(runner_mod, "_extract_ops_primitives", lambda *a, **kw: None)
+    monkeypatch.setattr(runner_mod, "notify_failure", lambda *a, **kw: None)
+    monkeypatch.setattr(runner_mod, "notify_completion", lambda *a, **kw: None)
+
+    async def fake_spawn(*args, **kwargs):
+        return _FakeProcess(stdout=stdout, stderr=b"", returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+
+    queue = _FakeQueue()
+    task = {
+        "id": "local-fix-9",
+        "payload": {"spec_path": str(tmp_path / "spec.json")},
+        "timeout_seconds": 30,
+        "notify": False,
+    }
+    await runner_mod._run_shaped_task(queue, task)
+    assert not queue.failed, "must not be recorded as failed"
+    assert len(queue.completed) == 1
+    return queue.completed[0][1]
+
+
+def test_provenance_stamps_served_model_into_complete_kwargs(monkeypatch, tmp_path):
+    """L1.D4(d): a PROVENANCE line with a valid echo stamps
+    served_model=<echo> into the completed yaml (served_model_provided=True).
+    The mixed-stdout channel is exercised: the full model result precedes the
+    line, and a LATER non-PROVENANCE line cannot clobber it (line-anchored,
+    last matching line wins)."""
+    stdout = (
+        b"full model result prose\n"
+        b"PROVENANCE: seat=gravitywell-slot1 served=gravitywell-27b\n"
+        b"trailing prose line\n"
+    )
+    kwargs = asyncio.run(_run_shaped_task_success(monkeypatch, tmp_path, stdout))
+    assert kwargs["served_model"] == "gravitywell-27b"
+    assert kwargs["served_model_provided"] is True
+
+
+def test_provenance_void_echo_stamps_explicit_null_never_alias(monkeypatch, tmp_path):
+    """L1.D4(d): a void echo (served absent from the line) stamps
+    served_model=None (explicit null) with served_model_provided=True -
+    NEVER the seat alias."""
+    stdout = (
+        b"full model result prose\n"
+        b"PROVENANCE: seat=gravitywell-slot1\n"
+    )
+    kwargs = asyncio.run(_run_shaped_task_success(monkeypatch, tmp_path, stdout))
+    assert kwargs["served_model"] is None
+    assert kwargs["served_model_provided"] is True
+    # The seat alias must never occupy the served-model slot.
+    assert kwargs["served_model"] != "gravitywell-slot1"
+
+
+def test_provenance_bound_violating_token_is_void(monkeypatch, tmp_path):
+    """L1.D3 boundedness: a bound-violating served token (charset) is VOID -
+    stamped as explicit null, never the violating string, never the alias."""
+    stdout = (
+        b"PROVENANCE: seat=gravitywell-slot1 served=evil;rm -rf /\n"
+    )
+    kwargs = asyncio.run(_run_shaped_task_success(monkeypatch, tmp_path, stdout))
+    assert kwargs["served_model"] is None
+    assert kwargs["served_model_provided"] is True
+
+
+def test_no_provenance_line_is_absence_not_void(monkeypatch, tmp_path):
+    """L1.D3: absence of the PROVENANCE line (pre-Leg-1 / non-local engines)
+    is a non-error - served_model_provided=False, so the yaml field stays
+    ABSENT (distinct from the explicit-null void)."""
+    stdout = b'{"verdict": "clean"}\n'
+    kwargs = asyncio.run(_run_shaped_task_success(monkeypatch, tmp_path, stdout))
+    assert kwargs["served_model"] is None
+    assert kwargs["served_model_provided"] is False
+
+
+def test_last_provenance_line_wins(monkeypatch, tmp_path):
+    """L1.D3 parse protocol: line-anchored, last matching line wins."""
+    stdout = (
+        b"PROVENANCE: seat=gravitywell-slot1 served=old-model\n"
+        b"PROVENANCE: seat=gravitywell-slot1 served=new-model\n"
+    )
+    kwargs = asyncio.run(_run_shaped_task_success(monkeypatch, tmp_path, stdout))
+    assert kwargs["served_model"] == "new-model"
+    assert kwargs["served_model_provided"] is True
