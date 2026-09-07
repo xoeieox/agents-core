@@ -3606,6 +3606,14 @@ def _start_refresh_thread(nodes: dict[str, _NodeState]) -> threading.Thread:
                             if state._stop_failed_this_tick:
                                 backoff = min(backoff + 15, GW_HOLD_REFRESH_SEC)
                             continue  # no hold refresh needed for idle node
+                        # _decide_idle_stop() returned False with no leases:
+                        # this node is already stopped (service_stopped=True) or
+                        # a stop is in flight, and is suspend-eligible. It must
+                        # NOT refresh the keepawake hold -- doing so holds the
+                        # box awake forever after a clean stop. (fix 2026-09-06:
+                        # the rev-3 extraction returned False for the stopped
+                        # case, which previously `continue`d inline.)
+                        continue  # stopped idle node: skip keepawake hold refresh
 
                     # Leases are active: re-issue the keepawake hold to refresh its TTL
                     try:
