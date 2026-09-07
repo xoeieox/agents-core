@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
+import httpx
 import pytest
 
 from agents_core.gw_agent import (
@@ -22,7 +23,9 @@ from agents_core.gw_agent import (
     DEFAULT_READONLY_TOOLS,
     GitExecutor,
     ReadFileExecutor,
+    RunCommandExecutor,
     RunTestsExecutor,
+    WebFetchExecutor,
     WriteFileExecutor,
     _build_fixer_result,
     _build_tool_block,
@@ -31,6 +34,7 @@ from agents_core.gw_agent import (
     _novelty_hash,
     _parse_pytest_outcome,
     _resolve_int_env,
+    _tool_output_cap,
     call_gw_agent,
 )
 
@@ -522,8 +526,9 @@ class TestCallGwAgentWriteable:
 
         assert result["final_diff"] == ""
         assert "should-not-appear" not in result["final_diff"]
-        # second call must be the staged diff
-        assert mock_run.call_args_list[1][0][0] == ["git", "-C", str(repo), "diff", "--cached"]
+        # the staged diff is the LAST call (the lapis-spec.md unstage probe
+        # and any `git reset` sit between add -A and the diff)
+        assert mock_run.call_args_list[-1][0][0] == ["git", "-C", str(repo), "diff", "--cached"]
 
     def test_writeable_ignores_return_transcript_arg(self, tmp_path):
         repo = _tmp_git_repo(tmp_path)
@@ -586,6 +591,11 @@ class TestReadOnlyRegression:
         assert "write_file" not in executors
         assert "apply_edit" not in executors
         assert "run_tests" not in executors
+        # agents-core-fixer-tools-v0: the readonly lane keeps no shell - the
+        # new writeable-lane tools are absent here, pinned in the test rather
+        # than left to factory design.
+        assert "run_command" not in executors
+        assert "web_fetch" not in executors
 
     def test_writeable_false_default_tools_unchanged(self):
         step1 = _make_stop_response("OK")
@@ -650,6 +660,10 @@ class TestReadOnlyRegression:
         assert "write_file" in sent_tool_names
         assert "apply_edit" in sent_tool_names
         assert "run_tests" in sent_tool_names
+        # agents-core-fixer-tools-v0: the writeable lane gains the general
+        # command surface + web fetch.
+        assert "run_command" in sent_tool_names
+        assert "web_fetch" in sent_tool_names
 
 
 # ---------------------------------------------------------------------------
@@ -1577,11 +1591,14 @@ class TestExploreCeiling:
 
 class TestRunTestsGuidanceError:
     def test_shell_shaped_target_bare_token_returns_guidance(self, tmp_path):
+        # agents-core-fixer-tools-v0: the error message now points at
+        # run_command (the writeable lane's general shell) instead of
+        # claiming there is no shell.
         ex = RunTestsExecutor(str(tmp_path))
         result = ex.execute({"target": "pwd"})
         assert isinstance(result, dict) and "error" in result
         assert "pytest path" in result["error"]
-        assert "no shell" in result["error"].lower()
+        assert "run_command" in result["error"]
 
     def test_shell_shaped_target_with_args_returns_guidance(self, tmp_path):
         ex = RunTestsExecutor(str(tmp_path))
@@ -1673,3 +1690,414 @@ class TestNoveltyNormalization:
         h1 = _novelty_hash("grep", {"pattern": "foo"}, "result A")
         h2 = _novelty_hash("grep", {"pattern": "foo"}, "result B")
         assert h1 != h2
+
+
+# ---------------------------------------------------------------------------
+# agents-core-fixer-tools-v0: _tool_output_cap env override
+# ---------------------------------------------------------------------------
+
+class TestToolOutputCap:
+    def test_env_override_honored(self, monkeypatch):
+        monkeypatch.setenv("GW_AGENT_TOOL_OUTPUT_CAP", "12345")
+        assert _tool_output_cap() == 12345
+
+    def test_unset_default_is_repointed_constant(self, monkeypatch):
+        monkeypatch.delenv("GW_AGENT_TOOL_OUTPUT_CAP", raising=False)
+        assert _tool_output_cap() == GW_AGENT_TOOL_OUTPUT_CAP == 32768
+
+    def test_malformed_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("GW_AGENT_TOOL_OUTPUT_CAP", "abc")
+        assert _tool_output_cap() == GW_AGENT_TOOL_OUTPUT_CAP
+
+    def test_read_file_at_new_default(self, tmp_path, monkeypatch):
+        """A 40k-char file returns 32768 chars + the enriched marker."""
+        monkeypatch.delenv("GW_AGENT_TOOL_OUTPUT_CAP", raising=False)
+        (tmp_path / "large.txt").write_text("x" * 40000)
+        ex = ReadFileExecutor(str(tmp_path))
+        result = ex.execute({"path": "large.txt"})
+        assert isinstance(result, str)
+        assert "…[truncated at 32768 chars" in result
+        assert "file has 1 lines" in result
+        assert "showing lines 1-1" in result
+        assert len(result) <= 32768 + 200
+
+    def test_read_file_env_override_lifts_marker(self, tmp_path, monkeypatch):
+        """The truncation marker interpolates the EFFECTIVE cap (helper
+        value), so a lifted env override never tells the model a wrong
+        number."""
+        monkeypatch.setenv("GW_AGENT_TOOL_OUTPUT_CAP", "5000")
+        (tmp_path / "large.txt").write_text("x" * 9000)
+        ex = ReadFileExecutor(str(tmp_path))
+        result = ex.execute({"path": "large.txt"})
+        assert isinstance(result, str)
+        assert "…[truncated at 5000 chars" in result
+
+
+# ---------------------------------------------------------------------------
+# agents-core-fixer-tools-v0: RunCommandExecutor (S1)
+# ---------------------------------------------------------------------------
+
+class TestRunCommandExecutor:
+    def test_echo_success(self, tmp_path):
+        ex = RunCommandExecutor(str(tmp_path))
+        result = ex.execute({"command": "echo hello"})
+        assert isinstance(result, dict) and "error" not in result
+        assert result["returncode"] == 0
+        assert "hello" in result["stdout"]
+        assert result["timed_out"] is False
+
+    def test_nonzero_returncode_captured(self, tmp_path):
+        ex = RunCommandExecutor(str(tmp_path))
+        result = ex.execute({"command": "bash -c 'exit 3'"})
+        assert isinstance(result, dict) and "error" not in result
+        assert result["returncode"] == 3
+        assert result["timed_out"] is False
+
+    def test_env_scrub_forgejo_token(self, tmp_path, monkeypatch):
+        """Gate condition rev 3: FORGEJO_TOKEN is scrubbed from the
+        subprocess env; an unrelated var (HOME) passes through."""
+        monkeypatch.setenv("FORGEJO_TOKEN", "secret-token-value")
+        monkeypatch.setenv("HOME", "/some/home")
+        ex = RunCommandExecutor(str(tmp_path))
+        result = ex.execute(
+            {"command": "python3 -c 'import os; print(os.environ)'"}
+        )
+        assert isinstance(result, dict) and "error" not in result
+        assert result["returncode"] == 0
+        assert "FORGEJO_TOKEN" not in result["stdout"]
+        assert "secret-token-value" not in result["stdout"]
+        assert "HOME" in result["stdout"]
+        assert "/some/home" in result["stdout"]
+
+    def test_timeout_with_partial_output(self, tmp_path):
+        """Pins the bytes-decode semantics: TimeoutExpired.stdout is bytes
+        even with text=True (CPython 3.12), so partial content must be
+        decoded, not lost."""
+        ex = RunCommandExecutor(str(tmp_path))
+        result = ex.execute(
+            {
+                "command": (
+                    "python3 -c "
+                    "'import sys,time; print(\"started\", flush=True); time.sleep(3)'"
+                ),
+                "timeout": 1,
+            }
+        )
+        assert isinstance(result, dict) and "error" not in result
+        assert result["timed_out"] is True
+        assert "started" in result["stdout"]
+        assert "[TIMEOUT after 1s]" in result["stdout"]
+
+    def test_cwd_confinement(self, tmp_path):
+        ex = RunCommandExecutor(str(tmp_path))
+        result = ex.execute({"command": "pwd"})
+        assert isinstance(result, dict) and "error" not in result
+        assert str(tmp_path).rstrip("/").replace("\\", "/") in result["stdout"].replace("\\", "/")
+
+    def test_output_capped(self, tmp_path):
+        ex = RunCommandExecutor(str(tmp_path))
+        result = ex.execute({"command": "python3 -c 'print(\"y\" * 100000)'"})
+        assert isinstance(result, dict) and "error" not in result
+        assert "…[truncated]" in result["stdout"]
+        assert len(result["stdout"]) <= GW_AGENT_TOOL_OUTPUT_CAP + 50
+
+    def test_empty_command_error(self, tmp_path):
+        ex = RunCommandExecutor(str(tmp_path))
+        assert ex.execute({}) == {"error": "command is required"}
+        assert ex.execute({"command": "   "}) == {"error": "command is required"}
+
+    def test_string_timeout_coerced(self, tmp_path):
+        """27B tool calls may send timeout as a string; int() coercion
+        must run, not TypeError."""
+        ex = RunCommandExecutor(str(tmp_path))
+        result = ex.execute({"command": "echo ok", "timeout": "300"})
+        assert isinstance(result, dict) and "error" not in result
+        assert result["returncode"] == 0
+        assert "ok" in result["stdout"]
+
+    def test_timeout_clamped_to_max(self, tmp_path):
+        """timeout=9999 is clamped to 600: a 3s command must NOT time
+        out under the clamped budget (it would under a 1s clamp floor
+        test; the clamp is verified by the command completing)."""
+        ex = RunCommandExecutor(str(tmp_path))
+        result = ex.execute(
+            {"command": "python3 -c 'import time; time.sleep(3)'", "timeout": 9999}
+        )
+        assert isinstance(result, dict) and "error" not in result
+        assert result["timed_out"] is False
+        assert result["returncode"] == 0
+
+    def test_timeout_clamped_to_floor(self, tmp_path):
+        """timeout=0 is clamped to 1s: a 3s command times out."""
+        ex = RunCommandExecutor(str(tmp_path))
+        result = ex.execute(
+            {"command": "python3 -c 'import time; time.sleep(3)'", "timeout": 0}
+        )
+        assert isinstance(result, dict) and "error" not in result
+        assert result["timed_out"] is True
+        assert "[TIMEOUT after 1s]" in result["stdout"]
+
+    def test_bad_timeout_falls_back_to_default(self, tmp_path):
+        ex = RunCommandExecutor(str(tmp_path))
+        result = ex.execute({"command": "echo ok", "timeout": "not-a-number"})
+        assert isinstance(result, dict) and "error" not in result
+        assert result["returncode"] == 0
+
+    def test_error_returned_not_raised(self, tmp_path):
+        with patch("agents_core.gw_agent.subprocess.run", side_effect=OSError("boom")):
+            ex = RunCommandExecutor(str(tmp_path))
+            result = ex.execute({"command": "echo x"})
+        assert isinstance(result, dict) and "error" in result
+        assert "run_command failed" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# agents-core-fixer-tools-v0: WebFetchExecutor (S2)
+# ---------------------------------------------------------------------------
+
+class _MockWebResponse:
+    def __init__(self, status_code=200, content=b"", content_type="text/plain"):
+        self.status_code = status_code
+        self.content = content
+        self.headers = {"content-type": content_type}
+
+
+class _MockWebClient:
+    """Context-managed stand-in for httpx.Client (mirror of the
+    tests/test_gw_agent_open_prs.py httpx patching pattern). Class-level
+    counters let the tests assert no I/O happened (scheme gate)."""
+
+    _next_response = None
+    _raise = None
+    constructed = 0
+    get_calls: list = []
+
+    def __init__(self, *args, **kwargs):
+        _MockWebClient.constructed += 1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, headers=None, **kwargs):
+        _MockWebClient.get_calls.append(url)
+        if _MockWebClient._raise is not None:
+            raise _MockWebClient._raise
+        return _MockWebClient._next_response
+
+    @classmethod
+    def reset(cls):
+        cls._next_response = None
+        cls._raise = None
+        cls.constructed = 0
+        cls.get_calls = []
+
+
+class TestWebFetchExecutor:
+    def _run(self, ex, url):
+        # _raise defaults to None here (reset() is called per test); only
+        # the exception-path test sets it.
+        return ex.execute({"url": url})
+
+    def test_text_plain_200(self, tmp_path):
+        _MockWebClient.reset()
+        ex = WebFetchExecutor(str(tmp_path))
+        _MockWebClient._next_response = _MockWebResponse(
+            200, b"hello body", "text/plain"
+        )
+        with patch("agents_core.gw_agent.httpx.Client", _MockWebClient):
+            result = self._run(ex, "http://example.com/plain")
+        assert isinstance(result, dict)
+        assert result["error"] is None
+        assert result["status"] == 200
+        assert result["content_type"] == "text/plain"
+        assert result["text"] == "hello body"
+        assert result["url"] == "http://example.com/plain"
+
+    def test_html_content_type_strips_tags(self, tmp_path):
+        _MockWebClient.reset()
+        ex = WebFetchExecutor(str(tmp_path))
+        _MockWebClient._next_response = _MockWebResponse(
+            200, b"<html><body><h1>Title</h1><p>para text</p></body></html>",
+            "text/html; charset=utf-8",
+        )
+        with patch("agents_core.gw_agent.httpx.Client", _MockWebClient):
+            result = self._run(ex, "http://example.com/page")
+        assert result["error"] is None
+        assert "<h1>" not in result["text"]
+        assert "<p>" not in result["text"]
+        assert "Title" in result["text"]
+        assert "para text" in result["text"]
+
+    def test_non_2xx_body_returned_with_status(self, tmp_path):
+        """No raise_for_status(): a 500 body is returned WITH its status,
+        not discarded."""
+        _MockWebClient.reset()
+        ex = WebFetchExecutor(str(tmp_path))
+        _MockWebClient._next_response = _MockWebResponse(
+            500, b"internal error page", "text/plain"
+        )
+        with patch("agents_core.gw_agent.httpx.Client", _MockWebClient):
+            result = self._run(ex, "http://example.com/broken")
+        assert result["error"] is None
+        assert result["status"] == 500
+        assert result["text"] == "internal error page"
+
+    def test_file_scheme_rejected_without_io(self, tmp_path):
+        """The scheme gate rejects file:// with no I/O - the httpx.Client
+        constructor is never reached."""
+        _MockWebClient.reset()
+        ex = WebFetchExecutor(str(tmp_path))
+        _MockWebClient._next_response = _MockWebResponse(200, b"should-not-appear")
+        with patch("agents_core.gw_agent.httpx.Client", _MockWebClient):
+            result = self._run(ex, "file:///etc/passwd")
+        assert isinstance(result, dict)
+        assert "error" in result
+        assert "unsupported scheme" in result["error"]
+        assert _MockWebClient.constructed == 0
+        assert _MockWebClient.get_calls == []
+        assert "should-not-appear" not in result.get("text", "")
+
+    def test_whitespace_padded_url_accepted(self, tmp_path):
+        _MockWebClient.reset()
+        ex = WebFetchExecutor(str(tmp_path))
+        _MockWebClient._next_response = _MockWebResponse(200, b"ok", "text/plain")
+        with patch("agents_core.gw_agent.httpx.Client", _MockWebClient):
+            result = self._run(ex, "  http://example.com/padded  ")
+        assert result["error"] is None
+        assert result["status"] == 200
+
+    def test_uppercase_scheme_normalized(self, tmp_path):
+        _MockWebClient.reset()
+        ex = WebFetchExecutor(str(tmp_path))
+        _MockWebClient._next_response = _MockWebResponse(200, b"ok", "text/plain")
+        with patch("agents_core.gw_agent.httpx.Client", _MockWebClient):
+            result = self._run(ex, "HTTP://example.com/upper")
+        assert result["error"] is None
+        assert result["status"] == 200
+
+    def test_exception_path_populates_error(self, tmp_path):
+        _MockWebClient.reset()
+        ex = WebFetchExecutor(str(tmp_path))
+        _MockWebClient._raise = httpx.ConnectError("connection refused")
+        with patch("agents_core.gw_agent.httpx.Client", _MockWebClient):
+            result = self._run(ex, "http://example.com/down")
+        assert isinstance(result, dict)
+        assert result["error"] is not None
+        assert "connection refused" in result["error"]
+        assert result["text"] == ""
+
+    def test_cap_applied_to_large_body(self, tmp_path):
+        _MockWebClient.reset()
+        ex = WebFetchExecutor(str(tmp_path))
+        _MockWebClient._next_response = _MockWebResponse(
+            200, b"z" * (GW_AGENT_TOOL_OUTPUT_CAP + 5000), "text/plain"
+        )
+        with patch("agents_core.gw_agent.httpx.Client", _MockWebClient):
+            result = self._run(ex, "http://example.com/big")
+        assert result["error"] is None
+        assert "…[truncated]" in result["text"]
+        assert len(result["text"]) <= GW_AGENT_TOOL_OUTPUT_CAP + 50
+
+    def test_missing_url_error(self, tmp_path):
+        ex = WebFetchExecutor(str(tmp_path))
+        result = ex.execute({})
+        assert isinstance(result, dict)
+        assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# agents-core-fixer-tools-v0: loop integration (run_command through the
+# mocked loop)
+# ---------------------------------------------------------------------------
+
+class TestRunCommandLoopIntegration:
+    def test_run_command_through_mocked_loop(self, tmp_path):
+        """One canned tool_call sequence exercising run_command through the
+        mocked loop: the dispatch resolves, the structured result is
+        appended as a tool message, no exception. run_command falls into
+        the explore-step novelty bucket (falls through _explore_steps +=
+        1) - asserted, not special-cased."""
+        repo = _tmp_git_repo(tmp_path)
+        step1 = _make_tool_call_response(
+            "run_command", {"command": "echo loop-integration-ok"}, "c1"
+        )
+        step2 = _make_stop_response("All done.")
+        responses = [
+            MagicMock(status_code=200, json=MagicMock(return_value=step1)),
+            MagicMock(status_code=200, json=MagicMock(return_value=step2)),
+        ]
+        for r in responses:
+            r.raise_for_status = MagicMock()
+
+        with patch("agents_core.gw_agent.requests.post", side_effect=responses), \
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
+            mock_client = MagicMock()
+            mock_client.acquire.return_value = {"status": "serving"}
+            MockDoorman.return_value = mock_client
+
+            fixer, transcript = call_gw_agent(
+                prompt="Run a command.",
+                cwd=str(repo),
+                writeable=True,
+                acquire_lease=True,
+                backend_url=None,
+            )
+
+        assert isinstance(fixer, dict)
+        assert fixer["concluded"] is True
+        assert len(transcript) == 1
+        entry = transcript[0]
+        assert entry["tool_name"] == "run_command"
+        assert entry["arguments"] == {"command": "echo loop-integration-ok"}
+        assert entry["error"] is None
+        result = json.loads(entry["result"])
+        assert result["returncode"] == 0
+        assert "loop-integration-ok" in result["stdout"]
+        # run_command is a non-progress explore step: it never resets the
+        # no-progress counter (falls through the novelty branches), so the
+        # run's only tool step counts as exploration. The run still
+        # concludes cleanly - the guard only aborts at the budget.
+        assert fixer["no_progress"] is False
+
+    def test_web_fetch_in_writeable_tool_block(self, tmp_path):
+        """The writeable system block renders run_command/web_fetch from
+        the live tools dict (generic signature path)."""
+        repo = _tmp_git_repo(tmp_path)
+        step1 = _make_stop_response("OK")
+        responses = [MagicMock(status_code=200, json=MagicMock(return_value=step1))]
+        responses[0].raise_for_status = MagicMock()
+
+        captured = []
+
+        def fake_post(url, json=None, timeout=None):
+            captured.append(json)
+            return responses.pop(0)
+
+        with patch("agents_core.gw_agent.requests.post", side_effect=fake_post), \
+             patch("agents_core.doorman_client.DoormanClient") as MockDoorman:
+            mock_client = MagicMock()
+            mock_client.acquire.return_value = {"status": "serving"}
+            MockDoorman.return_value = mock_client
+
+            call_gw_agent(
+                prompt="Fix.",
+                cwd=str(repo),
+                writeable=True,
+                acquire_lease=True,
+                backend_url=None,
+            )
+
+        system_msg = next(m for m in captured[0]["messages"] if m["role"] == "system")
+        content = system_msg["content"]
+        assert "run_command(command, timeout)" in content
+        assert "web_fetch(url)" in content
+        # Pinned literals survive the framing rewrite.
+        assert "FALSE CONTEXT" in content
+        assert "run_tests(target=" in content
+        assert "pytest path" in content
+        # The new framing names the tail-side git/PR boundary.
+        assert "run_command IS your shell" in content
+        assert "deterministic tail commits and opens the PR" in content
