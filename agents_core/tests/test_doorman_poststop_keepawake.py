@@ -15,13 +15,19 @@ _decide_idle_stop() check, so the hold refresh is reachable only when
 state.leases is non-empty (the stated intent of the "Leases are active"
 comment).
 
-These tests drive the ACTUAL _start_refresh_thread._loop closure (started
-via _start_refresh_thread, with the loop thread cancelled after its first
-iteration) and assert on the argv of any subprocess.run invocations:
+These tests drive the ACTUAL _start_refresh_thread._loop closure — one
+tick, hermetically (all network probes and subprocesses mocked) — and
+assert on the argv of any subprocess.run invocations:
 
   (A) no leases + service_stopped=True  -> NO gw-keepawake hold call
   (B) one active lease                  -> the doorman-refresh hold call
   (C) stop in flight, no leases         -> NO gw-keepawake hold call
+
+The thread is stopped after exactly one tick using the EXISTING
+test_doorman_server.py pattern: `patch("time.sleep",
+side_effect=_StopRefreshLoop)` plus `_run_refresh_thread_one_tick(nodes)`,
+which joins the thread and asserts it actually exited (no Thread.cancel()
+— threading.Thread has no such method).
 """
 
 from __future__ import annotations
@@ -29,33 +35,71 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agents_core.doorman_server import (
     GW_URL_DEFAULT,
     _NodeState,
-    _start_refresh_thread,
+)
+from agents_core.tests.test_doorman_server import (
+    _StopRefreshLoop,
+    _run_refresh_thread_one_tick,
 )
 
-DOORMAN_THREAD_NAME = "doorman-refresh"
+
+# ---------------------------------------------------------------------------
+# Hermetic pins (mirror the autouse fixtures in test_doorman_server.py)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _default_serve_mode_big(monkeypatch):
+    """Pin DOORMAN_DEFAULT_SERVE_MODE=big so the suite's wake/stop
+    dispatch is byte-identical regardless of the host's live default."""
+    monkeypatch.setattr("agents_core.doorman_server.DOORMAN_DEFAULT_SERVE_MODE", "big")
+
+
+@pytest.fixture(autouse=True)
+def _no_declared_posture_by_default(monkeypatch):
+    """Pin the declared-posture read to "unreadable" (None) so tests never
+    pick up a REAL /srv/agents/config/conductor.env off the host."""
+    monkeypatch.setattr(
+        "agents_core.doorman_server._NodeState._read_declared_home_posture",
+        lambda self: None,
+    )
+
+
+def _mock_requests_get():
+    """A requests.get that fails fast with a ConnectionError — every probe
+    in the tick path (health, /slots, /metrics, flash-next seat, glances)
+    is hermetically unreachable, so _refresh_serving_cache degrades to
+    "not serving / indeterminate" without a single real network call.
+    The probes never raise out of the loop (each catches its own errors),
+    and _decide_idle_stop()'s stop path is unreachable in all three cases
+    below (stopped / in-flight / leased), so no stop subprocess fires."""
+    import requests as req_lib
+
+    def _get(url, **kwargs):
+        raise req_lib.exceptions.ConnectionError("hermetic test: no network")
+
+    return _get
 
 
 def _run_one_tick(nodes: dict[str, _NodeState]) -> MagicMock:
     """Start the REAL refresh thread with the given nodes, let it complete
-    exactly one tick, cancel it, and return the mocked subprocess.run.
+    exactly one tick (the loop's first iteration skips the sleep), stop the
+    thread via the _StopRefreshLoop sentinel, and return the mocked
+    subprocess.run.
 
-    The loop's first iteration runs immediately (first_iteration skips the
-    sleep), so cancelling the thread right after start guarantees exactly
-    one tick of the per-node body — the code under test.
+    All network probes are mocked (requests.get -> ConnectionError) and
+    time.sleep is the loop-terminator, so the tick under test does no real
+    I/O and the thread is guaranteed dead before the patch stack tears
+    down (no leaked thread hitting the real subprocess/requests).
     """
-    with patch("agents_core.doorman_server.subprocess.run") as mock_run:
+    with patch("agents_core.doorman_server.subprocess.run") as mock_run, \
+         patch("agents_core.doorman_server.requests.get", side_effect=_mock_requests_get()), \
+         patch("time.sleep", side_effect=_StopRefreshLoop):
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        t = _start_refresh_thread(nodes)
-        try:
-            # The first tick runs synchronously inside the thread start path
-            # only after the thread body begins; join briefly so the tick
-            # completes, then cancel before the next sleep.
-            t.join(timeout=10.0)
-        finally:
-            t.cancel()
+        _run_refresh_thread_one_tick(nodes)
         return mock_run
 
 
