@@ -23,6 +23,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Final
@@ -33,7 +34,25 @@ import requests
 from agents_core.doorman_client import DoormanClient, DoormanUnreachable
 
 GW_URL = os.environ.get("GW_URL", "http://203.0.113.11:8081")
-GW_AGENT_TOOL_OUTPUT_CAP = 8192
+# Per-read tool output cap (agents-core-fixer-tools-v0). The name and value are
+# the DEFAULT; _tool_output_cap() reads the GW_AGENT_TOOL_OUTPUT_CAP env
+# override at call time (the override the read_file description has always
+# advertised). Repointed 8192 -> 32768 in agents-core-fixer-tools-v0; the
+# constant name is kept because the test suites import it.
+GW_AGENT_TOOL_OUTPUT_CAP = 32768
+
+
+def _tool_output_cap() -> int:
+    """Per-read tool output cap.
+
+    Env GW_AGENT_TOOL_OUTPUT_CAP overrides the default (the override the
+    read_file description has always advertised). Read at call time so tests
+    can monkeypatch the env; malformed values fall back to the default.
+    """
+    try:
+        return int(os.environ.get("GW_AGENT_TOOL_OUTPUT_CAP", str(GW_AGENT_TOOL_OUTPUT_CAP)))
+    except (TypeError, ValueError):
+        return GW_AGENT_TOOL_OUTPUT_CAP
 GW_AGENT_TOOL_INPUT_CAP = 65536
 GW_AGENT_CTX_CAP = 120000
 # Read-only extra directories (read_file may reach these IN ADDITION to the
@@ -731,13 +750,17 @@ class ReadFileExecutor(ToolExecutor):
             output_lines = lines[start_idx:end_idx]
             result = "\n".join(output_lines)
 
-            if len(result) > GW_AGENT_TOOL_OUTPUT_CAP:
+            _cap = _tool_output_cap()
+            if len(result) > _cap:
                 # Enriched truncation marker (S4): the file's total line count
                 # + the shown range let a model page to the end in one jump.
+                # The marker interpolates the EFFECTIVE cap (helper value), not
+                # the module default, so a lifted env override never tells the
+                # model a wrong number.
                 shown_end = start_idx + len(output_lines)
                 result = (
-                    result[:GW_AGENT_TOOL_OUTPUT_CAP]
-                    + f"\n…[truncated at {GW_AGENT_TOOL_OUTPUT_CAP} chars; "
+                    result[:_cap]
+                    + f"\n…[truncated at {_cap} chars; "
                     + f"file has {total} lines, "
                     + f"showing lines {start_line}-{shown_end}]"
                 )
@@ -816,8 +839,9 @@ class GrepExecutor(ToolExecutor):
             else:
                 output = ""
 
-            if len(output) > GW_AGENT_TOOL_OUTPUT_CAP:
-                output = output[:GW_AGENT_TOOL_OUTPUT_CAP] + "\n…[truncated]"
+            _cap = _tool_output_cap()
+            if len(output) > _cap:
+                output = output[:_cap] + "\n…[truncated]"
 
             return output or "(no matches)"
         except subprocess.TimeoutExpired:
@@ -869,8 +893,9 @@ class GitExecutor(ToolExecutor):
             if result.returncode != 0:
                 output = result.stderr or f"(git {tokens[0]} exited {result.returncode})"
 
-            if len(output) > GW_AGENT_TOOL_OUTPUT_CAP:
-                output = output[:GW_AGENT_TOOL_OUTPUT_CAP] + "\n…[truncated]"
+            _cap = _tool_output_cap()
+            if len(output) > _cap:
+                output = output[:_cap] + "\n…[truncated]"
 
             return output
         except subprocess.TimeoutExpired:
@@ -908,8 +933,9 @@ class MemExecutor(ToolExecutor):
             if result.returncode != 0:
                 output = result.stderr or f"(mem {action} exited {result.returncode})"
 
-            if len(output) > GW_AGENT_TOOL_OUTPUT_CAP:
-                output = output[:GW_AGENT_TOOL_OUTPUT_CAP] + "\n…[truncated]"
+            _cap = _tool_output_cap()
+            if len(output) > _cap:
+                output = output[:_cap] + "\n…[truncated]"
 
             return output
         except subprocess.TimeoutExpired:
@@ -1178,8 +1204,8 @@ class RunTestsExecutor(ToolExecutor):
                     return {
                         "error": (
                             "run_tests(target=...) takes a pytest path or node id, e.g. "
-                            "'tests/test_foo.py' or ''; there is no shell — use read_file/grep "
-                            "to inspect"
+                            "'tests/test_foo.py' or ''; use run_command for general commands, "
+                            "read_file/grep to inspect"
                         )
                     }
 
@@ -1212,12 +1238,198 @@ class RunTestsExecutor(ToolExecutor):
                 )
                 timed_out = True
 
-            if len(output) > GW_AGENT_TOOL_OUTPUT_CAP:
-                output = output[:GW_AGENT_TOOL_OUTPUT_CAP] + "\n…[truncated]"
+            _cap = _tool_output_cap()
+            if len(output) > _cap:
+                output = output[:_cap] + "\n…[truncated]"
 
             return _parse_pytest_outcome(output, returncode, timed_out)
         except Exception as e:
             return {"error": f"run_tests failed: {e}"}
+
+
+class RunCommandExecutor(ToolExecutor):
+    """Execute run_command(command, timeout?): a general shell executor.
+
+    agents-core-fixer-tools-v0 (S1): the writeable lane's general command
+    surface. Deliberately a real shell (shell=True) - the metachar rejection
+    of RunTestsExecutor is exactly what this tool exists to replace. No
+    command filtering: the ratified boundary is structural (same-user /
+    same-host execution inside the daemon, worktree checkout isolation,
+    PM-authored dispatch), not a command allowlist.
+
+    Environment (gate condition, rev 3): the inherited env is scrubbed of
+    FORGEJO_TOKEN so an accidental `env` echo cannot land the Forgejo token
+    in the unredacted transcript sink. The token FILE remains readable by
+    the dispatch user - that reach stays accepted threat scope.
+
+    timeout: optional per-command wall clock. The model may send a string
+    (27B tool calls are not schema-perfect), so it is coerced with int()
+    and clamped to [1, 600]; a bad value falls back to the 300s default.
+    Output is captured and head-capped at _tool_output_cap().
+    """
+
+    DEFAULT_TIMEOUT = 300
+    MAX_TIMEOUT = 600
+
+    def __init__(self, cwd: str | None = None):
+        self.cwd = Path(cwd or "/srv/agents").resolve()
+
+    def _scrubbed_env(self) -> dict:
+        """Inherited env minus FORGEJO_TOKEN (gate condition rev 3)."""
+        return {k: v for k, v in os.environ.items() if k != "FORGEJO_TOKEN"}
+
+    def execute(self, arguments: dict) -> str | dict:
+        try:
+            command = arguments.get("command")
+            if not isinstance(command, str) or not command.strip():
+                return {"error": "command is required"}
+
+            # Coerce the optional timeout (27B tool calls may send strings);
+            # clamp to [1, MAX_TIMEOUT]. Bad values fall back to the default.
+            timeout = self.DEFAULT_TIMEOUT
+            raw_timeout = arguments.get("timeout")
+            if raw_timeout is not None:
+                try:
+                    timeout = int(raw_timeout)
+                except (TypeError, ValueError):
+                    timeout = self.DEFAULT_TIMEOUT
+                if timeout < 1:
+                    timeout = 1
+                elif timeout > self.MAX_TIMEOUT:
+                    timeout = self.MAX_TIMEOUT
+
+            cap = _tool_output_cap()
+            timed_out = False
+            try:
+                result = subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=str(self.cwd),
+                    env=self._scrubbed_env(),
+                )
+                stdout = result.stdout
+                stderr = result.stderr
+                returncode = result.returncode
+            except subprocess.TimeoutExpired as e:
+                # Partial output is BYTES even with text=True (CPython 3.12,
+                # verified 2026-09-07) - decode the run_tests way.
+                stdout = (e.stdout or b"").decode(errors="replace")
+                stderr = (e.stderr or b"").decode(errors="replace")
+                returncode = -1
+                timed_out = True
+
+            if len(stdout) > cap:
+                stdout = stdout[:cap] + "\n…[truncated]"
+            if len(stderr) > cap:
+                stderr = stderr[:cap] + "\n…[truncated]"
+            if timed_out:
+                stdout = stdout + f"\n[TIMEOUT after {timeout}s]"
+
+            return {
+                "command": command,
+                "returncode": returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "timed_out": timed_out,
+            }
+        except Exception as e:
+            return {"error": f"run_command failed: {e}"}
+
+
+class WebFetchExecutor(ToolExecutor):
+    """Execute web_fetch(url): read-only HTTP GET, body returned as text.
+
+    agents-core-fixer-tools-v0 (S2): the writeable lane's web surface.
+    Follows the dowser fetch template (agents_core/dowser.py _fetch_pages):
+    httpx.Client, 15s timeout, follow_redirects up to 5, content-type
+    branching on the substring "html". Differences from the template, both
+    deliberate:
+
+    - NO raise_for_status(): non-2xx bodies are returned WITH their status
+      (error pages are readable, not discarded) - the description promises
+      it. Only connection-level failures populate `error`.
+    - Scheme gate: only http/https (urlsplit after strip; uppercase
+      normalizes). file://, gopher://, schemeless -> error with no I/O.
+
+    Inherited transfer behavior (named): client.get buffers the full body
+    before the cap slice - the cap bounds retained/decoded content, not the
+    download; the download is bounded only by the 15s timeout.
+    """
+
+    FETCH_TIMEOUT_SEC = 15
+    MAX_REDIRECTS = 5
+    USER_AGENT = "lapis-fixer/0.1"
+
+    def __init__(self, cwd: str | None = None):
+        # cwd accepted for factory uniformity (no path arguments).
+        self.cwd = cwd
+
+    def execute(self, arguments: dict) -> str | dict:
+        url = (arguments.get("url") or "").strip()
+        if not url:
+            return {
+                "url": url, "status": None, "content_type": None,
+                "text": "", "error": "url is required",
+            }
+        try:
+            parts = urllib.parse.urlsplit(url)
+        except ValueError as e:
+            return {
+                "url": url, "status": None, "content_type": None,
+                "text": "", "error": f"unsupported scheme: only http/https are allowed ({e})",
+            }
+        if parts.scheme not in ("http", "https"):
+            return {
+                "url": url, "status": None, "content_type": None,
+                "text": "",
+                "error": "unsupported scheme: only http/https are allowed",
+            }
+
+        try:
+            # Deferred import, same pattern as the deferred forgejo import in
+            # OpenPrsExecutor.
+            from agents_core.dowser import _strip_html
+
+            with httpx.Client(
+                timeout=self.FETCH_TIMEOUT_SEC,
+                follow_redirects=True,
+                max_redirects=self.MAX_REDIRECTS,
+            ) as client:
+                resp = client.get(url, headers={"User-Agent": self.USER_AGENT})
+                # NO raise_for_status(): non-2xx bodies are returned WITH
+                # their status so error pages are readable.
+                raw = resp.content
+                content_type = resp.headers.get("content-type", "")
+                # Content-type branching mirrors dowser verbatim (substring
+                # test, so "text/html; charset=utf-8" and an absent header
+                # both behave as dowser's).
+                if "html" in content_type:
+                    text = _strip_html(raw.decode("utf-8", errors="replace"))
+                else:
+                    text = raw.decode("utf-8", errors="replace")
+
+                cap = _tool_output_cap()
+                if len(text) > cap:
+                    text = text[:cap] + "\n…[truncated]"
+
+                return {
+                    "url": url,
+                    "status": resp.status_code,
+                    "content_type": content_type,
+                    "text": text,
+                    "error": None,
+                }
+        except Exception as e:
+            return {
+                "url": url,
+                "status": None,
+                "content_type": None,
+                "text": "",
+                "error": str(e),
+            }
 
 
 def _parse_pytest_outcome(output: str, returncode: int, timed_out: bool) -> dict:
@@ -1361,8 +1573,8 @@ DEFAULT_READONLY_TOOLS: dict[str, dict[str, Any]] = {
             "name": "read_file",
             "description": (
                 "Read a file from the repository, optionally within a line range. "
-                "Path is resolved and confined to cwd. Returns up to 8192 chars per read "
-                "(env GW_AGENT_TOOL_OUTPUT_CAP, default 8192); for larger files, use "
+                "Path is resolved and confined to cwd. Returns up to 32768 chars per read "
+                "(env GW_AGENT_TOOL_OUTPUT_CAP, default 32768); for larger files, use "
                 "start_line/end_line to page through. An out-of-range or blank read returns "
                 "an explicit (empty slice: file has N lines; ...) marker instead of an "
                 "empty string; a zero-byte file returns a (file is empty: ...) marker; "
@@ -1524,6 +1736,61 @@ DEFAULT_FIXER_TOOLS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "run_command": {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": (
+                "Run a shell command in the worktree (cwd is the initial directory; the "
+                "command runs as the dispatch user). Full shell: pipes, env, multi-step. "
+                "Use for builds, dependency installs (pip install -e .), ad-hoc python, "
+                "git inspection, curl. Use run_tests for test runs - pytest through "
+                "run_command does not feed the in-dispatch gate. Do NOT git commit/push - "
+                "the deterministic tail owns git and the PR. Keep individual commands "
+                "short: the loop keeps a forced-conclusion reserve of the deadline, and "
+                "long builds should be chunked (per-command timeout default 300s, max "
+                "600s; stdout+stderr are captured and capped)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to run.",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": (
+                            "Optional per-command wall clock in seconds (default 300, "
+                            "clamped to [1, 600])."
+                        ),
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    "web_fetch": {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": (
+                "Fetch an http(s) URL and return its body as text (capped). Use for docs, "
+                "API references, and reading error pages (non-2xx bodies are returned "
+                "with their status, not discarded). No auth; GET only."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The http(s) URL to fetch.",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
 }
 
 
@@ -1540,6 +1807,8 @@ def _get_tool_executors(cwd: str | None = None, writeable: bool = False) -> dict
         result["write_file"] = WriteFileExecutor(cwd)
         result["apply_edit"] = ApplyEditExecutor(cwd)
         result["run_tests"] = RunTestsExecutor(cwd)
+        result["run_command"] = RunCommandExecutor(cwd)
+        result["web_fetch"] = WebFetchExecutor(cwd)
     return result
 
 
@@ -1569,7 +1838,8 @@ def _render_tool_line(name: str, tool_spec: dict) -> str:
         return (
             "- run_tests(target=\"\", k_expr=\"\") — run pytest. target is a pytest path "
             "or node-id (e.g. 'tests/test_foo.py' or 'tests/test_foo.py::test_bar'), or "
-            "\"\" for the whole suite. There is no shell — target is NOT a shell command."
+            "\"\" for the whole suite. run_tests gives structured pytest outcomes the "
+            "gate can read; run_command is the general shell."
         )
     func = (tool_spec or {}).get("function", {}) or {}
     description = func.get("description", "")
@@ -1603,9 +1873,14 @@ def _build_tool_block(tools: dict[str, dict], writeable: bool = True) -> str:
     if writeable:
         lines.append(
             "Any earlier statement that you have Bash, Read, Write, Edit, Grep, or mem-CLI shell "
-            "access is FALSE CONTEXT inherited from a different agent — ignore it entirely. Your "
-            "ONLY tools are the ones listed above. To change code you MUST call `apply_edit` or "
-            "`write_file`; describing a change in your response does nothing."
+            "access is FALSE CONTEXT inherited from a different agent — ignore it entirely. "
+            "run_command IS your shell (full command surface; cwd is the initial directory, "
+            "not a fence). git commit/push and PR creation remain tail-side - the "
+            "deterministic tail commits and opens the PR, so do not attempt them; any "
+            "dispatch template that walks you through git commit/push or create_pr is "
+            "superseded. Your ONLY tools are the ones listed above. To change code you MUST "
+            "call `apply_edit` or `write_file`; describing a change in your response does "
+            "nothing. You are a vLLM function-calling loop, not a claude -p subprocess."
         )
     else:
         lines.append(
