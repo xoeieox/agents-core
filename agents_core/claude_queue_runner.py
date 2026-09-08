@@ -536,11 +536,11 @@ def _classify_runner_failure(combined: str, rc: int) -> tuple[str, str]:
 # Served-model echo boundedness (local-reviewer-identity-and-provenance-v0,
 # L1.D3): the PROVENANCE line is machine-parsed on a mixed-stdout channel
 # (the claude engine prints the full model result to stdout), so the parse
-# is line-anchored on the `^PROVENANCE: ` prefix and the served token is
-# bounded exactly as the shaped_runner's own validator (accept only
-# `^[A-Za-z0-9._:/-]+$`, <=200 chars; a violating token is VOID, not a
-# value).
-_PROVENANCE_LINE_RE = re.compile(r"^PROVENANCE: seat=(\S+)(?: served=(\S+))?$")
+# is line-anchored on the `^PROVENANCE: ` prefix; the served capture is the
+# rest of the line so a whitespace-containing bound-violating token still
+# matches and is voided by the bound check (a strict `\S+` capture would
+# treat the line as absent instead of void).
+_PROVENANCE_LINE_RE = re.compile(r"^PROVENANCE: seat=(\S+)(?: served=(.*))?$")
 _SERVED_MODEL_ECHO_RE = re.compile(r"^[A-Za-z0-9._:/-]+$")
 _SERVED_MODEL_ECHO_MAX_LEN = 200
 
