@@ -111,7 +111,11 @@ def scratch_repo(tmp_path):
     """
     origin = tmp_path / "origin.git"
     origin.mkdir()
-    subprocess.run(["git", "init", "--bare", str(origin)],
+    # -b main: without it the bare's HEAD is an unborn `master` on git >=
+    # 2.28 hosts, so `git clone` lands the clone on an unborn master and
+    # `git push -q origin main` dies with 'src refspec main does not match
+    # any' (finding/agents-core-scratch-repo-fixture-unborn-head-2026-09-05).
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(origin)],
                    check=True, capture_output=True)
 
     seed = tmp_path / "seed"
@@ -630,3 +634,139 @@ def test_gw_agent_fixer_untouched(tmp_path, monkeypatch):
     assert "local 122B fixer harness" in kw["body"]
     assert "local-opencode" not in kw["body"]
     assert "<!-- lapis-gpu-id: task-lf-untouched -->" in kw["body"]
+
+
+# ---------------------------------------------------------------------------
+# 14. agents-core-gate-uv-aware-v0 twin site: the opencode F4 gate re-run is
+#     repo-env-aware too (the same defect as the live _gate_targeted_rerun
+#     site, pinned so it cannot re-emerge if the engine goes live).
+# ---------------------------------------------------------------------------
+
+def test_opencode_f4_uv_worktree_uses_uv_prefix(scratch_repo, tmp_path,
+                                                monkeypatch):
+    """The F4 deterministic re-run in a uv-managed worktree (committed
+    uv.lock + a resolvable `uv` stub on PATH) runs as
+    `uv run --with pytest python -m pytest tests/test_fast.py -q` - the
+    prefix is applied ONCE at the base list (a double `uv run` prepend
+    would degrade to a spawn error and fail closed). The touched test
+    file is the target, and the run is green -> the PR opens (not a
+    salvage)."""
+    from agents_core import shaped_runner, worktree
+
+    # Commit uv.lock into the scratch repo so the worktree (fetched from
+    # origin) is a uv-managed repo.
+    (scratch_repo / "uv.lock").write_text("[[package]]\nname = 'scratch'\n")
+    subprocess.run(["git", "-C", str(scratch_repo), "add", "uv.lock"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(scratch_repo),
+                    "commit", "-qm", "add uv.lock"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(scratch_repo), "push", "-q", "origin",
+                    "main"], check=True, capture_output=True)
+
+    # A stub `uv` on PATH that records its argv (never actually run -
+    # subprocess.run is patched below).
+    bin_dir = tmp_path / "uvbin"
+    bin_dir.mkdir()
+    uv_stub = bin_dir / "uv"
+    uv_stub.write_text("#!/bin/sh\nexit 0\n")
+    uv_stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+
+    # A model-loop stub that touches the seeded test file (F4's touched
+    # source is the staged diff - _collect_diff_touched_tests reads
+    # `git diff --cached --name-only`, so the model loop must STAGE a
+    # test file without committing it: the `gate_fail` scenario appends
+    # to tests/test_fast.py but never `git add`s it (invisible to the
+    # staged diff); the `head_moved` scenario stages AND commits (F2
+    # fail-closed). The stub template has no "stage a test file, don't
+    # commit" scenario, so this test writes its own stub variant: it
+    # appends a PASSING test to the seeded tests/test_fast.py and
+    # `git add`s it (staged diff -> touched_tests = {tests/test_fast.py})
+    # without committing (HEAD stays at base_sha -> F2 passes).
+    scenario_file = tmp_path / "scenario.txt"
+    scenario_file.write_text("uv_touch\n")
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir(parents=True, exist_ok=True)
+    stub = stub_bin / "opencode"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "cmd=\"$1\"\n"
+        "dir=\"\"\n"
+        "prev=\"\"\n"
+        "for a in \"$@\"; do\n"
+        "    if [ \"$prev\" = \"--dir\" ]; then dir=\"$a\"; fi\n"
+        "    prev=\"$a\"\n"
+        "done\n"
+        "case \"$cmd\" in\n"
+        "    export)\n"
+        "        echo '{\"session_id\": \"ses_EXPORTED\", \"ok\": true}'\n"
+        "        exit 0\n"
+        "        ;;\n"
+        "    run)\n"
+        "        printf 'def test_uv_touched():\\\\n    assert True\\\\n' >> \"$dir/tests/test_fast.py\"\n"
+        "        git -C \"$dir\" add tests/test_fast.py\n"
+        "        echo '{\"type\":\"step_finish\",\"sessionID\":\"ses_UVT\"}'\n"
+        "        exit 0\n"
+        "        ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+    monkeypatch.setenv("OPENCODE_BIN", str(stub))
+    monkeypatch.setattr(worktree, "WORKTREE_ROOT", tmp_path / "wtroot")
+    monkeypatch.setattr(shaped_runner, "room_path",
+                        lambda key, *parts, **kw: tmp_path / "artifacts")
+
+    real_run = subprocess.run
+
+    def fake_run(cmd, *a, **kw):
+        argv0 = cmd[0] if isinstance(cmd, (list, tuple)) else str(cmd)
+        import sys as _sys_dbg
+        print(f"DBG_FAKE_RUN argv0={argv0!r} cmd={cmd!r}", file=_sys_dbg.stderr)
+        if argv0 == "git" or argv0.endswith("/git"):
+            return real_run(list(cmd), *a, **kw)
+        # The F4 re-run: green canned outcome; record the argv for the
+        # assertion. (The opencode model-loop binary is NOT a git argv -
+        # it is dispatched through Popen, but the engine's tail may still
+        # route non-git argvs here, so only record the pytest re-run and
+        # pass everything else through to the real runner.)
+        if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 \
+                and cmd[1] == "-m" and cmd[2] == "pytest":
+            fake_run.f4_argv = list(cmd)
+            _m = MagicMock(returncode=0, stdout="1 passed in 0.01s\n",
+                           stderr="")
+            print(f"DBG_FAKE_RUN inner_mock stdout={_m.stdout!r} returncode={_m.returncode!r}", file=_sys_dbg.stderr)
+            return _m
+        return real_run(list(cmd), *a, **kw)
+
+    # (The prior revision used `monkeypatch.setattr(..., side_effect=...)`,
+    # which is not a valid kwarg - the correct form is a MagicMock with a
+    # side_effect, as in test_f4_rc4_rc5_logged.)
+    monkeypatch.setattr(subprocess, "run",
+                        MagicMock(side_effect=fake_run))
+
+    spec = _loco_spec("task-uvf4", "tgt-uvf4")
+    with patch("agents_core.doorman_client.DoormanClient") as mock_dm, \
+         patch("agents_core.forgejo.create_pr",
+               return_value={"html_url":
+                             "http://forgejo/Erah/agents-core/pulls/77"}), \
+         patch("agents_core.forgejo.get_open_prs", return_value=[]):
+        mock_dm.return_value.acquire.return_value = {
+            "status": "serving", "work_id": "task-uvf4-berth-sup",
+        }
+        url = shaped_runner._run_local_opencode(spec, str(scratch_repo))
+
+    assert url == "http://forgejo/Erah/agents-core/pulls/77"
+    argv = fake_run.f4_argv
+    # The command is the resolved uv binary (NOT sys.executable).
+    assert argv[0] == str(bin_dir / "uv")
+    assert argv[0] != sys.executable
+    # The exact uv-run form, applied ONCE (a double prepend would show a
+    # second "run" token and fail closed).
+    assert argv[1:5] == ["run", "--with", "pytest", "python"]
+    assert argv[5:7] == ["-m", "pytest"]
+    # The touched test file is the target and -q is last.
+    assert "tests/test_fast.py" in argv
+    assert argv[-1] == "-q"
+    assert argv.count("run") == 1, "double uv-run prepend detected"
