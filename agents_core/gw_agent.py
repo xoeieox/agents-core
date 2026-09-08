@@ -855,8 +855,12 @@ class GitExecutor(ToolExecutor):
 
     ALLOWLIST = {"log", "show", "diff", "status", "blame", "ls-files", "rev-list", "cat-file", "describe", "shortlog", "fetch"}
 
-    def __init__(self, cwd: str | None = None):
+    def __init__(self, cwd: str | None = None, allowlist: set[str] | frozenset[str] | None = None):
         self.cwd = Path(cwd or "/srv/agents").resolve()
+        # fixer-reception-v0 (leg 1, D4b): an explicit per-engine allowlist
+        # (the local-auditor engine's AUDITOR_GIT_ALLOWLIST) replaces the
+        # class default when provided; None keeps the class default.
+        self._allowlist = allowlist if allowlist is not None else GitExecutor.ALLOWLIST
 
     def execute(self, arguments: dict) -> str | dict:
         try:
@@ -873,7 +877,7 @@ class GitExecutor(ToolExecutor):
             if not tokens:
                 return {"error": "no git subcommand provided"}
 
-            if tokens[0] not in self.ALLOWLIST:
+            if tokens[0] not in self._allowlist:
                 return {
                     "error": (
                         f"git {tokens[0]!r} not allowed (read-only); origin/main is already "
@@ -1189,6 +1193,19 @@ class RunTestsExecutor(ToolExecutor):
         self.cwd = Path(cwd or "/srv/agents").resolve()
         self.run_timeout = run_timeout
 
+    def _scrubbed_env(self) -> dict:
+        """Inherited env minus FORGEJO_TOKEN (parity with RunCommandExecutor's
+        scrub, agents-core-fixer-tools-v0 gate condition rev 3).
+
+        fixer-reception-v0 (leg 1, D3b): RunTestsExecutor previously ran with
+        the FULL inherited env while run_command was scrubbed - test code at
+        an unmerged PR head could echo FORGEJO_TOKEN into the transcript.
+        Side effect (named in the PR description): the fixer's own pytest
+        subprocesses lose the token too, which reduces their exposure as
+        well.
+        """
+        return {k: v for k, v in os.environ.items() if k != "FORGEJO_TOKEN"}
+
     def execute(self, arguments: dict) -> str | dict:
         try:
             target = arguments.get("target")
@@ -1227,6 +1244,7 @@ class RunTestsExecutor(ToolExecutor):
                     timeout=self.run_timeout,
                     cwd=str(self.cwd),
                     shell=False,
+                    env=self._scrubbed_env(),
                 )
                 output = result.stdout + result.stderr
                 returncode = result.returncode
@@ -1433,23 +1451,46 @@ class WebFetchExecutor(ToolExecutor):
 
 
 def _parse_pytest_outcome(output: str, returncode: int, timed_out: bool) -> dict:
-    """Parse pytest -q output into a structured outcome dict."""
+    """Parse pytest -q output into a structured outcome dict.
+
+    fixer-reception-v0 (leg 1, D3a): the summary line is located by
+    searching the FULL output for the LAST line matching the summary
+    regexes, NOT just the last line of the (possibly cap-truncated)
+    output. A capped run (RunTestsExecutor truncates context at
+    GW_AGENT_TOOL_OUTPUT_CAP) previously yielded (0, 0, 0) counts with a
+    "...[truncated]" summary - a broken witness the no-progress guard's
+    test-state check and the gate's _tests_passed both consumed. When no
+    line matches the summary regexes, the last-line behavior is the
+    fallback (byte-identical to pre-D3a for short outputs).
+    """
     lines = output.strip().splitlines()
-    summary = lines[-1] if lines else ""
 
-    passed = 0
-    failed = 0
-    errors = 0
+    def _summary_counts(line: str) -> tuple[int, int, int]:
+        passed_m = re.search(r"(\d+) passed", line)
+        failed_m = re.search(r"(\d+) failed", line)
+        error_m = re.search(r"(\d+) error", line)
+        return (
+            int(passed_m.group(1)) if passed_m else 0,
+            int(failed_m.group(1)) if failed_m else 0,
+            int(error_m.group(1)) if error_m else 0,
+        )
 
-    passed_m = re.search(r"(\d+) passed", summary)
-    failed_m = re.search(r"(\d+) failed", summary)
-    error_m = re.search(r"(\d+) error", summary)
-    if passed_m:
-        passed = int(passed_m.group(1))
-    if failed_m:
-        failed = int(failed_m.group(1))
-    if error_m:
-        errors = int(error_m.group(1))
+    # Last line anywhere in the output that carries a pytest summary
+    # ("N passed" / "N failed" / "N error"). The summary is the final
+    # pytest line; failure listings never contain those exact phrases, so
+    # the last match is the real summary even when the output was cap-
+    # truncated mid-listing. Fallback: the last line (byte-identical to
+    # the pre-D3a behavior for short outputs and for outputs with no
+    # summary line at all).
+    summary = ""
+    for line in reversed(lines):
+        if re.search(r"\d+ (passed|failed|error)", line):
+            summary = line
+            break
+    if not summary:
+        summary = lines[-1] if lines else ""
+
+    passed, failed, errors = _summary_counts(summary)
 
     tail_lines = lines[-20:] if len(lines) > 20 else lines
 
@@ -1794,15 +1835,66 @@ DEFAULT_FIXER_TOOLS: dict[str, dict[str, Any]] = {
 }
 
 
-def _get_tool_executors(cwd: str | None = None, writeable: bool = False) -> dict[str, ToolExecutor]:
-    """Instantiate tool executors with a given cwd. When writeable=True adds write executors."""
+# fixer-reception-v0 (leg 1, D4b): the local-auditor engine's git allowlist.
+# The read-only subcommands (the reviewer's set MINUS `fetch` - fetch
+# ref-mutates the shared clone and the auditor needs no network: all three
+# audit heads are already in the shared object store) PLUS `checkout` and
+# `rev-parse` (the auditor's three-head suite runs are in-place checkouts in
+# its single ephemeral worktree). NO push, NO fetch.
+AUDITOR_GIT_ALLOWLIST: Final[frozenset[str]] = frozenset(
+    {"log", "show", "diff", "status", "blame", "ls-files", "rev-list",
+     "cat-file", "describe", "shortlog", "checkout", "rev-parse"}
+)
+
+
+# fixer-reception-v0 (leg 1, D4b): the local-auditor engine's tool surface -
+# the minimal closed set that performs the audit mandate (three-head suite
+# runs + diff reading + file:line evidence). DEFAULT_READONLY_TOOLS PLUS
+# run_tests; the git description names the engine's own allowlist (read-only
+# subcommands + checkout + rev-parse - no fetch, no push). NO run_command,
+# NO apply_edit/write_file, NO web_fetch.
+AUDITOR_TOOLS: dict[str, dict[str, Any]] = {
+    **DEFAULT_READONLY_TOOLS,
+    "run_tests": DEFAULT_FIXER_TOOLS["run_tests"],
+}
+AUDITOR_TOOLS["git"] = {
+    **DEFAULT_READONLY_TOOLS["git"],
+    "function": {
+        **DEFAULT_READONLY_TOOLS["git"]["function"],
+        "description": (
+            "Execute a git command (log, show, diff, status, blame, ls-files, "
+            "rev-list, cat-file, describe, shortlog, checkout, rev-parse). "
+            "checkout/rev-parse are available for the auditor's in-place "
+            "three-head suite runs in this worktree. No fetch, no push. "
+            "Output is capped at 8KB."
+        ),
+    },
+}
+
+
+def _get_tool_executors(
+    cwd: str | None = None,
+    writeable: bool = False,
+    auditor: bool = False,
+) -> dict[str, ToolExecutor]:
+    """Instantiate tool executors with a given cwd. When writeable=True adds write executors.
+
+    fixer-reception-v0 (leg 1, D4b): auditor=True (writeable MUST be False)
+    builds the local-auditor engine's minimal closed grant: the read-only
+    executors (read_file / grep / git / mem / list_open_prs) PLUS run_tests,
+    with the git executor restricted to AUDITOR_GIT_ALLOWLIST (read-only
+    subcommands + checkout + rev-parse; no fetch, no push). NO run_command
+    (no full shell), NO apply_edit/write_file, NO web_fetch.
+    """
     result: dict[str, ToolExecutor] = {
         "read_file": ReadFileExecutor(cwd),
         "grep": GrepExecutor(cwd),
-        "git": GitExecutor(cwd),
+        "git": GitExecutor(cwd, allowlist=AUDITOR_GIT_ALLOWLIST if auditor else None),
         "mem": MemExecutor(cwd),
         "list_open_prs": OpenPrsExecutor(cwd),
     }
+    if auditor:
+        result["run_tests"] = RunTestsExecutor(cwd)
     if writeable:
         result["write_file"] = WriteFileExecutor(cwd)
         result["apply_edit"] = ApplyEditExecutor(cwd)
@@ -1985,6 +2077,19 @@ def _build_handler_context(
 # abort the run with stop_reason="mem_search_loop" when 5 more identical
 # queries fill the window after the injection.
 # ---------------------------------------------------------------------------
+# fixer-reception-v0 (leg 1, D2a): the no-progress guard's run_command
+# denylist - idempotent polling reads that do NOT count as novelty progress
+# even when novel (guard-farming boundary condition; a named tightening under
+# the arbiter-tightening doctrine). Comparison is on the stripped command
+# string; extending this set is a doctrine event (a mem record under
+# decision/arbiter-tighten-<name>-<date>), not implementer discretion.
+_NO_PROGRESS_DENYLIST: Final[frozenset[str]] = frozenset({
+    "git status",
+    "git log -1",
+    "git rev-parse HEAD",
+    "pwd",
+})
+
 MEM_SEARCH_LOOP_WINDOW: Final[int] = 5
 MEM_SEARCH_LOOP_INJECT_TEXT: Final[str] = (
     "You are repeating mem searches. Stop searching and start implementing. "
@@ -2118,6 +2223,7 @@ def _call_gw_agent_impl(
     skip_probe: bool = False,
     swarm_payload: bool = False,
     after_step: Callable[[dict], None] | None = None,
+    max_explore_steps: int | None = None,
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Run a multi-step read-only tool-loop on GravityWell.
 
@@ -2318,7 +2424,17 @@ def _call_gw_agent_impl(
     # total exploration regardless of novelty grace.
     if no_progress_steps is None:
         no_progress_steps = _resolve_int_env("GW_AGENT_NO_PROGRESS_STEPS", 12, log)
-    _max_explore_steps = _resolve_int_env("GW_AGENT_MAX_EXPLORE_STEPS", 20, log)
+    _env_explore_ceiling = _resolve_int_env("GW_AGENT_MAX_EXPLORE_STEPS", 20, log)
+    # fixer-reception-v0 (leg 1, D2b): an explicit per-run explore ceiling
+    # (threaded from the shaped_runner call site when the operator intent
+    # declares [investigation-budget: N steps]) raises the effective ceiling
+    # to max(env, explicit) - it can only LOWER the arbiter, never raise it
+    # (the arbiter-tightening doctrine, Invariant 2). The env var itself is
+    # never mutated. None (default) keeps the env value exactly as today.
+    if max_explore_steps is not None and max_explore_steps > _env_explore_ceiling:
+        _max_explore_steps = max_explore_steps
+    else:
+        _max_explore_steps = _env_explore_ceiling
 
     # Context-cap calibration (agents-core-fixer-budget-compact-salvage-v0, S1):
     # the compact guard's cap is env-resolvable per run (GW_AGENT_CTX_CAP),
@@ -2851,6 +2967,39 @@ def _call_gw_agent_impl(
                                     if _rhash not in _seen_result_hashes:
                                         step_made_progress = True
                                     _seen_result_hashes.add(_rhash)
+                                elif tool_name == "run_command":
+                                    # fixer-reception-v0 (leg 1, D2a): run_command joins
+                                    # the novelty accounting. A NOVEL command (args-only
+                                    # hash - the result is deliberately excluded, so a
+                                    # repeated command whose output legitimately changes
+                                    # is NON-novel and must not reset the guard: that is
+                                    # the spinning case the window exists to catch) counts
+                                    # as progress and resets consecutive_no_progress. A
+                                    # repeated identical command counts as spinning (no
+                                    # reset). _explore_steps already accumulated above
+                                    # (:2829 fires before this branch) - the explore
+                                    # ceiling is untouched; only the consecutive window
+                                    # is relaxed for shell-riding investigation.
+                                    #
+                                    # Denylist (gate finding, trickster - a named
+                                    # tightening under the arbiter-tightening doctrine,
+                                    # Invariant 2): idempotent polling reads are
+                                    # trivially-repeatable and semantically empty;
+                                    # without the denylist a run could farm
+                                    # consecutive_no_progress resets by cycling them
+                                    # (guard-farming). Extending the denylist is a
+                                    # doctrine event, not implementer discretion.
+                                    _rc_cmd = tool_args.get("command")
+                                    if (
+                                        isinstance(_rc_cmd, str)
+                                        and _rc_cmd.strip() not in _NO_PROGRESS_DENYLIST
+                                    ):
+                                        _rc_hash = _novelty_hash(
+                                            "run_command", tool_args, ""
+                                        )
+                                        if _rc_hash not in _seen_result_hashes:
+                                            step_made_progress = True
+                                        _seen_result_hashes.add(_rc_hash)
 
                     if _interrupted:
                         break
@@ -2939,11 +3088,24 @@ def _call_gw_agent_impl(
                                 })
 
                         if consecutive_no_progress >= no_progress_steps or _explore_steps >= _max_explore_steps:
+                            # fixer-reception-v0 (leg 1, D2b): name the budget source
+                            # when a declared investigation budget is in force so the
+                            # abort log distinguishes a declared-budget abort from an
+                            # env-default one.
+                            _budget_source = (
+                                f" (no_progress_steps={no_progress_steps} and "
+                                f"explore ceiling={_max_explore_steps} from the operator "
+                                f"intent's declared investigation budget)"
+                                if (no_progress_steps != _resolve_int_env("GW_AGENT_NO_PROGRESS_STEPS", 12, None)
+                                    or _max_explore_steps != _env_explore_ceiling)
+                                else ""
+                            )
                             if log:
                                 log(
                                     f"[gw_agent] no-progress guard: {consecutive_no_progress} "
                                     f"consecutive steps with no semantic progress "
                                     f"({_explore_steps} total exploration steps) - aborting"
+                                    f"{_budget_source}"
                                 )
                             return _finalize_writeable_or_readonly(
                                 messages, "", return_transcript, transcript, writeable, cwd,
@@ -3242,6 +3404,7 @@ def call_gw_agent(
     skip_probe: bool = False,
     swarm_payload: bool = False,
     after_step: Callable[[dict], None] | None = None,
+    max_explore_steps: int | None = None,
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Locality-ledger side-write wrapper around _call_gw_agent_impl().
 
@@ -3275,6 +3438,7 @@ def call_gw_agent(
             model=model, handler_hook=handler_hook, handler_objective=handler_objective,
             handler_max_interventions=handler_max_interventions, skip_probe=skip_probe,
             swarm_payload=swarm_payload, after_step=after_step,
+            max_explore_steps=max_explore_steps,
         )
         return _locality_result
     except Exception:

@@ -130,6 +130,11 @@ class ShapedAgent:
     acquire_lease: bool = True
     swarm_payload: bool = False
     think: bool = False
+    # fixer-reception-v0 (leg 1, D4c): the registry has no max_steps field
+    # today; when a registry entry defines max_steps, the spec dict carries
+    # it so the engine can honor it (the local-auditor engine reads
+    # spec.get("max_steps", 100)). None = absent -> engine default rules.
+    max_steps: int | None = None
 
 
 @dataclass
@@ -216,6 +221,11 @@ class Shaper:
                 acquire_lease=acquire_lease,
                 swarm_payload=swarm_payload,
                 think=think,
+                max_steps=(
+                    int(body["max_steps"])
+                    if body.get("max_steps") is not None
+                    else None
+                ),
             )
         self._registry = registry
 
@@ -318,6 +328,16 @@ class Shaper:
             "capture_meta": agent.capture_meta,
         }
 
+        # fixer-reception-v0 (leg 1, D4c): if the registry entry defines
+        # max_steps, the spec dict carries it (spec["max_steps"]) so the
+        # engine can read it (the local-auditor engine's
+        # spec.get("max_steps", 100)). timeout_s is already carried above
+        # (agent.timeout_s, registry-resolved). Absent registry max_steps ->
+        # no key -> the engine's own default rules (byte-identical for every
+        # existing engine).
+        if agent.max_steps is not None:
+            spec["max_steps"] = agent.max_steps
+
         spec_id = uuid.uuid4().hex[:12]
         spec_path = SPEC_DIR / f"{target_id}-{agent.name}-{spec_id}.json"
         # The slot_id IS the spec_id: stable, unique per dispatch, already carried on
@@ -378,7 +398,12 @@ class Shaper:
             # its worktree at the parked PR's head ref (the pre-aimed match
             # diagnostic's PR-head precondition), so it needs existing_branch in
             # the spec exactly like fixer_retry.
-            if agent_type in ("fixer_retry", "reviewer", "reviewer_fresh", "fixer_staged"):
+            # auditor (fixer-reception-v0, leg 1, D4a): the local-auditor
+            # engine runs its worktree at the salvage PR's head ref, so it
+            # needs existing_branch in the spec exactly like fixer_retry /
+            # reviewer (the shaper's existing_branch injection tuple is
+            # agent-keyed).
+            if agent_type in ("fixer_retry", "reviewer", "reviewer_fresh", "fixer_staged", "auditor"):
                 spec["existing_branch"] = vars_.get("existing_branch", "")
             # local-fixer, local-opencode and local-fixer-staged each manage their
             # OWN worktree inside their engine (_run_local_fixer /
