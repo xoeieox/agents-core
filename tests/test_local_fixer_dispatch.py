@@ -401,9 +401,12 @@ def test_run_local_fixer_retry_without_existing_branch_falls_back_to_base_branch
     assert mock_setup.call_args.args[2] == "main"
 
 
-def test_run_local_fixer_local_ignores_existing_branch(tmp_path):
-    """fixer_local (deprecated, no-existing-PR path) must not scope-creep into
-    the existing_branch check even if a stray existing_branch value is present."""
+def test_run_local_fixer_local_honors_verified_existing_branch(tmp_path):
+    """fixer-reception-v0 (leg 1, D1): the existing_branch verification is no
+    longer agent_type-gated - a spec-carried existing_branch is honored for
+    ALL agent types (mirroring the staged-path invariant, which verifies
+    existing_branch without an agent_type gate). A verified stray
+    existing_branch on a fixer_local spec now scopes the worktree to it."""
     spec = json.loads(_make_spec(
         tmp_path, agent_type="fixer_local", existing_branch="lapis/my-target-v0/forced",
     ).read_text())
@@ -426,7 +429,8 @@ def test_run_local_fixer_local_ignores_existing_branch(tmp_path):
 
     assert url == "http://x/pulls/1"
     mock_setup.assert_called_once()
-    assert mock_setup.call_args.args[2] == "main"
+    # The verified existing_branch is honored for all agent types.
+    assert mock_setup.call_args.args[2] == "lapis/my-target-v0/forced"
 
 
 def test_run_local_fixer_retry_reset_stale_local_branch_ref(tmp_path):

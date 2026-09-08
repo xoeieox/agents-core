@@ -109,8 +109,9 @@ def test_retry_run_pushes_to_verified_existing_branch(tmp_path, fake_py_infra, m
     push_refs: list[str] = []
 
     def fake_subprocess_run(cmd, **kwargs):
-        if isinstance(cmd, list) and len(cmd) > 2 and cmd[1] == "push":
+        if isinstance(cmd, list) and len(cmd) > 3 and cmd[1] == "-C" and cmd[3] == "push":
             # cmd = ["git", "-C", cwd, "push", "origin", "HEAD:<branch>"]
+            # (the subcommand is at index 3)
             push_refs.append(cmd[-1])
             return MagicMock(returncode=0, stdout="", stderr="")
         return MagicMock(returncode=0, stdout="", stderr="")
@@ -184,7 +185,9 @@ def test_initial_fixer_run_still_pushes_slug_default(tmp_path, fake_py_infra, mo
     push_refs: list[str] = []
 
     def fake_subprocess_run(cmd, **kwargs):
-        if isinstance(cmd, list) and len(cmd) > 2 and cmd[1] == "push":
+        if isinstance(cmd, list) and len(cmd) > 3 and cmd[1] == "-C" and cmd[3] == "push":
+            # cmd = ["git", "-C", cwd, "push", "origin", "HEAD:<branch>"]
+            # (the subcommand is at index 3)
             push_refs.append(cmd[-1])
         return MagicMock(returncode=0, stdout="", stderr="")
 
@@ -213,10 +216,16 @@ def test_push_failure_records_pm_push_failed_observation(tmp_path, fake_py_infra
     worktree = tmp_path / "wt"
     worktree.mkdir()
     _make_git_repo(worktree)
-    monkeypatch.setenv("GPU_QUEUE_DIR", str(tmp_path / "gpu-queue"))
+    # _tail_log resolves <shaped-dir> via room_path("gpu_queue.shaped"),
+    # whose classmap entry has NO env_var override - the GPU_QUEUE_DIR env
+    # only redirects the gpu_queue key. Point ROOM_ROOT at tmp_path so the
+    # tail log lands under tmp_path/srv/lapis/gpu-queue/shaped.
+    monkeypatch.setenv("ROOM_ROOT", str(tmp_path / "room"))
 
     def fake_subprocess_run(cmd, **kwargs):
-        if isinstance(cmd, list) and len(cmd) > 2 and cmd[1] == "push":
+        if isinstance(cmd, list) and len(cmd) > 3 and cmd[1] == "-C" and cmd[3] == "push":
+            # cmd = ["git", "-C", cwd, "push", "origin", "HEAD:<branch>"]
+            # (the subcommand is at index 3)
             return MagicMock(returncode=1, stdout="",
                              stderr="! [rejected] branch (non-fast-forward)")
         return MagicMock(returncode=0, stdout="", stderr="")
@@ -235,7 +244,7 @@ def test_push_failure_records_pm_push_failed_observation(tmp_path, fake_py_infra
     assert url == ""
     # The pm:push-failed observation landed in the run log
     # (<shaped-dir>/<task_id>-tail.log).
-    tail_log = tmp_path / "gpu-queue" / "shaped" / "retry-abc123-tail.log"
+    tail_log = tmp_path / "room" / "gpu-queue" / "shaped" / "retry-abc123-tail.log"
     assert tail_log.exists(), f"run log missing at {tail_log}"
     content = tail_log.read_text()
     assert "pm:push-failed" in content

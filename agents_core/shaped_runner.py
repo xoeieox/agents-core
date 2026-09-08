@@ -1963,14 +1963,18 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             _handler_objective = (spec.get("prompt") or "")[:1500]
             _handler_hook = _build_handler_hook(_handler_objective, _handler_model, _hook_timeout_s)
 
-        # fixer_retry dispatches target an already-open PR — the worktree must
-        # start from the PR's own branch, not base_branch (main), or the target
-        # file simply won't exist in the checkout. Verify the branch is really
-        # on origin first: the local-fixer GW sandbox has no git checkout tool,
-        # so if this is wrong there is no way for the model to self-correct.
+        # A spec-carried existing_branch is honored for ALL agent types —
+        # the worktree must start from the PR's own branch, not base_branch
+        # (main), or the target file simply won't exist in the checkout.
+        # Verify the branch is really on origin first: the local-fixer GW
+        # sandbox has no git checkout tool, so if this is wrong there is no
+        # way for the model to self-correct. (The agent_type gate was
+        # fixer_retry-only; it is removed to mirror the staged-path
+        # invariant, which verifies existing_branch without an
+        # agent_type gate.)
         existing_branch = spec.get("existing_branch") or ""
         worktree_ref = base_branch
-        if spec.get("agent_type") == "fixer_retry" and existing_branch:
+        if existing_branch:
             try:
                 verify = subprocess.run(
                     ["git", "-C", effective_cwd, "ls-remote", "--exit-code", "origin", existing_branch],
