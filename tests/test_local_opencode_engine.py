@@ -722,6 +722,8 @@ def test_opencode_f4_uv_worktree_uses_uv_prefix(scratch_repo, tmp_path,
 
     def fake_run(cmd, *a, **kw):
         argv0 = cmd[0] if isinstance(cmd, (list, tuple)) else str(cmd)
+        import sys as _sys_dbg
+        print(f"DBG_FAKE_RUN argv0={argv0!r} cmd={cmd!r}", file=_sys_dbg.stderr)
         if argv0 == "git" or argv0.endswith("/git"):
             return real_run(list(cmd), *a, **kw)
         # The F4 re-run: green canned outcome; record the argv for the
@@ -732,8 +734,10 @@ def test_opencode_f4_uv_worktree_uses_uv_prefix(scratch_repo, tmp_path,
         if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 \
                 and cmd[1] == "-m" and cmd[2] == "pytest":
             fake_run.f4_argv = list(cmd)
-            return MagicMock(returncode=0, stdout="1 passed in 0.01s\n",
-                             stderr="")
+            _m = MagicMock(returncode=0, stdout="1 passed in 0.01s\n",
+                           stderr="")
+            print(f"DBG_FAKE_RUN inner_mock stdout={_m.stdout!r} returncode={_m.returncode!r}", file=_sys_dbg.stderr)
+            return _m
         return real_run(list(cmd), *a, **kw)
 
     # (The prior revision used `monkeypatch.setattr(..., side_effect=...)`,

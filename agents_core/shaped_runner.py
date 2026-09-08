@@ -2646,6 +2646,8 @@ def _run_local_opencode(spec: dict, base_cwd: str | None) -> str:
         last_test_outcome = _parse_pytest_outcome(
             _pytest_output, _pytest_rc, _pytest_timed_out
         )
+        import sys as _sys_dbg
+        print(f"DBG_F4 test_cmd={test_cmd!r} rc={_pytest_rc} output={_pytest_output!r} outcome={last_test_outcome!r}", file=_sys_dbg.stderr)
 
         # D4 (agents-core-local-fixer-gate-perception-v0): name the
         # unusable F4 re-run shape explicitly instead of folding it into a
