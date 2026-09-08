@@ -1311,7 +1311,8 @@ def tail_finalize(
     # Deterministic git (model never touches git)
     def _git(*args: str) -> subprocess.CompletedProcess:
         try:
-            return subprocess.run(
+            import subprocess as _subprocess_mod
+            return _subprocess_mod.run(
                 ["git", "-C", cwd, *args],
                 capture_output=True, text=True, timeout=30,
             )
@@ -1334,10 +1335,25 @@ def tail_finalize(
         print(f"WARN: local-fixer: git commit failed: {r.stderr.strip()}", file=sys.stderr)
         _tail_log(task_id, f"git commit failed rc={r.returncode}: {r.stderr.strip()[:500]}")
         return ""
+    # fixer-reception-v0 (leg 1, D1): push-failure partition. A push to the
+    # verified existing branch can fail (non-fast-forward if the branch
+    # advanced between the setup's ls-remote verify and this push; branch
+    # protection). Log at ERROR with the full command + rc and record a
+    # pm:push-failed observation in the run log so the work loss is never
+    # silent: the transcript + local refs/wip survive (the WIP salvage hook
+    # is NOT extended to push-failure - named follow-on, not this change).
     r = _git("push", "origin", f"HEAD:{branch}")
     if r.returncode != 0:
-        print(f"WARN: local-fixer: git push failed: {r.stderr.strip()}", file=sys.stderr)
-        _tail_log(task_id, f"git push failed rc={r.returncode}: {r.stderr.strip()[:500]}")
+        print(
+            f"ERROR: local-fixer: git push failed - command: git push origin "
+            f"HEAD:{branch} (rc={r.returncode}): {r.stderr.strip()}",
+            file=sys.stderr,
+        )
+        _tail_log(
+            task_id,
+            f"pm:push-failed rc={r.returncode} branch={branch} "
+            f"stderr={r.stderr.strip()[:500]}",
+        )
         return ""
 
     # The pre-aimed / parked-PR case: the branch already has an open PR
@@ -2032,14 +2048,18 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             _handler_objective = (spec.get("prompt") or "")[:1500]
             _handler_hook = _build_handler_hook(_handler_objective, _handler_model, _hook_timeout_s)
 
-        # fixer_retry dispatches target an already-open PR — the worktree must
-        # start from the PR's own branch, not base_branch (main), or the target
-        # file simply won't exist in the checkout. Verify the branch is really
-        # on origin first: the local-fixer GW sandbox has no git checkout tool,
-        # so if this is wrong there is no way for the model to self-correct.
+        # A spec-carried existing_branch is honored for ALL agent types —
+        # the worktree must start from the PR's own branch, not base_branch
+        # (main), or the target file simply won't exist in the checkout.
+        # Verify the branch is really on origin first: the local-fixer GW
+        # sandbox has no git checkout tool, so if this is wrong there is no
+        # way for the model to self-correct. (The agent_type gate was
+        # fixer_retry-only; it is removed to mirror the staged-path
+        # invariant, which verifies existing_branch without an
+        # agent_type gate.)
         existing_branch = spec.get("existing_branch") or ""
         worktree_ref = base_branch
-        if spec.get("agent_type") == "fixer_retry" and existing_branch:
+        if existing_branch:
             try:
                 verify = subprocess.run(
                     ["git", "-C", effective_cwd, "ls-remote", "--exit-code", "origin", existing_branch],
@@ -2055,6 +2075,25 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
                 )
                 return ""
             worktree_ref = existing_branch
+
+        # fixer-reception-v0 (leg 1, D1): the slug re-home fix. The legacy
+        # local path always pushed to the `lapis/<tid>/local` slug default
+        # even when the worktree setup resolved existing_branch (fixer_retry
+        # with a spec-carried branch) - so a retry pushed to the default
+        # slug and the daemon watched the original head forever (orphan PR
+        # if the slug was free; a dead non-force push if it was parked).
+        # Mirror the staged invariant (:1489-1499): when setup used
+        # existing_branch, the tail's branch (checkout -B / push / open-PR
+        # scan) IS that verified branch, so the post-push scan finds the
+        # SAME PR advanced instead of opening a second one.
+        if worktree_ref != base_branch:
+            branch = worktree_ref
+            _tail_log(
+                task_id,
+                f"worktree: existing_branch {existing_branch} verified on origin "
+                f"- tail pushes to {branch} (the verified existing branch, "
+                f"not the {slug!r} slug default)",
+            )
 
         handle = setup_worktree(task_id, effective_cwd, worktree_ref)
         worktree_path = handle.path
@@ -2094,6 +2133,49 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
         else:
             _max_steps = 60
 
+        # fixer-reception-v0 (leg 1, D2b): honor a declared investigation
+        # budget in OPERATOR-AUTHORED INTENT ONLY. The dispatch record's
+        # operator intent field (spec["intent"]) is the force-dispatch /
+        # dispatch-record intent - NOT spec["prompt"], which embeds
+        # LLM-authored reviewer issue notes and, post leg-2, auditor brief
+        # text. The guardrail is not a prompt-injectable channel: the exact
+        # line form [investigation-budget: <N> steps] (N integer, 1..500)
+        # is honored ONLY in the operator intent. When present:
+        # no_progress_steps=N (the parameter exists end-to-end through
+        # call_gw_agent -> _call_gw_agent_impl) and the effective explore
+        # ceiling = max(env ceiling, 2*N) via the explicit max_explore_steps
+        # parameter (the env var is never mutated). Absent the line: env
+        # values rule, behavior unchanged.
+        _investigation_budget: int | None = None
+        _intent = spec.get("intent")
+        if isinstance(_intent, str):
+            _m = re.search(r"^\[investigation-budget:\s*(\d+)\s*steps\]\s*$", _intent, re.MULTILINE)
+            if _m:
+                _n = int(_m.group(1))
+                if 1 <= _n <= 500:
+                    _investigation_budget = _n
+                else:
+                    print(
+                        f"WARN: local-fixer: investigation budget {_n} out of range "
+                        f"1..500 in operator intent - ignoring (env values rule)",
+                        file=sys.stderr,
+                    )
+            else:
+                _m_loose = re.search(r"\[investigation-budget:", _intent)
+                if _m_loose:
+                    print(
+                        "WARN: local-fixer: malformed [investigation-budget: ...] line in "
+                        "operator intent - ignoring (env values rule)",
+                        file=sys.stderr,
+                    )
+        if _investigation_budget is not None:
+            _tail_log(
+                task_id,
+                f"investigation budget declared in operator intent: "
+                f"no_progress_steps={_investigation_budget}, "
+                f"explore ceiling=max(env, {2 * _investigation_budget})",
+            )
+
         fixer_result, transcript = call_gw_agent(
             prompt=spec["prompt"],
             system=spec.get("system", ""),
@@ -2104,6 +2186,15 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> str:
             on_wake_fail="skip",
             work_id=task_id,
             max_steps=_max_steps,
+            # fixer-reception-v0 (leg 1, D2b): the declared investigation
+            # budget (operator intent only - see the parse above). None
+            # keeps the env values in force (behavior unchanged).
+            no_progress_steps=(
+                _investigation_budget if _investigation_budget is not None else None
+            ),
+            max_explore_steps=(
+                2 * _investigation_budget if _investigation_budget is not None else None
+            ),
             backend_url=spec.get("backend_url"),
             acquire_lease=spec.get("acquire_lease", True),
             swarm_payload=spec.get("swarm_payload", False),
@@ -3104,6 +3195,66 @@ def _run_local_reviewer(spec: dict, base_cwd: str | None) -> str | None:
     return result
 
 
+def _run_local_auditor(spec: dict, base_cwd: str | None) -> str | None:
+    """Local-auditor engine (fixer-reception-v0, leg 1, D4).
+
+    Sibling to _run_local_reviewer (the reference: max_steps default 24,
+    writeable=False, json_mode=True). The auditor receives a non-passing
+    termination, investigates the actual state (three-head suite runs via
+    in-place git checkout in its single ephemeral worktree, diff reading,
+    file:line evidence), and returns a structured JSON audit brief. The
+    daemon (leg 2) encodes the JSON into the pm:auditor comment - the
+    auditor posts nothing.
+
+    (a) Worktree: the runner's existing worktree path (main() verifies
+    existing_branch on origin via ls-remote --exit-code and checks it out)
+    - this engine is NOT in the worktree_required exemption tuple, so the
+    runner provisions the worktree at the PR head. The auditor's spec
+    carries existing_branch via the shaper's existing_branch injection
+    tuple (shaper.py, agent-keyed).
+    (b) Tool grant: AUDITOR_TOOLS (DEFAULT_READONLY_TOOLS + run_tests) with
+    the git executor restricted to AUDITOR_GIT_ALLOWLIST (read-only
+    subcommands + checkout + rev-parse; NO fetch, NO push). NO
+    run_command, NO apply_edit/write_file, NO web_fetch. writeable=False
+    end-to-end.
+    (c) max_steps/timeout: spec-carried (the shaper plumbs registry
+    max_steps/timeout_s into the spec dict); defaults 100 / 1800.
+    (d) NO WIP salvage hook, NO push on this engine (the salvage/push
+    machinery is local-fixer-only; the auditor returns JSON and exits).
+    """
+    from agents_core.gw_agent import AUDITOR_TOOLS, call_gw_agent
+
+    task_id = spec.get("task_id") or spec.get("slot_id") or "aud-unknown"
+    cwd = base_cwd or "/srv/agents"
+    model = spec.get("model")
+    backend_url = spec.get("backend_url")
+
+    reason: list[str] = []
+    result = call_gw_agent(
+        prompt=spec["prompt"],
+        system=spec.get("system", ""),
+        cwd=cwd,
+        tools=AUDITOR_TOOLS,
+        writeable=False,
+        json_mode=True,
+        timeout=int(spec.get("timeout_s", 1800)),
+        think=False,
+        on_wake_fail="skip",
+        work_id=task_id,
+        max_steps=int(spec.get("max_steps", 100)),
+        model=model,
+        backend_url=backend_url,
+        acquire_lease=spec.get("acquire_lease", True),
+        lease_class="deferrable",
+        reason_out=reason,
+    )
+    if result is None:
+        why = reason[0] if reason else "no_content_no_reason"
+        print(f"ERROR: local auditor produced no verdict (reason={why})", file=sys.stderr)
+        return None
+    return result
+
+
 def main():
     if len(sys.argv) != 2:
         print("ERROR: usage: python3 -m agents_core.shaped_runner <spec.json>", file=sys.stderr)
@@ -3159,12 +3310,13 @@ def main():
             pass
         print(pr_url)
         return
-    elif engine not in ("claude", "local-reviewer"):
+    elif engine not in ("claude", "local-reviewer", "local-auditor"):
         # Fail loud on an unknown engine: a silent call_claude_cli
         # fall-through would burn a seat on a spec no engine understands.
         print(
             f"ERROR: unknown shaped-runner engine {engine!r}; allowed: "
-            "claude, local-fixer, local-fixer-staged, local-opencode, local-reviewer",
+            "claude, local-fixer, local-fixer-staged, local-opencode, "
+            "local-reviewer, local-auditor",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -3220,6 +3372,12 @@ def main():
 
         if engine == "local-reviewer":
             result = _run_local_reviewer(spec, cwd)
+        elif engine == "local-auditor":
+            # fixer-reception-v0 (leg 1, D4): the auditor runs through the
+            # same worktree path (worktree_required=True, existing_branch
+            # verified on origin) and returns its JSON audit brief; the
+            # daemon encodes it into the pm:auditor comment.
+            result = _run_local_auditor(spec, cwd)
         elif capture_meta:
             result, envelope = call_claude_cli(
                 prompt=spec["prompt"],
