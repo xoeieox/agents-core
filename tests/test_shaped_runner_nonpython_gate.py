@@ -203,10 +203,16 @@ def test_ac2_non_python_worktree_bypass_creates_pr_with_marker(tmp_path):
 
     assert url == "http://x/pulls/1"
     pr.assert_called_once()
-    # PR body carries the Test-gate section AND the machine-readable marker.
+    # S3 (agents-core-local-fixer-salvage-on-discard-v0, eb3d9e0/#271): the
+    # BYPASS is NOT a gate rejection - it is the only path that opens the
+    # NORMAL PR (gate_passed=True), so the body carries the provenance
+    # shape, not the [SALVAGE] shape. The bypass marker lives in the
+    # "## Test gate" section AND as a machine-readable comment.
     assert "## Test gate" in body
     assert "lapis-test-gate: bypassed-no-python-test-infra" in body
     assert "## Test outcome" in body
+    assert "Implemented by the local 122B fixer harness" in body
+    assert "[SALVAGE]" not in body
     # Friction mem entry written via the existing D6 helper (witnessed).
     mock_friction.assert_called_once()
     kw = mock_friction.call_args.kwargs

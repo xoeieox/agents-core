@@ -926,7 +926,15 @@ def tail_finalize(
     # only fix), the gate falls back to the legacy _tests_passed behavior
     # so a fixer cannot merge untested production code by simply refusing
     # to write tests.
-    if model_touched_tests:
+    if gate_bypassed:
+        # The no-python-test-infra bypass (agents-core-local-fixer-gate-nonpython-v0
+        # D2) is authoritative: the caller already set gate_passed=True
+        # because the worktree has no Python test infrastructure. The
+        # pytest-only re-derivation below must NOT override it - a
+        # claude-view-class repo can never pass the pytest gate, so
+        # re-deriving would discard the bypassed work as [SALVAGE].
+        pass
+    elif model_touched_tests:
         # Positive-only gate: every test the model touched must pass.
         # A touched test "fails" if a FAILED/ERROR node ID refers to it.
         # A node ID "refers" to a touched test file if the node's file
