@@ -10,9 +10,24 @@ Pattern: tests/test_shaper_backend_url_passthrough.py (patches
 subprocess.run + call_gw_agent + worktree + forgejo, calls
 sr._run_local_fixer directly); a subprocess.run side_effect captures the
 push ref.
+
+PATCHING NOTE (reviewer cycle-1, HIGH): `_run_local_fixer` resolves
+`call_gw_agent` / `setup_worktree` / `teardown_worktree` via function-local
+imports (`from agents_core.gw_agent import call_gw_agent` etc. inside the
+try block), so a module-level patch of the SOURCE attribute
+(`agents_core.gw_agent.call_gw_agent`) is NOT sufficient on its own: the
+local import re-binds the name from the source module at call time - which
+works only while the patch is active, and the shared `subprocess.run`
+attribute is only intercepted by patching the real subprocess module
+(`patch("subprocess.run")` patches the module attribute that every
+`import subprocess` / `import subprocess as _x` resolves to). These tests
+patch the source-module attributes (the names the function-local imports
+re-resolve at call time) AND the real subprocess module's run attribute,
+so each test genuinely exercises the `_run_local_fixer` push path.
 """
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -55,6 +70,23 @@ def _fake_handle(worktree: Path) -> MagicMock:
     return h
 
 
+def _make_git_repo(worktree: Path) -> None:
+    """Make the worktree a real git repo with one committed file.
+
+    The tail's `git commit` fails on an empty index (nothing to commit) -
+    a failed commit returns "" before the push, so the push never happens
+    and the push-ref assertions cannot fire. A real repo with a tracked
+    file lets the tail's checkout -B / add -A / commit / push run against
+    the fake subprocess.run (the push ref is captured from the argv).
+    """
+    subprocess.run(["git", "init", "-q", str(worktree)], check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], check=True, capture_output=True, cwd=str(worktree))
+    subprocess.run(["git", "config", "user.name", "t"], check=True, capture_output=True, cwd=str(worktree))
+    (worktree / "f.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "-A"], check=True, capture_output=True, cwd=str(worktree))
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], check=True, capture_output=True, cwd=str(worktree))
+
+
 @pytest.fixture
 def fake_py_infra(monkeypatch):
     """Force _has_python_test_infra True so the tail reaches the push
@@ -63,7 +95,7 @@ def fake_py_infra(monkeypatch):
     monkeypatch.setattr(sr, "_has_python_test_infra", lambda cwd: True)
 
 
-def test_retry_run_pushes_to_verified_existing_branch(tmp_path, fake_py_infra):
+def test_retry_run_pushes_to_verified_existing_branch(tmp_path, fake_py_infra, monkeypatch):
     """AC1: a retry-shaped run with existing_branch set pushes HEAD to that
     branch (not lapis/<tid>/local) and the post-push open-PR scan reports
     the EXISTING PR advanced (the returned URL is the existing PR's, not a
@@ -72,21 +104,8 @@ def test_retry_run_pushes_to_verified_existing_branch(tmp_path, fake_py_infra):
     spec = _make_retry_spec(tmp_path, existing)
     worktree = tmp_path / "wt"
     worktree.mkdir()
-    # A tracked file so the tail's diff is non-empty (the gate bypasses on
-    # an empty worktree and the push never happens).
-    (worktree / "f.py").write_text("x = 1\n")
-    # NOTE: patch.object(Path, "mkdir"/"write_text") must NOT be in this
-    # context: _has_python_test_infra walks the worktree via Path.mkdir /
-    # stat / iterdir, and a blanket Path patch makes the gate bypass fire
-    # (different tail branch) and the push never happens. The worktree dir
-    # is real (tmp_path); room paths are best-effort and tolerate missing
-    # dirs.
-    #
-    # The tail's _git() imports subprocess INSIDE the function (so a
-    # module-level `import subprocess` binding is NOT captured by
-    # patch("subprocess.run")); the side_effect is installed on the real
-    # subprocess module's run attribute, which the inner import picks up.
-    import subprocess as _sp
+    _make_git_repo(worktree)
+    monkeypatch.setenv("GPU_QUEUE_DIR", str(tmp_path / "gpu-queue"))
     push_refs: list[str] = []
 
     def fake_subprocess_run(cmd, **kwargs):
@@ -105,7 +124,7 @@ def test_retry_run_pushes_to_verified_existing_branch(tmp_path, fake_py_infra):
         patch("agents_core.forgejo.get_open_prs",
               return_value=[{"head": {"ref": existing},
                              "html_url": "http://x/pulls/945"}]),
-        patch.object(_sp, "run", side_effect=fake_subprocess_run),
+        patch("subprocess.run", side_effect=fake_subprocess_run),
     ):
         url = sr._run_local_fixer(spec, str(tmp_path))
 
@@ -116,7 +135,7 @@ def test_retry_run_pushes_to_verified_existing_branch(tmp_path, fake_py_infra):
     assert "lapis/my-target-v0/local" not in push_refs[0]
 
 
-def test_retry_run_worktree_set_up_at_existing_branch(tmp_path):
+def test_retry_run_worktree_set_up_at_existing_branch(tmp_path, fake_py_infra, monkeypatch):
     """The worktree is provisioned at the verified existing branch (the
     setup path is unchanged; the fix threads the SAME ref through to the
     push)."""
@@ -124,14 +143,14 @@ def test_retry_run_worktree_set_up_at_existing_branch(tmp_path):
     spec = _make_retry_spec(tmp_path, existing)
     worktree = tmp_path / "wt"
     worktree.mkdir()
+    _make_git_repo(worktree)
+    monkeypatch.setenv("GPU_QUEUE_DIR", str(tmp_path / "gpu-queue"))
 
     setup_refs: list[str] = []
 
     def fake_setup(task_id, effective_cwd, ref):
         setup_refs.append(ref)
         return _fake_handle(worktree)
-
-    import subprocess as _sp
 
     def fake_subprocess_run(cmd, **kwargs):
         return MagicMock(returncode=0, stdout="", stderr="")
@@ -143,14 +162,14 @@ def test_retry_run_worktree_set_up_at_existing_branch(tmp_path):
         patch("agents_core.forgejo.get_open_prs",
               return_value=[{"head": {"ref": existing},
                              "html_url": "http://x/pulls/945"}]),
-        patch.object(_sp, "run", side_effect=fake_subprocess_run),
+        patch("subprocess.run", side_effect=fake_subprocess_run),
     ):
         sr._run_local_fixer(spec, str(tmp_path))
 
     assert setup_refs == [existing]
 
 
-def test_initial_fixer_run_still_pushes_slug_default(tmp_path, fake_py_infra):
+def test_initial_fixer_run_still_pushes_slug_default(tmp_path, fake_py_infra, monkeypatch):
     """Behavior unchanged for the initial-dispatch case (no
     existing_branch): the tail still creates and pushes
     lapis/<tid>/local and opens a fresh PR via create_pr."""
@@ -159,9 +178,8 @@ def test_initial_fixer_run_still_pushes_slug_default(tmp_path, fake_py_infra):
     spec.pop("agent_type")
     worktree = tmp_path / "wt"
     worktree.mkdir()
-    # A tracked file so the tail's diff is non-empty (the gate bypasses on
-    # an empty worktree and the push never happens).
-    (worktree / "f.py").write_text("x = 1\n")
+    _make_git_repo(worktree)
+    monkeypatch.setenv("GPU_QUEUE_DIR", str(tmp_path / "gpu-queue"))
 
     push_refs: list[str] = []
 
@@ -170,8 +188,6 @@ def test_initial_fixer_run_still_pushes_slug_default(tmp_path, fake_py_infra):
             push_refs.append(cmd[-1])
         return MagicMock(returncode=0, stdout="", stderr="")
 
-    import subprocess as _sp
-
     with (
         patch("agents_core.gw_agent.call_gw_agent", return_value=(_good_result(), [])),
         patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
@@ -179,7 +195,7 @@ def test_initial_fixer_run_still_pushes_slug_default(tmp_path, fake_py_infra):
         patch("agents_core.forgejo.create_pr",
               return_value={"html_url": "http://x/pulls/100"}),
         patch("agents_core.forgejo.get_open_prs", return_value=[]),
-        patch.object(_sp, "run", side_effect=fake_subprocess_run),
+        patch("subprocess.run", side_effect=fake_subprocess_run),
     ):
         url = sr._run_local_fixer(spec, str(tmp_path))
 
@@ -196,8 +212,7 @@ def test_push_failure_records_pm_push_failed_observation(tmp_path, fake_py_infra
     spec = _make_retry_spec(tmp_path, existing)
     worktree = tmp_path / "wt"
     worktree.mkdir()
-
-    shaped_dir = tmp_path / "shaped"
+    _make_git_repo(worktree)
     monkeypatch.setenv("GPU_QUEUE_DIR", str(tmp_path / "gpu-queue"))
 
     def fake_subprocess_run(cmd, **kwargs):
@@ -206,8 +221,6 @@ def test_push_failure_records_pm_push_failed_observation(tmp_path, fake_py_infra
                              stderr="! [rejected] branch (non-fast-forward)")
         return MagicMock(returncode=0, stdout="", stderr="")
 
-    import subprocess as _sp
-
     with (
         patch("agents_core.gw_agent.call_gw_agent", return_value=(_good_result(), [])),
         patch("agents_core.worktree.setup_worktree", return_value=_fake_handle(worktree)),
@@ -215,7 +228,7 @@ def test_push_failure_records_pm_push_failed_observation(tmp_path, fake_py_infra
         patch("agents_core.forgejo.get_open_prs", return_value=[]),
         patch("agents_core.forgejo.create_pr", side_effect=AssertionError(
             "create_pr must NOT be called after a push failure")),
-        patch.object(_sp, "run", side_effect=fake_subprocess_run),
+        patch("subprocess.run", side_effect=fake_subprocess_run),
     ):
         url = sr._run_local_fixer(spec, str(tmp_path))
 

@@ -2422,6 +2422,14 @@ def _call_gw_agent_impl(
     # Effective local-fixer no-progress default raised 8 -> 12 (see novelty-aware guard
     # below); GW_AGENT_NO_PROGRESS_STEPS overrides, GW_AGENT_MAX_EXPLORE_STEPS bounds
     # total exploration regardless of novelty grace.
+    # fixer-reception-v0 (leg 1, D2b): capture whether the no-progress
+    # window came from an explicit per-run value (threaded from the
+    # shaped_runner call site when the operator intent declares
+    # [investigation-budget: N steps]) BEFORE env resolution overwrites
+    # the parameter - the abort-time budget-source attribution must be
+    # exact even when the declared value equals the env value (a
+    # re-resolve at abort time cannot tell the two apart).
+    _no_progress_declared = no_progress_steps is not None
     if no_progress_steps is None:
         no_progress_steps = _resolve_int_env("GW_AGENT_NO_PROGRESS_STEPS", 12, log)
     _env_explore_ceiling = _resolve_int_env("GW_AGENT_MAX_EXPLORE_STEPS", 20, log)
@@ -3092,13 +3100,20 @@ def _call_gw_agent_impl(
                             # when a declared investigation budget is in force so the
                             # abort log distinguishes a declared-budget abort from an
                             # env-default one.
+                            # Attribution from the captured flags, not a
+                            # re-resolve: a declared budget equal to the env
+                            # value still names its source (the reviewer-
+                            # flagged defect - the env re-resolve made the
+                            # two indistinguishable at abort time).
+                            _declared_parts = []
+                            if _no_progress_declared:
+                                _declared_parts.append(f"no_progress_steps={no_progress_steps}")
+                            if max_explore_steps is not None and max_explore_steps > _env_explore_ceiling:
+                                _declared_parts.append(f"explore ceiling={_max_explore_steps}")
                             _budget_source = (
-                                f" (no_progress_steps={no_progress_steps} and "
-                                f"explore ceiling={_max_explore_steps} from the operator "
+                                f" ({', '.join(_declared_parts)} from the operator "
                                 f"intent's declared investigation budget)"
-                                if (no_progress_steps != _resolve_int_env("GW_AGENT_NO_PROGRESS_STEPS", 12, None)
-                                    or _max_explore_steps != _env_explore_ceiling)
-                                else ""
+                                if _declared_parts else ""
                             )
                             if log:
                                 log(
