@@ -105,7 +105,11 @@ def _run(tmp_path: Path, worktree: Path, result: dict, mock_pr):
         patch.object(sr, "room_path", lambda name: shaped_dir),
         patch.object(sr, "_write_friction_entry", mock_friction),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        # local-reviewer-identity-and-provenance-v0 (L1.D3): _run_local_fixer
+        # returns (pr_url, provenance) - unpack the tuple; the provenance dict
+        # is out of scope for these gate tests (covered in
+        # test_shaped_runner_local_reviewer_verdict.py).
+        url, _prov = sr._run_local_fixer(spec, str(tmp_path))
     if mock_pr.call_args:
         body = mock_pr.call_args.kwargs.get("body", "")
     else:
@@ -211,7 +215,12 @@ def test_ac2_non_python_worktree_bypass_creates_pr_with_marker(tmp_path):
     assert "## Test gate" in body
     assert "lapis-test-gate: bypassed-no-python-test-infra" in body
     assert "## Test outcome" in body
-    assert "Implemented by the local 122B fixer harness" in body
+    # local-reviewer-identity-and-provenance-v0 (L1.D1/L1.D4): the retired
+    # hardcoded "122B" identity line is replaced by the seat-alias line with
+    # the explicit-void served-model form (the mock echo is absent here).
+    assert "Implemented by the local fixer harness (seat gravitywell-122b)" in body
+    assert "served model: not reported" in body
+    assert "local 122B fixer harness" not in body
     assert "[SALVAGE]" not in body
     # Friction mem entry written via the existing D6 helper (witnessed).
     mock_friction.assert_called_once()
@@ -412,7 +421,11 @@ def _run_with_rerun(tmp_path, worktree, result, mock_pr, rerun_side_effect,
         patch.object(sr, "_write_friction_entry", mock_friction),
         patch.object(sr, "_gate_targeted_rerun", mock_rerun),
     ):
-        url = sr._run_local_fixer(spec, str(tmp_path))
+        # local-reviewer-identity-and-provenance-v0 (L1.D3): _run_local_fixer
+        # returns (pr_url, provenance) - unpack the tuple; the provenance dict
+        # is out of scope for these gate tests (covered in
+        # test_shaped_runner_local_reviewer_verdict.py).
+        url, _prov = sr._run_local_fixer(spec, str(tmp_path))
     if mock_pr.call_args:
         body = mock_pr.call_args.kwargs.get("body", "")
     else:

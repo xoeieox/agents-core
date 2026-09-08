@@ -625,13 +625,18 @@ def test_gw_agent_fixer_untouched(tmp_path, monkeypatch):
         MockClient.return_value.acquire.return_value = {
             "status": "serving", "work_id": "task-lf-untouched-berth-sup",
         }
-        url = shaped_runner._run_local_fixer(spec, str(tmp_path))
+        url, _prov = shaped_runner._run_local_fixer(spec, str(tmp_path))
 
     assert url == "http://forgejo/pulls/42"
     mock_pr.assert_called_once()
     kw = mock_pr.call_args.kwargs
     assert kw["title"] == "fix(tgt-lf-untouched): local-fixer"
-    assert "local 122B fixer harness" in kw["body"]
+    # local-reviewer-identity-and-provenance-v0 (L1.D1): the retired "122B"
+    # identity line is replaced by the seat-alias line (this fixture declares
+    # no model, so unknown-seat) + the explicit-void served-model form.
+    assert "Implemented by the local fixer harness (seat unknown-seat)" in kw["body"]
+    assert "served model: not reported" in kw["body"]
+    assert "local 122B fixer harness" not in kw["body"]
     assert "local-opencode" not in kw["body"]
     assert "<!-- lapis-gpu-id: task-lf-untouched -->" in kw["body"]
 
