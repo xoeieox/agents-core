@@ -440,7 +440,10 @@ class TestSalvagePrOnOutputBudgetDeath:
             mock_create_pr.return_value = {
                 "html_url": "http://forgejo/agents-core/pulls/999",
             }
-            out = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
+            # L1.D3 (local-reviewer-identity-and-provenance-v0): _run_local_fixer
+            # returns (pr_url, provenance) - unpack the tuple; the provenance
+            # dict is out of scope for these salvage tests.
+            out, _prov = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
 
         # The PR was opened with the [SALVAGE] title.
         mock_create_pr.assert_called_once()
@@ -502,7 +505,8 @@ class TestSalvageNoneWithoutWipCommits:
                 "status": "serving", "work_id": "task-obx2-berth-sup",
             }
             mock_setup.return_value = MagicMock(path="/wt")
-            out = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
+            # L1.D3: _run_local_fixer returns (pr_url, provenance).
+            out, _prov = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
 
         assert out == ""
         err = capsys.readouterr().err
@@ -569,7 +573,8 @@ class TestSuccessPathUnchanged:
             mock_create_pr.return_value = {
                 "html_url": "http://forgejo/agents-core/pulls/1000",
             }
-            out = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
+            # L1.D3: _run_local_fixer returns (pr_url, provenance).
+            out, _prov = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
 
         # The PR was opened with the NORMAL title (no SALVAGE marker).
         mock_create_pr.assert_called_once()
@@ -623,7 +628,8 @@ class TestD5MemSearchLoopUnchanged:
                 "status": "serving", "work_id": "task-msl-berth-sup",
             }
             mock_setup.return_value = MagicMock(path="/wt")
-            out = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
+            # L1.D3: _run_local_fixer returns (pr_url, provenance).
+            out, _prov = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
 
         assert out == ""
         err = capsys.readouterr().err
@@ -754,7 +760,8 @@ class TestWipSalvageDefersToGreenPath:
             mock_create_pr.return_value = {
                 "html_url": "http://forgejo/agents-core/pulls/1001",
             }
-            out = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
+            # L1.D3: _run_local_fixer returns (pr_url, provenance).
+            out, _prov = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
 
         # The GREEN-salvage path was taken, not the WIP-salvage path:
         # exactly one PR, on the NORMAL branch (no -salvage suffix),
@@ -847,7 +854,10 @@ def _run_fixer_stubbed(spec: dict, wt_dir: Path, fake, create_pr_url: str):
         }
         mock_setup.return_value = MagicMock(path=str(wt_dir))
         mock_create_pr.return_value = {"html_url": create_pr_url}
-        out = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
+        # L1.D3: _run_local_fixer returns (pr_url, provenance) - unpack the
+        # tuple and keep returning the string member (call sites assert on
+        # it exactly as before).
+        out, _prov = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
     return out, mock_create_pr
 
 
