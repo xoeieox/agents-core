@@ -3220,91 +3220,34 @@ def _run_local_auditor(spec: dict, base_cwd: str | None) -> str | None:
     (c) max_steps/timeout: spec-carried (the shaper plumbs registry
     max_steps/timeout_s into the spec dict); defaults 100 / 1800.
     (d) NO WIP salvage hook, NO push on this engine (the salvage/push
-    machinery is local-fixer-only, the auditor returns JSON and exits).
-    (e) auditor-diagnosability-v0 (leg 1, D-A1 + D-A2): the model-facing
-    grant (AUDITOR_TOOLS, which includes run_tests) and the executor map
-    must AGREE - the loop's default registry is built as
-    _get_tool_executors(cwd, writeable=writeable) with auditor=False, so
-    without an explicit tool_executors every run_tests call dies at the
-    unknown-tool error ("unknown tool: run_tests" - live-witnessed in the
-    first live audit's root_cause section). The executor map is built
-    here with writeable=False, auditor=True and passed to call_gw_agent
-    (the tool_executors parameter, "used instead of the default
-    registry"). The per-step transcript is returned (return_transcript=
-    True) and written to {task_id}-gw-transcript.json in the shaped
-    artifact dir (mirroring the local-fixer write shape) REGARDLESS of
-    outcome - including the no-verdict case and a call_gw_agent raise
-    (best-effort [] + WARN + the standard None contract) - so the
-    postmortem lane survives the worktree teardown in main()'s finally.
+    machinery is local-fixer-only; the auditor returns JSON and exits).
     """
-    from agents_core.gw_agent import AUDITOR_TOOLS, _get_tool_executors, call_gw_agent
+    from agents_core.gw_agent import AUDITOR_TOOLS, call_gw_agent
 
     task_id = spec.get("task_id") or spec.get("slot_id") or "aud-unknown"
     cwd = base_cwd or "/srv/agents"
     model = spec.get("model")
     backend_url = spec.get("backend_url")
 
-    _ARTIFACT_DIR = room_path("gpu_queue.shaped")
-    transcript_path = _ARTIFACT_DIR / f"{task_id}-gw-transcript.json"
-
-    def _write_transcript(transcript: list) -> None:
-        """Local-fixer write shape (shaped_runner local-fixer artifact):
-        JSON dump to the shaped dir, OSError -> WARN on stderr."""
-        try:
-            _ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-            transcript_path.write_text(
-                json.dumps(transcript, ensure_ascii=False, default=str)
-            )
-        except OSError as exc:
-            print(f"WARN: local-auditor: transcript write failed: {exc}", file=sys.stderr)
-
     reason: list[str] = []
-    try:
-        result = call_gw_agent(
-            prompt=spec["prompt"],
-            system=spec.get("system", ""),
-            cwd=cwd,
-            tools=AUDITOR_TOOLS,
-            writeable=False,
-            json_mode=True,
-            timeout=int(spec.get("timeout_s", 1800)),
-            think=False,
-            on_wake_fail="skip",
-            work_id=task_id,
-            max_steps=int(spec.get("max_steps", 100)),
-            model=model,
-            backend_url=backend_url,
-            acquire_lease=spec.get("acquire_lease", True),
-            lease_class="deferrable",
-            reason_out=reason,
-            return_transcript=True,
-            tool_executors=_get_tool_executors(cwd, writeable=False, auditor=True),
-        )
-    except Exception as exc:
-        # D-A2(d) raise-safe write: the in-loop transcript is unrecoverable
-        # on a raise, so the artifact carries []; the WARN line is captured
-        # in the runner's failed-output tail slice. Standard no-verdict
-        # contract (None) - main() takes its existing ERROR/exit(1) path
-        # and tears the worktree down in its finally.
-        print(f"WARN: local-auditor: call_gw_agent raised: {exc}", file=sys.stderr)
-        _write_transcript([])
-        return None
-
-    # Defensive unpack (D-A2(b)): with return_transcript=True every loop
-    # exit (including on_wake_fail="skip" early exits) returns
-    # (payload, transcript); bare None is only reachable with
-    # return_transcript=False, which this call never uses. The isinstance
-    # guard is retained as a shape-drift guard.
-    transcript: list = []
-    if isinstance(result, tuple):
-        result, transcript = result
-
-    # Write REGARDLESS of outcome - including the no-verdict case (that is
-    # when the transcript is most needed) - and BEFORE the worktree
-    # teardown (this function returns to main() before its finally tears
-    # the worktree down).
-    _write_transcript(transcript)
-
+    result = call_gw_agent(
+        prompt=spec["prompt"],
+        system=spec.get("system", ""),
+        cwd=cwd,
+        tools=AUDITOR_TOOLS,
+        writeable=False,
+        json_mode=True,
+        timeout=int(spec.get("timeout_s", 1800)),
+        think=False,
+        on_wake_fail="skip",
+        work_id=task_id,
+        max_steps=int(spec.get("max_steps", 100)),
+        model=model,
+        backend_url=backend_url,
+        acquire_lease=spec.get("acquire_lease", True),
+        lease_class="deferrable",
+        reason_out=reason,
+    )
     if result is None:
         why = reason[0] if reason else "no_content_no_reason"
         print(f"ERROR: local auditor produced no verdict (reason={why})", file=sys.stderr)
