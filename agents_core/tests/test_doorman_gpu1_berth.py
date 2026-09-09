@@ -775,7 +775,9 @@ class TestLocalFixerTruncationAndSpecStaging:
                 "status": "serving", "work_id": "task-obx-berth-sup",
             }
             mock_setup.return_value = MagicMock(path="/wt")
-            out = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
+            # L1.D3 (local-reviewer-identity-and-provenance-v0): _run_local_fixer
+            # returns (pr_url, provenance) - unpack the tuple.
+            out, _prov = shaped_runner._run_local_fixer(spec, base_cwd="/srv/agents")
         err = capsys.readouterr().err
         assert out == ""
         assert "output budget exhausted" in err
@@ -815,7 +817,9 @@ class TestLocalFixerTruncationAndSpecStaging:
                 "status": "serving", "work_id": "task-staged-berth-sup",
             }
             mock_setup.return_value = MagicMock(path=str(wt_dir))
-            out = shaped_runner._run_local_fixer({
+            # L1.D3 (local-reviewer-identity-and-provenance-v0): _run_local_fixer
+            # returns (pr_url, provenance) - unpack the tuple.
+            out, _prov = shaped_runner._run_local_fixer({
                 "task_id": "task-staged",
                 "target_id": "tgt-staged",
                 "repo": "agents-core",
