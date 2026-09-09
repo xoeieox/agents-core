@@ -398,9 +398,16 @@ def _mce_state() -> dict:
     return {"available": False, "note": "no /sys/devices/system/machinecheck/* on this host"}
 
 
-def capture_snapshot(event: FaultEvent) -> Path:
-    """Write per-event JSON snapshot atomically. Returns the snapshot path."""
-    FAULT_EVENT_DIR.mkdir(parents=True, exist_ok=True)
+def capture_snapshot(event: FaultEvent, output_dir: Path | None = None) -> Path:
+    """Write per-event JSON snapshot atomically. Returns the snapshot path.
+
+    `output_dir` overrides the module-level FAULT_EVENT_DIR constant (default).
+    Callers — and tests — can pass an explicit directory so I/O is redirected
+    without monkeypatching module globals (overridable-path convention, cf.
+    GPUQueue/TargetStore/MemoryStore).
+    """
+    out_dir = Path(output_dir) if output_dir is not None else FAULT_EVENT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     utc_str = event.captured_at_utc.strftime("%Y-%m-%dT%H-%M-%SZ")
     pacific_dt = event.captured_at_utc + PACIFIC_OFFSET
@@ -408,7 +415,7 @@ def capture_snapshot(event: FaultEvent) -> Path:
     utc_iso = event.captured_at_utc.strftime("%Y-%m-%dT%H:%M:%S.") + \
               f"{event.captured_at_utc.microsecond // 1000:03d}Z"
 
-    target = FAULT_EVENT_DIR / f"{utc_str}-{event.pid}.json"
+    target = out_dir / f"{utc_str}-{event.pid}.json"
 
     load1, load5, load15 = _read_loadavg()
     meminfo = _read_meminfo()
@@ -455,7 +462,7 @@ def capture_snapshot(event: FaultEvent) -> Path:
     }
 
     # Atomic write: tmpfile in same directory + rename
-    fd, tmp_path = tempfile.mkstemp(dir=FAULT_EVENT_DIR, prefix=".tmp-", suffix=".json")
+    fd, tmp_path = tempfile.mkstemp(dir=out_dir, prefix=".tmp-", suffix=".json")
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(snapshot, f, indent=2)
@@ -477,19 +484,27 @@ def capture_snapshot(event: FaultEvent) -> Path:
 SUMMARY_MAX_LINES = 10_000
 
 
-def append_summary_line(event: FaultEvent, snapshot_path: Path) -> None:
-    """Append one line to the rolling JSONL summary. Rolls at SUMMARY_MAX_LINES."""
-    SUMMARY_JSONL.parent.mkdir(parents=True, exist_ok=True)
+def append_summary_line(event: FaultEvent, snapshot_path: Path,
+                        jsonl_path: Path | None = None) -> None:
+    """Append one line to the rolling JSONL summary. Rolls at SUMMARY_MAX_LINES.
+
+    `jsonl_path` overrides the module-level SUMMARY_JSONL constant (default).
+    Callers — and tests — can pass an explicit path so I/O is redirected
+    without monkeypatching module globals (overridable-path convention, cf.
+    GPUQueue/TargetStore/MemoryStore).
+    """
+    summary_path = Path(jsonl_path) if jsonl_path is not None else SUMMARY_JSONL
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Roll if over limit
-    if SUMMARY_JSONL.exists():
+    if summary_path.exists():
         try:
-            with open(SUMMARY_JSONL) as f:
+            with open(summary_path) as f:
                 count = sum(1 for _ in f)
             if count >= SUMMARY_MAX_LINES:
                 date_tag = event.captured_at_utc.strftime("%Y-%m-%d")
-                rolled = SUMMARY_JSONL.with_suffix(f".{date_tag}.jsonl")
-                SUMMARY_JSONL.rename(rolled)
+                rolled = summary_path.with_suffix(f".{date_tag}.jsonl")
+                summary_path.rename(rolled)
         except OSError as exc:
             logger.warning("summary roll check failed: %s", exc)
 
@@ -502,7 +517,7 @@ def append_summary_line(event: FaultEvent, snapshot_path: Path) -> None:
         "snapshot": str(snapshot_path),
     })
     try:
-        with open(SUMMARY_JSONL, "a") as f:
+        with open(summary_path, "a") as f:
             f.write(line + "\n")
     except OSError as exc:
         logger.error("failed to append summary line: %s", exc)
