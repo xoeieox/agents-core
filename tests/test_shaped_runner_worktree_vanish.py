@@ -590,6 +590,90 @@ def test_t4_vanished_push_failure_returns_empty_never_raises(tmp_path):
     assert tail.index(VANISHED_LINE) < tail.index("wip-salvage push failed")
 
 
+def test_t4_friction_refresh_preserves_status_field(tmp_path):
+    """The D2 salvage_success friction refresh must preserve the entry's
+    status field (the _write_friction_entry contract: status is the
+    dedup/recurrence signal - a resolved entry is flipped back to open on
+    recurrence). The refresh writes via a raw MemoryStore set; without the
+    status guard a pre-existing entry's status would be dropped (and a
+    resolved entry would not flip back to open). Driven with a fake
+    MemoryStore: the initial _write_friction_entry (mocked) is followed by
+    the raw refresh inside tail_finalize, which the fake store records."""
+    wt_dir = tmp_path / "wt"
+    wt_dir.mkdir()
+    shutil.rmtree(str(wt_dir))  # the external deleter
+    dead_clone = tmp_path / "clone"
+    dead_clone.mkdir()  # exists but is NOT a git repo -> push fails
+
+    fkey = "friction/agents-core-worktree-vanished"
+    # A pre-existing RESOLVED entry (a prior recurrence was fixed) - the
+    # refresh must flip it back to open AND add salvage_success.
+    pre_existing = {
+        "status": "resolved",
+        "test_node_id": "worktree-vanished",
+        "error_signature": "worktree-vanished:mid-run",
+        "first_seen": "2026-09-08",
+        "last_seen": "2026-09-09",
+        "first_task_id": "old-task",
+        "last_task_id": "old-task",
+    }
+
+    class _FakeStore:
+        def __init__(self):
+            self.sets: list[tuple[str, str, list]] = []
+
+        def get(self, key):
+            if key == fkey:
+                return {"content": json.dumps(pre_existing)}
+            return None
+
+        def set(self, key, content, tags=None):
+            self.sets.append((key, content, list(tags or [])))
+
+        def close(self):
+            pass
+
+    mock_pr = MagicMock()
+    mock_friction = MagicMock()
+    kwargs = _tail_finalize_kwargs(
+        tmp_path,
+        worktree_path=str(wt_dir),
+        repo_cwd=str(dead_clone),
+        worktree_vanished=True,
+        wip_commit_count=1,
+        wip_head_sha="deadbeef0000",
+    )
+    fake_store = _FakeStore()
+    shaped_dir = tmp_path / "shaped-rt"
+    shaped_dir.mkdir(exist_ok=True)
+    with (
+        patch("agents_core.forgejo.create_pr", mock_pr),
+        patch("agents_core.forgejo.get_open_prs", return_value=[]),
+        patch.object(sr, "room_path", lambda name: shaped_dir),
+        patch.object(sr, "_write_friction_entry", mock_friction),
+        patch("agents_core.mem.MemoryStore", return_value=fake_store),
+    ):
+        url = sr.tail_finalize(**kwargs)
+
+    assert url == ""  # push failed (dead clone) -> fail-closed
+    # The raw refresh wrote exactly one entry back to the store...
+    assert len(fake_store.sets) == 1
+    wkey, wcontent, wtags = fake_store.sets[0]
+    assert wkey == fkey
+    assert wtags == ["friction", "test-gate", "agents-core"]
+    written = json.loads(wcontent)
+    # ...with salvage_success (the push failed -> False)...
+    assert written["salvage_success"] is False
+    # ...the status field PRESERVED and flipped back to open (recurrence
+    # of a resolved friction)...
+    assert written["status"] == "open"
+    # ...and the pre-existing content fields intact (not dropped).
+    assert written["test_node_id"] == "worktree-vanished"
+    assert written["error_signature"] == "worktree-vanished:mid-run"
+    assert written["first_seen"] == "2026-09-08"
+    assert written["last_task_id"] == "old-task"
+
+
 # ---------------------------------------------------------------------------
 # T5: the cwd-missing re-run diag label
 # ---------------------------------------------------------------------------

@@ -1396,6 +1396,13 @@ def tail_finalize(
                                         _existing.get("content") or "{}")
                                 except (json.JSONDecodeError, TypeError):
                                     _fjson = {}
+                            # Preserve the entry's status field (the
+                            # _write_friction_entry contract: status: open
+                            # is the dedup/recurrence signal; a resolved
+                            # entry is flipped back to open on recurrence)
+                            # - the raw refresh must not drop it.
+                            if _fjson.get("status") != "open":
+                                _fjson["status"] = "open"
                             _fjson["salvage_success"] = bool(_salvage_url)
                             _store.set(
                                 _fkey,
