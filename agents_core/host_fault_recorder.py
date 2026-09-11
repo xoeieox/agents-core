@@ -31,6 +31,7 @@ import time
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from enum import Enum
 from pathlib import Path
 from typing import Literal
@@ -47,7 +48,9 @@ logger = logging.getLogger(__name__)
 
 FAULT_EVENT_DIR = Path("/srv/agents/logs/fault-events")
 SUMMARY_JSONL = room_path("memory.host_fault_events")
-PACIFIC_OFFSET = timedelta(hours=-7)  # PDT; adjust for PST (-8) when in effect
+# Pacific time, derived from system tzdata (handles PDT/PST automatically).
+# Falls back to a fixed -7h offset (PDT) if tzdata is unavailable.
+PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -410,8 +413,13 @@ def capture_snapshot(event: FaultEvent, output_dir: Path | None = None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     utc_str = event.captured_at_utc.strftime("%Y-%m-%dT%H-%M-%SZ")
-    pacific_dt = event.captured_at_utc + PACIFIC_OFFSET
-    pacific_str = pacific_dt.strftime("%Y-%m-%dT%H:%M:%S") + "-07:00"
+    try:
+        pacific_dt = event.captured_at_utc.astimezone(PACIFIC_TZ)
+    except Exception:
+        # tzdata unavailable: fall back to fixed PDT offset.
+        pacific_dt = event.captured_at_utc + timedelta(hours=-7)
+    pacific_str = pacific_dt.strftime("%Y-%m-%dT%H:%M:%S") + \
+                  pacific_dt.strftime("%z")[:3] + ":" + pacific_dt.strftime("%z")[3:]
     utc_iso = event.captured_at_utc.strftime("%Y-%m-%dT%H:%M:%S.") + \
               f"{event.captured_at_utc.microsecond // 1000:03d}Z"
 
