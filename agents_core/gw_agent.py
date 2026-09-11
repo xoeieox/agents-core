@@ -1540,11 +1540,29 @@ def _build_fixer_result(
         text=True,
         timeout=15,
     )
+    worktree_vanished = False
     if add_result.returncode != 0:
-        print(
-            f"WARN: _build_fixer_result: git add -A failed (rc={add_result.returncode}) - final_diff empty",
-            file=sys.stderr,
-        )
+        if not os.path.isdir(cwd):
+            # agents-core-fixer-worktree-vanish-salvage-v0 (D1): a git-add
+            # failure whose cwd no longer exists is NOT "the model wrote
+            # nothing" - an external process deleted the worktree mid-run
+            # (the finding/fixer-worktrees-destroyed-external-process-*
+            # incident class). Name the shape distinctly so the tail can
+            # stop mislabelling it (timeout/spawn error) and can salvage
+            # the WIP ref (which survives in the parent clone's gitdir).
+            worktree_vanished = True
+            print(
+                f"WARN: _build_fixer_result: worktree vanished mid-run - "
+                f"external deletion suspected "
+                f"(mem finding/fixer-worktrees-destroyed-external-process-*) - "
+                f"final_diff empty",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"WARN: _build_fixer_result: git add -A failed (rc={add_result.returncode}) - final_diff empty",
+                file=sys.stderr,
+            )
         final_diff = ""
     else:
         # Local-fixer staging convention: the harness stages the bound spec at
@@ -1583,6 +1601,11 @@ def _build_fixer_result(
 
     return {
         "final_diff": final_diff,
+        # agents-core-fixer-worktree-vanish-salvage-v0 (D1): True only when
+        # the git-add failure above was caused by a missing cwd (external
+        # worktree deletion). Default False - healthy and git-failure-with-
+        # live-cwd runs are byte-identical to pre-spec.
+        "worktree_vanished": worktree_vanished,
         "last_test_outcome": last_test_outcome,
         "concluded": concluded,
         "max_steps_reached": max_steps_reached,
