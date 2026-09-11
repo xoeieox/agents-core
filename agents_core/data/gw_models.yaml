@@ -77,3 +77,17 @@ models:
     operator_alias: gravitywell
     display_label: "Qwen3.8 Flash-Next (NVFP4, SSD-stream)"
     weights_hint: "/data/models/sglang-ssd-stream/huggingface/hub/models--garnermccloud--Qwen3.8-Flash-Next-NVFP4-SSD-Stream"
+
+  # Gemma-4-31B heretic solo posture (conductor-gw-roster-v0 D3 / PR 2) — the
+  # flip-tested creative seat (ops/gw-slot1-gemma4-31b-heretic-flip-test-2026-09-08).
+  # mode_alias "solo" (NOT "big"): the same trap as the 27B row — "big" would
+  # join gw_big_seat_members() and flip serving_is_big on a solo posture.
+  # Appended at END OF FILE — _gw_registry_lookup matches in file order and
+  # returns the first hit, so lookup("solo") and lookup("gravitywell") still
+  # resolve to the 27B row (first hit); only canonical_id and display_label
+  # are unique to this row.
+  - canonical_id: gravitywell-gemma4-31b
+    mode_alias: solo
+    operator_alias: gravitywell
+    display_label: gemma-4-31b-heretic-nvfp4
+    weights_hint: "gemma-4-31B-it-heretic-NVFP4"
