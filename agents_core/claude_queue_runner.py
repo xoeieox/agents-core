@@ -1279,9 +1279,10 @@ class Daemon:
 
     async def _worker(self, task: dict):
         # Branch order is load-bearing: council.run FIRST (council descriptions
-        # are free-form decision text and can start with "fixer:"). Sub-cap
-        # BEFORE self.sem is load-bearing too (a claimed task waiting on the
-        # sub-cap must not hold a global slot; council precedent).
+        # are free-form decision text and can start with "fixer:"). The
+        # family sub-cap is acquired BEFORE the global worker semaphore and
+        # is load-bearing too (a claimed task waiting on the sub-cap must
+        # not hold a global slot; council precedent).
         if task.get("task_type") == "council.run":
             async with _COUNCIL_SEM:
                 async with self.sem:

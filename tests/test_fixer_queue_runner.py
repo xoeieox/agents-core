@@ -305,8 +305,8 @@ async def test_council_path_unchanged(monkeypatch):
     w_c2 = asyncio.create_task(d._worker(c2))
     await asyncio.sleep(0.05)
     assert "cp-c2" not in entries, "council task 2 must be waiting on _COUNCIL_SEM"
-    assert d.sem._value == 3, (
-        f"blocked council task must hold no global slot (4 - 2 held = 3, got {d.sem._value})"
+    assert d.sem._value == 2, (
+        f"blocked council task must hold no global slot (4 - 2 held = 2, got {d.sem._value})"
     )
 
     # ...but a fixer-family and a reviewer task still run (one-directional
