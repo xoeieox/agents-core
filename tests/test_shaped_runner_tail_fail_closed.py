@@ -272,7 +272,10 @@ def test_main_maps_sentinel_to_exit_3_local_fixer(tmp_path, capsys):
         patch.object(sys, "argv", ["shaped_runner", str(spec_path)]),
         patch.object(
             shaped_runner, "_run_local_fixer",
-            return_value=shaped_runner.TAIL_UNCLASSIFIED_DEATH,
+            return_value=(
+                shaped_runner.TAIL_UNCLASSIFIED_DEATH,
+                {"seat": "haiku", "served": ""},
+            ),
         ),
     ):
         with pytest.raises(SystemExit) as exc_info:
@@ -320,7 +323,12 @@ def test_main_normal_url_still_exits_0(tmp_path, capsys):
         patch.object(sys, "argv", ["shaped_runner", str(spec_path)]),
         patch.object(
             shaped_runner, "_run_local_fixer",
-            return_value="http://forgejo/agents-core/pulls/123",
+            # main()'s local-fixer block unpacks the (pr_url, provenance)
+            # tuple (L1.D3 contract) - the mock must return the tuple shape.
+            return_value=(
+                "http://forgejo/agents-core/pulls/123",
+                {"seat": "haiku", "served": ""},
+            ),
         ),
     ):
         # main() must NOT sys.exit(3) here - the local-fixer block
