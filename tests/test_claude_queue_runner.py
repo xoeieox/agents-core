@@ -637,11 +637,12 @@ def test_startup_sweep_clears_ghost_in_flight_entry(tmp_path, monkeypatch):
     assert "ghost-id" not in persisted["in_flight"]
 
 
-def test_startup_sweep_accepts_council_dir_arg_without_monkeypatch(tmp_path):
+def test_startup_sweep_accepts_council_dir_arg_without_monkeypatch(tmp_path, monkeypatch):
     """council_dir is a real parameter (default _COUNCIL_DIR) — tests can pass
     a tmp_path directly instead of monkeypatching the module constant."""
     from agents_core.claude_queue import ClaudeQueue
 
+    monkeypatch.setattr(runner_mod, "WORKTREE_ROOT", tmp_path / "worktrees")
     council_dir = tmp_path / "council"
     council_dir.mkdir()
     (council_dir / "orphan.yaml").write_text(
