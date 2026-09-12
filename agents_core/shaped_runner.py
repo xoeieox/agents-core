@@ -1084,6 +1084,13 @@ def tail_finalize(
                 "(no uv.lock or uv not resolvable)",
             )
         rerun_outcome = _gate_targeted_rerun(cwd, model_touched_tests)
+        # agents-core-fixer-worktree-vanish-salvage-v0 (D1): a fired re-run
+        # that produced NO usable outcome (None - timeout/spawn error or
+        # cwd gone) must keep the unusable label; without this flag the
+        # model's last outcome (a dict) survives in last_test_outcome and
+        # _rerun_diag mislabels the gate FAILED line as
+        # rerun=true (last: ...).
+        rerun_no_outcome = rerun_outcome is None
         if rerun_outcome is not None:
             last_test_outcome = rerun_outcome
             gate_passed = (rerun_outcome.get("returncode") == 0)
@@ -1127,7 +1134,7 @@ def tail_finalize(
                 else "rerun-rc=5 no-tests-ran"
             )
             return f"; {name}"
-        if last_test_outcome is None:
+        if rerun_no_outcome or last_test_outcome is None:
             # The re-run fired but was unusable: the fail-closed verdict
             # is kept and the re-run's non-participation is named, not
             # folded into the model's last outcome.
