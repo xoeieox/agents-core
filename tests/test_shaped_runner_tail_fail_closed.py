@@ -339,6 +339,60 @@ def test_main_normal_url_still_exits_0(tmp_path, capsys):
 
     captured = capsys.readouterr()
     assert "http://forgejo/agents-core/pulls/123" in captured.out
+    # Explicit rc=0: main() returned cleanly (no SystemExit), which is
+    # the honest rc=0 path for a normal PR URL.
+    # (A clean return from main() means the process exits 0.)
+
+
+def test_main_normal_url_staged_does_not_reach_call_claude_cli(tmp_path, capsys):
+    """(d) Non-sentinel path pin (local-fixer-staged): the engine-run
+    function returns a normal PR URL -> main() prints the URL, does not
+    SystemExit, and does NOT reach call_claude_cli (the shared tail
+    below the if/elif chain)."""
+    shaped_dir = tmp_path / "shaped"
+    shaped_dir.mkdir()
+    spec_path = _make_spec_file(shaped_dir, "local-fixer-staged")
+
+    with (
+        patch.object(sys, "argv", ["shaped_runner", str(spec_path)]),
+        patch.object(
+            shaped_runner, "_run_local_fixer_staged",
+            return_value="http://forgejo/agents-core/pulls/456",
+        ),
+        patch.object(shaped_runner, "call_claude_cli") as mock_cc,
+    ):
+        # main() must return cleanly (rc=0) - no SystemExit.
+        shaped_runner.main()
+
+    captured = capsys.readouterr()
+    assert "http://forgejo/agents-core/pulls/456" in captured.out
+    # The shared call_claude_cli tail must NOT have been reached.
+    mock_cc.assert_not_called()
+
+
+def test_main_normal_url_opencode_does_not_reach_call_claude_cli(tmp_path, capsys):
+    """(d) Non-sentinel path pin (local-opencode): the engine-run
+    function returns a normal PR URL -> main() prints the URL, does not
+    SystemExit, and does NOT reach call_claude_cli."""
+    shaped_dir = tmp_path / "shaped"
+    shaped_dir.mkdir()
+    spec_path = _make_spec_file(shaped_dir, "local-opencode")
+
+    with (
+        patch.object(sys, "argv", ["shaped_runner", str(spec_path)]),
+        patch.object(
+            shaped_runner, "_run_local_opencode",
+            return_value="http://forgejo/agents-core/pulls/789",
+        ),
+        patch.object(shaped_runner, "call_claude_cli") as mock_cc,
+    ):
+        # main() must return cleanly (rc=0) - no SystemExit.
+        shaped_runner.main()
+
+    captured = capsys.readouterr()
+    assert "http://forgejo/agents-core/pulls/789" in captured.out
+    # The shared call_claude_cli tail must NOT have been reached.
+    mock_cc.assert_not_called()
 
 
 def test_engine_dispatch_exit_named_empty_string_is_rc0(capsys):

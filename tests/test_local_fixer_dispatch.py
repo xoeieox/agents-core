@@ -565,8 +565,8 @@ def test_no_pr_when_zero_passing_tests(tmp_path):
     mock_pr.assert_not_called()
 
 
-def test_no_is_none_check_needed_concluded_false_covers_doorman_unreachable(tmp_path):
-    """writeable=True never returns None; concluded=False covers doorman-unreachable."""
+def test_no_is_none_check_needed_concluded_false_covers_unclassified_death(tmp_path):
+    """writeable=True never returns None; concluded=False covers unclassified terminal death."""
     spec = json.loads(_make_spec(tmp_path).read_text())
     worktree = tmp_path / "wt"
     worktree.mkdir()
@@ -1149,7 +1149,7 @@ def test_warn_message_no_progress(tmp_path, capsys):
     assert "doorman" not in err.lower()
 
 
-def test_warn_message_doorman_unreachable(tmp_path, capsys):
+def test_warn_message_unclassified_terminal_death(tmp_path, capsys):
     """AC4: concluded=False with no max_steps/no_progress flags → the
     unclassified terminal death line (agents-core-shaperunner-fail-closed-v0:
     the old doorman/wake-timeout label was false by construction and is

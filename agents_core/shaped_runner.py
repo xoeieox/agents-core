@@ -3640,6 +3640,11 @@ def main():
         except OSError:
             pass
         _engine_dispatch_exit(pr_url, engine)
+        # A non-sentinel (normal PR URL) result must NOT fall through to
+        # the shared call_claude_cli tail below the if/elif chain - the
+        # local-fixer block's return after _engine_dispatch_exit is the
+        # contract for every local engine dispatch block.
+        return
     elif engine == "local-opencode":
         pr_url = _run_local_opencode(spec, base_cwd)
         try:
@@ -3647,6 +3652,8 @@ def main():
         except OSError:
             pass
         _engine_dispatch_exit(pr_url, engine)
+        # Same contract as the local-fixer block: terminal on this path.
+        return
     elif engine not in ("claude", "local-reviewer", "local-auditor"):
         # Fail loud on an unknown engine: a silent call_claude_cli
         # fall-through would burn a seat on a spec no engine understands.
