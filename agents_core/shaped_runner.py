@@ -625,6 +625,7 @@ def _open_wip_salvage_pr(
     step_count: int,
     transcript_path: Path,
     concluded: bool = False,
+    repo_cwd: str = "",
 ) -> str:
     """Push the WIP ref (or HEAD for concluded worktree salvage) to a
     per-task-unique <slug>-salvage branch and open an advisory [SALVAGE] PR
@@ -637,6 +638,14 @@ def _open_wip_salvage_pr(
     a second salvage of the same target from clobbering the first's branch.
     The PR is advisory (never auto-merged); the run is still LOST (or
     concluded-but-gate-rejected - this returns the PR URL or "").
+
+    agents-core-fixer-worktree-vanish-salvage-v0 (D2): the git root is the
+    worktree when it still exists, else the parent clone (``repo_cwd``) when
+    given - the WIP ref (refs/wip/<task_id>) lives in the SHARED common
+    gitdir, so it resolves and is pushable from the parent clone after the
+    worktree was deleted mid-run (verified live 2026-09-11). With neither
+    available the root stays ``worktree_path`` (the pre-spec behavior - the
+    push fails and the never-raises contract returns "").
     """
     import subprocess
 
@@ -658,15 +667,29 @@ def _open_wip_salvage_pr(
         f"{hashlib.sha1(task_id_for_hash.encode()).hexdigest()[:8]}"
     )
 
+    # D2 root selection (agents-core-fixer-worktree-vanish-salvage-v0): the
+    # worktree when it still exists (pre-spec behavior), else the parent
+    # clone (repo_cwd) when non-empty, else worktree_path (the pre-spec
+    # behavior - a deleted worktree with no repo_cwd fails the push and
+    # soft-fails to ""). The None/empty guard below keeps the
+    # never-raises contract, so this fallback applies to the
+    # non-empty-but-deleted case only.
+    if worktree_path and os.path.isdir(worktree_path):
+        _git_root = worktree_path
+    elif repo_cwd:
+        _git_root = repo_cwd
+    else:
+        _git_root = worktree_path
+
     def _git(*args: str) -> subprocess.CompletedProcess:
         try:
             return subprocess.run(
-                ["git", "-C", worktree_path, *args],
+                ["git", "-C", _git_root, *args],
                 capture_output=True, text=True, timeout=60,
             )
         except subprocess.TimeoutExpired:
             print(f"WARN: wip-salvage: git {args[0]} timed out", file=sys.stderr)
-            return subprocess.CompletedProcess(["git", "-C", worktree_path, *args], 1, "", "timeout")
+            return subprocess.CompletedProcess(["git", "-C", _git_root, *args], 1, "", "timeout")
 
     if not worktree_path or not wip_head_sha:
         print("WARN: wip-salvage: no WIP head sha - no PR", file=sys.stderr)
@@ -706,9 +729,23 @@ def _open_wip_salvage_pr(
             f"see the transcript for the gate's failures. The remaining work is "
             f"making that final state pass the test gate.\n"
         )
+    # D2 first-line state case (agents-core-fixer-worktree-vanish-salvage-v0):
+    # a run that DID conclude but lost its diff to a mid-run worktree
+    # deletion must not be mislabeled "not concluded, no gate_passed".
+    # concluded=False stays in force for the "What remains" section below -
+    # the WIP-snapshot text (incl. the non-cumulative-head caveat) is the
+    # accurate description of what a refs/wip/<task_id> push carries; the
+    # concluded=True "worktree's FINAL state / model's final test run
+    # failed" text would be wrong for this shape.
+    if stop_reason == "concluded_empty_diff_wip_salvage":
+        _state_line = "concluded, but the diff was lost to a mid-run worktree deletion"
+    elif not concluded:
+        _state_line = "not concluded, no gate_passed"
+    else:
+        _state_line = "concluded, test gate rejected the work"
     pr_body = (
         f"**[SALVAGE] advisory PR - the run is LOST "
-        f"({'not concluded, no gate_passed' if not concluded else 'concluded, test gate rejected the work'})."
+        f"({_state_line})."
         f" stop_reason: {stop_reason}.\n\n"
         f"## Task\n\n"
         f"- task_id: `{task_id}`\n"
@@ -914,6 +951,8 @@ def tail_finalize(
     _wip_git=None,
     seat_alias: str = "",
     served_model: str = "",
+    worktree_vanished: bool = False,
+    repo_cwd: str = "",
 ) -> str:
     """The shared deterministic git/PR tail (fixers-harness-staged-v0, S6).
 
@@ -1045,6 +1084,13 @@ def tail_finalize(
                 "(no uv.lock or uv not resolvable)",
             )
         rerun_outcome = _gate_targeted_rerun(cwd, model_touched_tests)
+        # agents-core-fixer-worktree-vanish-salvage-v0 (D1): a fired re-run
+        # that produced NO usable outcome (None - timeout/spawn error or
+        # cwd gone) must keep the unusable label; without this flag the
+        # model's last outcome (a dict) survives in last_test_outcome and
+        # _rerun_diag mislabels the gate FAILED line as
+        # rerun=true (last: ...).
+        rerun_no_outcome = rerun_outcome is None
         if rerun_outcome is not None:
             last_test_outcome = rerun_outcome
             gate_passed = (rerun_outcome.get("returncode") == 0)
@@ -1088,12 +1134,28 @@ def tail_finalize(
                 else "rerun-rc=5 no-tests-ran"
             )
             return f"; {name}"
-        if last_test_outcome is None:
-            # The re-run fired but was unusable (timeout/spawn error):
-            # the fail-closed verdict is kept and the re-run's
-            # non-participation is named, not folded into the model's
-            # last outcome.
+        if rerun_no_outcome or last_test_outcome is None:
+            # The re-run fired but was unusable: the fail-closed verdict
+            # is kept and the re-run's non-participation is named, not
+            # folded into the model's last outcome.
+            # agents-core-fixer-worktree-vanish-salvage-v0 (D1): the
+            # cwd-missing shape (external worktree deletion - the
+            # "cwd ... is not an existing directory" WARN from
+            # _gate_targeted_rerun) is a DIFFERENT cause of death than a
+            # genuine timeout/spawn error, and mislabelling it sent the
+            # 2026-09-11 PM session down a wrong theory. Name it.
+            if not os.path.isdir(cwd):
+                return "; rerun=fired-but-unusable:cwd-missing"
             return "; rerun=fired-but-unusable (timeout/spawn error)"
+        # D1 (agents-core-fixer-worktree-vanish-salvage-v0): a re-run that
+        # fired but whose cwd is now missing is the same external-deletion
+        # cause of death as the None shape above (the partial-deletion
+        # shape - the worktree root is gone while the re-run's own cwd
+        # survived, so the re-run still produced an outcome). Name it
+        # instead of folding it into the model's last outcome as a
+        # rerun=true success.
+        if not os.path.isdir(cwd):
+            return "; rerun=fired-but-unusable:cwd-missing"
         return (
             "; rerun=true (last: "
             f"passed={int((last_test_outcome or {}).get('passed') or 0)} "
@@ -1267,6 +1329,106 @@ def tail_finalize(
 
     if not salvaged:
         if not final_diff.strip():
+            # agents-core-fixer-worktree-vanish-salvage-v0 (D1/D2): the
+            # concluded + empty-diff + WIP-present partition (the #291
+            # class - a vanished worktree: the model finished, git add -A
+            # failed on the deleted cwd, the WIP ref survives in the
+            # parent clone's shared gitdir). Ordering (Council synthesis
+            # 2026-09-11-121532): the PRIMARY diagnostic line is static -
+            # it names the cause of death and is emitted FIRST, before the
+            # recovery attempt; recovery nuance is carried by a separate
+            # appended line + the friction entry, never by rewriting the
+            # primary line. The run is still LOST (no
+            # concluded/gate_passed semantics) - the salvage PR is
+            # advisory-only, never auto-merged (inherited from the
+            # existing salvage machinery); the positive-only gate is
+            # unchanged (fail-closed).
+            if worktree_vanished:
+                _vanished_line = (
+                    "run discarded - worktree vanished mid-run "
+                    "(external deletion; NOT a gate or test-runner failure)"
+                )
+                print(
+                    f"WARN: local-fixer: {_vanished_line}",
+                    file=sys.stderr,
+                )
+                _tail_log(task_id, _vanished_line)
+                _write_friction_entry(
+                    repo=bare_repo,
+                    node_id="worktree-vanished",
+                    error_signature="worktree-vanished:mid-run",
+                    task_id=task_id,
+                    today=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    log=lambda m: print(m, file=sys.stderr),
+                )
+                if wip_commit_count > 0 and wip_head_sha:
+                    # D2: open the advisory [SALVAGE] PR from the WIP ref
+                    # (pushable from the parent clone - repo_cwd fallback
+                    # root). The primary line above is already written and
+                    # stays immutable; _open_wip_salvage_pr appends its own
+                    # "[SALVAGE] PR opened" line on success or a distinct
+                    # footnote line on push failure. Refresh the stable-key
+                    # friction entry with the recovery outcome so the
+                    # recurrence + salvage_success trend is legible via
+                    # `mem search worktree-vanished`.
+                    print(
+                        "WARN: local-fixer: worktree vanished - WIP commits "
+                        f"exist ({wip_commit_count}) - opening advisory "
+                        "[SALVAGE] PR (concluded, empty diff, WIP salvage)",
+                        file=sys.stderr,
+                    )
+                    _salvage_url = _open_wip_salvage_pr(
+                        worktree_path, wip_ref, wip_head_sha, wip_steps,
+                        stop_reason="concluded_empty_diff_wip_salvage",
+                        task_id=task_id,
+                        target_id=target_id,
+                        bare_repo=bare_repo,
+                        branch=branch, slug=slug,
+                        step_count=step_count,
+                        transcript_path=transcript_path,
+                        concluded=False,
+                        repo_cwd=repo_cwd,
+                    )
+                    try:
+                        from agents_core.mem import MemoryStore
+
+                        _store = MemoryStore()
+                        try:
+                            _fkey = f"friction/{bare_repo}-worktree-vanished"
+                            _existing = _store.get(_fkey)
+                            _fjson: dict = {}
+                            if _existing:
+                                try:
+                                    _fjson = json.loads(
+                                        _existing.get("content") or "{}")
+                                except (json.JSONDecodeError, TypeError):
+                                    _fjson = {}
+                            # Preserve the entry's status field (the
+                            # _write_friction_entry contract: status: open
+                            # is the dedup/recurrence signal; a resolved
+                            # entry is flipped back to open on recurrence)
+                            # - the raw refresh must not drop it.
+                            if _fjson.get("status") != "open":
+                                _fjson["status"] = "open"
+                            _fjson["salvage_success"] = bool(_salvage_url)
+                            _store.set(
+                                _fkey,
+                                json.dumps(_fjson, ensure_ascii=False),
+                                tags=["friction", "test-gate", bare_repo],
+                            )
+                        finally:
+                            _store.close()
+                    except Exception as exc:
+                        print(
+                            f"WARN: local-fixer: friction salvage_success "
+                            f"refresh failed: {exc}",
+                            file=sys.stderr,
+                        )
+                    return _salvage_url
+                # No WIP commits: the distinct vanished line + friction
+                # entry are the whole outcome (invariant: no-WIP behavior
+                # unchanged - no PR).
+                return ""
             print("WARN: local-fixer: empty diff — no PR", file=sys.stderr)
             _tail_log(task_id, "empty diff - no PR")
             return ""
@@ -1727,6 +1889,12 @@ def _run_local_fixer_staged(spec: dict, base_cwd: str | None) -> str:
             kwargs.setdefault("gate_bypassed", None)
             kwargs.setdefault("model_touched_tests", set())
             kwargs.setdefault("gate_rerun_fired", True)
+            # agents-core-fixer-worktree-vanish-salvage-v0 (D2): the staged
+            # path has no WIP ref (no per-step WIP hook in fixer_stages -
+            # wip_commit_count=0 / wip_head_sha="" by default), so the new
+            # salvage partition is a no-op there by construction; plumb the
+            # parent-clone root for parity with the legacy call site.
+            kwargs.setdefault("repo_cwd", effective_cwd)
             return tail_finalize(**kwargs)
 
         # Remove the staged spec before the deterministic tail so it is
@@ -2392,6 +2560,13 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> tuple[str, dict | None
             served_model=(
                 _served_model_out[-1] if _served_model_out else ""
             ),
+            # agents-core-fixer-worktree-vanish-salvage-v0 (D1/D2): the
+            # worktree-vanished flag from the fixer result (git add -A
+            # failed on a deleted cwd) and the parent-clone path as the
+            # salvage push fallback root (the WIP ref resolves from the
+            # shared common gitdir after the worktree is gone).
+            worktree_vanished=fixer_result.get("worktree_vanished", False),
+            repo_cwd=effective_cwd,
         )
         return _legacy_tail_result, _provenance
     except Exception as exc:
