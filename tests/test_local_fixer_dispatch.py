@@ -505,7 +505,11 @@ def test_no_pr_when_not_concluded(tmp_path):
     ):
         url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
-    assert url == ""
+    # agents-core-shaperunner-fail-closed-v0: a not-concluded run with no
+    # salvageable WIP is an unclassified terminal death - the tail returns
+    # the distinct sentinel (not "") so main() exits 3 (the queue records
+    # a failed dispatch instead of a silent rc=0). No PR is opened.
+    assert url == sr.TAIL_UNCLASSIFIED_DEATH
     mock_pr.assert_not_called()
 
 
@@ -561,15 +565,20 @@ def test_no_pr_when_zero_passing_tests(tmp_path):
     mock_pr.assert_not_called()
 
 
-def test_no_is_none_check_needed_concluded_false_covers_doorman_unreachable(tmp_path):
-    """writeable=True never returns None; concluded=False covers doorman-unreachable."""
+def test_no_is_none_check_needed_concluded_false_covers_unclassified_death(tmp_path):
+    """writeable=True never returns None; concluded=False covers unclassified terminal death."""
     spec = json.loads(_make_spec(tmp_path).read_text())
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
     import agents_core.shaped_runner as sr
 
-    # Simulate what _build_fixer_result returns when doorman is unreachable
+    # Simulate what _build_fixer_result returns when the run dies
+    # not-concluded with no salvageable WIP (agents-core-shaperunner-
+    # fail-closed-v0: this is the unclassified terminal death - the tail
+    # returns the distinct sentinel instead of ""; a REAL
+    # DoormanUnreachable is caught and soft-failed at the lease-acquire
+    # sites, never at the tail).
     doorman_unreachable = {"final_diff": "", "concluded": False, "last_test_outcome": None, "steps": []}
 
     with (
@@ -582,7 +591,7 @@ def test_no_is_none_check_needed_concluded_false_covers_doorman_unreachable(tmp_
     ):
         url, _ = sr._run_local_fixer(spec, str(tmp_path))
 
-    assert url == ""
+    assert url == sr.TAIL_UNCLASSIFIED_DEATH
     mock_pr.assert_not_called()
 
 
@@ -1140,8 +1149,12 @@ def test_warn_message_no_progress(tmp_path, capsys):
     assert "doorman" not in err.lower()
 
 
-def test_warn_message_doorman_unreachable(tmp_path, capsys):
-    """AC4: concluded=False with no max_steps/no_progress flags → DoormanUnreachable message."""
+def test_warn_message_unclassified_terminal_death(tmp_path, capsys):
+    """AC4: concluded=False with no max_steps/no_progress flags → the
+    unclassified terminal death line (agents-core-shaperunner-fail-closed-v0:
+    the old doorman/wake-timeout label was false by construction and is
+    replaced by the observed terminal cause - here no stop_reason is
+    recorded)."""
     spec = json.loads(_make_spec(tmp_path).read_text())
     worktree = tmp_path / "wt"
     worktree.mkdir()
@@ -1158,7 +1171,8 @@ def test_warn_message_doorman_unreachable(tmp_path, capsys):
         sr._run_local_fixer(spec, str(tmp_path))
 
     err = capsys.readouterr().err
-    assert "DoormanUnreachable" in err or "doorman" in err.lower()
+    assert "unclassified terminal death" in err
+    assert "no stop_reason recorded" in err
 
 
 # ---------------------------------------------------------------------------

@@ -70,6 +70,16 @@ def _validate_served_model_echo(value) -> str:
     return value
 
 
+# Fail-closed sentinel (agents-core-shaperunner-fail-closed-v0): the tail's
+# catch-all partition for an unclassified terminal death (not concluded,
+# neither WIP-salvage-eligible nor no_progress nor max_steps) returns this
+# instead of "". main() maps it to exit code 3 (distinct from 1 = call
+# returned None, 2 = config error) so a ghost death shows as a FAILED
+# dispatch in the claude-queue-runner log (rc is the only signal the runner
+# logs) instead of a success with an empty stdout line.
+TAIL_UNCLASSIFIED_DEATH = "TAIL_UNCLASSIFIED_DEATH"
+
+
 # ---------------------------------------------------------------------------
 # Handler supervision (agents-core-handler-operative-live-supervision-v0)
 #
@@ -1320,12 +1330,30 @@ def tail_finalize(
             _tail_log(task_id, "run not concluded - max_steps ceiling reached (no passing tests or empty diff)")
             return ""
         else:
+            # Fail-closed (agents-core-shaperunner-fail-closed-v0): this
+            # catch-all is reached ONLY for an unclassified terminal death
+            # (not concluded, neither WIP-salvage-eligible nor no_progress
+            # nor max_steps - e.g. a model-down / context death). Report the
+            # OBSERVED terminal cause from the run record (stop_reason), or
+            # say exactly that no cause was recorded - never a doorman claim
+            # (a real DoormanUnreachable is caught and soft-failed at the
+            # lease-acquire sites, never at the tail). Return the distinct
+            # sentinel (not "") so main() exits 3 and the queue runner
+            # records the dispatch as failed instead of a silent rc=0.
+            if stop_reason:
+                _death_cause = f"stop_reason={stop_reason}"
+            else:
+                _death_cause = "no stop_reason recorded"
             print(
-                "WARN: local-fixer: run not concluded - DoormanUnreachable or wake timeout",
+                f"ERROR: local-fixer: run not concluded - unclassified "
+                f"terminal death ({_death_cause})",
                 file=sys.stderr,
             )
-            _tail_log(task_id, "run not concluded - DoormanUnreachable or wake timeout")
-            return ""
+            _tail_log(
+                task_id,
+                f"run not concluded - unclassified terminal death ({_death_cause})",
+            )
+            return TAIL_UNCLASSIFIED_DEATH
 
     if not salvaged:
         if not final_diff.strip():
@@ -3532,6 +3560,36 @@ def _run_local_auditor(spec: dict, base_cwd: str | None) -> str | None:
     return result
 
 
+def _engine_dispatch_exit(pr_url: str, engine: str) -> None:
+    """Terminal exit for the local engine dispatch blocks (agents-core-
+    shaperunner-fail-closed-v0).
+
+    The tail's catch-all partition for an unclassified terminal death
+    returns the TAIL_UNCLASSIFIED_DEATH sentinel instead of "". Map it to
+    a distinct non-zero exit code - 3 (distinct from 1 = call returned
+    None, 2 = config error) - with a loud ERROR line on stderr carrying
+    the same observed cause the tail already printed. rc is the only
+    signal the claude-queue-runner logs for a shaped_runner invocation,
+    so rc=3 makes a ghost death show as a failed dispatch (queue.fail)
+    instead of a success with an empty stdout line. A normal PR URL (or
+    "" from a NAMED failure path - no_progress / max_steps / empty diff /
+    gate-rejected salvage) still exits 0 with the URL printed: those
+    paths are already loud in the log and are the guard-scaling item's
+    territory, not this unit's.
+    """
+    if pr_url == TAIL_UNCLASSIFIED_DEATH:
+        print(
+            f"ERROR: {engine} dispatch ended in an unclassified terminal "
+            f"death (no salvageable WIP; the tail's observed cause is on "
+            f"stderr above) - exiting 3 so the queue records a failed "
+            f"dispatch",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+    print(pr_url)
+    return None
+
+
 def main():
     if len(sys.argv) != 2:
         print("ERROR: usage: python3 -m agents_core.shaped_runner <spec.json>", file=sys.stderr)
@@ -3570,7 +3628,7 @@ def main():
             spec_path.unlink()
         except OSError:
             pass
-        print(pr_url)
+        _engine_dispatch_exit(pr_url, engine)
         _print_provenance_line(prov)
         return
     elif engine == "local-fixer-staged":
@@ -3581,7 +3639,11 @@ def main():
             spec_path.unlink()
         except OSError:
             pass
-        print(pr_url)
+        _engine_dispatch_exit(pr_url, engine)
+        # A non-sentinel (normal PR URL) result must NOT fall through to
+        # the shared call_claude_cli tail below the if/elif chain - the
+        # local-fixer block's return after _engine_dispatch_exit is the
+        # contract for every local engine dispatch block.
         return
     elif engine == "local-opencode":
         pr_url = _run_local_opencode(spec, base_cwd)
@@ -3589,7 +3651,8 @@ def main():
             spec_path.unlink()
         except OSError:
             pass
-        print(pr_url)
+        _engine_dispatch_exit(pr_url, engine)
+        # Same contract as the local-fixer block: terminal on this path.
         return
     elif engine not in ("claude", "local-reviewer", "local-auditor"):
         # Fail loud on an unknown engine: a silent call_claude_cli
