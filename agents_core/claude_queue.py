@@ -267,6 +267,244 @@ def _task_backend_url(task: dict) -> str | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Claim-time doorman lease (attestation-contract-v0, leg 1, D5).
+#
+# The 2026-09-08 cohort: three claimed GW-backend tasks died
+# `gw_not_serving` - the seat parked under claimed work because the run's
+# lease is acquired at its FIRST LLM call (ensure_serving), not at claim.
+# The idle-park decision runs only while the lease set is empty, so a
+# claimed-but-not-yet-calling GW task reads as idle and the seat can park
+# under it. D5: on a successful GW-backend claim, best-effort acquire a
+# doorman lease for the run; release it on every run exit path.
+#
+# The wake trap: the lease-acquire path cold-wakes a down seat
+# (ensure_serving), so the acquire is preceded by a cheap SERVING PROBE
+# that reads the doorman's own view (liveness + seat state), NOT the GW
+# seat directly. Doorman unreachable or seat not serving -> SKIP the lease
+# (the first LLM call's existing ensure_serving wake path handles that
+# case; the death-class signals cover its failure).
+#
+# Scope: GW-backend tasks ONLY, matched by URL identity against the
+# doorman's configured gw_url (the DOORMAN_SERVER env the doorman itself
+# serves on - not a string guess). No backend_url / other seat -> no lease.
+#
+# Best-effort contract: an acquire failure NEVER blocks the claim (the run
+# proceeds lease-less; the death-class signals cover the seat-down case).
+# ---------------------------------------------------------------------------
+
+# The claim lease covers the claim -> first-LLM-call window (worktree
+# setup, ~minutes) plus margin. The queue's hard cap is submit +
+# timeout_s + 60 (shaper), so the lease TTL is the task's own timeout +
+# 60 - the same arithmetic as the local-fixer supervisor lease, which
+# structurally outlives a hard-killed run and needs no renewal.
+_CLAIM_LEASE_TTL_MARGIN_S = 60
+
+# The doorman's own liveness endpoint (doorman_server.py /healthz route -
+# the doorman process's health, NOT the GW seat's /health).
+_DOORMAN_HEALTHZ_PATH = "/healthz"
+
+# The doorman's /status snapshot (doorman_server.py status_snapshot()).
+# The shape is FLAT at the top level: {"serving": bool|None,
+# "serving_mode": str, "service_stopped": bool, "lease_count": int,
+# ...} - the doorman's own cached view of whether its GW seat is serving
+# (_is_serving probes {gw_url}/health on the refresh tick and caches the
+# result in _cached_serving, which status_snapshot surfaces as
+# "serving"). The three-state seat probe vocabulary (down /
+# up_registered / up_unverified) belongs to the doorman's separate
+# flash-next (:30000) seat axis (the "flashnext" block of the snapshot) -
+# NOT the GW seat the claim lease protects.
+_DOORMAN_STATUS_PATH = "/status"
+
+
+def _doorman_probe_serving(base_url: str, timeout: float = 2.0) -> bool | None:
+    """The D5 serving probe (the wake trap).
+
+    Reads the doorman's view of the GW seat (liveness via the doorman's
+    own /healthz endpoint + the seat state the doorman itself computes -
+    the flat top-level "serving" field of its /status snapshot, cached
+    from the doorman's own {gw_url}/health probe), NOT the GW seat
+    directly - so the claim path never cold-wakes a down seat. Returns:
+
+      True  - doorman up AND its own view says the seat is serving
+              (acquire the lease)
+      False - doorman up but its own view says the seat is not serving
+              (SKIP - no wake)
+      None  - doorman unreachable / unreadable (SKIP - the first LLM
+              call's existing ensure_serving wake path handles it)
+
+    Never raises: any failure shape degrades to None (fail-open to
+    "skip the lease", never to "wake the seat").
+    """
+    try:
+        import requests
+
+        # Liveness first (the doorman's own /healthz endpoint): an
+        # unreachable doorman is None (skip) - never a wake.
+        health = requests.get(
+            f"{base_url.rstrip('/')}{_DOORMAN_HEALTHZ_PATH}", timeout=timeout,
+        )
+        if health.status_code != 200:
+            return None
+        # The seat state: the doorman's own view of its GW seat - the
+        # flat top-level "serving" field of the /status snapshot
+        # (status_snapshot(): serving = self._cached_serving, refreshed
+        # from the doorman's own {gw_url}/health probe on the refresh
+        # tick). None (pre-first-refresh) -> not serving (skip, no wake).
+        resp = requests.get(
+            f"{base_url.rstrip('/')}{_DOORMAN_STATUS_PATH}", timeout=timeout,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if not isinstance(data, dict):
+            return None
+        return data.get("serving") is True
+    except Exception:
+        return None
+
+
+def _doorman_lease_acquire(
+    base_url: str, work_id: str, ttl_sec: int = 1860,
+    reason: str = "claim-lease", timeout: float = 10.0,
+) -> bool:
+    """Best-effort doorman lease acquire for the claim -> first-call
+    window.
+
+    Reuses the EXISTING DoormanClient.acquire() seam (doorman_client.py -
+    the same client the LLM path uses, incl. its bearer-token header and
+    the /lease/acquire contract) with the existing lease-class semantics:
+    role="worker" + the default deferrable class (the LLM path's
+    _LEASE_CLASS_DEFAULT; fixers are deferrable by the class-aware
+    gate's own docstring). No new endpoint, no hand-built body.
+
+    Returns True when a lease was registered (status "serving"); False on
+    any refusal/unreachable/exception (the claim is never blocked). Never
+    raises.
+    """
+    try:
+        from agents_core.doorman_client import DoormanClient
+
+        client = DoormanClient(base_url=base_url, timeout=timeout)
+        try:
+            res = client.acquire(
+                "gravitywell", work_id, ttl_sec=ttl_sec, reason=reason,
+                role="worker",
+            )
+        finally:
+            client.close()
+        return (res or {}).get("status") == "serving"
+    except Exception:
+        return False
+
+
+def _doorman_lease_release(base_url: str, work_id: str, timeout: float = 10.0) -> bool:
+    """Best-effort doorman lease release (idempotent - unknown work_id is
+    a no-op server-side) via the EXISTING DoormanClient.release() seam
+    (doorman_client.py). Returns True on success; False on any
+    unreachable/exception. Never raises: a lost release degrades to the
+    TTL-bounded zombie window (the existing lease contract)."""
+    try:
+        from agents_core.doorman_client import DoormanClient
+
+        client = DoormanClient(base_url=base_url, timeout=timeout)
+        try:
+            client.release("gravitywell", work_id)
+        finally:
+            client.close()
+        return True
+    except Exception:
+        return False
+
+
+def _acquire_claim_lease(
+    *,
+    base_url: str,
+    work_id: str,
+    task_id: str,
+    spec_dir=None,
+    timeout_s: int | None = None,
+    backend_url: str | None = None,
+) -> bool:
+    """The D5 claim seam: probe -> acquire for a GW-backend claim.
+
+    Called from the runner's claim loop after a successful GW-backend
+    claim (the spec's backend_url must name the doorman-managed GW seat -
+    URL identity against the doorman's configured base, not a string
+    guess). Returns True when a lease is live for the run.
+
+    Scope gate: the task's backend_url is taken from the
+    ``backend_url`` parameter - the _task_backend_url(chosen) result the
+    claim() call site already computed (the spec JSON is NOT re-read
+    here). The spec_dir/task_id parameters are retained for the
+    historical seam shape (the runner's ctx resolution) and are unused
+    in the scope gate.
+
+    Contract:
+      - non-GW-backend task (backend_url absent or != base_url) -> False,
+        no probe, no acquire (scoped, per the spec)
+      - probe False (seat down) -> False and the acquire path is NOT
+        entered (no wake triggered from the claim path)
+      - probe None (doorman unreachable) -> False (skip; the first LLM
+        call's ensure_serving wake path handles that case)
+      - acquire failure -> False (best-effort: the claim is not blocked)
+    """
+    # Scope gate: GW-backend tasks only, by URL identity against the
+    # doorman's configured base (the _task_backend_url fail-open contract
+    # the seat serialization guard uses - the same value claim() computed).
+    task_backend = backend_url
+    if not isinstance(task_backend, str) or not task_backend:
+        return False
+    if task_backend.rstrip("/") != (base_url or "").rstrip("/"):
+        return False
+
+    # Serving probe BEFORE acquire (the wake trap): the probe reads the
+    # doorman's view (liveness + seat state), NOT the GW seat directly.
+    serving = _doorman_probe_serving(base_url)
+    if serving is not True:
+        # Seat down (False) or doorman unreachable (None): skip the lease.
+        # The acquire path is deliberately NOT entered - a blind acquire
+        # would cold-wake a down seat (the wake trap).
+        return False
+
+    ttl = (
+        int(timeout_s) + _CLAIM_LEASE_TTL_MARGIN_S
+        if isinstance(timeout_s, (int, float)) and timeout_s > 0
+        else 1860
+    )
+    return _doorman_lease_acquire(
+        base_url, work_id, ttl_sec=ttl, reason="claim-lease",
+    )
+
+
+def _release_claim_lease(
+    *,
+    base_url: str,
+    work_id: str,
+    task_id: str,
+    spec_dir=None,
+    backend_url: str | None = None,
+) -> bool:
+    """The D5 release seam: release the claim lease on a run exit path.
+
+    Called on EVERY enumerated exit (success, failure, timeout-kill,
+    requeue) so the seat is never lease-pinned by a dead run beyond its
+    TTL. Requeue releases here and re-acquires on the re-claim (via
+    _acquire_claim_lease), so a requeued task is never lease-less in the
+    park window. Returns True on a 200; False otherwise (never raises).
+
+    The scope gate mirrors _acquire_claim_lease: the task's backend_url
+    is the ``backend_url`` parameter (the _task_backend_url result the
+    claim() call site computed) - the spec JSON is NOT re-read here.
+    """
+    task_backend = backend_url
+    if not isinstance(task_backend, str) or not task_backend:
+        return False
+    if task_backend.rstrip("/") != (base_url or "").rstrip("/"):
+        return False
+    return _doorman_lease_release(base_url, work_id)
+
+
 def _active_occupies(active_task: dict, now_dt: datetime) -> bool:
     """Does an active task still occupy its seat?
 
@@ -661,6 +899,32 @@ class ClaudeQueue:
             # The claimed task leaves pending/: drop its dedup entries.
             self._logged_deferrals.discard(chosen["id"])
             self._warned_spec_ids.discard(chosen["id"])
+
+            # D5 (attestation-contract-v0, leg 1): on a successful
+            # GW-backend claim, best-effort acquire the doorman claim lease
+            # (the claim -> first-LLM-call window). The probe reads the
+            # doorman's view (liveness + seat state), NOT the GW seat
+            # directly, so a down seat is never cold-woken from the claim
+            # path; the run's exit paths release the lease
+            # (_release_claim_lease). The scope gate consumes the
+            # _task_backend_url(chosen) result computed here (the spec
+            # JSON is read exactly once per claim, by _task_backend_url's
+            # fail-open contract). Best-effort: any failure shape is
+            # swallowed (a lease failure never blocks the claim - the
+            # first LLM call's existing ensure_serving wake path handles
+            # the seat-down case, and the death-class signals cover its
+            # failure).
+            try:
+                _claim_backend_url = _task_backend_url(chosen)
+                if _claim_backend_url:
+                    _acquire_claim_lease(
+                        base_url=_claim_backend_url,
+                        work_id=chosen["id"],
+                        task_id=chosen["id"],
+                        backend_url=_claim_backend_url,
+                    )
+            except Exception:
+                pass  # best-effort: a lease failure never blocks the claim
 
             state = self._read_state()
             self._refresh_state(state)

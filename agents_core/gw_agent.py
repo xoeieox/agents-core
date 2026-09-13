@@ -1524,6 +1524,7 @@ def _build_fixer_result(
     interrupt_reason: str = "",
     stop_reason: str = "",
     result_text: str = "",
+    base_sha: str = "",
 ) -> dict:
     """Build a FixerResult dict from the completed writeable run.
 
@@ -1534,6 +1535,16 @@ def _build_fixer_result(
     an empty diff and be discarded by the harness. Staging here is a no-op for
     the harness's own `git add -A` + commit (idempotent).
     """
+    # base_sha (attestation-contract-v0, leg 1, D2 part 1): the worktree's
+    # HEAD at SETUP time, threaded from the engine (the F2 pattern the
+    # local-opencode engine already had - captured immediately after
+    # setup_worktree, BEFORE the run, via `git rev-parse HEAD`). The
+    # deterministic tail's empty-diff recovery re-derives the deliverable
+    # as HEAD vs base when the model self-committed (clean index, HEAD
+    # past base) - a post-run capture would read the model's own commit
+    # and the recovery diff would be empty, so the base must be the
+    # pre-run HEAD. Additive key: existing consumers ignore it.
+
     add_result = subprocess.run(
         ["git", "-C", cwd, "add", "-A"],
         capture_output=True,
@@ -1606,6 +1617,7 @@ def _build_fixer_result(
         # worktree deletion). Default False - healthy and git-failure-with-
         # live-cwd runs are byte-identical to pre-spec.
         "worktree_vanished": worktree_vanished,
+        "base_sha": base_sha,
         "last_test_outcome": last_test_outcome,
         "concluded": concluded,
         "max_steps_reached": max_steps_reached,
@@ -2247,6 +2259,7 @@ def _call_gw_agent_impl(
     swarm_payload: bool = False,
     after_step: Callable[[dict], None] | None = None,
     max_explore_steps: int | None = None,
+    base_sha: str = "",
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Run a multi-step read-only tool-loop on GravityWell.
 
@@ -2424,6 +2437,32 @@ def _call_gw_agent_impl(
 
     if work_id is None:
         work_id = uuid.uuid4().hex[:8]
+
+    # base_sha (attestation-contract-v0, leg 1, D2 part 1): the worktree's
+    # HEAD at SETUP time, threaded from the engine (captured immediately
+    # after setup_worktree, BEFORE the run - the F2 pattern the
+    # local-opencode engine already had). The tail's empty-diff
+    # self-commit recovery re-derives the deliverable as HEAD vs base;
+    # a post-run capture would read the model's own commit and the
+    # recovery diff would be empty. A failed capture degrades the tail
+    # to today's bail behavior (never blocks the run).
+    if writeable and not base_sha:
+        try:
+            _base_probe = subprocess.run(
+                ["git", "-C", cwd, "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if _base_probe.returncode == 0:
+                base_sha = _base_probe.stdout.strip()
+            elif log:
+                log(
+                    f"[gw_agent] base_sha capture failed "
+                    f"rc={_base_probe.returncode}: "
+                    f"{_base_probe.stderr.strip()[:200]}"
+                )
+        except Exception as exc:
+            if log:
+                log(f"[gw_agent] base_sha capture failed ({exc})")
 
     # Capture swarm flag BEFORE backend_url is reassigned to GW_URL.
     # After the reassignment backend_url is never None, so testing it downstream is useless.
@@ -3443,6 +3482,7 @@ def call_gw_agent(
     swarm_payload: bool = False,
     after_step: Callable[[dict], None] | None = None,
     max_explore_steps: int | None = None,
+    base_sha: str = "",
 ) -> str | None | tuple[str | None, list[dict]] | tuple[dict, list[dict]]:
     """Locality-ledger side-write wrapper around _call_gw_agent_impl().
 
@@ -3476,7 +3516,7 @@ def call_gw_agent(
             model=model, handler_hook=handler_hook, handler_objective=handler_objective,
             handler_max_interventions=handler_max_interventions, skip_probe=skip_probe,
             swarm_payload=swarm_payload, after_step=after_step,
-            max_explore_steps=max_explore_steps,
+            max_explore_steps=max_explore_steps, base_sha=base_sha,
         )
         return _locality_result
     except Exception:
@@ -3723,6 +3763,7 @@ def _finalize_writeable_or_readonly(
     reason_out: list[str] | None = None,
     reason: str | None = None,
     stop_reason: str = "",
+    base_sha: str = "",
 ) -> str | None | tuple:
     """Route to FixerResult or plain result based on writeable flag.
 
@@ -3740,6 +3781,7 @@ def _finalize_writeable_or_readonly(
     if writeable:
         fixer = _build_fixer_result(
             cwd, transcript,
+            base_sha=base_sha,
             concluded=concluded and not max_steps_reached and not no_progress and not budget_forced and not interrupted,
             max_steps_reached=max_steps_reached,
             no_progress=no_progress,

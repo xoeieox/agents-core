@@ -1159,6 +1159,12 @@ def run_staged_mission(
     # contract.
     # ------------------------------------------------------------------
     if tail_finalize is not None:
+        # D2 (attestation-contract-v0, leg 1): the worktree's HEAD at
+        # SETUP time (captured pre-stage - the stages' LLM calls may
+        # commit their own work, so a post-run capture would read the
+        # model's commit, not the base). The tail's empty-diff
+        # self-commit recovery re-derives the deliverable as HEAD vs
+        # this base. An absent capture degrades the tail to the bail.
         outcome.pr_url = tail_finalize(
             task_id=task_id,
             target_id=target_id,
@@ -1185,6 +1191,7 @@ def run_staged_mission(
             model_touched_tests=set(mission.tests),
             gate_rerun_fired=True,
             _wip_git=None,
+            base_sha=_git_head_sha(cwd),
         )
     outcome.final_state = "completed"
     path = _write_report(
@@ -1209,6 +1216,28 @@ def _git_diff(cwd: str) -> str:
             capture_output=True, text=True, timeout=15,
         )
         return r.stdout if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _git_head_sha(cwd: str) -> str:
+    """The worktree's HEAD sha (empty string on any git failure).
+
+    D2 (attestation-contract-v0, leg 1): the tail's empty-diff
+    self-commit recovery needs the worktree's HEAD at SETUP time (the
+    F2 pattern the local-opencode engine already had). The staged
+    mission captures it once, pre-stage, and threads it to the tail
+    (the stages run LLM calls that may commit their own work - a
+    post-run capture would read the model's commit, not the base).
+    """
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return r.stdout.strip() if r.returncode == 0 else ""
     except Exception:
         return ""
 
