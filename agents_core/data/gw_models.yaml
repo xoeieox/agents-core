@@ -91,3 +91,19 @@ models:
     operator_alias: gravitywell
     display_label: gemma-4-31b-heretic-nvfp4
     weights_hint: "gemma-4-31B-it-heretic-NVFP4"
+
+  # 27B uncensored solo posture (gw-models-row-nvfp4-uncensored-v0) — the
+  # OrcaRouter NVFP4 day seat (Erah ruling 2026-09-13; served id verified
+  # live 09-11 and 09-13). Same trap as the 27B row: mode_alias "solo",
+  # NOT "big" (would join gw_big_seat_members() and flip serving_is_big on
+  # a solo posture). Appended at END OF FILE — _gw_registry_lookup matches
+  # in file order and returns the first hit, so every existing lookup stays
+  # byte-identical; only canonical_id and display_label are unique to this
+  # row. Shape-identical to the gravitywell-27b sibling; the deployed
+  # /srv/agents copy already carries this row (host-ops fold, PM session)
+  # — this PR is the repo canonical.
+  - canonical_id: gravitywell-27b-nvfp4-uncensored
+    mode_alias: solo
+    operator_alias: gravitywell
+    display_label: qwen3.8-27b-nvfp4-uncensored
+    weights_hint: "Qwen3.8-27B-Uncensored-NVFP4"
