@@ -29,6 +29,41 @@ declared required-check constants and the id-5 (private-key custody)
 allowance, which is a permitted skip against the current vendored verifier
 build, always surfaced, never silently absorbed.
 
+TWO CACHES EXIST (phala-attestation-cache-v0, 2026-09-14), both in-process
+and both fail-closed:
+
+1. The online ``aci verify`` leg's transcript is cached per keyset digest
+   for one hour (``_online_verify_cache``) — that leg is nonce-independent,
+   so the transcript is safe to reuse.
+2. The whole VERIFIED attestation bundle (report bytes, the nonce used, the
+   ``ReportVerification`` result, the keyset digest) is cached
+   process-wide under the ``(base_url, verify_target)`` tuple for
+   ``min(ttl_env, 3600, not_after)`` seconds (``_attestation_cache``, TTL
+   env ``PHALA_ATTESTATION_CACHE_TTL_SECS``, default 900s, hard ceiling
+   3600s IN the clamp expression). A cache HIT skips BOTH the attestation
+   GET and both CLI legs; a MISS runs the full fresh-nonce flow verbatim.
+   The store is MODULE-level (process-wide, shared across client
+   instances) because the node2 consumer drops the client per pass — an
+   instance-level cache would never hit there.
+
+Nonce posture under a hit (deliberate, bounded): a hit reuses the cached
+(report, nonce) pair instead of minting fresh ones — the pair was fully
+verified at store time, a hit re-presents a still-valid proof rather than a
+fabricated one, mints no fresh nonce, performs no attestation traffic, and
+never re-sends the pair to the gateway. The replay window is bounded by
+``min(ttl_env, 3600, not_after)``; freshness-of-hardware (id-1) is the
+online leg's collateral job and inherits the same bounded staleness the
+existing 1-hour online cache already accepted. The nonce-bound offline
+audit leg is NEVER cached by itself — its verdict is bound to the nonce —
+the only reuse on a hit is re-presenting the same verified pair. A keyset
+rotation at the same target is not detected at hit time; a POST rejected
+with 400/401/403/422 pops the entry and re-raises fail-closed, otherwise
+detection is delayed up to ``min(ttl, 3600, not_after)``. The locality row
+stays honest: ``report_verified`` / ``custody_unverified`` / ``e2ee_applied``
+/ ``channel`` are unchanged; cache status is additive in ``extra``
+(``attestation_cache_hit`` / ``attestation_cache_age_s``) — "verified 14
+minutes ago" never reads as "verified this instant".
+
 Streaming, ``prompt``/``input`` (completions/embeddings) field paths, and
 audio response decryption are out of scope for v0 — request sealing covers
 ``messages[].content``; response opening covers ``choices[].message.content``
@@ -173,6 +208,116 @@ _ONLINE_VERIFY_CACHE_TTL_SECS = 3600.0
 # key is nonce-independent by construction, so sharing it across clients is
 # safe and matches "cached per keyset digest for one hour" in the spec.
 _online_verify_cache: dict[str, tuple[float, dict]] = {}
+
+# ---------------------------------------------------------------------------
+# Verified-attestation bundle cache (phala-attestation-cache-v0, 2026-09-14).
+# The verifying client used to pay the attestation GET + the two `aci` CLI
+# verify legs on EVERY call, which at production call rates gets Phala
+# rate-limiting (correction/phala-guarded-client-per-call-attestation-rate-
+# limited-2026-09-14). The cache stores the whole VERIFIED bundle — report
+# bytes, the nonce used, the ReportVerification result, the keyset digest —
+# under one TTL, so a hit skips the attestation GET AND both CLI legs.
+#
+# Nonce posture (deliberate, bounded): a hit reuses the cached report and its
+# nonce instead of minting fresh ones. The (report, nonce) pair was fully
+# verified at store time; a hit re-presents a still-valid proof, it never
+# mints a fresh nonce, performs no attestation traffic, and the pair is NOT
+# re-sent to the gateway anywhere (the nonce rode only on the store-time GET
+# query and the local `aci audit --nonce` arg). The replay window this opens
+# is bounded by min(ttl_env, _ATTESTATION_CACHE_TTL_CEILING_SECS, not_after).
+#
+# Key is the TUPLE (base_url, verify_target) — NOT a flat f-string: a pipe in
+# a URL would collide, and the tuple makes the invalidation semantics
+# precise (a None dimension in invalidate_attestation_cache = no filter).
+# The key deliberately does NOT include the keyset digest — it is only
+# knowable post-verify, and the whole point of a hit is to skip the verify.
+# A keyset rotation at the same target is therefore not detected at hit
+# time; it is caught on a POST auth/keyset rejection (see
+# _ATTESTATION_POST_REJECT_STATUSES) with detection otherwise delayed up to
+# min(ttl, ceiling, not_after).
+#
+# MODULE-LEVEL store, process-wide, shared across client instances: the
+# node2 consumer (lapis-pm corroboration_adapter) builds a fresh client per
+# corroboration pass, so a client-instance-level cache would never hit there
+# and every pass + the grammar-degrade retry would re-pay fetch + two legs —
+# the exact rate-limit failure mode this cache exists to remove. In-process
+# only, no cross-process coordination (daemon restart re-verifies once;
+# acceptable, matching _online_verify_cache house style).
+# ---------------------------------------------------------------------------
+PHALA_ATTESTATION_CACHE_TTL_ENV = "PHALA_ATTESTATION_CACHE_TTL_SECS"
+DEFAULT_ATTESTATION_CACHE_TTL_SECS = 900.0
+# Hard ceiling on the effective TTL, IN the clamp expression (evaluated at
+# store time): ttl_effective = min(ttl_env, ceiling, max(0.0, not_after -
+# time.time())). The ceiling must be in the min itself, not a prose clause —
+# an implementer copying a ceiling-less formula ships 24h staleness with
+# ttl_env=86400.
+_ATTESTATION_CACHE_TTL_CEILING_SECS = 3600.0
+# A chat-completion POST rejected with one of these statuses is a keyset
+# rotation (or auth failure) rejected at the hop: the cached bundle is stale
+# for the gateway, so the entry is popped and the error re-raised fail-
+# closed. Transient statuses (5xx, ...) do NOT pop — the bundle is still
+# valid, the failure is the gateway's.
+_ATTESTATION_POST_REJECT_STATUSES = frozenset({400, 401, 403, 422})
+
+
+@dataclass(frozen=True)
+class _VerifiedAttestation:
+    """A fully verified attestation bundle, cached process-wide under
+    (base_url, verify_target). Stored ONLY after
+    `require_verified_report_binding` has passed — no code path can reach
+    the POST with a bundle that did not pass the full two-leg gate at store
+    time."""
+
+    report: dict
+    nonce: str
+    verification: ReportVerification
+    keyset_digest: str
+    cached_at_monotonic: float
+    not_after: int  # wall clock (unix secs) — the report's keyset validity bound
+
+
+# (base_url, verify_target) -> (cached_at_monotonic, _VerifiedAttestation).
+# Module-level, time.monotonic() stamped, in-process only — see the section
+# comment above for why the store is process-wide and not client-instance
+# level.
+_attestation_cache: dict[tuple[str, str], tuple[float, _VerifiedAttestation]] = {}
+
+
+def _attestation_cache_ttl_secs() -> float:
+    """Read the env TTL at call time (not module load) so tests/ops can
+    override without a process restart — same pattern as `_aci_verifier_bin`.
+    Returns ONLY the env-ceiling clamp min(ttl_env,
+    _ATTESTATION_CACHE_TTL_CEILING_SECS); the per-report `not_after` term is
+    applied at store time against the report. A ttl_env <= 0 disables the
+    cache (never store) — it is NOT a verify-off switch: with the cache
+    disabled every call still runs both legs."""
+    raw = os.environ.get(PHALA_ATTESTATION_CACHE_TTL_ENV)
+    if raw is None:
+        ttl_env = DEFAULT_ATTESTATION_CACHE_TTL_SECS
+    else:
+        try:
+            ttl_env = float(raw)
+        except ValueError:
+            ttl_env = DEFAULT_ATTESTATION_CACHE_TTL_SECS
+    return min(ttl_env, _ATTESTATION_CACHE_TTL_CEILING_SECS)
+
+
+def invalidate_attestation_cache(*, base_url: str | None = None, verify_target: str | None = None) -> int:
+    """Drop verified-attestation cache entries, returning the count dropped.
+
+    A `None` argument is NO filter on that dimension (wildcard); all-`None`
+    drops everything. For tests, the contractor canary, and the retry path.
+    """
+    dropped = 0
+    for key in list(_attestation_cache.keys()):
+        k_base, k_target = key
+        if base_url is not None and k_base != base_url:
+            continue
+        if verify_target is not None and k_target != verify_target:
+            continue
+        del _attestation_cache[key]
+        dropped += 1
+    return dropped
 
 
 # ---------------------------------------------------------------------------
@@ -1113,15 +1258,29 @@ def reconcile_daily_spend(provider_reported_usd: float | None, *, day: date | No
 class PhalaTeeClient:
     """Client for Phala's Attested Confidential Inference API.
 
-    Every call through `chat_completion` fetches a fresh attestation report,
-    verifies its binding (`require_verified_report_binding`), refuses to
-    proceed on any failed required check, and records one locality-ledger
-    entry (`cost_class="paid-phala-tee"`) carrying `report_verified` /
+    Every call through `chat_completion` verifies the attestation binding
+    (`require_verified_report_binding`) before proceeding, refuses on any
+    failed required check, and records one locality-ledger entry
+    (`cost_class="paid-phala-tee"`) carrying `report_verified` /
     `e2ee_applied` / `channel` / `custody_unverified` so the claims — "sent
     to Phala", "sent to Phala with the channel verified", "sent to Phala
     with body-level e2ee applied" — are never collapsed into one row. See
     the module docstring: this is a confidentiality claim, not a
     content-trust claim.
+
+    Attestation fetch/verify is amortized by the module-level
+    verified-attestation bundle cache (phala-attestation-cache-v0): a MISS
+    fetches a fresh attestation report, mints a fresh nonce, runs the full
+    two-leg verify, and stores the verified bundle; a HIT within
+    `min(ttl_env, 3600, not_after)` reuses the stored verified bundle and
+    skips the attestation GET and both CLI legs. A hit re-presents the same
+    verified (report, nonce) pair — it mints no fresh nonce and performs no
+    attestation traffic — so the locality row marks it honestly via
+    `extra.attestation_cache_hit` / `extra.attestation_cache_age_s`
+    ("verified N seconds ago", never "verified this instant"). The spend
+    cap still runs pre-I/O on hits and misses alike, and no code path
+    reaches the POST with a bundle that did not pass the full two-leg gate
+    at store time.
     """
 
     # Old ceiling this default replaces (agents-core-phala-gate-voicing-v0). Live
@@ -1204,15 +1363,92 @@ class PhalaTeeClient:
         (agents-core-phala-spend-cap-v0)."""
         _check_phala_spend_cap()
 
-        if nonce is None:
-            nonce = os.urandom(32).hex()  # aci/1 requires 64 hex chars (32 bytes).
+        cache_key = (self._base_url, self._verify_target)
 
-        report = self.fetch_attestation(nonce=nonce)
-        # verify_report_binding's base_url means "the thing to verify" —
-        # pass the verification target, not the traffic route: self._base_url
-        # is pinned to the loopback aci-serve hop and can never TLS-handshake
-        # (id-6 needs a live TLS channel to the real service).
-        verification = require_verified_report_binding(report, nonce, base_url=self._verify_target)
+        # --- verified-attestation bundle cache (phala-attestation-cache-v0).
+        # A HIT skips the attestation GET and BOTH CLI legs: the stored
+        # bundle passed the full two-leg gate at store time, and the
+        # (report, nonce) pair is re-presented as-is — no fresh nonce, no
+        # attestation traffic. The loopback verify-target refusal fires
+        # inside require_verified_report_binding on the miss path BEFORE
+        # any subprocess (it fires before the fetch today; the hit path
+        # never re-reads a target that could not have been verified).
+        cache_hit = False
+        cache_age_s: float | None = None
+        cached = _attestation_cache.get(cache_key)
+        if cached is not None:
+            cached_at, bundle = cached
+            # Hit check in the monotonic domain (house style, matching
+            # _online_verify_cache). The store-time ttl_effective was
+            # clamped to min(ttl_env, ceiling, max(0.0, not_after -
+            # store_now_wall)), so a wall-clock-expired report (not_after
+            # in the past) was never stored. Re-checking the store-time
+            # ttl_env alone would drift the not_after clamp by the wall
+            # clock's movement since store time (the two clocks are not
+            # locked), so the hit additionally requires the report's
+            # keyset to still be within its own validity window (L4) —
+            # this is the wall-clock clamp winning over the monotonic ttl.
+            if time.monotonic() - cached_at < _attestation_cache_ttl_secs() and bundle.not_after > time.time():
+                cache_hit = True
+                cache_age_s = time.monotonic() - cached_at
+
+        if cache_hit:
+            report = bundle.report
+            nonce = bundle.nonce
+            verification = bundle.verification
+        else:
+            if nonce is None:
+                nonce = os.urandom(32).hex()  # aci/1 requires 64 hex chars (32 bytes).
+
+            # verify_report_binding's base_url means "the thing to verify" —
+            # pass the verification target, not the traffic route:
+            # self._base_url is pinned to the loopback aci-serve hop and can
+            # never TLS-handshake (id-6 needs a live TLS channel to the real
+            # service).
+            try:
+                report = self.fetch_attestation(nonce=nonce)
+                verification = require_verified_report_binding(report, nonce, base_url=self._verify_target)
+            except (AciError, requests.RequestException):
+                # Fail-closed invalidation: a toolchain fault (any AciError
+                # subclass — the verify legs, the loopback-target refusal,
+                # the plaintext-not-loopback refusal, E2eeNotAppliedError)
+                # or a fetch HTTP failure means the bundle is not
+                # trustworthy; drop any stale entry for this key and
+                # re-raise. Never degrade to an unverified send.
+                _attestation_cache.pop(cache_key, None)
+                raise
+
+            # Insert the bundle IMMEDIATELY after verification, BEFORE the
+            # POST: a transient POST failure does not invalidate a still-
+            # valid bundle (the intended amortization path). ttl_env <= 0
+            # disables the cache (never store) — not a verify-off switch.
+            ttl_env = _attestation_cache_ttl_secs()
+            if ttl_env > 0:
+                not_after = (
+                    report.get("attestation", {}).get("workload_keyset", {}).get("not_after")
+                    or 0
+                )
+                # Clamp evaluated at STORE time, ceiling IN the expression:
+                # min(ttl_env, ceiling, max(0.0, not_after - now_wall)).
+                # A wall-clock-expired report (not_after in the past) is a
+                # miss — never stored, never served.
+                ttl_effective = min(
+                    ttl_env,
+                    _ATTESTATION_CACHE_TTL_CEILING_SECS,
+                    max(0.0, float(not_after) - time.time()),
+                )
+                if ttl_effective > 0:
+                    _attestation_cache[cache_key] = (
+                        time.monotonic(),
+                        _VerifiedAttestation(
+                            report=report,
+                            nonce=nonce,
+                            verification=verification,
+                            keyset_digest=verification.workload_keyset_digest,
+                            cached_at_monotonic=time.monotonic(),
+                            not_after=int(not_after),
+                        ),
+                    )
 
         capabilities = report.get("service_capabilities") or {}
         supported_versions = capabilities.get("supported_e2ee_versions") or []
@@ -1242,14 +1478,26 @@ class PhalaTeeClient:
         headers.update(e2ee_headers)
 
         start = time.monotonic()
-        resp = self._session.post(
-            f"{self._base_url}/v1/chat/completions",
-            json=body,
-            headers=headers,
-            timeout=self._timeout,
-        )
-        duration_ms = int((time.monotonic() - start) * 1000)
-        resp.raise_for_status()
+        try:
+            resp = self._session.post(
+                f"{self._base_url}/v1/chat/completions",
+                json=body,
+                headers=headers,
+                timeout=self._timeout,
+            )
+            duration_ms = int((time.monotonic() - start) * 1000)
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            # Keyset rotation rejected at the hop: a POST 400/401/403/422
+            # means the gateway no longer accepts the cached keyset — the
+            # bundle is stale, so pop the entry (the node2 grammar-degrade
+            # retry then re-verifies fresh on its next call) and re-raise
+            # fail-closed. Transient statuses (5xx, ...) do NOT pop: the
+            # bundle is still valid, the failure is the gateway's.
+            status = getattr(e.response, "status_code", None)
+            if status in _ATTESTATION_POST_REJECT_STATUSES:
+                _attestation_cache.pop(cache_key, None)
+            raise
 
         applied = resp.headers.get("x-e2ee-applied", "").strip().lower() == "true"
         response_json = resp.json()
@@ -1300,6 +1548,13 @@ class PhalaTeeClient:
                 "report_verified": verification.ok,
                 # id-5 custody allowance, surfaced — never absorbed silently.
                 "custody_unverified": verification.custody_skipped,
+                # Verified-attestation cache status, ADDITIVE in extra only
+                # (spend-cap ledger-row doctrine: report_verified /
+                # custody_unverified / e2ee_applied / channel above are
+                # unchanged). "Verified 14 minutes ago" must never read as
+                # "verified this instant".
+                "attestation_cache_hit": cache_hit,
+                "attestation_cache_age_s": cache_age_s,
                 # Distinct signal (Facets `transmuter`, 2026-08-04) paired with the
                 # 30s→300s timeout raise above: a call that would have failed under
                 # the old ceiling must not simply succeed silently at 200s — flag it
