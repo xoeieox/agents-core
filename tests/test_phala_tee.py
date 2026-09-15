@@ -1204,6 +1204,11 @@ def test_chat_completion_threads_usage_cost_and_token_counts_into_ledger(monkeyp
     assert recorded["extra"]["total_tokens"] == 17
     assert recorded["extra"]["reasoning_tokens"] == 0
     assert recorded["extra"]["cost_unpriced"] is False
+    # Cache status is additive in extra only (spend-cap row doctrine): a
+    # miss row carries hit=False + age None; the row's other fields are
+    # untouched by the cache.
+    assert recorded["extra"]["attestation_cache_hit"] is False
+    assert recorded["extra"]["attestation_cache_age_s"] is None
 
 
 def test_chat_completion_records_none_cost_and_marker_when_usage_absent(monkeypatch):

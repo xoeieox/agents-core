@@ -1348,7 +1348,13 @@ class PhalaTeeClient:
         nonce: str | None = None,
         extra_body: dict | None = None,
     ) -> dict:
-        """Fetch + verify attestation, seal `messages[].content]` IF the
+        """Fetch + verify attestation (MISS: a fresh nonce is minted, the
+        attestation is fetched, both `aci` legs run, and the verified
+        bundle is stored; HIT within min(ttl_env, 3600, not_after): the
+        cached verified bundle is reused as-is and the attestation GET +
+        both CLI legs are skipped — the locality row marks the hit via
+        extra.attestation_cache_hit / attestation_cache_age_s), seal
+        `messages[].content]` IF the
         gateway advertises a supported e2ee version, POST
         /v1/chat/completions, and decrypt the response when sealed. Raises
         `ReportVerificationError` if the report fails binding verification;
