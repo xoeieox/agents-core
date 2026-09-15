@@ -221,18 +221,21 @@ def test_verify_ecdsa_secp256k1_rejects_s_at_or_above_curve_order():
 # ---------------------------------------------------------------------------
 
 
-def _build_aci1_report(*, e2ee_versions=None):
+def _build_aci1_report(*, e2ee_versions=None, not_after_offset=3600):
     """A synthetic aci/1-shaped attestation report — no workload_id,
     workload_identity, keyset_endorsement, or keyset_epoch, matching the
     live wire format captured 2026-08-07 (finding/brix-phala-aci1-break-
-    confirmed-and-restoration-in-flight-2026-08-07)."""
+    confirmed-and-restoration-in-flight-2026-08-07). `not_after_offset`
+    (default 3600, unchanged behavior) makes the keyset's wall-clock
+    validity bound testable for the verified-attestation cache's
+    not_after clamp (DoD-3, DoD-9)."""
     service_priv = X25519PrivateKey.generate()
     service_pub_hex = service_priv.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw
     ).hex()
     keyset = {
         "e2ee_public_keys": [{"algo": phala_tee.E2EE_ALGO, "public_key": service_pub_hex}],
-        "not_after": int(time.time()) + 3600,
+        "not_after": int(time.time()) + not_after_offset,
         "receipt_signing_keys": [],
         "subject": None,
         "tls_public_keys": [],
@@ -307,6 +310,9 @@ def _install_aci_cli_stub(monkeypatch, *, audit_transcript, verify_transcript):
 
     monkeypatch.setattr(phala_tee, "_run_aci_json", fake_run_aci_json)
     monkeypatch.setattr(phala_tee, "_online_verify_cache", {})
+    # phala-attestation-cache-v0: reset the verified-bundle cache too —
+    # chat_completion tests must start from a clean module-level store.
+    monkeypatch.setattr(phala_tee, "_attestation_cache", {})
     return calls
 
 
@@ -1198,6 +1204,11 @@ def test_chat_completion_threads_usage_cost_and_token_counts_into_ledger(monkeyp
     assert recorded["extra"]["total_tokens"] == 17
     assert recorded["extra"]["reasoning_tokens"] == 0
     assert recorded["extra"]["cost_unpriced"] is False
+    # Cache status is additive in extra only (spend-cap row doctrine): a
+    # miss row carries hit=False + age None; the row's other fields are
+    # untouched by the cache.
+    assert recorded["extra"]["attestation_cache_hit"] is False
+    assert recorded["extra"]["attestation_cache_age_s"] is None
 
 
 def test_chat_completion_records_none_cost_and_marker_when_usage_absent(monkeypatch):
@@ -1367,6 +1378,341 @@ def test_reconcile_daily_spend_unknown_provider_value_still_reports_ledger_total
     assert result["ledger_total_usd"] == 1.00
     assert result["divergence_usd"] is None
     assert result["material_divergence"] is False
+
+
+# ---------------------------------------------------------------------------
+# Verified-attestation bundle cache (phala-attestation-cache-v0, 2026-09-14).
+#
+# These tests use the REAL `verify_report_binding` + `_install_aci_cli_stub`
+# (the call-counting fake at the single subprocess boundary, which resets
+# both caches) + a MagicMock session counting `.get`/`.post` — NOT
+# `_stub_chat_completion_deps`, which stubs `require_verified_report_binding`
+# out (audit count 0, defeating the DoD-1 discriminator). The discriminators
+# are the attestation GET count and the audit-leg count: the online-leg cache
+# alone would also give verify==1, so GET + audit are what prove the
+# verified bundle was served from the cache.
+# ---------------------------------------------------------------------------
+
+
+def _http_error(status_code):
+    import requests as _requests
+
+    resp = mock.Mock()
+    resp.status_code = status_code
+    return _requests.HTTPError(response=resp)
+
+
+def _make_cache_client(monkeypatch, *, report, keyset_digest, nonce, session, base_url="http://127.0.0.1:4180"):
+    """Wire the real two-leg verify against a MagicMock session and build a
+    client pinned at loopback (plaintext path, no e2ee sealing). The audit
+    transcript is nonce-bound, so a hit (which never re-runs the audit leg)
+    is the only thing that keeps the audit count at 1."""
+    audit = _passing_transcript(
+        checks=[
+            ("id-1", "skip"), ("id-2", "pass"), ("id-3", "pass"),
+            ("id-4", "pass"), ("id-5", "skip"), ("id-6", "skip"),
+        ],
+        keyset_digest=keyset_digest,
+        nonce=nonce,
+        exit_code=1,
+        verified=False,
+        failed=0,
+    )
+    verify = _passing_transcript(
+        checks=[("id-1", "pass"), ("id-5", "skip"), ("id-6", "pass")],
+        exit_code=0,
+        verified=False,
+        failed=0,
+    )
+    calls = _install_aci_cli_stub(monkeypatch, audit_transcript=audit, verify_transcript=verify)
+
+    resp = mock.MagicMock()
+    resp.raise_for_status = mock.MagicMock()
+    resp.headers = {}
+    resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+    session.post.return_value = resp
+    get_resp = mock.MagicMock()
+    get_resp.raise_for_status = mock.MagicMock()
+    get_resp.json.return_value = report
+    session.get.return_value = get_resp
+
+    client = phala_tee.PhalaTeeClient(session=session, base_url=base_url, verify_target="https://real.example.com")
+    return client, calls
+
+
+def test_attestation_cache_hit_skips_fetch_and_both_legs(monkeypatch):
+    """DoD-1: two chat_completion calls within ttl produce exactly ONE
+    attestation GET and ONE audit leg (the amortization proof). The
+    discriminators are the GET count and the audit count — the online-leg
+    cache alone would also give verify==1, so GET + audit are what prove
+    the verified bundle was served from the cache."""
+    report, keyset_digest, _ = _build_aci1_report()
+    nonce = "a" * 64
+    session = mock.MagicMock()
+    client, calls = _make_cache_client(monkeypatch, report=report, keyset_digest=keyset_digest, nonce=nonce, session=session)
+
+    client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m", nonce=nonce)
+    assert session.get.call_count == 1
+    assert session.post.call_count == 1
+    assert calls == {"audit": 1, "verify": 1}
+
+    client.chat_completion(messages=[{"role": "user", "content": "again"}], model="m", nonce=nonce)
+    assert session.get.call_count == 1  # hit: no second attestation GET
+    assert session.post.call_count == 2
+    assert calls["audit"] == 1  # hit: no second audit leg
+    assert calls["verify"] == 1
+
+
+def test_attestation_cache_miss_after_ttl_refetches_and_reinserts(monkeypatch):
+    """DoD-2: advancing the fake monotonic clock past ttl makes the second
+    call a miss — it re-fetches, re-audits, and re-inserts."""
+    report, keyset_digest, _ = _build_aci1_report()
+    nonce = "a" * 64
+    session = mock.MagicMock()
+    client, calls = _make_cache_client(monkeypatch, report=report, keyset_digest=keyset_digest, nonce=nonce, session=session)
+
+    clock = [1000.0]
+    monkeypatch.setattr(phala_tee.time, "monotonic", lambda: clock[0])
+
+    client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m", nonce=nonce)
+    assert session.get.call_count == 1
+    assert calls["audit"] == 1
+
+    # Past the default 900s ttl (well under the 3600s ceiling).
+    clock[0] = 1000.0 + 901.0
+    client.chat_completion(messages=[{"role": "user", "content": "again"}], model="m", nonce=nonce)
+    assert session.get.call_count == 2  # miss: re-fetches
+    assert calls["audit"] == 2  # miss: re-runs the audit leg
+    assert session.post.call_count == 2
+
+    # Re-inserted: a call back inside ttl is a hit again.
+    clock[0] = 1000.0 + 901.0 + 10.0
+    client.chat_completion(messages=[{"role": "user", "content": "third"}], model="m", nonce=nonce)
+    assert session.get.call_count == 2
+    assert calls["audit"] == 2
+
+
+def test_attestation_cache_not_after_clamp_wins_over_ttl(monkeypatch):
+    """DoD-3: an entry stored with not_after 60s out while ttl is 900 must
+    be a MISS at t+120s — the wall-clock clamp wins over ttl. The report
+    is built AFTER the clock patch so not_after is in the fake domain."""
+    clock = [1000.0]
+    monkeypatch.setattr(phala_tee.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(phala_tee.time, "time", lambda: clock[0])
+
+    report, keyset_digest, _ = _build_aci1_report(not_after_offset=60)
+    nonce = "a" * 64
+    session = mock.MagicMock()
+    client, calls = _make_cache_client(monkeypatch, report=report, keyset_digest=keyset_digest, nonce=nonce, session=session)
+
+    client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m", nonce=nonce)
+    assert session.get.call_count == 1
+    assert calls["audit"] == 1
+
+    # +120s: still inside the 900s ttl, but past not_after (+60s) -> MISS.
+    clock[0] = 1120.0
+    client.chat_completion(messages=[{"role": "user", "content": "again"}], model="m", nonce=nonce)
+    assert session.get.call_count == 2
+    assert calls["audit"] == 2
+
+
+def test_attestation_cache_fail_closed_invalidation_on_aci_error(monkeypatch):
+    """DoD-4: the first call succeeds and caches; the second call is a
+    forced miss that fails with AciError -> the cache entry is gone,
+    chat_completion raises, and no HTTP POST was issued on the failing
+    call."""
+    report, keyset_digest, _ = _build_aci1_report()
+    nonce = "a" * 64
+    session = mock.MagicMock()
+    client, calls = _make_cache_client(monkeypatch, report=report, keyset_digest=keyset_digest, nonce=nonce, session=session)
+
+    client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m", nonce=nonce)
+    assert session.post.call_count == 1
+    assert (client._base_url, client._verify_target) in phala_tee._attestation_cache
+
+    # Force a miss, then make the audit leg fail with a toolchain fault.
+    phala_tee.invalidate_attestation_cache()
+    monkeypatch.setattr(
+        phala_tee, "_run_aci_json",
+        mock.Mock(side_effect=phala_tee.AciVerifierTimeoutError("aci", 30.0)),
+    )
+
+    with pytest.raises(phala_tee.AciVerifierTimeoutError):
+        client.chat_completion(messages=[{"role": "user", "content": "again"}], model="m", nonce=nonce)
+
+    assert (client._base_url, client._verify_target) not in phala_tee._attestation_cache
+    assert session.post.call_count == 1  # no POST issued on the failing call
+
+
+def test_attestation_cache_post_reject_pops_entry_and_reraises(monkeypatch):
+    """M2 pop-list: a chat-completion POST rejected with 401 (keyset
+    rotation rejected at the hop) pops the cached entry and re-raises
+    fail-closed — the next call re-verifies fresh instead of reusing a
+    stale bundle for the full ttl."""
+    report, keyset_digest, _ = _build_aci1_report()
+    nonce = "a" * 64
+    session = mock.MagicMock()
+    client, _calls = _make_cache_client(monkeypatch, report=report, keyset_digest=keyset_digest, nonce=nonce, session=session)
+
+    client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m", nonce=nonce)
+    key = (client._base_url, client._verify_target)
+    assert key in phala_tee._attestation_cache
+
+    session.post.side_effect = _http_error(401)
+    with pytest.raises(Exception):
+        client.chat_completion(messages=[{"role": "user", "content": "again"}], model="m", nonce=nonce)
+    assert key not in phala_tee._attestation_cache  # popped on the 401
+
+    # Transient statuses do NOT pop: a fresh store survives a 502.
+    session.post.side_effect = None
+    client.chat_completion(messages=[{"role": "user", "content": "fresh"}], model="m", nonce=nonce)
+    assert key in phala_tee._attestation_cache
+    session.post.side_effect = _http_error(502)
+    with pytest.raises(Exception):
+        client.chat_completion(messages=[{"role": "user", "content": "x"}], model="m", nonce=nonce)
+    assert key in phala_tee._attestation_cache  # still there after a 5xx
+
+
+def test_attestation_cache_ledger_honesty_hit_and_miss_rows(monkeypatch):
+    """DoD-5: the locality row's existing fields are unchanged; cache status
+    is additive in extra only. Hit rows carry attestation_cache_hit=True +
+    a non-negative age; miss rows carry hit=False + age None."""
+    report, keyset_digest, _ = _build_aci1_report()
+    nonce = "a" * 64
+    session = mock.MagicMock()
+    client, _calls = _make_cache_client(monkeypatch, report=report, keyset_digest=keyset_digest, nonce=nonce, session=session)
+
+    rows = []
+    monkeypatch.setattr(phala_tee.locality, "record", lambda **kw: rows.append(kw))
+
+    client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m", nonce=nonce)
+    client.chat_completion(messages=[{"role": "user", "content": "again"}], model="m", nonce=nonce)
+
+    assert len(rows) == 2
+    miss_extra, hit_extra = rows[0]["extra"], rows[1]["extra"]
+
+    # Existing row fields unchanged (spend-cap doctrine).
+    for extra in (miss_extra, hit_extra):
+        assert extra["report_verified"] is True
+        assert extra["custody_unverified"] is True
+        assert extra["e2ee_applied"] is False
+        assert extra["channel"] == "plaintext-loopback"
+
+    assert miss_extra["attestation_cache_hit"] is False
+    assert miss_extra["attestation_cache_age_s"] is None
+    assert hit_extra["attestation_cache_hit"] is True
+    assert isinstance(hit_extra["attestation_cache_age_s"], float)
+    assert hit_extra["attestation_cache_age_s"] >= 0.0
+
+
+def test_attestation_cache_ttl_zero_disables_cache_but_never_verification(monkeypatch):
+    """DoD-6: ttl<=0 disables the cache (every call fetches + audits) but
+    never verification — the loopback-target refusal still fires."""
+    report, keyset_digest, _ = _build_aci1_report()
+    nonce = "a" * 64
+    session = mock.MagicMock()
+    client, calls = _make_cache_client(monkeypatch, report=report, keyset_digest=keyset_digest, nonce=nonce, session=session)
+    monkeypatch.setenv(phala_tee.PHALA_ATTESTATION_CACHE_TTL_ENV, "0")
+
+    client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m", nonce=nonce)
+    client.chat_completion(messages=[{"role": "user", "content": "again"}], model="m", nonce=nonce)
+
+    assert session.get.call_count == 2  # cache disabled: every call fetches
+    assert calls["audit"] == 2  # ... and re-audits
+    assert len(phala_tee._attestation_cache) == 0  # never stored
+
+    # The loopback verify-target refusal is untouched (existing behavior).
+    with pytest.raises(phala_tee.LoopbackVerificationTargetError):
+        phala_tee.verify_report_binding(report, nonce, base_url="http://127.0.0.1:4180")
+
+
+def test_invalidate_attestation_cache_returns_drop_count_and_forces_reverify(monkeypatch):
+    """DoD-7: invalidate_attestation_cache() returns the drop count and
+    forces a fresh verify on the next call (canary hook)."""
+    report, keyset_digest, _ = _build_aci1_report()
+    nonce = "a" * 64
+    session = mock.MagicMock()
+    client, calls = _make_cache_client(monkeypatch, report=report, keyset_digest=keyset_digest, nonce=nonce, session=session)
+
+    client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m", nonce=nonce)
+    assert len(phala_tee._attestation_cache) == 1
+
+    assert phala_tee.invalidate_attestation_cache() == 1
+    assert len(phala_tee._attestation_cache) == 0
+
+    client.chat_completion(messages=[{"role": "user", "content": "again"}], model="m", nonce=nonce)
+    assert session.get.call_count == 2  # forced fresh verify, not a hit
+    assert calls["audit"] == 2
+
+    # Dimension filters: None = wildcard, a value = exact match.
+    assert phala_tee.invalidate_attestation_cache(base_url="http://nope.example.com") == 0
+    assert len(phala_tee._attestation_cache) == 1
+    assert phala_tee.invalidate_attestation_cache(base_url=client._base_url) == 1
+    assert len(phala_tee._attestation_cache) == 0
+
+
+def test_attestation_cache_shared_across_client_instances(monkeypatch):
+    """DoD-8: two chat_completion calls via TWO DISTINCT PhalaTeeClient
+    instances within ttl still yield session .get count == 1 — the store is
+    MODULE-level (process-wide). An instance-level cache would give
+    .get == 2 and never amortize on the node2 per-pass client."""
+    report, keyset_digest, _ = _build_aci1_report()
+    nonce = "a" * 64
+    session = mock.MagicMock()
+    client_a, calls = _make_cache_client(monkeypatch, report=report, keyset_digest=keyset_digest, nonce=nonce, session=session)
+
+    client_a.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m", nonce=nonce)
+    assert session.get.call_count == 1
+    assert calls["audit"] == 1
+
+    client_b = phala_tee.PhalaTeeClient(session=session, base_url=client_a._base_url, verify_target=client_a._verify_target)
+    client_b.chat_completion(messages=[{"role": "user", "content": "again"}], model="m", nonce=nonce)
+    assert session.get.call_count == 1  # hit across instances
+    assert calls["audit"] == 1
+    assert session.post.call_count == 2
+
+
+def test_attestation_cache_ttl_ceiling_in_expression(monkeypatch):
+    """DoD-9: ttl_env=86400 is clamped to the 3600s ceiling IN the
+    expression — a second call at t+3601s is a MISS (effective ttl ==
+    3600, not 86400). not_after is far out so the wall-clock term does not
+    interfere (the ceiling is the binding clamp). The report is built AFTER
+    the clock patch so not_after is in the fake domain."""
+    clock = [1000.0]
+    monkeypatch.setattr(phala_tee.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(phala_tee.time, "time", lambda: clock[0])
+    monkeypatch.setenv(phala_tee.PHALA_ATTESTATION_CACHE_TTL_ENV, "86400")
+
+    report, keyset_digest, _ = _build_aci1_report(not_after_offset=86400)
+    nonce = "a" * 64
+    session = mock.MagicMock()
+    client, calls = _make_cache_client(monkeypatch, report=report, keyset_digest=keyset_digest, nonce=nonce, session=session)
+
+    client.chat_completion(messages=[{"role": "user", "content": "hi"}], model="m", nonce=nonce)
+    assert session.get.call_count == 1
+    assert calls["audit"] == 1
+
+    # t+3601s: past the 3600s ceiling -> MISS (would be a hit if the
+    # ceiling were not in the clamp expression).
+    clock[0] = 1000.0 + 3601.0
+    client.chat_completion(messages=[{"role": "user", "content": "again"}], model="m", nonce=nonce)
+    assert session.get.call_count == 2
+    assert calls["audit"] == 2
+
+
+def test_attestation_cache_ttl_env_read_and_clamped():
+    assert phala_tee._attestation_cache_ttl_secs() == phala_tee.DEFAULT_ATTESTATION_CACHE_TTL_SECS
+
+
+def test_attestation_cache_ttl_env_overrides_and_clamps_to_ceiling(monkeypatch):
+    monkeypatch.setenv(phala_tee.PHALA_ATTESTATION_CACHE_TTL_ENV, "120")
+    assert phala_tee._attestation_cache_ttl_secs() == 120.0
+    monkeypatch.setenv(phala_tee.PHALA_ATTESTATION_CACHE_TTL_ENV, "86400")
+    assert phala_tee._attestation_cache_ttl_secs() == phala_tee._ATTESTATION_CACHE_TTL_CEILING_SECS
+    monkeypatch.setenv(phala_tee.PHALA_ATTESTATION_CACHE_TTL_ENV, "0")
+    assert phala_tee._attestation_cache_ttl_secs() == 0.0
+    monkeypatch.setenv(phala_tee.PHALA_ATTESTATION_CACHE_TTL_ENV, "garbage")
+    assert phala_tee._attestation_cache_ttl_secs() == phala_tee.DEFAULT_ATTESTATION_CACHE_TTL_SECS
 
 
 @pytest.mark.integration
