@@ -36,7 +36,13 @@ from pathlib import Path
 
 import psutil
 
-from agents_core.claude_queue import CLAUDE_QUEUE_DIR, ClaudeQueue
+from agents_core.claude_queue import (
+    CLAUDE_QUEUE_DIR,
+    ClaudeQueue,
+    _acquire_claim_lease as _cq_acquire_claim_lease,
+    _release_claim_lease as _cq_release_claim_lease,
+    _task_backend_url as _cq_task_backend_url,
+)
 from agents_core.gpu import PACIFIC, Priority as QueuePriority  # noqa: F401
 from agents_core.notify import Priority as PushoverPriority, _capture_event, send_notification
 from agents_core.room_paths import room_path
@@ -619,6 +625,103 @@ def _write_success_output(path: Path, combined: str) -> None:
 # Per-task execution
 # ---------------------------------------------------------------------------
 
+def _claim_lease_ctx(task: dict) -> tuple[str, str, str | None, str]:
+    """D5 (attestation-contract-v0, leg 1): resolve the claim-lease context
+    for a claimed task.
+
+    Returns (base_url, work_id, backend_url, gw_url) where:
+      base_url    - the doorman's own base (DOORMAN_SERVER - the port the
+                    doorman serves the /lease/* endpoints on). The lease
+                    acquire/release and the serving probe ride this base.
+      work_id     - the lease's work_id (the task id - the same key the
+                    per-run LLM lease uses, so the claim lease is visible to
+                    the park decision for the full claim -> first-call
+                    window)
+      backend_url - the task's spec backend_url (claude_queue._task_backend_url
+                    fail-open contract: None when the task carries no
+                    spec_path or no backend_url - non-GW tasks, no lease).
+                    This is the GW SEAT endpoint (the doorman's configured
+                    gw_url, GW_URL - the same env the doorman probes for its
+                    /status "serving" view and agents_core.llm uses for its
+                    LLM calls). Consumed by the D5 seams' scope gate INSTEAD
+                    of a second spec-JSON read (the claim() call site computes
+                    the same value via the same fail-open function). The
+                    scope gate compares backend_url against the FIXED GW_URL
+                    anchor (os.environ["GW_URL"] - the same env
+                    doorman_server.create_app reads for the node's gw_url),
+                    NOT against the task's own backend_url (a self-
+                    referential comparison is a tautology that scopes
+                    nothing - cycle-3 reviewer finding) and NOT against the
+                    doorman's own port (cycle-2 reviewer finding: the rev-1
+                    gate compared the GW seat URL against DOORMAN_SERVER and
+                    failed for every real GW task).
+
+      gw_url      - the FIXED GW_URL env (the doorman's configured gw_url
+                    anchor for the scope gate - the same env
+                    doorman_server.create_app reads for the node's gw_url).
+                    The task's own backend_url is NOT the anchor (cycle-3
+                    reviewer finding).
+
+    Never raises: any failure shape degrades to (base, work_id, None, gw_url).
+    """
+    base_url = os.environ.get("DOORMAN_SERVER", "http://127.0.0.1:8407")
+    work_id = task.get("id", "")
+    # The D5 scope-gate anchor: the FIXED GW_URL env (the same env
+    # doorman_server.create_app reads for the node's gw_url) - NOT the
+    # task's own backend_url (a self-referential comparison is a
+    # tautology that scopes nothing - cycle-3 reviewer finding).
+    gw_url = os.environ.get("GW_URL", "")
+    backend_url: str | None = None
+    try:
+        backend_url = _cq_task_backend_url(task)
+    except Exception:
+        backend_url = None
+    return base_url, work_id, backend_url, gw_url
+
+
+def _acquire_claim_lease(task: dict) -> bool:
+    """D5 claim seam (best-effort): acquire the doorman claim lease after a
+    successful GW-backend claim. Never raises; a failure is a WARN line -
+    the run proceeds lease-less (the death-class signals cover the
+    seat-down case)."""
+    base_url, work_id, backend_url, gw_url = _claim_lease_ctx(task)
+    if backend_url is None:
+        return False
+    try:
+        return _cq_acquire_claim_lease(
+            base_url=base_url,
+            work_id=work_id,
+            task_id=task.get("id", ""),
+            backend_url=backend_url,
+            timeout_s=task.get("timeout_seconds"),
+            gw_url=gw_url,
+        )
+    except Exception as e:
+        log.warning("claim-lease: acquire failed for %s: %s",
+                    task.get("id"), e)
+        return False
+
+
+def _release_claim_lease(task: dict) -> None:
+    """D5 release seam: release the claim lease on a run exit path.
+    Never raises (a lost release degrades to the TTL-bounded zombie
+    window)."""
+    base_url, work_id, backend_url, gw_url = _claim_lease_ctx(task)
+    if backend_url is None:
+        return
+    try:
+        _cq_release_claim_lease(
+            base_url=base_url,
+            work_id=work_id,
+            task_id=task.get("id", ""),
+            backend_url=backend_url,
+            gw_url=gw_url,
+        )
+    except Exception as e:
+        log.warning("claim-lease: release failed for %s: %s",
+                    task.get("id"), e)
+
+
 async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
     """Spawn _runner.py, capture output, write output file, mark done.
 
@@ -637,6 +740,17 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
         return
 
     log.info(f"claim {task_id} model={task.get('model')} timeout={timeout}s")
+
+    # D5 (attestation-contract-v0, leg 1): the claim-time doorman lease.
+    # Best-effort: scoped to GW-backend tasks (the spec's backend_url names
+    # the doorman's seat), probe-gated (no cold-wake of a down seat),
+    # released on every exit path below.
+    if _acquire_claim_lease(task):
+        log.info(
+            "claim-lease: acquired doorman lease for %s "
+            "(claim -> first-call window)",
+            task_id,
+        )
 
     # Cgroup isolation: wrap in a user-manager scope (fail-closed).
     _orig_argv = [sys.executable, "-m", RUNNER_SCRIPT_MODULE, spec_path]
@@ -673,6 +787,9 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
         _cage_unavail_hold_until = _now + _backoff_s
         _is_critical = _cage_unavail_consecutive >= _CAGE_ESCALATION_THRESHOLD
         _requeue_to_pending(queue, task_id)
+        # D5: release on requeue - the requeued task is never lease-less in
+        # the park window (it re-acquires on the re-claim).
+        _release_claim_lease(task)
         if _is_critical:
             log.critical(
                 "cgroup-isolation: user bus PERSISTENTLY unreachable (%s) — "
@@ -726,6 +843,7 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
         Path(output_path).write_text(msg)
         queue.fail(task_id, error=msg)
         notify_failure(task, msg)
+        _release_claim_lease(task)  # D5: release on every run exit path
         return
 
     try:
@@ -752,6 +870,7 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
             _estore.close()
         except Exception:
             pass
+        _release_claim_lease(task)  # D5: release on every run exit path
         return
 
     combined = (stdout_b + stderr_b).decode(errors="replace").strip()
@@ -762,6 +881,7 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
         Path(output_path).write_text(result)
         queue.fail(task_id, error=f"interrupted signal {-rc}")
         notify_failure(task, result)
+        _release_claim_lease(task)  # D5: release on every run exit path
         return
 
     if rc != 0:
@@ -770,6 +890,7 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
         Path(output_path).write_text(result)
         queue.fail(task_id, error=error_str)
         notify_failure(task, result)
+        _release_claim_lease(task)  # D5: release on every run exit path
         return
 
     # Success path: write the full agent response. Consumers (e.g. spec-review
@@ -798,6 +919,7 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
         output_path,
     )
     notify_completion(task, output_path)
+    _release_claim_lease(task)  # D5: release on every run exit path
     log.info(f"done  {task_id} rc=0")
 
 
@@ -1283,6 +1405,10 @@ class Daemon:
         # family sub-cap is acquired BEFORE the global worker semaphore and
         # is load-bearing too (a claimed task waiting on the sub-cap must
         # not hold a global slot; council precedent).
+        # D5 (attestation-contract-v0, leg 1): the claim lease is released
+        # on EVERY exit path - including the raise path (the handler's
+        # return paths release themselves; this finally covers the
+        # exception escape so a run that raises is never lease-pinned).
         if task.get("task_type") == "council.run":
             async with _COUNCIL_SEM:
                 async with self.sem:
@@ -1302,6 +1428,8 @@ class Daemon:
             log.exception(
                 f"unhandled error in task {task.get('id')}: {e}"
             )
+        finally:
+            _release_claim_lease(task)
 
     async def run(self):
         startup_sweep(self.queue, council_dir=self.council_dir)

@@ -552,16 +552,148 @@ def _error_signature(node_id: str, last_test_outcome: dict | None) -> str:
     return f"{exc_type}@{node_id}"
 
 
+def _empty_diff_recovery_rederive(
+    worktree_path: str | Path, base_sha: str,
+) -> dict | None:
+    """D2 (attestation-contract-v0, leg 1): the empty-diff self-commit
+    recovery re-derivation.
+
+    Re-derives the deliverable from the worktree when the in-tail diff
+    (index-vs-HEAD) is empty: `git diff --name-status <base_sha> HEAD`.
+    Non-empty -> the model committed its own work (clean index, HEAD past
+    base) and the gate-verified worktree state IS the deliverable:
+    returns {"head_sha", "diff_summary"} (the diff summary is derived
+    from <base_sha> HEAD so the PR body is not empty where the in-tail
+    diff would be "(no changes)"). Empty re-derivation (the no-work case)
+    -> None (the bail fires, with the WARN naming the WIP ref + HEAD sha).
+
+    Never attempts a commit (the recovery pushes HEAD as-is - a commit on
+    a clean index returns rc=1, the rev-1 bail). Never raises: any git
+    failure degrades to None.
+    """
+    def _git(*args: str) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(worktree_path), *args],
+                capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            print(
+                f"WARN: self-commit-recovery: git {args[0]} timed out",
+                file=sys.stderr,
+            )
+            return subprocess.CompletedProcess(
+                ["git", "-C", str(worktree_path), *args], 1, "", "timeout",
+            )
+
+    if not base_sha:
+        return None
+    head = _git("rev-parse", "HEAD")
+    if head.returncode != 0:
+        return None
+    head_sha = head.stdout.strip()
+    if not head_sha:
+        return None
+    rederive = _git("diff", "--name-status", base_sha, head_sha)
+    if rederive.returncode != 0 or not rederive.stdout.strip():
+        return None
+    diffstat = _git("diff", base_sha, head_sha).stdout
+    diff_lines = [
+        l for l in diffstat.splitlines()
+        if l.startswith(("diff --git", "---", "+++", "@@", " "))
+        or l[:1] in ("+", "-")
+    ]
+    return {
+        "head_sha": head_sha,
+        "diff_summary": "\n".join(diff_lines[:40]) or "(no changes)",
+    }
+
+
+def _empty_diff_recovery_body(
+    recovered: dict, head_sha: str,
+) -> str:
+    """D2 (attestation-contract-v0, leg 1): the self-commit-recovery PR
+    body. Carries the machine-visible marker
+    `<!-- lapis-self-commit-recovery: <head_sha> -->` (the brief surfaces
+    the recovery) and the non-empty diff summary derived from
+    <base_sha> HEAD (the in-tail diff is empty by construction here, so
+    the body must not read "(no changes)").
+    """
+    return (
+        f"Implemented by the local fixer harness. "
+        f"Self-commit recovery: the model committed its "
+        f"own work (clean index, HEAD past base) and the "
+        f"gate-verified worktree state was pushed as-is.\n\n"
+        f"## Diff summary\n\n```diff\n"
+        f"{recovered.get('diff_summary', '')}\n```\n\n"
+        f"<!-- lapis-self-commit-recovery: {head_sha} -->"
+    )
+
+
+# D4b (attestation-contract-v0, leg 1): the friction record's on-disk home.
+# The friction writer mirrors the mem entry to a JSON file here (the mem
+# store is the primary record; the file is the repo-visible witness - the
+# live record that carried `first_task_id: abc123` was this shape). The
+# module-level name is a seam: tests monkeypatch FRICTION_DIR to a tmp dir.
+# The key rides the gpu_queue base (the friction entries witness test-gate
+# failures of the local-fixer harness - the gpu_queue classmap has no
+# dedicated friction key, and the friction/ subdir keeps the records
+# namespaced off the shaped/ artifact dir).
+FRICTION_DIR = room_path("gpu_queue") / "friction"
+
+
+def _write_friction_file(
+    key: str, entry: dict, repo: str, log: Callable[[str], None] | None,
+) -> None:
+    """D4b (attestation-contract-v0, leg 1): mirror the friction entry to
+    <FRICTION_DIR>/<repo>-<node-slug>.json (the repo-visible witness).
+
+    Dedup mirrors the mem contract: an existing open record is updated
+    in place (last_seen / last_task_id refresh), never duplicated. Never
+    raises: a friction-write failure is logged and swallowed so it can
+    never block the test gate or the PR tail.
+    """
+    try:
+        FRICTION_DIR.mkdir(parents=True, exist_ok=True)
+        path = FRICTION_DIR / f"{key.split('/', 1)[1]}.json"
+        existing_json: dict = {}
+        if path.exists():
+            try:
+                _loaded = json.loads(path.read_text())
+                if isinstance(_loaded, dict):
+                    existing_json = _loaded
+            except (json.JSONDecodeError, OSError):
+                existing_json = {}
+        if existing_json:
+            entry = {**existing_json, **entry}
+        path.write_text(json.dumps(entry, ensure_ascii=False, indent=2) + "\n")
+    except Exception as exc:
+        if log:
+            log(f"WARN: friction file write failed for {key}: {exc}")
+        else:
+            print(f"WARN: friction file write failed for {key}: {exc}",
+                  file=sys.stderr)
+
+
 def _write_friction_entry(
     *,
     repo: str,
-    node_id: str,
-    error_signature: str,
-    task_id: str,
-    today: str,
+    node_id: str = "",
+    error_signature: str = "",
+    task_id: str = "",
+    today: str = "",
     log: Callable[[str], None] | None = None,
+    category: str = "",
+    detail: str = "",
 ) -> None:
-    """Write (or dedup-update) a friction mem entry for a pre-existing test failure.
+    """Write (or dedup-update) a friction entry for a pre-existing test failure.
+
+    Signature (attestation-contract-v0 rev-4): the canonical fields
+    (node_id / error_signature / task_id / today) plus the generic
+    category / detail aliases (the D4b gate-bypass caller shape -
+    category names the friction class, detail the one-line witness).
+    Absent fields degrade to "" / "unknown" (never the abc123
+    placeholder).
 
     D6 (agents-core-local-fixer-harness-fix-v0): the friction entry is the
     signal a future daemon-side follow-up spec will scan for (status: open)
@@ -571,9 +703,25 @@ def _write_friction_entry(
     last_seen/last_task_id without duplicating; if status: resolved, flip
     back to open (the friction recurred).
 
+    D4b (attestation-contract-v0, leg 1): the entry carries the REAL task id
+    in its task-id fields (the caller at the friction seam has it) and is
+    mirrored to a file under FRICTION_DIR (the repo-visible witness). The
+    `abc123` placeholder path is gone: an absent/empty task id degrades to
+    "unknown", never a placeholder.
+
     Never raises: a friction-write failure is logged and swallowed so it can
     never block the test gate or the PR tail.
     """
+    # D4b: the real task id, never the placeholder. An absent/empty id
+    # degrades to "unknown" (the friction seam is generic - some callers
+    # have no task id in scope).
+    task_id = task_id or "unknown"
+    # The generic aliases fold into the canonical fields: a category
+    # names the friction class (the node slug), a detail the one-line
+    # witness (the error signature).
+    node_id = node_id or category or "unknown"
+    error_signature = error_signature or detail or ""
+    today = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     key = f"friction/{repo}-{_slugify(node_id)}"
     try:
         from agents_core.mem import MemoryStore
@@ -613,6 +761,19 @@ def _write_friction_entry(
                           tags=["friction", "test-gate", repo])
         finally:
             store.close()
+        # D4b (attestation-contract-v0, leg 1): the repo-visible witness -
+        # the friction record mirrored to a file under FRICTION_DIR carrying
+        # the real task id (the mem store is the primary record; the file is
+        # the on-disk shape a postmortem reads).
+        _write_friction_file(key, {
+            "status": "open",
+            "test_node_id": node_id,
+            "error_signature": error_signature,
+            "first_seen": today,
+            "last_seen": today,
+            "first_task_id": task_id,
+            "last_task_id": task_id,
+        }, repo, log)
     except Exception as exc:
         if log:
             log(f"WARN: friction entry write failed for {key}: {exc}")
@@ -727,10 +888,14 @@ def _open_wip_salvage_pr(
             f"after): the spec's remaining work items are NOT in this salvage. The "
             f"WIP commits are a compile-gated snapshot of the whole-file writes "
             f"made up to the death - a partial implementation at best.\n\n"
-            f"Note: the WIP floor is non-cumulative - the branch HEAD's tree holds only the "
-            f"files written by the LAST write step; earlier steps' writes live in the branch's "
-            f"commit history (the WIP hook resets the index to HEAD between steps). Review the "
-            f"history (git log), not just the head, to reconstruct the run's work.\n"
+            f"Note: the WIP floor is CUMULATIVE (attestation-contract-v0, leg 1, "
+            f"D1) - the branch HEAD's tree carries every write step's files at "
+            f"their final content (the hook loads the prior WIP tip's tree into "
+            f"the index before staging each step's paths). Deletion tolerance "
+            f"is named: a file deleted in a later step persists at the tip "
+            f"(add does not prune) - the floor is a salvage floor, not a "
+            f"worktree mirror. The commit history still carries the per-step "
+            f"granularity (git log) for finer reconstruction.\n"
         )
     else:
         what_remains = (
@@ -963,6 +1128,7 @@ def tail_finalize(
     served_model: str = "",
     worktree_vanished: bool = False,
     repo_cwd: str = "",
+    base_sha: str = "",
 ) -> str:
     """The shared deterministic git/PR tail (fixers-harness-staged-v0, S6).
 
@@ -982,6 +1148,22 @@ def tail_finalize(
 
     if wip_steps is None:
         wip_steps = []
+
+    # Deterministic git (model never touches git) - defined at tail entry
+    # so EVERY path (the empty-diff bail, the self-commit recovery, the
+    # salvage partitions, the normal PR path) can use it. The legacy
+    # tail defined it later (after the salvage partitions); the bail
+    # needs it earlier, so it is hoisted here with the identical body.
+    def _git(*args: str) -> subprocess.CompletedProcess:
+        try:
+            import subprocess as _subprocess_mod
+            return _subprocess_mod.run(
+                ["git", "-C", cwd, *args],
+                capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"WARN: local-fixer: git {args[0]} timed out", file=sys.stderr)
+            return subprocess.CompletedProcess(["git", "-C", cwd, *args], 1, "", "timeout")
 
     def _tests_passed(outcome: dict | None) -> bool:
         if not outcome:
@@ -1051,6 +1233,16 @@ def tail_finalize(
     # when the touched branch would fail closed. STRICTLY MORE PERMISSIVE:
     # the re-run only fires when the gate would otherwise fail closed -
     # it can flip fail->pass, never pass->fail. The re-run re-tests the
+    # CURRENT worktree state, so a fix made after the model's last
+    # run_tests is picked up (the v2-retry shape). The re-run outcome
+    # REPLACES the model's last outcome as the DECIDING outcome for the
+    # gate and the D2/D5 surfaces when it fires (the re-run is the
+    # authoritative tail - the local-fixer path adopts the opencode
+    # tail's doctrine by analogy). Decision rule: returncode == 0
+    # (rc=1 failures, rc=2 collection error, rc=4 usage/path error,
+    # rc=5 no tests collected - an empty touched file correctly fails
+    # closed). A None (unusable) re-run keeps the fail-closed verdict.
+    #
     # CURRENT worktree state, so a fix made after the model's last
     # run_tests is picked up (the v2-retry shape). The re-run outcome
     # REPLACES the model's last outcome as the DECIDING outcome for the
@@ -1357,6 +1549,54 @@ def tail_finalize(
 
     if not salvaged:
         if not final_diff.strip():
+            # Cycle-4 reviewer (PR #322) routing fix: a CONCLUDED run with
+            # >=1 WIP commit and an empty in-tail diff (the model
+            # self-committed - the index-vs-HEAD diff is empty by
+            # construction) must route to the existing [SALVAGE] path
+            # BEFORE the D2 normal-PR self-commit recovery below. The D2
+            # recovery is scoped to the NON-concluded shape (the guard at
+            # the recovery site: `base_sha and gate_passed and not
+            # concluded`); without this early return the concluded shape
+            # falls through the recovery skip and reaches the
+            # `if not gate_passed:` partition, which is skipped for a
+            # gate-PASSED run - so the run bails at the normal-PR path's
+            # clean-index commit rc=1 with NO PR and NO salvage (the
+            # silent-loss shape the D2 finding exists to kill). A
+            # concluded run's final worktree state is exactly what the
+            # gate tested, so the concluded_gate_rejected worktree-salvage
+            # partition (below, which commits the worktree state and
+            # pushes HEAD as the salvage commit) is the correct carrier -
+            # a [SALVAGE] PR is advisory (never auto-merged), which is
+            # the right disposition for gate-green-but-unconcluded-shape
+            # work (Standing ratification 3: salvage semantics unchanged -
+            # a run that opens a [SALVAGE] PR is not a death). The
+            # worktree_vanished partition above runs first (it returns
+            # early) - a vanished worktree is a distinct death class.
+            if (concluded and wip_commit_count > 0
+                    and base_sha
+                    and _empty_diff_recovery_rederive(cwd, base_sha) is not None):
+                print(
+                    "WARN: local-fixer: concluded, empty in-tail diff, "
+                    "HEAD past base (the model self-committed) - opening "
+                    "advisory [SALVAGE] PR (concluded, gate passed, "
+                    "worktree salvage)",
+                    file=sys.stderr,
+                )
+                _tail_log(
+                    task_id,
+                    "concluded, empty diff, HEAD past base - opening "
+                    "advisory [SALVAGE] PR (worktree salvage)",
+                )
+                return _open_wip_salvage_pr(
+                    worktree_path, "HEAD",
+                    _git("rev-parse", "HEAD").stdout.strip(), [],
+                    stop_reason="concluded_gate_rejected",
+                    concluded=True, task_id=task_id,
+                    target_id=target_id, bare_repo=bare_repo,
+                    branch=branch, slug=slug,
+                    step_count=step_count,
+                    transcript_path=transcript_path,
+                )
             # agents-core-fixer-worktree-vanish-salvage-v0 (D1/D2): the
             # concluded + empty-diff + WIP-present partition (the #291
             # class - a vanished worktree: the model finished, git add -A
@@ -1371,6 +1611,9 @@ def tail_finalize(
             # advisory-only, never auto-merged (inherited from the
             # existing salvage machinery); the positive-only gate is
             # unchanged (fail-closed).
+            # (a) the vanished-worktree partition runs FIRST - it returns
+            # early: a vanished worktree is a distinct death class and must
+            # be ruled out before any recovery that needs a live cwd.
             if worktree_vanished:
                 _vanished_line = (
                     "run discarded - worktree vanished mid-run "
@@ -1457,8 +1700,181 @@ def tail_finalize(
                 # entry are the whole outcome (invariant: no-WIP behavior
                 # unchanged - no PR).
                 return ""
-            print("WARN: local-fixer: empty diff — no PR", file=sys.stderr)
-            _tail_log(task_id, "empty diff - no PR")
+            # (b) D2 (attestation-contract-v0, leg 1): empty-diff recovery for
+            # self-committed GREEN work. final_diff is index-vs-HEAD; when
+            # the model committed its own work (the documented case - the
+            # run's tail would otherwise bail on a clean index and drop a
+            # gate-green run with no PR and no salvage), re-derive the
+            # deliverable from the worktree: HEAD vs the captured base.
+            #
+            # gate_passed guard (attestation-contract-v0 rev-4): the
+            # recovery opens a NORMAL PR - a run with a clean index and a
+            # FAILED gate must NOT push/open a PR through it. That shape
+            # routes to the [SALVAGE] path below (the if-not-gate_passed
+            # block) instead.
+            #
+            # concluded guard (cycle-4 reviewer, PR #322): the D2 contract
+            # is scoped to the NON-concluded self-commit case. The
+            # concluded + gate_passed + empty-tail-diff + HEAD-past-base
+            # shape keeps routing to the existing [SALVAGE] path exactly
+            # as before (the D2 DO-NOT-CHANGE list / Standing ratification
+            # 3: D1/D2 change how the WIP tree is constructed and how the
+            # empty-diff bail recovers, NOT when salvage fires - a run
+            # that opens a [SALVAGE] PR is not a death). The concluded
+            # shape therefore skips the normal-PR recovery below and
+            # falls through to the concluded [SALVAGE] partitions:
+            # worktree_vanished -> the concluded_empty_diff_wip_salvage
+            # partition (above), else (with WIP commits) the
+            # concluded_gate_rejected worktree-salvage partition (below,
+            # which commits the worktree state - a no-op commit here on
+            # the clean index, then pushes HEAD as the salvage commit),
+            # else the WARN bail (no work past base).
+            _recovery_head = ""
+            if base_sha and gate_passed and not concluded:
+                _recovered = _empty_diff_recovery_rederive(cwd, base_sha)
+                if _recovered is not None:
+                    # The model self-committed: the gate-verified worktree
+                    # state IS the deliverable. Skip the commit step (a
+                    # commit on a clean index returns rc=1 -> the rev-1
+                    # bail) and push HEAD as-is (the gate-rejected salvage
+                    # path's established wip_ref="HEAD" in-file pattern).
+                    #
+                    # Spec basis for push-HEAD-as-is (cycle-2 review
+                    # attestation): the recovery must NOT re-run the gate
+                    # on the recovered diff - the gate already ran on
+                    # exactly this worktree state (the in-tail diff is
+                    # empty by construction: the model committed its own
+                    # work, so worktree == HEAD == the gate-tested state).
+                    # Re-running the gate would test the identical state a
+                    # second time; the gate_passed check above is the
+                    # complete gate attestation for this path.
+                    _recovery_head_sha = _recovered["head_sha"]
+                    _recovery_diffstat = _recovered["diff_summary"]
+                    print(
+                        f"INFO: local-fixer: empty in-tail diff but HEAD is "
+                        f"past base ({base_sha[:12]} -> "
+                        f"{_recovery_head_sha[:12]}) - the model "
+                        f"self-committed; opening the PR from the worktree "
+                        f"HEAD (self-commit recovery)",
+                        file=sys.stderr,
+                    )
+                    _tail_log(
+                        task_id,
+                        f"self-commit recovery: index clean, HEAD "
+                        f"{_recovery_head_sha[:12]} past base "
+                        f"{base_sha[:12]} - PR from HEAD",
+                    )
+                    r = _git("checkout", "-B", branch)
+                    if r.returncode != 0:
+                        print(
+                            f"WARN: local-fixer: git checkout -B failed "
+                            f"(self-commit recovery): {r.stderr.strip()}",
+                            file=sys.stderr,
+                        )
+                        _tail_log(
+                            task_id,
+                            f"self-commit recovery: git checkout -B failed "
+                            f"rc={r.returncode}: {r.stderr.strip()[:500]}",
+                        )
+                        return ""
+                    r = _git("push", "origin", f"HEAD:{branch}")
+                    if r.returncode != 0:
+                        print(
+                            f"ERROR: local-fixer: git push failed "
+                            f"(self-commit recovery) - command: git push "
+                            f"origin HEAD:{branch} (rc={r.returncode}): "
+                            f"{r.stderr.strip()}",
+                            file=sys.stderr,
+                        )
+                        _tail_log(
+                            task_id,
+                            f"pm:push-failed rc={r.returncode} "
+                            f"branch={branch} (self-commit recovery) "
+                            f"stderr={r.stderr.strip()[:500]}",
+                        )
+                        return ""
+                    # The pre-aimed / parked-PR case: the branch already
+                    # has an open PR and the push advanced its head.
+                    if branch:
+                        try:
+                            for _pr in _forgejo.get_open_prs(repo=bare_repo):
+                                if (_pr.get("head") or {}).get("ref") == branch:
+                                    _pr_url = _pr.get("html_url", "")
+                                    _tail_log(
+                                        task_id,
+                                        f"open PR already exists on "
+                                        f"{branch!r} (self-commit "
+                                        f"recovery) - head advanced: "
+                                        f"{_pr_url}",
+                                    )
+                                    return _pr_url
+                        except Exception as exc:
+                            print(
+                                f"WARN: local-fixer: open-PR scan failed "
+                                f"(self-commit recovery): {exc} - falling "
+                                f"through to create_pr",
+                                file=sys.stderr,
+                            )
+                    # Provenance PR body - the diff summary is derived from
+                    # <base_sha> HEAD (the in-tail diff is empty by
+                    # construction here, so the body must not read
+                    # "(no changes)"); the marker makes the recovery
+                    # machine-visible to the brief.
+                    _recovery_body = (
+                        _empty_diff_recovery_body(
+                            _recovered, _recovery_head_sha,
+                        )
+                        + f"\n\n## Test outcome\n\n{test_summary}\n\n"
+                        f"## Steps\n\n{step_count} tool-call step(s) "
+                        f"executed.\n\n"
+                        f"## Transcript\n\n`{transcript_path}`\n\n"
+                        f"<!-- lapis-gpu-id: {task_id} -->\n"
+                        f"<!-- lapis-tid: {target_id} -->\n"
+                        f"<!-- lapis-engine: local-fixer -->"
+                    )
+                    try:
+                        pr = _forgejo.create_pr(
+                            repo=bare_repo,
+                            title=f"fix({target_id}): local-fixer",
+                            head=branch,
+                            base="main",
+                            body=_recovery_body,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"WARN: local-fixer: create_pr failed "
+                            f"(self-commit recovery): {exc}",
+                            file=sys.stderr,
+                        )
+                        _tail_log(
+                            task_id,
+                            f"create_pr FAILED (self-commit recovery): "
+                            f"{exc}",
+                        )
+                        return ""
+                    _tail_log(
+                        task_id,
+                        f"create_pr OK (self-commit recovery) "
+                        f"url={pr.get('html_url', '')}",
+                    )
+                    return pr.get("html_url", "")
+            # No work past base either: keep the bail, but name the WIP
+            # ref AND the worktree HEAD sha (postmortem material - the
+            # finding's named minimum; the ERROR-first-line / non-zero-
+            # exit death-class seam belongs to the death-class stream and
+            # is NOT re-implemented here).
+            _empty_head = _git("rev-parse", "HEAD").stdout.strip()
+            print(
+                f"WARN: local-fixer: empty diff — no PR "
+                f"(wip_ref={wip_ref or '<none>'}, "
+                f"worktree HEAD={_empty_head or '<unresolvable>'})",
+                file=sys.stderr,
+            )
+            _tail_log(
+                task_id,
+                f"empty diff - no PR (wip_ref={wip_ref or '<none>'}, "
+                f"worktree HEAD={_empty_head or '<unresolvable>'})",
+            )
             return ""
         if not gate_passed:
             # D1 (agents-core-local-fixer-harness-fix-v0): the positive-only
@@ -1529,18 +1945,7 @@ def tail_finalize(
                 transcript_path=transcript_path,
             )
 
-    # Deterministic git (model never touches git)
-    def _git(*args: str) -> subprocess.CompletedProcess:
-        try:
-            import subprocess as _subprocess_mod
-            return _subprocess_mod.run(
-                ["git", "-C", cwd, *args],
-                capture_output=True, text=True, timeout=30,
-            )
-        except subprocess.TimeoutExpired:
-            print(f"WARN: local-fixer: git {args[0]} timed out", file=sys.stderr)
-            return subprocess.CompletedProcess(["git", "-C", cwd, *args], 1, "", "timeout")
-
+    # (_git is defined at tail entry - see above.)
     r = _git("checkout", "-B", branch)
     if r.returncode != 0:
         print(f"WARN: local-fixer: git checkout -b failed: {r.stderr.strip()}", file=sys.stderr)
@@ -2172,11 +2577,50 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> tuple[str, dict | None
                         file=sys.stderr,
                     )
                     return
+            # Resolve the parent ONCE (attestation-contract-v0, leg 1, D1
+            # rev-2 pin): the sha given to read-tree below and the sha
+            # consumed by commit-tree -p MUST be the same resolved value -
+            # a ref that moved between the two calls would desync the tree
+            # from its declared parent. A missing WIP ref (the first step)
+            # resolves to HEAD (the base) - the same fallback the pre-D1
+            # hook used.
             parent = _wip_git("rev-parse", "--verify", wip_ref)
             if parent.returncode != 0:
                 parent = _wip_git("rev-parse", "HEAD")
                 if parent.returncode != 0:
                     return
+            parent_sha = parent.stdout.strip()
+            # The read-tree source: the ref itself (its current value at
+            # this moment - the same commit as parent_sha; the ref cannot
+            # move between the resolution above and this call, so the
+            # tree loaded and the declared parent are the same commit).
+            # Using the ref (not the sha) keeps the call shape identical
+            # for the first step (wip_ref missing -> read-tree HEAD) and
+            # later steps (read-tree <prior WIP tip>).
+            _read_tree_ref = wip_ref
+            # CUMULATIVE WIP floor (attestation-contract-v0, leg 1, D1):
+            # load the prior WIP tip's tree into the index BEFORE staging
+            # this step's paths, so the new commit's tree is CUMULATIVE
+            # (previous tip's tree + this step's files) instead of
+            # base-HEAD + this step's files (the non-cumulative seam that
+            # shipped two 09-08 test-file-only salvage PRs). read-tree
+            # moves the index only - the worktree HEAD is never touched.
+            # Deletion tolerance is named and accepted (add does not
+            # prune): the WIP floor is a salvage floor, not a worktree
+            # mirror - the contract is "every step's files at final
+            # content", not a mirror of deletions.
+            rt = _wip_git("read-tree", _read_tree_ref)
+            if rt.returncode != 0:
+                # The first step (wip_ref missing) reads HEAD instead -
+                # the same tree the parent resolution fell back to.
+                rt = _wip_git("read-tree", "HEAD")
+                if rt.returncode != 0:
+                    print(
+                        f"WARN: wip-commit: git read-tree failed "
+                        f"({rt.stderr.strip()}) - falling back to the "
+                        f"pre-D1 non-cumulative index",
+                        file=sys.stderr,
+                    )
             add = _wip_git("add", "--", *paths)
             if add.returncode != 0:
                 print(f"WARN: wip-commit: git add failed: {add.stderr.strip()}", file=sys.stderr)
@@ -2187,7 +2631,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> tuple[str, dict | None
                 _wip_git("reset")
                 return
             commit = _wip_git(
-                "commit-tree", tree.stdout.strip(), "-p", parent.stdout.strip(),
+                "commit-tree", tree.stdout.strip(), "-p", parent_sha,
                 "-m", f"wip: {task_id} step {step_num} [auto]",
             )
             if commit.returncode != 0:
@@ -2195,11 +2639,16 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> tuple[str, dict | None
                 _wip_git("reset")
                 return
             upd = _wip_git("update-ref", wip_ref, commit.stdout.strip())
-            # Unstage: restore the index (and the worktree's HEAD) exactly as found.
-            _wip_git("reset")
             if upd.returncode != 0:
                 print(f"WARN: wip-commit: git update-ref failed: {upd.stderr.strip()}", file=sys.stderr)
+                # Unstage before the return: a failed update-ref must not
+                # leave the index loaded with the cumulative tree (the
+                # worktree's HEAD is untouched either way - read-tree and
+                # commit-tree are plumbing).
+                _wip_git("reset")
                 return
+            # Unstage: restore the index (and the worktree's HEAD) exactly as found.
+            _wip_git("reset")
             wip_commit_count += 1
             wip_head_sha = commit.stdout.strip()
             wip_steps.append(int(step_num))
@@ -2376,6 +2825,43 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> tuple[str, dict | None
         worktree_path = handle.path
         cwd = str(worktree_path)
 
+        # base_sha (attestation-contract-v0, leg 1, D2 part 1): the
+        # worktree's HEAD at setup time (the F2 pattern the local-opencode
+        # engine already had). The deterministic tail's empty-diff
+        # self-commit recovery re-derives the deliverable as HEAD vs base
+        # when the model self-committed (clean index, HEAD past base) -
+        # the local-fixer engine had no base sha today, so the recovery
+        # was unreachable without it. A failed capture degrades the tail
+        # to today's bail behavior (never blocks the run).
+        base_sha = ""
+        try:
+            _base_probe = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=cwd, capture_output=True, text=True, timeout=30,
+            )
+            if _base_probe.returncode == 0:
+                base_sha = _base_probe.stdout.strip()
+            else:
+                print(
+                    f"WARN: local-fixer: base_sha capture failed "
+                    f"rc={_base_probe.returncode}: "
+                    f"{_base_probe.stderr.strip()[:200]}",
+                    file=sys.stderr,
+                )
+        except subprocess.TimeoutExpired:
+            print(
+                "WARN: local-fixer: base_sha capture timed out "
+                "(rev-parse HEAD) - the empty-diff self-commit recovery "
+                "degrades to the bail",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            print(
+                f"WARN: local-fixer: base_sha capture failed ({exc}) - "
+                f"the empty-diff self-commit recovery degrades to the bail",
+                file=sys.stderr,
+            )
+
         # Stage the bound spec into the worktree so the model can page it
         # (its file readers are cwd-confined; /srv/lapis/planning is unreadable).
         # Best-effort: any miss degrades to "run exactly as today".
@@ -2492,6 +2978,12 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> tuple[str, dict | None
             # separate refs/wip/<task_id> ref. Local-fixer runs only.
             after_step=_wip_commit_hook,
             served_model_out=_served_model_out,
+            # D2 (attestation-contract-v0, leg 1): the worktree's HEAD at
+            # SETUP time (captured above, post-setup_worktree - the F2
+            # pattern the local-opencode engine already had). The tail's
+            # empty-diff self-commit recovery re-derives the deliverable
+            # as HEAD vs this base.
+            base_sha=base_sha,
         )
 
         # Remove the staged spec before the deterministic git tail so it is
@@ -2511,6 +3003,11 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> tuple[str, dict | None
             print(f"WARN: local-fixer: transcript write failed: {exc}", file=sys.stderr)
 
         final_diff = fixer_result.get("final_diff") or ""
+        # D2 (attestation-contract-v0, leg 1): the worktree's HEAD at
+        # SETUP time (captured above, post-setup_worktree - the F2 pattern
+        # the local-opencode engine already had). The tail's empty-diff
+        # self-commit recovery re-derives the deliverable as HEAD vs base.
+        # An absent capture degrades the tail to today's bail behavior.
         concluded = fixer_result.get("concluded", False)
         last_test_outcome = fixer_result.get("last_test_outcome")
         max_steps_hit = fixer_result.get("max_steps_reached", False)
@@ -2595,6 +3092,7 @@ def _run_local_fixer(spec: dict, base_cwd: str | None) -> tuple[str, dict | None
             # shared common gitdir after the worktree is gone).
             worktree_vanished=fixer_result.get("worktree_vanished", False),
             repo_cwd=effective_cwd,
+            base_sha=base_sha,
         )
         return _legacy_tail_result, _provenance
     except Exception as exc:

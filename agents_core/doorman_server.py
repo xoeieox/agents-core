@@ -654,6 +654,166 @@ def _describe_stopped_units(stdout: str | None, node_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Restore-failure streak + page (attestation-contract-v0, leg 1, D4)
+# ---------------------------------------------------------------------------
+
+# D4 constants: the 09-08 incident's WAKE_REFUSED loop ran ~40s then went
+# quiet while the seat stayed down (last_error was recorded, nothing paged).
+# 3 consecutive restore failures within 10 minutes pages HIGH once per
+# episode (I5 page hygiene - no repetition while the streak persists; the
+# Forgejo-unreachable 3-strike pattern is the shape precedent).
+_RESTORE_FAILURE_STREAK_THRESHOLD = 3
+_RESTORE_FAILURE_WINDOW_SEC = 600  # 10 minutes
+_RESTORE_FAILURE_PAGE_SOURCE = "lapis-pm-doorman"  # I5: the pinned source
+
+
+class _RestoreFailureStreak:
+    """Consecutive-restore-failure counter (per seat, in the refresh-thread
+    state). Reset on any successful serve or successful restore; the streak
+    also resets when the window lapses (>10 min since the first failure -
+    the episode is over) or the failure reason changes (a new failure
+    class is a new episode).
+
+    The page fires exactly once per episode: `_page_fired` latches on the
+    threshold-crossing failure and clears on reset (success / window lapse
+    / reason change), so a persistent streak pages once, not per failure.
+    """
+
+    def __init__(self) -> None:
+        self.consecutive: int = 0
+        self.first_ts: float | None = None
+        self.last_ts: float | None = None
+        self.last_reason: str = ""
+        self.last_detail: str = ""
+        self._page_fired: bool = False
+
+    def record_failure(
+        self,
+        reason: str,
+        detail: str,
+        now: float | None = None,
+        _should_page: bool = True,
+        _on_page=None,
+    ) -> bool:
+        """Record a restore failure. Returns True when the threshold was
+        crossed (the page condition holds). `_should_page` / `_on_page`
+        are test seams (the wiring seam `_maybe_page_restore_failure`
+        supplies them in production).
+
+        Lock note (attestation-contract-v0 rev-4): the PRODUCTION wiring
+        (_record_restore_failure) calls this with _should_page=False under
+        self.lock and sends the page OUTSIDE the lock - the page's network
+        send must never run while holding self.lock. The _on_page seam
+        (used by the unit tests) runs inline here and is test-only."""
+        if now is None:
+            now = time.time()
+        reason = (reason or "")[:80]
+        detail = (detail or "")[:300]
+        # Episode boundaries: window lapse or a new failure class.
+        if (
+            self.consecutive == 0
+            or self.first_ts is None
+            or (now - self.first_ts) > _RESTORE_FAILURE_WINDOW_SEC
+            or (reason and self.last_reason and reason != self.last_reason)
+        ):
+            self.consecutive = 0
+            self.first_ts = now
+            self._page_fired = False
+        self.consecutive += 1
+        self.last_ts = now
+        self.last_reason = reason
+        self.last_detail = detail
+        if (
+            self.consecutive >= _RESTORE_FAILURE_STREAK_THRESHOLD
+            and not self._page_fired
+            and _should_page
+        ):
+            self._page_fired = True
+            if _should_page and _on_page is not None:
+                try:
+                    _on_page()
+                except Exception:
+                    pass  # page-only: a page failure never raises into the wake path
+            return True
+        return False
+
+    def record_success(self) -> None:
+        """A successful serve or restore: the streak (and the page latch)
+        reset - the next episode pages again."""
+        self.consecutive = 0
+        self.first_ts = None
+        self.last_ts = None
+        self.last_reason = ""
+        self.last_detail = ""
+        self._page_fired = False
+
+
+def _build_restore_failure_page(
+    seat_id: str,
+    reason: str,
+    detail: str,
+    streak: int,
+    last_ts: float | None,
+) -> str:
+    """The D4 page body (I1: the signal lands on a named human-visible
+    surface). Content: seat id, the WAKE_REFUSED/fail reason + detail
+    (the recorded string), streak length, last failure ts, and the
+    one-line manual-restore command."""
+    ts_str = (
+        datetime.datetime.fromtimestamp(last_ts, datetime.timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+        if last_ts
+        else "unknown"
+    )
+    detail = (detail or "")[:300]
+    reason = (reason or "unknown")[:80]
+    return (
+        f"GW seat restore failing: {seat_id} - {streak} consecutive "
+        f"restore failures (last {ts_str}). Reason: {reason or 'unknown'}. "
+        f"Detail: {detail or 'n/a'}. Manual restore: "
+        f"ssh gravitywell 'gw-topology converge --posture slot1-solo' "
+        f"(or the declared home posture per /srv/agents/config/conductor.env)."
+    )
+
+
+def _maybe_page_restore_failure(
+    *,
+    reason: str,
+    detail: str,
+    streak: int,
+    last_ts: float | None,
+    seat_id: str,
+) -> bool:
+    """The wiring seam the wake-failure path calls after recording a
+    failure (the streak counter decides WHEN; this decides the page
+    CONTENT + delivery). Page-only (Standing ratification 4): never
+    restarts or stops the doorman or the seat. Never raises."""
+    try:
+        from agents_core.notify import Priority, send_notification
+
+        body = _build_restore_failure_page(
+            seat_id=seat_id,
+            reason=reason,
+            detail=detail,
+            streak=streak,
+            last_ts=last_ts,
+        )
+        send_notification(
+            body,
+            title=f"GW seat restore failing: {seat_id}",
+            priority=Priority.HIGH,
+            source=_RESTORE_FAILURE_PAGE_SOURCE,
+        )
+        return True
+    except Exception as exc:  # page-only: a page failure is a log line, not a raise
+        log.error(
+            f"[doorman] D4 restore-failure page failed: {exc}"
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Node state (per-node; Unit 1 only handles "gravitywell")
 # ---------------------------------------------------------------------------
 
@@ -681,6 +841,11 @@ class _NodeState:
         self.leases: dict[str, dict] = {}
         self.last_wake_at: float | None = None
         self.last_error: str | None = None
+        # D4 (attestation-contract-v0, leg 1): the consecutive-restore-
+        # failure streak (per seat). Mutated only under self.lock by the
+        # wake-failure path (_refuse_wake / _fail_wake) and reset under
+        # self.lock on any successful serve/restore.
+        self.restore_failure_streak = _RestoreFailureStreak()
         # Service-lifecycle fields (gravitywell-doorman-clean-stop-v0)
         # Seeded at construction (doorman-seed-idle-since-on-startup-v0): leases
         # starts empty, so idle-tracking must begin now, not only on a later
@@ -2231,6 +2396,10 @@ class _NodeState:
                     self.service_stopped = False
                     self._cached_serving = True
                     self._serving_checked_at = time.time()
+                    # D4: a successful serve resets the restore-failure
+                    # streak (the episode is over; the next one pages
+                    # again).
+                    self.restore_failure_streak.record_success()
                 self._place_hold()
                 return True
             time.sleep(poll_interval)
@@ -2298,6 +2467,10 @@ class _NodeState:
                     self.service_stopped = False
                     self._cached_serving = True
                     self._serving_checked_at = time.time()
+                    # D4: a successful serve resets the restore-failure
+                    # streak (the episode is over; the next one pages
+                    # again).
+                    self.restore_failure_streak.record_success()
                 self._place_hold()
                 return True
             time.sleep(poll_interval)
@@ -2427,6 +2600,48 @@ class _NodeState:
         )
         return None
 
+    def _record_restore_failure(self, record: str, reason: str, detail: str) -> None:
+        """D4 (attestation-contract-v0, leg 1): record a restore failure
+        (WAKE_REFUSED / WAKE_FAILED) in the streak counter.
+
+        Lock discipline: the streak mutation happens under self.lock, but
+        the page's network send (send_notification -> Pushover POST)
+        happens OUTSIDE the lock - the page seam is invoked after the
+        `with self.lock` block. Holding self.lock across a network send
+        would stall every lease-registry mutation and the refresh thread
+        for the duration of a slow/failing Pushover delivery.
+
+        The 09-08 loop ran ~40s then went quiet while the seat stayed
+        down - the refusal recorded last_error and paged nothing. The
+        streak counter pages HIGH once per episode after 3 consecutive
+        failures within 10 minutes (I5: no repetition while the streak
+        persists; reset on any successful serve/restore).
+        """
+        with self.lock:
+            self.last_error = record
+            crossed = self.restore_failure_streak.record_failure(
+                reason, detail, _should_page=False,
+            )
+            # The page decision + content snapshot is taken UNDER the lock
+            # (the streak accounting stays atomic); the send itself runs
+            # after the block (see the docstring).
+            _streak = self.restore_failure_streak.consecutive
+            _last_ts = self.restore_failure_streak.last_ts
+        if crossed:
+            # The page send runs OUTSIDE self.lock (the lock is already
+            # released above - the page's network call must never hold
+            # self.lock; the content values were snapshotted under it).
+            _maybe_page_restore_failure(
+                reason=reason, detail=detail,
+                streak=_streak,
+                last_ts=_last_ts,
+                seat_id=self.node_name,
+            )
+            log.warning(
+                f"[{self.node_name}] D4: restore-failure streak crossed "
+                f"the page threshold (see the HIGH page)"
+            )
+
     def _refuse_wake(self, reason: str, detail: str) -> bool:
         """Emit a WAKE_REFUSED record (A6) and set last_error to the same
         structured shape, so the refusal category is readable from /status
@@ -2435,8 +2650,7 @@ class _NodeState:
         _fail_wake's attempted-and-failed shape."""
         record = f'WAKE_REFUSED reason={reason} detail="{detail}"'
         log.error(f"[{self.node_name}] {record}")
-        with self.lock:
-            self.last_error = record
+        self._record_restore_failure(record, reason, detail)
         return False
 
     def _fail_wake(self, reason: str, detail: str) -> bool:
@@ -2447,8 +2661,10 @@ class _NodeState:
         survives in logs and last_error."""
         record = f'WAKE_FAILED reason={reason} detail="{detail}"'
         log.error(f"[{self.node_name}] {record}")
-        with self.lock:
-            self.last_error = record
+        # D4: an attempted-then-failed wake is the same restore-failure
+        # class (the seat was commanded and did not come up). The page
+        # send runs OUTSIDE self.lock (see _record_restore_failure).
+        self._record_restore_failure(record, reason, detail)
         return False
 
     def _wake_generic_posture(self, posture_name: str) -> bool:
@@ -2586,6 +2802,9 @@ class _NodeState:
                 self.service_stopped = False
                 self._cached_serving = True
                 self._serving_checked_at = time.time()
+                # D4: a successful serve resets the restore-failure
+                # streak (the episode is over; the next one pages again).
+                self.restore_failure_streak.record_success()
             self._place_hold()
             return True
 
@@ -2604,6 +2823,10 @@ class _NodeState:
                     self.service_stopped = False
                     self._cached_serving = True
                     self._serving_checked_at = time.time()
+                    # D4: a successful serve resets the restore-failure
+                    # streak (the episode is over; the next one pages
+                    # again).
+                    self.restore_failure_streak.record_success()
                 self._place_hold()
                 return True
             time.sleep(poll_interval)
