@@ -22,10 +22,18 @@ configured gw_url, the GW_URL env the doorman probes for its /status
 "serving" view and agents_core.llm uses for its LLM calls), while the
 doorman's own base (DOORMAN_SERVER, e.g. http://127.0.0.1:8407) is the
 port the doorman serves the /lease/* endpoints on. The two are DIFFERENT
-URLs: the scope gate compares backend_url against the gw_url anchor
-(the task's own backend_url), NOT against the doorman's own port. The
-rev-1 tests masked the inverted gate by passing backend_url ==
-base_url (both :8407) - they must use the production shape.
+URLs.
+
+SCOPE ANCHOR (cycle-3 reviewer finding): the scope gate compares the
+task's backend_url against the FIXED GW_URL anchor (the same env
+doorman_server.create_app reads for the node's gw_url) - NOT the task's
+own backend_url (a self-referential backend_url != backend_url
+comparison is a tautology that scopes nothing: a non-GW-backend task
+would still probe + acquire a doorman lease) and NOT the doorman's own
+port. The rev-1 tests masked the inverted gate by passing backend_url
+== base_url (both :8407); the rev-2 tests masked the tautology by
+passing gw_url=backend_url (both :8081) - both masked shapes are
+asserted against the fixed anchor here.
 
 These tests drive the probe + acquire/release seams against a mock
 doorman (no LLM, no real doorman - the HTTP seams and the exit-path
@@ -46,10 +54,13 @@ from agents_core.claude_queue import (
     _doorman_lease_release,
 )
 
-# The production shape: the GW seat endpoint (the task's backend_url -
-# the doorman's configured gw_url) and the doorman's own base
-# (DOORMAN_SERVER - the port the doorman serves /lease/* on).
+# The production shape: the GW seat endpoint (the task's backend_url for
+# a GW-backend task - the doorman's configured gw_url), the FIXED GW_URL
+# anchor (the same env doorman_server.create_app reads for the node's
+# gw_url - the scope gate's comparison anchor), and the doorman's own
+# base (DOORMAN_SERVER - the port the doorman serves /lease/* on).
 GW_SEAT_URL = "http://127.0.0.1:8081"
+GW_URL_ANCHOR = "http://127.0.0.1:8081"
 DOORMAN_BASE_URL = "http://127.0.0.1:8407"
 
 
@@ -211,7 +222,10 @@ class TestClaimLeaseIntegration:
 
     Production shape: base_url = the doorman's own port (:8407),
     backend_url = the GW seat endpoint (:8081) - the scope gate's
-    gw_url anchor is the task's backend_url, NOT the doorman base.
+    gw_url anchor is the FIXED GW_URL env (the doorman's configured
+    gw_url), NOT the task's own backend_url (cycle-3 reviewer finding:
+    the self-referential comparison is a tautology) and NOT the
+    doorman base.
     """
 
     def test_gw_backend_serving_acquires_lease(self, tmp_path: Path, monkeypatch):
@@ -245,7 +259,7 @@ class TestClaimLeaseIntegration:
             task_id="t1",
             spec_dir=tmp_path / "spec",
             backend_url=GW_SEAT_URL,
-            gw_url=GW_SEAT_URL,
+            gw_url=GW_URL_ANCHOR,
         )
         assert lease is True
         # the lease was acquired against the DOORMAN base, not the GW
@@ -274,7 +288,7 @@ class TestClaimLeaseIntegration:
             task_id="t1",
             spec_dir=tmp_path / "spec",
             backend_url=GW_SEAT_URL,
-            gw_url=GW_SEAT_URL,
+            gw_url=GW_URL_ANCHOR,
         )
         assert lease is False
         assert acquired == []  # the acquire path was not entered (no wake)
@@ -301,7 +315,7 @@ class TestClaimLeaseIntegration:
             task_id="t1",
             spec_dir=tmp_path / "spec",
             backend_url="http://other-seat:9999",
-            gw_url=GW_SEAT_URL,
+            gw_url=GW_URL_ANCHOR,
         )
         assert lease is False
         assert acquired == []
@@ -327,17 +341,23 @@ class TestClaimLeaseIntegration:
             task_id="t1",
             spec_dir=tmp_path / "spec",
             backend_url=None,
-            gw_url=GW_SEAT_URL,
+            gw_url=GW_URL_ANCHOR,
         )
         assert lease is False
         assert acquired == []
 
     def test_gate_is_not_the_doorman_base(self, tmp_path: Path, monkeypatch):
-        """The cycle-2 regression: the scope gate must compare the task's
-        backend_url (the GW seat, :8081) against the gw_url anchor, NOT
-        against the doorman's own port (:8407). With the rev-1 inverted
-        gate (comparing against base_url) this production-shape call
-        would return False and the lease would never acquire."""
+        """The cycle-2 + cycle-3 regression: the scope gate must compare
+        the task's backend_url (the GW seat, :8081) against the FIXED
+        GW_URL anchor (the doorman's configured gw_url - the same env
+        doorman_server.create_app reads), NOT against the doorman's own
+        port (:8407) and NOT against the task's own backend_url (a
+        self-referential comparison is a tautology that scopes nothing).
+        With the rev-1 inverted gate (comparing against base_url) this
+        production-shape call would return False and the lease would
+        never acquire; with the rev-2 tautological anchor (gw_url =
+        backend_url) the non-GW-backend case below would wrongly
+        acquire."""
         _write_spec(tmp_path / "spec", "t1", GW_SEAT_URL)
 
         monkeypatch.setattr(
@@ -352,18 +372,90 @@ class TestClaimLeaseIntegration:
         )
 
         # production shape: backend_url != base_url (the GW seat is NOT
-        # the doorman's port)
+        # the doorman's port), and the anchor is the FIXED GW_URL env
+        # (here equal to the GW seat endpoint - the configured shape)
         assert GW_SEAT_URL != DOORMAN_BASE_URL
+        assert GW_URL_ANCHOR == GW_SEAT_URL
         lease = claude_queue._acquire_claim_lease(
             base_url=DOORMAN_BASE_URL,
             work_id="wid-t1",
             task_id="t1",
             spec_dir=tmp_path / "spec",
             backend_url=GW_SEAT_URL,
-            gw_url=GW_SEAT_URL,
+            gw_url=GW_URL_ANCHOR,
         )
         assert lease is True
         assert acquired == [(DOORMAN_BASE_URL, "wid-t1")]
+
+    def test_gate_anchor_is_not_the_task_backend_url(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """The cycle-3 regression (the self-referential gate): the scope
+        gate's anchor is the FIXED GW_URL env, NOT the task's own
+        backend_url. A non-GW-backend task (backend_url != GW_URL) must
+        acquire NO lease - no probe, no acquire - even though its own
+        backend_url is present and well-formed. With the rev-2
+        tautological anchor (gw_url=backend_url) this call would pass
+        the gate and acquire, which is exactly the defect the directive
+        (2026-09-15) names."""
+        _write_spec(tmp_path / "spec", "t1", "http://other-seat:9999")
+
+        probed = []
+        monkeypatch.setattr(
+            claude_queue, "_doorman_probe_serving",
+            lambda *a, **k: (probed.append(1), True)[1],
+        )
+        acquired = []
+        monkeypatch.setattr(
+            claude_queue, "_doorman_lease_acquire",
+            lambda base_url, wid, **k: (
+                acquired.append((base_url, wid)), True)[1],
+        )
+
+        # the task's backend_url is present but is NOT the doorman's
+        # configured GW seat (the fixed anchor)
+        assert "http://other-seat:9999" != GW_URL_ANCHOR
+        lease = claude_queue._acquire_claim_lease(
+            base_url=DOORMAN_BASE_URL,
+            work_id="wid-t1",
+            task_id="t1",
+            spec_dir=tmp_path / "spec",
+            backend_url="http://other-seat:9999",
+            gw_url=GW_URL_ANCHOR,
+        )
+        assert lease is False
+        assert acquired == []  # the acquire path was not entered
+        assert probed == []  # and neither was the serving probe
+
+    def test_gate_anchor_unset_no_lease(self, tmp_path: Path, monkeypatch):
+        """A GW-backend task whose backend_url is present but the GW_URL
+        anchor env is unset (empty) -> no lease (the gate compares
+        against the fixed anchor; an unset anchor matches nothing)."""
+        _write_spec(tmp_path / "spec", "t1", GW_SEAT_URL)
+
+        probed = []
+        monkeypatch.setattr(
+            claude_queue, "_doorman_probe_serving",
+            lambda *a, **k: (probed.append(1), True)[1],
+        )
+        acquired = []
+        monkeypatch.setattr(
+            claude_queue, "_doorman_lease_acquire",
+            lambda base_url, wid, **k: (
+                acquired.append((base_url, wid)), True)[1],
+        )
+
+        lease = claude_queue._acquire_claim_lease(
+            base_url=DOORMAN_BASE_URL,
+            work_id="wid-t1",
+            task_id="t1",
+            spec_dir=tmp_path / "spec",
+            backend_url=GW_SEAT_URL,
+            gw_url="",
+        )
+        assert lease is False
+        assert acquired == []
+        assert probed == []
 
     def test_release_on_exit_paths(self, tmp_path: Path, monkeypatch):
         """The success/failure/raise/requeue exit paths each release the
@@ -391,12 +483,12 @@ class TestClaimLeaseIntegration:
         lease = claude_queue._acquire_claim_lease(
             base_url=DOORMAN_BASE_URL, work_id="wid-t1",
             task_id="t1", spec_dir=tmp_path / "spec",
-            backend_url=GW_SEAT_URL, gw_url=GW_SEAT_URL,
+            backend_url=GW_SEAT_URL, gw_url=GW_URL_ANCHOR,
         )
         claude_queue._release_claim_lease(
             base_url=DOORMAN_BASE_URL, work_id="wid-t1",
             task_id="t1", spec_dir=tmp_path / "spec",
-            backend_url=GW_SEAT_URL, gw_url=GW_SEAT_URL,
+            backend_url=GW_SEAT_URL, gw_url=GW_URL_ANCHOR,
         )
         assert released == [(DOORMAN_BASE_URL, "wid-t1")]
 
@@ -405,19 +497,19 @@ class TestClaimLeaseIntegration:
         lease = claude_queue._acquire_claim_lease(
             base_url=DOORMAN_BASE_URL, work_id="wid-t1",
             task_id="t1", spec_dir=tmp_path / "spec",
-            backend_url=GW_SEAT_URL, gw_url=GW_SEAT_URL,
+            backend_url=GW_SEAT_URL, gw_url=GW_URL_ANCHOR,
         )
         claude_queue._release_claim_lease(
             base_url=DOORMAN_BASE_URL, work_id="wid-t1",
             task_id="t1", spec_dir=tmp_path / "spec",
-            backend_url=GW_SEAT_URL, gw_url=GW_SEAT_URL,
+            backend_url=GW_SEAT_URL, gw_url=GW_URL_ANCHOR,
         )
         # re-claim: the lease is re-acquired (the requeued task is never
         # lease-less in the park window)
         lease = claude_queue._acquire_claim_lease(
             base_url=DOORMAN_BASE_URL, work_id="wid-t1",
             task_id="t1", spec_dir=tmp_path / "spec",
-            backend_url=GW_SEAT_URL, gw_url=GW_SEAT_URL,
+            backend_url=GW_SEAT_URL, gw_url=GW_URL_ANCHOR,
         )
         assert lease is True
         assert len(acquired) == 3  # initial + re-claim x2 (the requeue
@@ -441,7 +533,7 @@ class TestClaimLeaseIntegration:
         lease = claude_queue._acquire_claim_lease(
             base_url=DOORMAN_BASE_URL, work_id="wid-t1",
             task_id="t1", spec_dir=tmp_path / "spec",
-            backend_url=GW_SEAT_URL, gw_url=GW_SEAT_URL,
+            backend_url=GW_SEAT_URL, gw_url=GW_URL_ANCHOR,
         )
         assert lease is False  # best-effort: the claim is not blocked
 
@@ -473,10 +565,14 @@ class TestClaimLeaseClaimLoop:
     ):
         """A successful GW-backend claim acquires the lease with the
         production shape: base_url = the doorman's own port,
-        backend_url = the GW seat endpoint (the gw_url anchor)."""
+        backend_url = the GW seat endpoint, gw_url = the FIXED GW_URL
+        anchor (the same env doorman_server.create_app reads for the
+        node's gw_url - NOT the task's own backend_url, the cycle-3
+        tautology)."""
         q = self._queue(tmp_path, "t1", GW_SEAT_URL)
 
         monkeypatch.setenv("DOORMAN_SERVER", DOORMAN_BASE_URL)
+        monkeypatch.setenv("GW_URL", GW_URL_ANCHOR)
         calls = []
         monkeypatch.setattr(
             claude_queue, "_acquire_claim_lease",
@@ -488,10 +584,11 @@ class TestClaimLeaseClaimLoop:
         assert len(calls) == 1
         kw = calls[0]
         # the lease rides the doorman's own port; the scope anchor is the
-        # GW seat endpoint (the task's backend_url)
+        # FIXED GW_URL env (here the GW seat endpoint - the configured
+        # shape), NOT the task's own backend_url
         assert kw["base_url"] == DOORMAN_BASE_URL
         assert kw["backend_url"] == GW_SEAT_URL
-        assert kw["gw_url"] == GW_SEAT_URL
+        assert kw["gw_url"] == GW_URL_ANCHOR
         assert kw["work_id"] == "t1"
 
     def test_claim_non_gw_backend_no_lease(self, tmp_path: Path, monkeypatch):
@@ -506,6 +603,7 @@ class TestClaimLeaseClaimLoop:
         q = self._queue(tmp_path, "t1", "http://other-seat:9999")
 
         monkeypatch.setenv("DOORMAN_SERVER", DOORMAN_BASE_URL)
+        monkeypatch.setenv("GW_URL", GW_URL_ANCHOR)
         calls = []
         monkeypatch.setattr(
             claude_queue, "_acquire_claim_lease",
@@ -517,6 +615,11 @@ class TestClaimLeaseClaimLoop:
         # call site) and it refused (False - no probe, no acquire)
         assert len(calls) == 1
         assert calls[0]["backend_url"] == "http://other-seat:9999"
+        # the anchor is the FIXED GW_URL env, NOT the task's own
+        # backend_url (the cycle-3 tautology): the two are DIFFERENT
+        # here, so the gate is doing real scoping
+        assert calls[0]["gw_url"] == GW_URL_ANCHOR
+        assert calls[0]["gw_url"] != "http://other-seat:9999"
 
     def test_claim_no_backend_url_no_lease(self, tmp_path: Path, monkeypatch):
         """No backend_url in the spec (fail-open to None) -> no lease
@@ -524,6 +627,7 @@ class TestClaimLeaseClaimLoop:
         q = self._queue(tmp_path, "t1", None)
 
         monkeypatch.setenv("DOORMAN_SERVER", DOORMAN_BASE_URL)
+        monkeypatch.setenv("GW_URL", GW_URL_ANCHOR)
         calls = []
         monkeypatch.setattr(
             claude_queue, "_acquire_claim_lease",
@@ -532,3 +636,83 @@ class TestClaimLeaseClaimLoop:
         task = q.claim()
         assert task is not None
         assert calls == []
+
+
+class TestClaimLeaseRunnerCtx:
+    """The runner's claim-lease context (_claim_lease_ctx): the gw_url
+    anchor is the FIXED GW_URL env (the same env doorman_server.create_app
+    reads for the node's gw_url), NOT the task's own backend_url (the
+    cycle-3 tautology: a self-referential comparison scopes nothing)."""
+
+    def test_ctx_gw_url_anchor_is_env_not_backend_url(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """The runner ctx resolves gw_url from the GW_URL env, which is
+        DIFFERENT from the task's backend_url (the non-GW-backend shape):
+        the acquire/release seams pass the env anchor to the scope gate,
+        so a non-GW-backend task acquires no lease."""
+        from agents_core import claude_queue_runner as cqr
+
+        _write_spec(tmp_path / "spec", "t1", "http://other-seat:9999")
+        task = {
+            "id": "t1",
+            "payload": {
+                "spec_path": str(tmp_path / "spec" / "t1.json"),
+                "_ignore_intention_registry": True,
+            },
+        }
+        monkeypatch.setenv("DOORMAN_SERVER", DOORMAN_BASE_URL)
+        monkeypatch.setenv("GW_URL", GW_URL_ANCHOR)
+
+        base_url, work_id, backend_url, gw_url = cqr._claim_lease_ctx(task)
+        assert base_url == DOORMAN_BASE_URL
+        assert work_id == "t1"
+        assert backend_url == "http://other-seat:9999"
+        # the anchor is the FIXED GW_URL env, NOT the task's own
+        # backend_url (the cycle-3 tautology)
+        assert gw_url == GW_URL_ANCHOR
+        assert gw_url != backend_url
+
+    def test_ctx_gw_backend_task_anchor_matches(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """A GW-backend task (backend_url == the configured GW seat) ->
+        the env anchor equals the backend_url and the scope gate passes."""
+        from agents_core import claude_queue_runner as cqr
+
+        _write_spec(tmp_path / "spec", "t1", GW_SEAT_URL)
+        task = {
+            "id": "t1",
+            "payload": {
+                "spec_path": str(tmp_path / "spec" / "t1.json"),
+                "_ignore_intention_registry": True,
+            },
+        }
+        monkeypatch.setenv("DOORMAN_SERVER", DOORMAN_BASE_URL)
+        monkeypatch.setenv("GW_URL", GW_URL_ANCHOR)
+
+        base_url, work_id, backend_url, gw_url = cqr._claim_lease_ctx(task)
+        assert backend_url == GW_SEAT_URL
+        assert gw_url == GW_URL_ANCHOR
+        assert gw_url == backend_url  # the configured GW shape
+
+    def test_ctx_gw_url_env_unset_empty_anchor(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """GW_URL unset -> the anchor is the empty string (the gate
+        matches nothing - no lease)."""
+        from agents_core import claude_queue_runner as cqr
+
+        _write_spec(tmp_path / "spec", "t1", GW_SEAT_URL)
+        task = {
+            "id": "t1",
+            "payload": {
+                "spec_path": str(tmp_path / "spec" / "t1.json"),
+                "_ignore_intention_registry": True,
+            },
+        }
+        monkeypatch.setenv("DOORMAN_SERVER", DOORMAN_BASE_URL)
+        monkeypatch.delenv("GW_URL", raising=False)
+
+        base_url, work_id, backend_url, gw_url = cqr._claim_lease_ctx(task)
+        assert gw_url == ""

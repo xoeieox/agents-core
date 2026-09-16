@@ -354,9 +354,8 @@ def _collect_model_touched_tests(transcript: list[dict], cwd: str) -> set[str]:
     return touched
 
 
-def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str] | None,
-                         timeout_s: int = 180,
-                         env: dict | None = None) -> dict | None:
+def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str],
+                         timeout_s: int = 180) -> dict | None:
     """Deterministic targeted re-run of model-touched tests (local-fixer gate
     perception). Mirrors the fixer's own run_tests invocation
     (gw_agent.py:1098-1116) in shape (same env - inherited, no env override,
@@ -368,13 +367,8 @@ def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str] | None,
     legacy command. For uv repos the gate's interpreter/env therefore
     DELIBERATELY diverges from the model's own run_tests tool (which stays
     host-Python and cannot import the project deps): the gate is the
-    authority and the model cannot reproduce the gate's env.
-    `model_touched_tests=None` (the no-python-test-infra shape with no
-    model test files) runs the FULL-SUITE collection (the legacy
-    behavior); `env` (default None -> inherited) overrides the
-    subprocess env (the model's run_tests env mirror for the scoped
-    re-run). Returns the _parse_pytest_outcome dict, or None when the
-    re-run itself is unusable
+    authority and the model cannot reproduce the gate's env. Returns the
+    _parse_pytest_outcome dict, or None when the re-run itself is unusable
     (timeout or spawn error).
 
     agents-core-local-fixer-gate-perception-v0 D1: the harness re-runs the
@@ -391,20 +385,12 @@ def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str] | None,
     189s runtime of the D2a acceptance test file - the acceptance mission
     would fail deterministically at the gate otherwise.
     """
-    if model_touched_tests is None:
-        # No tests touched (the no-python-test-infra shape with no model
-        # test files): the re-run is the FULL-SUITE collection (the
-        # legacy behavior - the gate must still see a green run, and a
-        # 0-passed collection is a fail-closed verdict).
-        _touched_set: set[str] = set()
-    else:
-        _touched_set = model_touched_tests
     if not Path(cwd).is_dir():
         # A missing worktree is an unusable re-run, never a crash: the gate
         # stays fail-closed (the caller keeps its verdict) with this WARN.
         print(
             f"WARN: local-fixer: gate targeted re-run unusable - cwd {cwd!r} "
-            f"is not an existing directory (touched={sorted(_touched_set)})",
+            f"is not an existing directory (touched={sorted(model_touched_tests)})",
             file=sys.stderr,
         )
         return None
@@ -419,7 +405,7 @@ def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str] | None,
     # test. shell=False makes the run_tests shell-metachar guard unnecessary.
     argv_paths = [
         ("./" + p) if p.startswith("-") else p
-        for p in sorted(_touched_set)
+        for p in sorted(set(model_touched_tests))
     ]
     # agents-core-gate-uv-aware-v0: repo-env-aware prefix. Non-uv (or uv
     # unresolvable): [sys.executable, "-m", "pytest", ...] - byte-identical
@@ -436,7 +422,6 @@ def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str] | None,
             timeout=timeout_s,  # legacy parity: run_tests' own cap (gw_agent.py:1074)
             cwd=cwd,
             shell=False,
-            env=env,  # None -> inherited (legacy behavior)
         )
         output = r.stdout + r.stderr
         returncode = r.returncode
@@ -446,7 +431,7 @@ def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str] | None,
         # the WARN so an unusable re-run is visible, not a silent 0/0.
         print(
             f"WARN: local-fixer: gate targeted re-run timed out after {timeout_s}s "
-            f"(touched={sorted(_touched_set)})",
+            f"(touched={sorted(model_touched_tests)})",
             file=sys.stderr,
         )
         return None
@@ -456,7 +441,7 @@ def _gate_targeted_rerun(cwd: str, model_touched_tests: set[str] | None,
         # contract) - WARN + None keeps the fail-closed verdict.
         print(
             f"WARN: local-fixer: gate targeted re-run spawn error "
-            f"(touched={sorted(_touched_set)}): {exc}",
+            f"(touched={sorted(model_touched_tests)}): {exc}",
             file=sys.stderr,
         )
         return None

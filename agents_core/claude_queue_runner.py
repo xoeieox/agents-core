@@ -625,11 +625,11 @@ def _write_success_output(path: Path, combined: str) -> None:
 # Per-task execution
 # ---------------------------------------------------------------------------
 
-def _claim_lease_ctx(task: dict) -> tuple[str, str, str | None]:
+def _claim_lease_ctx(task: dict) -> tuple[str, str, str | None, str]:
     """D5 (attestation-contract-v0, leg 1): resolve the claim-lease context
     for a claimed task.
 
-    Returns (base_url, work_id, backend_url) where:
+    Returns (base_url, work_id, backend_url, gw_url) where:
       base_url    - the doorman's own base (DOORMAN_SERVER - the port the
                     doorman serves the /lease/* endpoints on). The lease
                     acquire/release and the serving probe ride this base.
@@ -646,22 +646,37 @@ def _claim_lease_ctx(task: dict) -> tuple[str, str, str | None]:
                     LLM calls). Consumed by the D5 seams' scope gate INSTEAD
                     of a second spec-JSON read (the claim() call site computes
                     the same value via the same fail-open function). The
-                    scope gate compares backend_url against the gw_url anchor
-                    (the task's own backend_url), NOT against the doorman's
-                    own port - the two are different URLs (cycle-2 reviewer
-                    finding: the rev-1 gate compared the GW seat URL against
-                    DOORMAN_SERVER and failed for every real GW task).
+                    scope gate compares backend_url against the FIXED GW_URL
+                    anchor (os.environ["GW_URL"] - the same env
+                    doorman_server.create_app reads for the node's gw_url),
+                    NOT against the task's own backend_url (a self-
+                    referential comparison is a tautology that scopes
+                    nothing - cycle-3 reviewer finding) and NOT against the
+                    doorman's own port (cycle-2 reviewer finding: the rev-1
+                    gate compared the GW seat URL against DOORMAN_SERVER and
+                    failed for every real GW task).
 
-    Never raises: any failure shape degrades to (base, work_id, None).
+      gw_url      - the FIXED GW_URL env (the doorman's configured gw_url
+                    anchor for the scope gate - the same env
+                    doorman_server.create_app reads for the node's gw_url).
+                    The task's own backend_url is NOT the anchor (cycle-3
+                    reviewer finding).
+
+    Never raises: any failure shape degrades to (base, work_id, None, gw_url).
     """
     base_url = os.environ.get("DOORMAN_SERVER", "http://127.0.0.1:8407")
     work_id = task.get("id", "")
+    # The D5 scope-gate anchor: the FIXED GW_URL env (the same env
+    # doorman_server.create_app reads for the node's gw_url) - NOT the
+    # task's own backend_url (a self-referential comparison is a
+    # tautology that scopes nothing - cycle-3 reviewer finding).
+    gw_url = os.environ.get("GW_URL", "")
     backend_url: str | None = None
     try:
         backend_url = _cq_task_backend_url(task)
     except Exception:
         backend_url = None
-    return base_url, work_id, backend_url
+    return base_url, work_id, backend_url, gw_url
 
 
 def _acquire_claim_lease(task: dict) -> bool:
@@ -669,7 +684,7 @@ def _acquire_claim_lease(task: dict) -> bool:
     successful GW-backend claim. Never raises; a failure is a WARN line -
     the run proceeds lease-less (the death-class signals cover the
     seat-down case)."""
-    base_url, work_id, backend_url = _claim_lease_ctx(task)
+    base_url, work_id, backend_url, gw_url = _claim_lease_ctx(task)
     if backend_url is None:
         return False
     try:
@@ -679,7 +694,7 @@ def _acquire_claim_lease(task: dict) -> bool:
             task_id=task.get("id", ""),
             backend_url=backend_url,
             timeout_s=task.get("timeout_seconds"),
-            gw_url=backend_url,
+            gw_url=gw_url,
         )
     except Exception as e:
         log.warning("claim-lease: acquire failed for %s: %s",
@@ -691,7 +706,7 @@ def _release_claim_lease(task: dict) -> None:
     """D5 release seam: release the claim lease on a run exit path.
     Never raises (a lost release degrades to the TTL-bounded zombie
     window)."""
-    base_url, work_id, backend_url = _claim_lease_ctx(task)
+    base_url, work_id, backend_url, gw_url = _claim_lease_ctx(task)
     if backend_url is None:
         return
     try:
@@ -700,7 +715,7 @@ def _release_claim_lease(task: dict) -> None:
             work_id=work_id,
             task_id=task.get("id", ""),
             backend_url=backend_url,
-            gw_url=backend_url,
+            gw_url=gw_url,
         )
     except Exception as e:
         log.warning("claim-lease: release failed for %s: %s",

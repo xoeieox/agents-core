@@ -294,8 +294,13 @@ def _task_backend_url(task: dict) -> str | None:
 # http://127.0.0.1:8081), NOT the doorman's own port (DOORMAN_SERVER,
 # e.g. http://127.0.0.1:8407) - comparing against the doorman's own
 # port would fail for every real GW task and the lease would never
-# acquire (cycle-2 reviewer finding). No backend_url / other seat ->
-# no lease.
+# acquire (cycle-2 reviewer finding). The anchor is the FIXED GW_URL env
+# (the same env doorman_server.create_app reads for the node's gw_url),
+# NOT the task's own backend_url: a self-referential
+# backend_url != backend_url gate is a tautology that scopes nothing
+# (cycle-3 reviewer finding: the rev-2 call sites passed
+# gw_url=backend_url, so a non-GW-backend task still probed + acquired a
+# doorman lease). No backend_url / other seat -> no lease.
 #
 # Best-effort contract: an acquire failure NEVER blocks the claim (the run
 # proceeds lease-less; the death-class signals cover the seat-down case).
@@ -454,15 +459,18 @@ def _acquire_claim_lease(
     historical seam shape (the runner's ctx resolution) and are unused
     in the scope gate.
 
-    The ``gw_url`` parameter is the doorman's configured GW SEAT base
-    (GW_URL - the same env the doorman probes for its /status "serving"
-    view and agents_core.llm uses for its LLM calls). The task's
-    backend_url is that GW seat endpoint - NOT the doorman's own port
-    (DOORMAN_SERVER): the lease itself is acquired against the
-    doorman's base (``base_url``), but the SCOPE gate compares against
-    the seat (cycle-2 reviewer finding: comparing the GW seat URL
-    against the doorman's own port fails for every real GW task and the
-    lease never acquired).
+    The ``gw_url`` parameter is the doorman's configured GW SEAT base -
+    the FIXED GW_URL env (the same env doorman_server.create_app reads
+    for the node's gw_url, and the same env agents_core.llm uses for its
+    LLM calls). The task's backend_url is that GW seat endpoint - NOT
+    the doorman's own port (DOORMAN_SERVER): the lease itself is acquired
+    against the doorman's base (``base_url``), and the SCOPE gate
+    compares the task's backend_url against this fixed anchor (cycle-2
+    reviewer finding: comparing against the doorman's own port fails for
+    every real GW task and the lease never acquired; cycle-3 reviewer
+    finding: the anchor must be the fixed GW_URL env, NOT the task's own
+    backend_url - a self-referential comparison is a tautology that
+    scopes nothing).
 
     Contract:
       - non-GW-backend task (backend_url absent or != gw_url) -> False,
@@ -474,9 +482,11 @@ def _acquire_claim_lease(
       - acquire failure -> False (best-effort: the claim is not blocked)
     """
     # Scope gate: GW-backend tasks only, by URL identity against the
-    # doorman's configured gw_url (the GW seat base - the
-    # _task_backend_url fail-open contract the seat serialization guard
-    # uses - the same value claim() computed).
+    # FIXED GW_URL anchor (the doorman's configured gw_url - the same
+    # env doorman_server.create_app reads for the node's gw_url). The
+    # anchor is NOT the task's own backend_url: a self-referential
+    # comparison is a tautology that scopes nothing (cycle-3 reviewer
+    # finding).
     task_backend = backend_url
     if not isinstance(task_backend, str) or not task_backend:
         return False
@@ -521,9 +531,12 @@ def _release_claim_lease(
 
     The scope gate mirrors _acquire_claim_lease: the task's backend_url
     is the ``backend_url`` parameter (the _task_backend_url result the
-    claim() call site computed) and the identity anchor is the
-    doorman's configured gw_url (``gw_url`` - the GW seat base, NOT the
-    doorman's own port) - the spec JSON is NOT re-read here.
+    claim() call site computed) and the identity anchor is the FIXED
+    GW_URL env (``gw_url`` - the doorman's configured gw_url, the same
+    env doorman_server.create_app reads for the node's gw_url; NOT the
+    task's own backend_url - a self-referential comparison is a
+    tautology that scopes nothing - and NOT the doorman's own port) -
+    the spec JSON is NOT re-read here.
     """
     task_backend = backend_url
     if not isinstance(task_backend, str) or not task_backend:
@@ -954,19 +967,24 @@ class ClaudeQueue:
                     # The lease is acquired against the doorman's base
                     # (DOORMAN_SERVER - the doorman's own port), but the
                     # scope gate compares the task's backend_url against
-                    # the doorman's configured gw_url (GW_URL - the GW
-                    # seat base the doorman probes for its /status
-                    # "serving" view and agents_core.llm uses for its
-                    # LLM calls). The two are DIFFERENT URLs: the task
-                    # backend_url is the GW seat endpoint (e.g.
-                    # http://127.0.0.1:8081), the doorman base is its
-                    # own port (e.g. http://127.0.0.1:8407).
+                    # the FIXED GW_URL anchor (the same env
+                    # doorman_server.create_app reads for the node's
+                    # gw_url - the GW seat base the doorman probes for
+                    # its /status "serving" view and agents_core.llm
+                    # uses for its LLM calls). The anchor is NOT the
+                    # task's own backend_url (a self-referential
+                    # comparison is a tautology that scopes nothing -
+                    # cycle-3 reviewer finding). The two URLs are
+                    # DIFFERENT: the task backend_url is the GW seat
+                    # endpoint (e.g. http://127.0.0.1:8081), the
+                    # doorman base is its own port (e.g.
+                    # http://127.0.0.1:8407).
                     _acquire_claim_lease(
                         base_url=_claim_doorman_base,
                         work_id=chosen["id"],
                         task_id=chosen["id"],
                         backend_url=_claim_backend_url,
-                        gw_url=_claim_backend_url,
+                        gw_url=os.environ.get("GW_URL", ""),
                     )
             except Exception:
                 pass  # best-effort: a lease failure never blocks the claim
