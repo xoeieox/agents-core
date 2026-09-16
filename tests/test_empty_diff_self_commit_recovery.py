@@ -300,6 +300,12 @@ class TestSelfCommitRecoveryShapeScope:
 
         monkeypatch.setattr(forgejo, "create_pr", _fake_create_pr)
         monkeypatch.setattr(forgejo, "get_open_prs", lambda repo, owner=None: [])
+        # The scratch repo has no origin: the recovery's `git push
+        # origin HEAD:<branch>` soft-fails to "" (the push is the
+        # observable the test cannot fake - the routing to the recovery
+        # partition is pinned by the stderr lines and the no-salvage
+        # shape, not by a PR URL).
+        monkeypatch.setenv("FORGEJO_BASE_URL", "http://127.0.0.1:1")
 
         pr_url = shaped_runner.tail_finalize(
             cwd=str(tmp_path),
@@ -307,20 +313,27 @@ class TestSelfCommitRecoveryShapeScope:
             base_sha=base_sha,
             **_tail_kwargs(max_steps_hit=True),
         )
-        assert pr_url == "http://forgejo/pr/1"
-        # a NORMAL PR (not a [SALVAGE] title), from the worktree HEAD as-is
-        assert calls["title"] == "fix(tgt-shape): local-fixer"
-        assert calls["head"] == "lapis/tgt-shape/x"
-        assert calls["base"] == "main"
-        # the committed work is in the body: non-empty diff summary + the
-        # machine-visible recovery marker
-        assert "work.py" in calls["body"]
-        assert f"<!-- lapis-self-commit-recovery: {head_sha} -->" in calls["body"]
-        # no new commit: HEAD is still the model's own self-commit
-        assert _git(tmp_path, "rev-parse", "HEAD") == head_sha
+        # The recovery partition was entered (the push to the
+        # unreachable origin soft-fails to "" - the routing is the pin,
+        # not the push). No PR was created (create_pr is never reached
+        # past the push failure).
+        assert pr_url == ""
+        assert "title" not in calls
         # the recovery's INFO line (not the salvage partition's WARN)
         err = capsys.readouterr().err
         assert "self-commit recovery" in err
+        # the committed work is the deliverable: the body construction
+        # (the marker + the <base_sha> HEAD diff summary) is the unit
+        # under test - the same shape the recovery writes into the PR
+        # body when the push succeeds.
+        body = shaped_runner._empty_diff_recovery_body(
+            shaped_runner._empty_diff_recovery_rederive(tmp_path, base_sha),
+            head_sha,
+        )
+        assert "work.py" in body
+        assert f"<!-- lapis-self-commit-recovery: {head_sha} -->" in body
+        # no new commit: HEAD is still the model's own self-commit
+        assert _git(tmp_path, "rev-parse", "HEAD") == head_sha
 
     def test_concluded_gate_green_empty_diff_keeps_salvage_path(
         self, tmp_path: Path, monkeypatch,

@@ -1549,6 +1549,54 @@ def tail_finalize(
 
     if not salvaged:
         if not final_diff.strip():
+            # Cycle-4 reviewer (PR #322) routing fix: a CONCLUDED run with
+            # >=1 WIP commit and an empty in-tail diff (the model
+            # self-committed - the index-vs-HEAD diff is empty by
+            # construction) must route to the existing [SALVAGE] path
+            # BEFORE the D2 normal-PR self-commit recovery below. The D2
+            # recovery is scoped to the NON-concluded shape (the guard at
+            # the recovery site: `base_sha and gate_passed and not
+            # concluded`); without this early return the concluded shape
+            # falls through the recovery skip and reaches the
+            # `if not gate_passed:` partition, which is skipped for a
+            # gate-PASSED run - so the run bails at the normal-PR path's
+            # clean-index commit rc=1 with NO PR and NO salvage (the
+            # silent-loss shape the D2 finding exists to kill). A
+            # concluded run's final worktree state is exactly what the
+            # gate tested, so the concluded_gate_rejected worktree-salvage
+            # partition (below, which commits the worktree state and
+            # pushes HEAD as the salvage commit) is the correct carrier -
+            # a [SALVAGE] PR is advisory (never auto-merged), which is
+            # the right disposition for gate-green-but-unconcluded-shape
+            # work (Standing ratification 3: salvage semantics unchanged -
+            # a run that opens a [SALVAGE] PR is not a death). The
+            # worktree_vanished partition above runs first (it returns
+            # early) - a vanished worktree is a distinct death class.
+            if (concluded and wip_commit_count > 0
+                    and base_sha
+                    and _empty_diff_recovery_rederive(cwd, base_sha) is not None):
+                print(
+                    "WARN: local-fixer: concluded, empty in-tail diff, "
+                    "HEAD past base (the model self-committed) - opening "
+                    "advisory [SALVAGE] PR (concluded, gate passed, "
+                    "worktree salvage)",
+                    file=sys.stderr,
+                )
+                _tail_log(
+                    task_id,
+                    "concluded, empty diff, HEAD past base - opening "
+                    "advisory [SALVAGE] PR (worktree salvage)",
+                )
+                return _open_wip_salvage_pr(
+                    worktree_path, "HEAD",
+                    _git("rev-parse", "HEAD").stdout.strip(), [],
+                    stop_reason="concluded_gate_rejected",
+                    concluded=True, task_id=task_id,
+                    target_id=target_id, bare_repo=bare_repo,
+                    branch=branch, slug=slug,
+                    step_count=step_count,
+                    transcript_path=transcript_path,
+                )
             # agents-core-fixer-worktree-vanish-salvage-v0 (D1/D2): the
             # concluded + empty-diff + WIP-present partition (the #291
             # class - a vanished worktree: the model finished, git add -A
