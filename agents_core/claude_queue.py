@@ -286,8 +286,16 @@ def _task_backend_url(task: dict) -> str | None:
 # case; the death-class signals cover its failure).
 #
 # Scope: GW-backend tasks ONLY, matched by URL identity against the
-# doorman's configured gw_url (the DOORMAN_SERVER env the doorman itself
-# serves on - not a string guess). No backend_url / other seat -> no lease.
+# doorman's configured gw_url - the GW SEAT base URL (GW_URL, the same
+# env the doorman probes for its own /status "serving" view and the same
+# env agents_core.llm uses for its LLM calls - doorman_server.py
+# create_app reads GW_URL for the node's gw_url; llm.py GW_URL). The
+# task's backend_url is the GW seat LLM endpoint (e.g.
+# http://127.0.0.1:8081), NOT the doorman's own port (DOORMAN_SERVER,
+# e.g. http://127.0.0.1:8407) - comparing against the doorman's own
+# port would fail for every real GW task and the lease would never
+# acquire (cycle-2 reviewer finding). No backend_url / other seat ->
+# no lease.
 #
 # Best-effort contract: an acquire failure NEVER blocks the claim (the run
 # proceeds lease-less; the death-class signals cover the seat-down case).
@@ -335,28 +343,33 @@ def _doorman_probe_serving(base_url: str, timeout: float = 2.0) -> bool | None:
 
     Never raises: any failure shape degrades to None (fail-open to
     "skip the lease", never to "wake the seat").
+
+    Transport: the EXISTING DoormanClient (doorman_client.py, httpx -
+    the same client the LLM path and the lease seams use, incl. its
+    bearer-token header) - no second HTTP library in the claim path
+    (cycle-2 reviewer finding: the rev-1 requests import was redundant
+    with the httpx client the module already routes through; requests
+    IS a declared dependency, but the probe rides the shared client).
     """
     try:
-        import requests
+        from agents_core.doorman_client import DoormanClient
 
-        # Liveness first (the doorman's own /healthz endpoint): an
-        # unreachable doorman is None (skip) - never a wake.
-        health = requests.get(
-            f"{base_url.rstrip('/')}{_DOORMAN_HEALTHZ_PATH}", timeout=timeout,
-        )
-        if health.status_code != 200:
-            return None
-        # The seat state: the doorman's own view of its GW seat - the
-        # flat top-level "serving" field of the /status snapshot
-        # (status_snapshot(): serving = self._cached_serving, refreshed
-        # from the doorman's own {gw_url}/health probe on the refresh
-        # tick). None (pre-first-refresh) -> not serving (skip, no wake).
-        resp = requests.get(
-            f"{base_url.rstrip('/')}{_DOORMAN_STATUS_PATH}", timeout=timeout,
-        )
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
+        client = DoormanClient(base_url=base_url, timeout=timeout)
+        try:
+            # Liveness first (the doorman's own /healthz endpoint): an
+            # unreachable doorman is None (skip) - never a wake.
+            health = client.healthz()
+            if not isinstance(health, dict):
+                return None
+            # The seat state: the doorman's own view of its GW seat -
+            # the flat top-level "serving" field of the /status snapshot
+            # (status_snapshot(): serving = self._cached_serving,
+            # refreshed from the doorman's own {gw_url}/health probe on
+            # the refresh tick). None (pre-first-refresh) -> not serving
+            # (skip, no wake).
+            data = client.status()
+        finally:
+            client.close()
         if not isinstance(data, dict):
             return None
         return data.get("serving") is True
@@ -425,12 +438,13 @@ def _acquire_claim_lease(
     spec_dir=None,
     timeout_s: int | None = None,
     backend_url: str | None = None,
+    gw_url: str | None = None,
 ) -> bool:
     """The D5 claim seam: probe -> acquire for a GW-backend claim.
 
     Called from the runner's claim loop after a successful GW-backend
     claim (the spec's backend_url must name the doorman-managed GW seat -
-    URL identity against the doorman's configured base, not a string
+    URL identity against the doorman's configured gw_url, not a string
     guess). Returns True when a lease is live for the run.
 
     Scope gate: the task's backend_url is taken from the
@@ -440,8 +454,18 @@ def _acquire_claim_lease(
     historical seam shape (the runner's ctx resolution) and are unused
     in the scope gate.
 
+    The ``gw_url`` parameter is the doorman's configured GW SEAT base
+    (GW_URL - the same env the doorman probes for its /status "serving"
+    view and agents_core.llm uses for its LLM calls). The task's
+    backend_url is that GW seat endpoint - NOT the doorman's own port
+    (DOORMAN_SERVER): the lease itself is acquired against the
+    doorman's base (``base_url``), but the SCOPE gate compares against
+    the seat (cycle-2 reviewer finding: comparing the GW seat URL
+    against the doorman's own port fails for every real GW task and the
+    lease never acquired).
+
     Contract:
-      - non-GW-backend task (backend_url absent or != base_url) -> False,
+      - non-GW-backend task (backend_url absent or != gw_url) -> False,
         no probe, no acquire (scoped, per the spec)
       - probe False (seat down) -> False and the acquire path is NOT
         entered (no wake triggered from the claim path)
@@ -450,12 +474,13 @@ def _acquire_claim_lease(
       - acquire failure -> False (best-effort: the claim is not blocked)
     """
     # Scope gate: GW-backend tasks only, by URL identity against the
-    # doorman's configured base (the _task_backend_url fail-open contract
-    # the seat serialization guard uses - the same value claim() computed).
+    # doorman's configured gw_url (the GW seat base - the
+    # _task_backend_url fail-open contract the seat serialization guard
+    # uses - the same value claim() computed).
     task_backend = backend_url
     if not isinstance(task_backend, str) or not task_backend:
         return False
-    if task_backend.rstrip("/") != (base_url or "").rstrip("/"):
+    if task_backend.rstrip("/") != (gw_url or "").rstrip("/"):
         return False
 
     # Serving probe BEFORE acquire (the wake trap): the probe reads the
@@ -484,6 +509,7 @@ def _release_claim_lease(
     task_id: str,
     spec_dir=None,
     backend_url: str | None = None,
+    gw_url: str | None = None,
 ) -> bool:
     """The D5 release seam: release the claim lease on a run exit path.
 
@@ -495,12 +521,14 @@ def _release_claim_lease(
 
     The scope gate mirrors _acquire_claim_lease: the task's backend_url
     is the ``backend_url`` parameter (the _task_backend_url result the
-    claim() call site computed) - the spec JSON is NOT re-read here.
+    claim() call site computed) and the identity anchor is the
+    doorman's configured gw_url (``gw_url`` - the GW seat base, NOT the
+    doorman's own port) - the spec JSON is NOT re-read here.
     """
     task_backend = backend_url
     if not isinstance(task_backend, str) or not task_backend:
         return False
-    if task_backend.rstrip("/") != (base_url or "").rstrip("/"):
+    if task_backend.rstrip("/") != (gw_url or "").rstrip("/"):
         return False
     return _doorman_lease_release(base_url, work_id)
 
@@ -915,13 +943,30 @@ class ClaudeQueue:
             # the seat-down case, and the death-class signals cover its
             # failure).
             try:
+                # The doorman's own base (the port the doorman serves
+                # the /lease/* endpoints on) - the same env
+                # doorman_client.DoormanClient defaults to.
+                _claim_doorman_base = os.environ.get(
+                    "DOORMAN_SERVER", "http://127.0.0.1:8407",
+                )
                 _claim_backend_url = _task_backend_url(chosen)
                 if _claim_backend_url:
+                    # The lease is acquired against the doorman's base
+                    # (DOORMAN_SERVER - the doorman's own port), but the
+                    # scope gate compares the task's backend_url against
+                    # the doorman's configured gw_url (GW_URL - the GW
+                    # seat base the doorman probes for its /status
+                    # "serving" view and agents_core.llm uses for its
+                    # LLM calls). The two are DIFFERENT URLs: the task
+                    # backend_url is the GW seat endpoint (e.g.
+                    # http://127.0.0.1:8081), the doorman base is its
+                    # own port (e.g. http://127.0.0.1:8407).
                     _acquire_claim_lease(
-                        base_url=_claim_backend_url,
+                        base_url=_claim_doorman_base,
                         work_id=chosen["id"],
                         task_id=chosen["id"],
                         backend_url=_claim_backend_url,
+                        gw_url=_claim_backend_url,
                     )
             except Exception:
                 pass  # best-effort: a lease failure never blocks the claim

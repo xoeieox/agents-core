@@ -630,9 +630,9 @@ def _claim_lease_ctx(task: dict) -> tuple[str, str, str | None]:
     for a claimed task.
 
     Returns (base_url, work_id, backend_url) where:
-      base_url    - the doorman's configured base (DOORMAN_SERVER, the same
-                    env the doorman serves on) - the URL-identity anchor for
-                    the GW-backend scope check
+      base_url    - the doorman's own base (DOORMAN_SERVER - the port the
+                    doorman serves the /lease/* endpoints on). The lease
+                    acquire/release and the serving probe ride this base.
       work_id     - the lease's work_id (the task id - the same key the
                     per-run LLM lease uses, so the claim lease is visible to
                     the park decision for the full claim -> first-call
@@ -640,9 +640,17 @@ def _claim_lease_ctx(task: dict) -> tuple[str, str, str | None]:
       backend_url - the task's spec backend_url (claude_queue._task_backend_url
                     fail-open contract: None when the task carries no
                     spec_path or no backend_url - non-GW tasks, no lease).
-                    Consumed by the D5 seams' scope gate INSTEAD of a
-                    second spec-JSON read (the claim() call site computes
-                    the same value via the same fail-open function).
+                    This is the GW SEAT endpoint (the doorman's configured
+                    gw_url, GW_URL - the same env the doorman probes for its
+                    /status "serving" view and agents_core.llm uses for its
+                    LLM calls). Consumed by the D5 seams' scope gate INSTEAD
+                    of a second spec-JSON read (the claim() call site computes
+                    the same value via the same fail-open function). The
+                    scope gate compares backend_url against the gw_url anchor
+                    (the task's own backend_url), NOT against the doorman's
+                    own port - the two are different URLs (cycle-2 reviewer
+                    finding: the rev-1 gate compared the GW seat URL against
+                    DOORMAN_SERVER and failed for every real GW task).
 
     Never raises: any failure shape degrades to (base, work_id, None).
     """
@@ -671,6 +679,7 @@ def _acquire_claim_lease(task: dict) -> bool:
             task_id=task.get("id", ""),
             backend_url=backend_url,
             timeout_s=task.get("timeout_seconds"),
+            gw_url=backend_url,
         )
     except Exception as e:
         log.warning("claim-lease: acquire failed for %s: %s",
@@ -691,6 +700,7 @@ def _release_claim_lease(task: dict) -> None:
             work_id=work_id,
             task_id=task.get("id", ""),
             backend_url=backend_url,
+            gw_url=backend_url,
         )
     except Exception as e:
         log.warning("claim-lease: release failed for %s: %s",

@@ -1164,6 +1164,22 @@ def tail_finalize(
     if wip_steps is None:
         wip_steps = []
 
+    # Deterministic git (model never touches git) - defined at tail entry
+    # so EVERY path (the empty-diff bail, the self-commit recovery, the
+    # salvage partitions, the normal PR path) can use it. The legacy
+    # tail defined it later (after the salvage partitions); the bail
+    # needs it earlier, so it is hoisted here with the identical body.
+    def _git(*args: str) -> subprocess.CompletedProcess:
+        try:
+            import subprocess as _subprocess_mod
+            return _subprocess_mod.run(
+                ["git", "-C", cwd, *args],
+                capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"WARN: local-fixer: git {args[0]} timed out", file=sys.stderr)
+            return subprocess.CompletedProcess(["git", "-C", cwd, *args], 1, "", "timeout")
+
     def _tests_passed(outcome: dict | None) -> bool:
         if not outcome:
             return False
@@ -1241,44 +1257,6 @@ def tail_finalize(
     # (rc=1 failures, rc=2 collection error, rc=4 usage/path error,
     # rc=5 no tests collected - an empty touched file correctly fails
     # closed). A None (unusable) re-run keeps the fail-closed verdict.
-    #
-    # agents-core-local-fixer-gate-nonpython-v0 (Deliverable 3,
-    # attestation-contract-v0 leg 1 D4b): the re-run is scoped to the
-    # model's touched tests ONLY when the worktree has NO Python test
-    # infrastructure - the full-suite collection (the legacy behavior)
-    # is exactly what hangs in a Rust+TS worktree (a root-level
-    # pyproject/setup.cfg is pytest infra but the suite itself has no
-    # python tests; a full-dir collection can run for minutes on a
-    # large non-python repo). A worktree WITH python test infra keeps
-    # the legacy full-suite command byte-identically (the _test_prefix
-    # + argv_paths shape is unchanged).
-    if not _has_python_test_infra(Path(cwd)):
-        _touched_paths = sorted(set(model_touched_tests))
-        _touched_env = {
-            **os.environ,
-            # The model's own run_tests tool runs with this env
-            # (gw_agent.py RunToolsExecutor) - the re-run mirrors it so
-            # the gate re-tests in the same environment the model saw.
-            "PYTHONPATH": cwd,
-        }
-        _touched_rerun = _gate_targeted_rerun(
-            cwd, set(_touched_paths) if _touched_paths else None,
-            timeout_s=180, env=_touched_env,
-        )
-        if _touched_rerun is not None:
-            last_test_outcome = _touched_rerun
-            gate_passed = (_touched_rerun.get("returncode") == 0)
-            _tail_log(
-                task_id,
-                "gate re-run scoped to model-touched tests "
-                f"(no python test infra in worktree; "
-                f"touched={_touched_paths or '[] (no tests touched)'}; "
-                f"rc={_touched_rerun.get('returncode')})",
-            )
-            gate_rerun_fired = True
-            return gate_passed, last_test_outcome
-        # The scoped re-run was unusable (spawn/timeout): fall through to
-        # the legacy full-suite re-run below (fail-closed behavior).
     #
     # CURRENT worktree state, so a fix made after the model's last
     # run_tests is picked up (the v2-retry shape). The re-run outcome
@@ -1917,18 +1895,7 @@ def tail_finalize(
                 transcript_path=transcript_path,
             )
 
-    # Deterministic git (model never touches git)
-    def _git(*args: str) -> subprocess.CompletedProcess:
-        try:
-            import subprocess as _subprocess_mod
-            return _subprocess_mod.run(
-                ["git", "-C", cwd, *args],
-                capture_output=True, text=True, timeout=30,
-            )
-        except subprocess.TimeoutExpired:
-            print(f"WARN: local-fixer: git {args[0]} timed out", file=sys.stderr)
-            return subprocess.CompletedProcess(["git", "-C", cwd, *args], 1, "", "timeout")
-
+    # (_git is defined at tail entry - see above.)
     r = _git("checkout", "-B", branch)
     if r.returncode != 0:
         print(f"WARN: local-fixer: git checkout -b failed: {r.stderr.strip()}", file=sys.stderr)

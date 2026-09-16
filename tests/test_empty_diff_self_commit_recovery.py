@@ -16,8 +16,16 @@ PR carrying the committed work (body diff summary non-empty, marker
 present); the no-work case leaves a WARN naming the WIP ref + HEAD sha.
 
 These tests drive the recovery decision + the PR-body construction
-against a real scratch git repo (no LLM, no Forgejo - the git operations
-and the body shape are the unit under test).
+against a real scratch git repo, and the REAL tail bail path
+(`tail_finalize` with an empty final_diff) - no LLM, no Forgejo (the
+git operations, the body shape, and the tail's bail WARN are the unit
+under test).
+
+Cycle-2 reviewer finding: the rev-1 tests asserted on a synthetic ERROR
+line printed by the test itself (test_bail_warn_names_wip_ref_and_head_sha)
+and on the gw_agent source text (test_base_sha_capture_present_at_tail_entry
+was a source-inspection assertion, not behavioral). Both now exercise the
+real code path.
 """
 from __future__ import annotations
 
@@ -95,18 +103,48 @@ class TestSelfCommitRecovery:
         assert "work.py" in body
         assert "(no changes)" not in body
 
-    def test_base_sha_capture_present_at_tail_entry(self):
-        """The base_sha capture is asserted present at tail entry (absent
-        capture -> the recovery path is unreachable, so the capture
-        itself is tested): gw_agent._build_fixer_result captures
-        `git rev-parse HEAD` after setup (the F2 pattern the opencode
-        engine already had)."""
+    def test_base_sha_capture_threads_to_tail_entry(self, tmp_path: Path):
+        """The base_sha capture is asserted BEHAVIORALLY at tail entry
+        (absent capture -> the recovery path is unreachable, so the
+        capture itself is tested): the local-fixer engine captures
+        `git rev-parse HEAD` at SETUP time (post-setup_worktree - the F2
+        pattern the opencode engine already had), threads it into
+        gw_agent._build_fixer_result, and the engine threads the
+        fixer_result's base_sha into tail_finalize.
+
+        The unit under test is the THREADING: _build_fixer_result
+        carries the base_sha parameter through into the result dict, and
+        tail_finalize's signature accepts it (a pre-run capture, not a
+        post-run one - a post-run capture would read the model's own
+        commit and the recovery diff would be empty).
+        """
         import inspect
 
         from agents_core import gw_agent
-        src = inspect.getsource(gw_agent._build_fixer_result)
-        assert '"base_sha"' in src
-        assert "rev-parse" in src
+
+        # (1) _build_fixer_result carries the base_sha parameter into the
+        # result dict (behavioral: call it in a real scratch repo with a
+        # known HEAD and assert the result carries it).
+        base_sha = _init_repo(tmp_path)
+        result = gw_agent._build_fixer_result(
+            cwd=str(tmp_path),
+            transcript=[],
+            concluded=True,
+            base_sha=base_sha,
+        )
+        assert result.get("base_sha") == base_sha
+
+        # (2) the engine threads the capture into _build_fixer_result and
+        # the fixer_result into tail_finalize (signature-level: the
+        # parameter exists on both seams - the capture itself is the
+        # subprocess `git rev-parse HEAD` at setup, exercised by the
+        # real engine in production and by (1) here).
+        sig = inspect.signature(gw_agent._build_fixer_result)
+        assert "base_sha" in sig.parameters
+        assert sig.parameters["base_sha"].default == ""
+        tail_sig = inspect.signature(shaped_runner.tail_finalize)
+        assert "base_sha" in tail_sig.parameters
+        assert tail_sig.parameters["base_sha"].default == ""
 
     def test_no_commit_step_on_clean_index(self, tmp_path: Path):
         """The normal PR path bails on a clean index (commit -m on a clean
@@ -126,22 +164,58 @@ class TestSelfCommitRecovery:
         assert recovered["head_sha"] == head_before
         assert _git(tmp_path, "rev-parse", "HEAD") == head_before
 
-    def test_bail_warn_names_wip_ref_and_head_sha(self, tmp_path: Path, capsys):
-        """The no-work bail: the WARN line names the WIP ref + HEAD sha
-        (postmortem material - the finding's named minimum)."""
+    def test_bail_warn_names_wip_ref_and_head_sha(
+        self, tmp_path: Path, capsys, monkeypatch,
+    ):
+        """The no-work bail: the REAL tail bail path (tail_finalize with
+        an empty final_diff and an empty re-derivation) prints a WARN
+        naming the WIP ref + the worktree HEAD sha (postmortem material
+        - the finding's named minimum).
+
+        Cycle-2 reviewer finding: the rev-1 test asserted on a synthetic
+        ERROR line printed by the test itself. This test drives the
+        actual tail_finalize bail: the recovery is unreachable (no work
+        past base), the gate is green, and the tail's own WARN line is
+        captured from stderr.
+        """
         base_sha = _init_repo(tmp_path)
         head_sha = _git(tmp_path, "rev-parse", "HEAD")
-
-        # the bail path (re-derivation empty): the WARN is printed
-        # (the tail prints it; here we assert the shape the tail uses)
         wip_ref = "refs/heads/wip-salvage"
-        # simulate the tail's bail WARN (the exact line the tail prints)
-        import sys
-        print(
-            f"ERROR: shaped: empty diff at tail (no work vs base {base_sha[:8]}); "
-            f"WIP ref {wip_ref}, worktree HEAD {head_sha[:8]} - no PR, no salvage",
-            file=sys.stderr,
+
+        # No work past base: the recovery re-derivation is empty, so the
+        # bail fires. Forgejo is unreachable (the bail returns before
+        # any PR call, so no network).
+        monkeypatch.setenv("FORGEJO_BASE_URL", "http://127.0.0.1:1")
+
+        pr_url = shaped_runner.tail_finalize(
+            task_id="t-bail",
+            target_id="tgt-bail",
+            bare_repo="owner/repo",
+            branch="lapis/tgt-bail/x",
+            slug="tgt-bail",
+            cwd=str(tmp_path),
+            worktree_path=str(tmp_path),
+            final_diff="",  # index-vs-HEAD: empty (the bail condition)
+            concluded=True,
+            last_test_outcome=None,
+            max_steps_hit=False,
+            no_progress_hit=False,
+            stop_reason="",
+            step_count=1,
+            transcript_path=tmp_path / "transcript.jsonl",
+            gate_passed=True,
+            gate_bypassed=None,
+            model_touched_tests=set(),
+            gate_rerun_fired=False,
+            wip_ref=wip_ref,
+            base_sha=base_sha,
         )
+        # the bail: no PR opened
+        assert pr_url == ""
+
         err = capsys.readouterr().err
+        # the REAL tail WARN line names the WIP ref + the worktree HEAD
+        # sha (the finding's named minimum - postmortem material)
+        assert "empty diff" in err
         assert wip_ref in err
         assert head_sha[:8] in err
