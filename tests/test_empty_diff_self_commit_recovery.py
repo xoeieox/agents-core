@@ -219,3 +219,219 @@ class TestSelfCommitRecovery:
         assert "empty diff" in err
         assert wip_ref in err
         assert head_sha[:8] in err
+
+
+# ---------------------------------------------------------------------------
+# Cycle-4 reviewer finding (PR #322): the D2 recovery is scoped to the
+# NON-concluded self-commit shape. The concluded + gate_passed +
+# empty-tail-diff + HEAD-past-base shape must keep routing to the existing
+# [SALVAGE] path exactly as before (D2 DO-NOT-CHANGE list / Standing
+# ratification 3: D1/D2 change how the WIP tree is constructed / how the
+# empty-diff bail recovers, NOT when salvage fires). These two tests pin
+# both shapes against the REAL tail_finalize decision:
+#   non-concluded self-commit -> normal PR with the committed work
+#   concluded gate-green empty-tail-diff -> [SALVAGE] path (unchanged)
+# ---------------------------------------------------------------------------
+
+
+def _tail_kwargs(**overrides) -> dict:
+    """The tail_finalize kwargs for the shape-pinning tests (real scratch
+    repo, empty in-tail diff)."""
+    kwargs = dict(
+        task_id="t-shape",
+        target_id="tgt-shape",
+        bare_repo="owner/repo",
+        branch="lapis/tgt-shape/x",
+        slug="tgt-shape",
+        worktree_path=None,
+        final_diff="",  # index-vs-HEAD: empty (the model self-committed)
+        last_test_outcome={"passed": 1, "failed": 0, "errors": 0,
+                           "returncode": 0},
+        max_steps_hit=False,
+        no_progress_hit=False,
+        stop_reason="",
+        step_count=1,
+        transcript_path=Path("transcript.jsonl"),
+        gate_passed=True,
+        gate_bypassed=None,
+        model_touched_tests=set(),
+        gate_rerun_fired=False,
+        wip_ref="",
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+class TestSelfCommitRecoveryShapeScope:
+    def test_non_concluded_self_commit_opens_normal_pr(
+        self, tmp_path: Path, monkeypatch, capsys,
+    ):
+        """NON-concluded self-commit (clean index, HEAD past base, gate
+        green, max-steps ceiling): the D2 recovery opens a NORMAL PR
+        carrying the committed work (the marker present, the diff summary
+        non-empty). The max-steps shape is the real non-concluded shape
+        that reaches the empty-diff partition with gate_passed (the
+        `if not concluded` block's salvaged=True branch: a budget ceiling
+        with a gate-green worktree is salvage-eligible and falls through
+        to the empty-diff partition, where the recovery fires - a
+        non-concluded run with neither a budget flag nor a no-progress
+        abort is an unclassified death - TAIL_UNCLASSIFIED_DEATH - and
+        never reaches the recovery).
+        """
+        import agents_core.forgejo as forgejo
+
+        base_sha = _init_repo(tmp_path)
+        (tmp_path / "work.py").write_text("work\n")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "commit", "-qm", "model self-commit"],
+                       cwd=tmp_path, check=True)
+        head_sha = _git(tmp_path, "rev-parse", "HEAD")
+
+        calls = {}
+
+        def _fake_create_pr(repo, title, head, base="main", body="",
+                            owner=None):
+            calls["repo"] = repo
+            calls["title"] = title
+            calls["head"] = head
+            calls["base"] = base
+            calls["body"] = body
+            return {"html_url": "http://forgejo/pr/1"}
+
+        monkeypatch.setattr(forgejo, "create_pr", _fake_create_pr)
+        monkeypatch.setattr(forgejo, "get_open_prs", lambda repo, owner=None: [])
+
+        pr_url = shaped_runner.tail_finalize(
+            cwd=str(tmp_path),
+            concluded=False,
+            base_sha=base_sha,
+            **_tail_kwargs(max_steps_hit=True),
+        )
+        assert pr_url == "http://forgejo/pr/1"
+        # a NORMAL PR (not a [SALVAGE] title), from the worktree HEAD as-is
+        assert calls["title"] == "fix(tgt-shape): local-fixer"
+        assert calls["head"] == "lapis/tgt-shape/x"
+        assert calls["base"] == "main"
+        # the committed work is in the body: non-empty diff summary + the
+        # machine-visible recovery marker
+        assert "work.py" in calls["body"]
+        assert f"<!-- lapis-self-commit-recovery: {head_sha} -->" in calls["body"]
+        # no new commit: HEAD is still the model's own self-commit
+        assert _git(tmp_path, "rev-parse", "HEAD") == head_sha
+        # the recovery's INFO line (not the salvage partition's WARN)
+        err = capsys.readouterr().err
+        assert "self-commit recovery" in err
+
+    def test_concluded_gate_green_empty_diff_keeps_salvage_path(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """CONCLUDED + gate_passed + empty-tail-diff + HEAD-past-base:
+        the D2 normal-PR recovery is OUT OF SCOPE for this shape (cycle-4
+        reviewer, PR #322). The shape keeps routing to the existing
+        [SALVAGE] path exactly as before - the if-not-gate_passed
+        concluded_gate_rejected worktree-salvage partition (DO-NOT-CHANGE):
+        the salvage commit + the [SALVAGE] PR from the salvage ref, never
+        the normal-PR recovery (no `lapis-self-commit-recovery` marker, no
+        normal-PR title)."""
+        import agents_core.forgejo as forgejo
+
+        base_sha = _init_repo(tmp_path)
+        (tmp_path / "work.py").write_text("work\n")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "commit", "-qm", "model self-commit"],
+                       cwd=tmp_path, check=True)
+        head_sha = _git(tmp_path, "rev-parse", "HEAD")
+
+        calls = {}
+
+        def _fake_create_pr(repo, title, head, base="main", body="",
+                            owner=None):
+            calls["title"] = title
+            calls["head"] = head
+            calls["body"] = body
+            return {"html_url": "http://forgejo/pr/2"}
+
+        monkeypatch.setattr(forgejo, "create_pr", _fake_create_pr)
+        monkeypatch.setattr(forgejo, "get_open_prs", lambda repo, owner=None: [])
+
+        pr_url = shaped_runner.tail_finalize(
+            cwd=str(tmp_path),
+            concluded=True,
+            base_sha=base_sha,
+            **_tail_kwargs(),
+        )
+        # The concluded shape does NOT take the normal-PR recovery (the
+        # `lapis-self-commit-recovery` marker is absent from any PR body
+        # and no normal-PR title was attempted). The concluded shape's
+        # salvage routing is the pre-D2 behavior, pinned here against the
+        # real tail: with WIP commits the concluded_gate_rejected
+        # worktree-salvage partition opens the [SALVAGE] PR; with no WIP
+        # commits it bails with the WARN naming the WIP ref + HEAD sha
+        # (the D2 extension of the existing bail).
+        assert "lapis-self-commit-recovery" not in (calls.get("body") or "")
+        assert calls.get("title", "").startswith("[SALVAGE]") or pr_url == ""
+        # the model's self-commit was NOT pushed as a normal PR: HEAD is
+        # unchanged (no recovery commit, no checkout -B + push from the
+        # recovery path)
+        assert _git(tmp_path, "rev-parse", "HEAD") == head_sha
+
+    def test_concluded_gate_green_empty_diff_with_wip_salvages(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """CONCLUDED + gate_passed + empty-tail-diff + HEAD-past-base WITH
+        WIP commits: the existing [SALVAGE] path is unchanged - the
+        concluded_gate_rejected worktree-salvage partition commits the
+        worktree state (a no-op commit on the clean index) and opens the
+        [SALVAGE] PR from the salvage ref. The D2 normal-PR recovery does
+        NOT fire for this shape (cycle-4 reviewer, PR #322)."""
+        import agents_core.forgejo as forgejo
+
+        base_sha = _init_repo(tmp_path)
+        (tmp_path / "work.py").write_text("work\n")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "commit", "-qm", "model self-commit"],
+                       cwd=tmp_path, check=True)
+        head_sha = _git(tmp_path, "rev-parse", "HEAD")
+
+        # A WIP ref exists in this scratch repo (the salvage partition
+        # pushes the WIP history; the push fails against the unreachable
+        # origin, so the partition soft-fails to "" - the routing to the
+        # salvage partition itself is what is pinned).
+        subprocess.run(["git", "update-ref", "refs/wip/t-shape", head_sha],
+                       cwd=tmp_path, check=True)
+
+        calls = {}
+
+        def _fake_create_pr(repo, title, head, base="main", body="",
+                            owner=None):
+            calls["title"] = title
+            calls["head"] = head
+            calls["body"] = body
+            return {"html_url": "http://forgejo/pr/3"}
+
+        monkeypatch.setattr(forgejo, "create_pr", _fake_create_pr)
+        monkeypatch.setattr(forgejo, "get_open_prs", lambda repo, owner=None: [])
+        monkeypatch.setenv("FORGEJO_BASE_URL", "http://127.0.0.1:1")
+
+        pr_url = shaped_runner.tail_finalize(
+            cwd=str(tmp_path),
+            concluded=True,
+            base_sha=base_sha,
+                wip_commit_count=1,
+            wip_head_sha=head_sha,
+            **_tail_kwargs(wip_ref="refs/wip/t-shape"),
+        )
+        # The salvage partition was entered (the push to the unreachable
+        # origin soft-fails to "" - the routing is the pin, not the push).
+        # The normal-PR recovery did NOT fire: no recovery marker in any
+        # PR body, and the model's self-commit was NOT pushed as a normal
+        # PR (HEAD unchanged - the salvage partition's no-op commit on
+        # the clean index does not move HEAD).
+        assert "lapis-self-commit-recovery" not in (calls.get("body") or "")
+        assert calls.get("title", "").startswith("[SALVAGE]") or pr_url == ""
+        assert _git(tmp_path, "rev-parse", "HEAD") == head_sha
+        # the stderr names the salvage routing (the partition's WARN),
+        # not the normal-PR recovery's INFO line
+        err = capsys.readouterr().err
+        assert "self-commit recovery" not in err
+        assert "empty diff" in err or "wip-salvage" in err

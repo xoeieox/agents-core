@@ -1660,12 +1660,29 @@ def tail_finalize(
             # deliverable from the worktree: HEAD vs the captured base.
             #
             # gate_passed guard (attestation-contract-v0 rev-4): the
-            # recovery opens a NORMAL PR - a concluded run with a clean
-            # index and a FAILED gate must NOT push/open a PR through it.
-            # That shape routes to the [SALVAGE] path below (the
-            # if-not-gate_passed block) instead.
+            # recovery opens a NORMAL PR - a run with a clean index and a
+            # FAILED gate must NOT push/open a PR through it. That shape
+            # routes to the [SALVAGE] path below (the if-not-gate_passed
+            # block) instead.
+            #
+            # concluded guard (cycle-4 reviewer, PR #322): the D2 contract
+            # is scoped to the NON-concluded self-commit case. The
+            # concluded + gate_passed + empty-tail-diff + HEAD-past-base
+            # shape keeps routing to the existing [SALVAGE] path exactly
+            # as before (the D2 DO-NOT-CHANGE list / Standing ratification
+            # 3: D1/D2 change how the WIP tree is constructed and how the
+            # empty-diff bail recovers, NOT when salvage fires - a run
+            # that opens a [SALVAGE] PR is not a death). The concluded
+            # shape therefore skips the normal-PR recovery below and
+            # falls through to the concluded [SALVAGE] partitions:
+            # worktree_vanished -> the concluded_empty_diff_wip_salvage
+            # partition (above), else (with WIP commits) the
+            # concluded_gate_rejected worktree-salvage partition (below,
+            # which commits the worktree state - a no-op commit here on
+            # the clean index, then pushes HEAD as the salvage commit),
+            # else the WARN bail (no work past base).
             _recovery_head = ""
-            if base_sha and gate_passed:
+            if base_sha and gate_passed and not concluded:
                 _recovered = _empty_diff_recovery_rederive(cwd, base_sha)
                 if _recovered is not None:
                     # The model self-committed: the gate-verified worktree
