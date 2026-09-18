@@ -90,6 +90,11 @@ class = "B"
 env_var = ["TARGETS_DIR", "WEAVER_TARGETS_DIR", "PM_TARGETS_DIR"]
 access = "both"
 
+[keys.friction]
+subpath = "friction"
+class = "B"
+access = "both"
+
 [keys."targets.comments"]
 subpath = "targets/comments"
 class = "B"
