@@ -122,9 +122,18 @@ class MemClient:
         _timeout = timeout if timeout is not None else float(
             os.environ.get("MEM_CLIENT_TIMEOUT", "5.0")
         )
+        _principal = (
+            principal if principal is not None
+            else os.environ.get("MEM_PRINCIPAL", "")
+        )
         headers = {}
         if _token:
             headers["Authorization"] = f"Bearer {_token}"
+        if _principal:
+            # The principal travels in a dedicated header (D1) — never in
+            # `source`, which the server backfills to its hostname and which
+            # any client can spoof.
+            headers["X-Mem-Principal"] = _principal
         self._client = httpx.Client(
             base_url=self._base_url,
             headers=headers,
