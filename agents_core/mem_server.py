@@ -584,8 +584,14 @@ def create_app(
         # decision/memdb-promotion-<YYYYMMDD>-<curator> lists promoted keys +
         # their --from refs. Upserted (append-if-new) so a curation run
         # accumulates its batch in one key.
+        # The batch decision key is ALSO a store write — it rides the same
+        # write-class guard (a reader must not be able to write the batch
+        # key even if the promoted row's write were somehow allowed).
         day = datetime.now(timezone.utc).strftime("%Y%m%d")
         batch_key = f"decision/memdb-promotion-{day}-{principal}"
+        reject = _write_guard(request, "PUT", batch_key)
+        if reject is not None:
+            return reject
         line = f"- {key} --from {ref}"
         existing = store.get(batch_key)
         if existing and line in existing["content"]:
