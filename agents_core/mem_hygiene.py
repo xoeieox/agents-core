@@ -510,10 +510,25 @@ class MemHygieneRunner:
         self._artifact_dir = artifact_dir
         now = datetime.now(timezone.utc)
         self.run_id = run_id or f"hyg-{now.strftime('%Y%m%dT%H%M%SZ')}-{now.microsecond:06d}"
-        # Ensure the quarantine table exists (idempotent).
+        self._schema_ready = False
+
+    def ensure_schema(self) -> None:
+        """Bootstrap the quarantine table ONCE per runner instance.
+
+        Reviewer medium (PR #329 cycle 1): the schema bootstrap used to run
+        in __init__ and thus re-executed the (idempotent) CREATE TABLE IF
+        NOT EXISTS + commit on every construction — the mem-server builds a
+        runner per request. It is now lazy: called at the top of each
+        run/restore/ageout mutation, executed at most once per instance,
+        and kept OUTSIDE the run transaction (the spec's one-transaction-
+        per-run invariant covers the run, not the bootstrap).
+        """
+        if self._schema_ready:
+            return
         with self._store._lock:
             self._store._conn.executescript(QUARANTINE_SCHEMA)
             self._store._conn.commit()
+        self._schema_ready = True
 
     # ------------------------------------------------------------------
     # D2 — dead-stream classifier (direct SQL, both stores)
