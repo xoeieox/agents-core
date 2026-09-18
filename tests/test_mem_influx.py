@@ -298,6 +298,48 @@ def test_observe_report_endpoint(tmp_db, allowlist_file, observe_log, no_enforce
 
 
 # ---------------------------------------------------------------------------
+# D1 — promote is in the write class (reviewer PR #328 cycle 2 [med])
+# ---------------------------------------------------------------------------
+
+def test_promote_by_reader_rejected_403_enforce(tmp_db, allowlist_file, observe_log, enforce):
+    """The /v0/promote endpoint runs the write-class guard on the validated
+    key: a reader (absent principal) is rejected with 403 principal_reader
+    and NOTHING is written (neither the promoted row nor the batch decision
+    key)."""
+    with _enforce_client(tmp_db, allowlist_file, observe_log, enforce) as c:
+        resp = c.post(
+            "/v0/promote",
+            json={
+                "key": "finding/promote-reader",
+                "from": "openclaw/gw",
+                "content": "x",
+            },
+        )
+        assert resp.status_code == 403
+        assert resp.json()["error"]["code"] == "principal_reader"
+        # Nothing landed: no promoted row, no batch decision key.
+        assert c.get("/v0/memories/finding/promote-reader").status_code == 404
+
+
+def test_promote_by_curator_allowed_enforce(tmp_db, allowlist_file, observe_log, enforce):
+    """The same promote, by a registered curator, is allowed under
+    enforcement (the guard passes for the curator role)."""
+    with _enforce_client(tmp_db, allowlist_file, observe_log, enforce) as c:
+        resp = c.post(
+            "/v0/promote",
+            json={
+                "key": "finding/promote-curator",
+                "from": "openclaw/gw",
+                "principal": "brix-pm",
+                "content": "x",
+            },
+            headers={"X-Mem-Principal": "brix-pm"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["source"] == "promoted:openclaw/gw"
+
+
+# ---------------------------------------------------------------------------
 # D3 — machine-state reject + machinery-store write
 # ---------------------------------------------------------------------------
 
