@@ -972,6 +972,7 @@ class MemHygieneRunner:
 
     def quarantine_stats(self) -> dict[str, Any]:
         """``mem hygiene list`` surface: quarantine table census."""
+        self.ensure_schema()
         with self._store._lock:
             conn = self._store._conn
             by_run = [
