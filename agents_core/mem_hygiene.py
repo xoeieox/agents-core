@@ -295,16 +295,6 @@ CREATE TABLE IF NOT EXISTS memories_quarantine (
 );
 """
 
-# Keys that carry the D4 write-guard bypass (named exception, panel F6):
-# restore/purge are direct store writes from the maintenance path and
-# intentionally bypass the set-guard; each bypass is logged in the run's
-# provenance line. The guard consults this set BEFORE the source-pattern
-# reject so the maintenance path can never be locked out by its own guard.
-GUARD_BYPASS_KEYS: frozenset[str] = frozenset({
-    "decision/mem-hygiene-guard-bypass",
-})
-
-
 def is_atom_class_key(key: str) -> bool:
     """True if `key` sits under an atom-class prefix (D6 must-not-touch)."""
     return key.startswith(ATOM_CLASS_PREFIXES)
