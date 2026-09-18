@@ -921,6 +921,7 @@ class MemHygieneRunner:
         if is_atom_class_key(prefix):
             raise ValueError(f"refusing to restore atom-class prefix {prefix!r}")
         pattern = _like_escape(prefix) + "%"
+        self.ensure_schema()
         with self._store._lock:
             conn = self._store._conn
             try:
