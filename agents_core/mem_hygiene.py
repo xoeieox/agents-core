@@ -753,12 +753,22 @@ class MemHygieneRunner:
         *,
         dry_run: bool = False,
         allow_over_cap: bool = False,
+        candidates: list[dict] | None = None,
+        prefixes: list[CandidatePrefix] | None = None,
     ) -> QuarantineVerdict:
         """One hygiene run (D1 + D3). dry_run=True writes the candidate
         artifact and returns without mutating. Otherwise: one transaction
         — INSERT OR IGNORE into memories_quarantine + DELETE from
         memories — with the count-mismatch abort and the FTS integrity
-        halt. Raises HygieneAborted on any abort condition."""
+        halt. Raises HygieneAborted on any abort condition.
+
+        ``candidates``/``prefixes`` (reviewer medium, PR #329 cycle 1): a
+        caller that already ran the dry-run enumeration (the night node
+        writes the candidate artifact BEFORE any mutation) may pass its
+        result through so the mutation operates on the SAME enumeration —
+        no double-classification, and the store cannot drift between the
+        artifact and the quarantine. When omitted, this method enumerates
+        itself (the server endpoints keep that shape)."""
         now = datetime.now(timezone.utc)
         verdict = QuarantineVerdict(
             run_id=self.run_id,
@@ -767,7 +777,8 @@ class MemHygieneRunner:
             batch_cap=self._config.batch_cap,
             allow_over_cap=allow_over_cap,
         )
-        candidates, prefixes = self.list_candidates(now=now)
+        if candidates is None or prefixes is None:
+            candidates, prefixes = self.list_candidates(now=now)
         eligible = [p for p in prefixes if p.eligible]
         verdict.eligible_prefixes = eligible
         verdict.ineligible_prefixes = [p for p in prefixes if not p.eligible]
