@@ -804,6 +804,7 @@ class MemHygieneRunner:
             return verdict
 
         reason = "dead-stream quarantine (mem-hygiene-automation-v0)"
+        self.ensure_schema()
         with self._store._lock:
             conn = self._store._conn
             try:
