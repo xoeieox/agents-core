@@ -1,0 +1,13 @@
+{
+  "comment": "Machine-state allowlist + thresholds for the mem hygiene runner (mem-hygiene-automation-v0). Explicit config via MEM_HYGIENE_CONFIG — never auto-inferred. D6 backstop: any allowlist entry under an atom-class prefix (decision/, finding/, correction/, reference/, pattern/, intent/, project/, candidate/, state/, scar/, router/lapis-pm/) is refused in code regardless of this file.",
+  "registry": "dead_producers.json",
+  "allowlist": [
+    "elevator/",
+    "weather/",
+    "test/",
+    "arc-scratch-20260727/"
+  ],
+  "dead_stream_age_days": 30,
+  "batch_cap": 5000,
+  "rollback_window_days": 14
+}
