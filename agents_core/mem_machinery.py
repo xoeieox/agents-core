@@ -88,19 +88,53 @@ class MachineStateEntry:
     dead_since: str | None = None
 
 
+@dataclass(frozen=True)
+class ExcludedPrefix:
+    """A prefix that is DELIBERATELY NOT a machine-state prefix (the file's
+    ``excluded`` section). Carried through ``load_allowlist`` so the exclusion
+    rationale is machine-readable (reviewer 2026-09-18, PR #330 cycle 1
+    [low]): the note used to live only in the top-level human ``note`` string
+    and a non-standard top-level ``excluded`` field that ``load_allowlist``
+    ignored. Shape: {prefix, state: "excluded", reason}. The prefix follows the
+    same literal trailing-slash convention as machine-state entries; ``reason``
+    is free-text (the 'why' for the exclusion)."""
+    prefix: str
+    state: str
+    reason: str
+
+
 @dataclass
 class MachineStateAllowlist:
     """The parsed, validated allowlist.
 
     ``entries`` preserves file order. ``prefixes`` is the tuple used for
     ``str.startswith`` matching (the startswith-only convention).
+    ``excluded`` carries the file's ``excluded`` section (prefixes that are
+    DELIBERATELY NOT machine-state) so the exclusion rationale is machine-
+    readable, not just human-readable in the top-level ``note`` (reviewer
+    2026-09-18, PR #330 cycle 1 [low]). Excluded prefixes are NOT in
+    ``entries`` and are never treated as machine-state — this field is
+    documentation that the parser actually consumes, so a parser reading the
+    JSON alone can see WHY a prefix is absent from the faucet list.
     """
 
     entries: list[MachineStateEntry] = field(default_factory=list)
+    excluded: list[ExcludedPrefix] = field(default_factory=list)
 
     @property
     def prefixes(self) -> tuple[str, ...]:
         return tuple(e.prefix for e in self.entries)
+
+    @property
+    def excluded_prefixes(self) -> tuple[str, ...]:
+        return tuple(e.prefix for e in self.excluded)
+
+    def is_excluded(self, key: str) -> bool:
+        """True if the key falls under a DELIBERATELY-excluded prefix
+        (documented non-machine-state). Excluded prefixes are never
+        machine-state — this is a documentation/consistency surface, not a
+        routing one (route_to_exhaust only ever consults ``entries``)."""
+        return any(key.startswith(e.prefix) for e in self.excluded)
 
     def producer_for(self, key: str) -> str | None:
         """The registered producer principal for a key under a machine-state
@@ -112,6 +146,32 @@ class MachineStateAllowlist:
 
     def is_machine_state(self, key: str) -> bool:
         return any(key.startswith(e.prefix) for e in self.entries)
+
+
+def _validate_excluded_entry(raw: Any, idx: int) -> ExcludedPrefix:
+    if not isinstance(raw, dict):
+        raise AllowlistError(f"excluded entry #{idx} is not an object: {raw!r}")
+    prefix = raw.get("prefix")
+    if not isinstance(prefix, str) or not prefix:
+        raise AllowlistError(f"excluded entry #{idx} has a missing/empty 'prefix'")
+    if not prefix.endswith("/"):
+        raise AllowlistError(
+            f"excluded entry #{idx} prefix {prefix!r} must be a literal "
+            f"trailing-slash prefix (startswith-only convention)"
+        )
+    state = raw.get("state")
+    if state != "excluded":
+        raise AllowlistError(
+            f"excluded entry #{idx} ({prefix!r}) has invalid 'state' {state!r} "
+            f"(must be 'excluded')"
+        )
+    reason = raw.get("reason")
+    if not isinstance(reason, str) or not reason:
+        raise AllowlistError(
+            f"excluded entry #{idx} ({prefix!r}) has a missing/empty 'reason' "
+            f"(the exclusion rationale must be machine-readable)"
+        )
+    return ExcludedPrefix(prefix=prefix, state=state, reason=reason)
 
 
 def _validate_entry(raw: Any, idx: int) -> MachineStateEntry:
@@ -200,7 +260,25 @@ def load_allowlist(path: Path | str = ALLOWLIST_PATH) -> MachineStateAllowlist:
             )
         seen.add(e.prefix)
 
-    return MachineStateAllowlist(entries=entries)
+    # The 'excluded' section (optional): prefixes that are DELIBERATELY NOT
+    # machine-state, with a machine-readable reason. Parsed and validated so
+    # the rationale is not invisible to anything that parses the JSON alone
+    # (reviewer 2026-09-18, PR #330 cycle 1 [low]). An excluded prefix that
+    # also appears in 'prefixes' is a config error (contradictory).
+    excluded_raw = data.get("excluded", [])
+    if not isinstance(excluded_raw, list):
+        raise AllowlistError(
+            f"allowlist file 'excluded' must be a list: {p}"
+        )
+    excluded = [_validate_excluded_entry(raw, i) for i, raw in enumerate(excluded_raw)]
+    for e in excluded:
+        if e.prefix in seen:
+            raise AllowlistError(
+                f"allowlist file prefix {e.prefix!r} is both in 'prefixes' and "
+                f"'excluded' (contradictory): {p}"
+            )
+
+    return MachineStateAllowlist(entries=entries, excluded=excluded)
 
 
 def machine_state_prefixes(path: Path | str = ALLOWLIST_PATH) -> tuple[str, ...]:

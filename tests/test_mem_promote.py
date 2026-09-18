@@ -206,6 +206,26 @@ def test_client_promote_posts_promote_endpoint():
     assert body["from"] == "openclaw/gw"
     assert body["principal"] == "brix-pm"
     assert body["content"] == "the finding"
+    # No rationale sent (optional; omitted when empty).
+    assert "rationale" not in body
+
+
+@respx.mock
+def test_client_promote_sends_rationale():
+    """The client sends the one-line rationale (D2 named decision artifact)
+    in the /v0/promote body when provided."""
+    c = MemClient(base_url=BASE, principal="brix-pm")
+    route = respx.post(f"{BASE}/v0/promote").mock(
+        return_value=httpx.Response(200, json={
+            "key": "finding/x", "content": "h", "tags": "promoted",
+            "source": "promoted:openclaw/gw", "created_at": "x", "updated_at": "y",
+            "batch_key": "decision/memdb-promotion-20260914-brix-pm",
+        })
+    )
+    c.promote("finding/x", "openclaw/gw", "brix-pm", "the finding",
+              rationale="friction-cluster insight")
+    body = json.loads(route.calls[0].request.content)
+    assert body["rationale"] == "friction-cluster insight"
 
 
 @respx.mock
@@ -272,6 +292,64 @@ def test_server_promote_provenance_round_trip(tmp_db, allowlist_file, observe_lo
         batch = c.get(f"/v0/memories/{body['batch_key']}").json()
         assert "finding/openclaw-friction-cluster" in batch["content"]
         assert "--from openclaw/gw" in batch["content"]
+
+
+def test_server_promote_batch_key_includes_rationale(tmp_db, allowlist_file, observe_log, no_enforce):
+    """The D2 named decision artifact: the batch decision key lists promoted
+    keys + their --from refs + one-line rationale. The rationale is audit
+    metadata only — it is NOT part of the provenance header shape (the
+    header stays exactly [promoted from <agent>/<store> by <principal> at
+    <ts>])."""
+    with _server_client(tmp_db, allowlist_file, observe_log, no_enforce) as c:
+        resp = c.post(
+            "/v0/promote",
+            json={
+                "key": "finding/openclaw-friction-cluster",
+                "from": "openclaw/gw",
+                "principal": "brix-pm",
+                "content": "the finding",
+                "tags": "openclaw",
+                "rationale": "friction-cluster insight",
+            },
+            headers={"X-Mem-Principal": "brix-pm"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        # The provenance header shape is UNCHANGED by the rationale (the
+        # rationale is audit metadata, not part of the header).
+        parsed = parse_promoted_header(body["content"])
+        assert parsed is not None
+        assert parsed["agent"] == "openclaw" and parsed["store"] == "gw"
+        assert parsed["principal"] == "brix-pm"
+
+        # The batch decision key lists the promoted key + ref + rationale.
+        batch = c.get(f"/v0/memories/{body['batch_key']}").json()
+        assert "finding/openclaw-friction-cluster" in batch["content"]
+        assert "--from openclaw/gw" in batch["content"]
+        assert "friction-cluster insight" in batch["content"]
+
+
+def test_server_promote_rejects_multi_line_rationale(tmp_db, allowlist_file, observe_log, no_enforce):
+    """A multi-line/control-char rationale is rejected with a loud 400
+    (the batch key is a single-content audit row — a multi-line rationale
+    would corrupt the line-based listing the same way a --from injection
+    would corrupt the header)."""
+    with _server_client(tmp_db, allowlist_file, observe_log, no_enforce) as c:
+        resp = c.post(
+            "/v0/promote",
+            json={
+                "key": "finding/x",
+                "from": "openclaw/gw",
+                "principal": "brix-pm",
+                "content": "x",
+                "rationale": "line1\nline2",
+            },
+            headers={"X-Mem-Principal": "brix-pm"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"]["error"]["code"] == "bad_rationale"
+        # The row must NOT have been written.
+        assert c.get("/v0/memories/finding/x").status_code == 404
 
 
 def test_server_promote_rejects_newline_ref_loud_400(tmp_db, allowlist_file, observe_log, no_enforce):

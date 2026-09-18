@@ -121,6 +121,73 @@ def test_accepts_valid_allowlist(tmp_db, allowlist_file, observe_log, no_enforce
 
 
 # ---------------------------------------------------------------------------
+# Excluded-prefix parsing (reviewer 2026-09-18, PR #330 cycle 1 [low])
+# ---------------------------------------------------------------------------
+
+def test_excluded_prefix_is_machine_readable(tmp_path):
+    """The 'excluded' section of the allowlist is parsed and validated so
+    the exclusion rationale is machine-readable (not just human-readable in
+    the top-level 'note' string). A parser reading the JSON alone can see
+    WHY a prefix is absent from the faucet list."""
+    from agents_core.mem_machinery import load_allowlist
+
+    allowlist = load_allowlist(SHARED_ALLOWLIST)
+    # The shared allowlist has 'test/' in its excluded section.
+    assert "test/" in allowlist.excluded_prefixes
+    # The excluded prefix is NOT in the machine-state entries.
+    assert "test/" not in allowlist.prefixes
+    # The rationale is machine-readable (not just a human note).
+    test_entry = next(e for e in allowlist.excluded if e.prefix == "test/")
+    assert test_entry.state == "excluded"
+    assert test_entry.reason  # non-empty
+    # The excluded prefix is never treated as machine-state.
+    assert not allowlist.is_machine_state("test/key")
+    assert allowlist.is_excluded("test/key")
+
+
+def test_excluded_prefix_malformed_refuses(tmp_db, tmp_path, observe_log, no_enforce):
+    """A malformed 'excluded' entry (missing reason, wrong state, or a
+    prefix that is also in 'prefixes') REFUSES TO START (fail-closed)."""
+    # Missing reason.
+    bad = tmp_path / "bad-excluded.json"
+    bad.write_text(json.dumps({"prefixes": [], "excluded": [
+        {"prefix": "test/", "state": "excluded"}]}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="REFUSES TO START"):
+        create_app(tmp_db, allowlist_path=bad)
+
+    # Wrong state.
+    bad2 = tmp_path / "bad-state.json"
+    bad2.write_text(json.dumps({"prefixes": [], "excluded": [
+        {"prefix": "test/", "state": "live", "reason": "x"}]}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="REFUSES TO START"):
+        create_app(tmp_db, allowlist_path=bad2)
+
+    # Contradictory: a prefix in both 'prefixes' and 'excluded'.
+    bad3 = tmp_path / "contradictory.json"
+    bad3.write_text(json.dumps({
+        "prefixes": [{"prefix": "test/", "producer_principal": "x",
+                      "store": "machinery", "state": "live"}],
+        "excluded": [{"prefix": "test/", "state": "excluded", "reason": "x"}],
+    }), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="REFUSES TO START"):
+        create_app(tmp_db, allowlist_path=bad3)
+
+
+def test_excluded_in_healthz(tmp_db, allowlist_file, observe_log, no_enforce):
+    """The healthz endpoint surfaces the excluded prefixes (machine-readable
+    rationale) so an operator can see WHY a prefix is absent from the
+    faucet list."""
+    app = create_app(tmp_db, allowlist_path=allowlist_file)
+    with TestClient(app) as c:
+        body = c.get("/healthz").json()
+    excluded = body["machinery_allowlist"]["excluded"]
+    # The shared allowlist has 'test/' excluded.
+    assert any(e["prefix"] == "test/" for e in excluded)
+    test_entry = next(e for e in excluded if e["prefix"] == "test/")
+    assert test_entry["reason"]  # non-empty
+
+
+# ---------------------------------------------------------------------------
 # D1 — principal fail-closed (enforce mode)
 # ---------------------------------------------------------------------------
 

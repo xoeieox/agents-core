@@ -38,7 +38,12 @@ PROMOTED_HEADER_RE = re.compile(
 # --from must be a path-like/ref-like token: no newlines, no control chars.
 # One `if` in the promote handler (panel security F6) — newline injection into
 # the provenance header is the attack this shape exists to block.
-_FROM_INVALID_RE = re.compile(r"[\n\r\x00-\x1f\x7f]")
+# Also reused by the server's /v0/promote handler for the one-line rationale
+# check (a multi-line/control-char rationale would corrupt the batch decision
+# key's line-based listing the same way).
+INVALID_REF_CHARS_RE = re.compile(r"[\n\r\x00-\x1f\x7f]")
+# Back-compat alias (pre-rename name; kept so existing imports/tests still work).
+_FROM_INVALID_RE = INVALID_REF_CHARS_RE
 
 
 def validate_promote_source_ref(ref: str) -> str:
@@ -49,7 +54,7 @@ def validate_promote_source_ref(ref: str) -> str:
     empty. The shape is a path-like/ref-like token: no newlines or control
     chars, ever.
     """
-    if not ref or _FROM_INVALID_RE.search(ref):
+    if not ref or INVALID_REF_CHARS_RE.search(ref):
         raise ValueError(
             f"--from ref is not a valid path-like/ref-like token "
             f"(no newlines or control chars): {ref!r}"
@@ -108,6 +113,46 @@ class MemHTTPError(Exception):
         self.status_code = status_code
         self.body = body
         super().__init__(f"HTTP {status_code}: {body}")
+
+
+# ---------------------------------------------------------------------------
+# --store plumbing (openclaw-memdb-influx-reader-v0, D2 / Files-changed)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# --store plumbing (openclaw-memdb-influx-reader-v0, D2 / Files-changed)
+# ---------------------------------------------------------------------------
+
+# RESCOPED (rev-2, 2026-09-14 gate proceed-to-bind): the machinery store is
+# the EXISTING exhaust store (the route_to_exhaust mechanism in
+# mem_exhaust.py), not a second sqlite (no mem_machinery.db). 'machinery'
+# == 'exhaust' for every allowlist entry.
+#
+# The --store flag is therefore MOOT at the HTTP layer: the mem-server routes
+# machine-state keys to the machinery (exhaust) store transparently at the
+# set() chokepoint (MemoryStore.set -> mem_exhaust.route_to_exhaust), so the
+# client never selects a store — the server does. This plumbing exists so the
+# spec's Files-changed line is honored and so a future non-rescoped
+# second-sqlite deployment has a named flag ready. The flag is validated
+# (loud ValueError on a typo) so a caller who passes it gets a clear error
+# rather than a silent no-op.
+STORE_ATOMS = "atoms"
+STORE_MACHINERY = "machinery"
+# Accepted values for the --store flag. 'exhaust' is an alias for 'machinery'
+# (the rescoped store name) so a caller who knows the underlying store can
+# use either.
+KNOWN_STORES = (STORE_ATOMS, STORE_MACHINERY, "exhaust")
+
+
+def validate_store(store: str) -> str:
+    """Validate a --store value. Returns the normalized store name
+    ('exhaust' -> 'machinery'). Raises ValueError on an unknown store so a
+    typo is loud, not silently ignored (fail-closed at the client edge)."""
+    if store in KNOWN_STORES:
+        return STORE_MACHINERY if store == "exhaust" else store
+    raise ValueError(
+        f"unknown --store {store!r} (known: {', '.join(KNOWN_STORES)})"
+    )
 
 
 class MemClient:
@@ -175,7 +220,23 @@ class MemClient:
         content: str,
         tags: str = "",
         source: str = "",
+        store: str = STORE_ATOMS,
     ) -> dict:
+        """Upsert a memory.
+
+        `store` is the --store flag (openclaw-memdb-influx-reader-v0, D2 /
+        Files-changed). RESCOPED (rev-2): the machinery store is the EXISTING
+        exhaust store, so the flag is MOOT at the HTTP layer — the server
+        routes machine-state keys to the machinery (exhaust) store
+        transparently at the set() chokepoint. The flag is validated (loud
+        ValueError on a typo) but does NOT change routing: the server's
+        route_to_exhaust is the single source of truth for where a key lands.
+        Passing store='machinery' for a non-machine-state key is a no-op (the
+        key still lands in mem.db) — the server does not honor a
+        client-selected store for a key that is not machine-state, because
+        that would let a client move an arbitrary key out of the ledger of
+        record (influx, not merge: mem.db is the single ledger of record)."""
+        validate_store(store)
         body: dict[str, Any] = {"content": content, "tags": tags, "source": source}
         return self._check(self._client.put(f"/v0/memories/{key}", json=body)).json()
 
@@ -212,6 +273,7 @@ class MemClient:
         principal: str,
         content: str,
         tags: str = "",
+        rationale: str = "",
     ) -> dict:
         """Promote one row from an agent store into mem.db (D2).
 
@@ -228,6 +290,13 @@ class MemClient:
         exact provenance header, sets source="promoted:<agent>/<store>", adds
         the 'promoted' tag, and upserts the batch decision key. The client
         still validates the ref up front so a bad ref never leaves the process.
+
+        `rationale` is the one-line rationale the D2 named decision artifact
+        requires per promoted key: the batch decision key
+        decision/memdb-promotion-<YYYYMMDD>-<curator> lists promoted keys +
+        their --from refs + one-line rationale. It is audit metadata only —
+        it is NOT part of the provenance header shape (the header stays
+        exactly `[promoted from <agent>/<store> by <principal> at <ts>]`).
         """
         # Client-side shape validation (loud ValueError) before any request.
         validate_promote_source_ref(ref)
@@ -243,6 +312,8 @@ class MemClient:
         }
         if tags:
             body["tags"] = tags
+        if rationale:
+            body["rationale"] = rationale
         return self._check(
             self._client.post("/v0/promote", json=body)
         ).json()

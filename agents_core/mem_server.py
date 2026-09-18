@@ -52,7 +52,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from agents_core import mem_machinery
 from agents_core.mem import MemoryStore
-from agents_core.mem_client import build_promoted_content
+from agents_core.mem_client import INVALID_REF_CHARS_RE, build_promoted_content
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -424,6 +424,12 @@ def create_app(
             "machinery_allowlist": {
                 "path": str(_allowlist_path),
                 "prefixes": list(allowlist.prefixes),
+                # Deliberately-excluded prefixes (machine-readable rationale,
+                # reviewer 2026-09-18 PR #330 cycle 1 [low]).
+                "excluded": [
+                    {"prefix": e.prefix, "reason": e.reason}
+                    for e in allowlist.excluded
+                ],
             },
         }
 
@@ -509,24 +515,42 @@ def create_app(
         key. The server is the source of truth for the provenance shape —
         an auditor who cannot parse the shape cannot audit.
 
-        Body: {key, from, principal, content, tags?}
+        Body: {key, from, principal, content, tags?, rationale?}
           key       — the mem.db key to write
           from      — the --from agent-store ref, '<agent>/<store>'
           principal — the curator principal (X-Mem-Principal header is the
                       identity; this is the provenance header's 'by')
           content   — the promoted body (the header line is prepended)
           tags      — extra tags (the 'promoted' tag is always added)
+          rationale — one-line rationale (D2 named decision artifact: the
+                      batch key lists promoted keys + their --from refs +
+                      one-line rationale). Audit metadata only — never part
+                      of the provenance header shape.
 
         Writes with source="promoted:<agent>/<store>", tags 'promoted' +
         curator-chosen tags, and the exact provenance header as the first
         line of the content. Also upserts the batch decision key
         decision/memdb-promotion-<YYYYMMDD>-<principal> listing the promoted
-        key + its --from ref (the auditable-to-a-decision artifact).
+        key + its --from ref + one-line rationale (the
+        auditable-to-a-decision artifact).
         """
         key = body.get("key", "")
         ref = body.get("from", "")
         principal = body.get("principal", "") or _principal_of(request)
         content = body.get("content", "")
+        # One-line rationale (D2 named decision artifact). Newline/control-char
+        # rejection: the batch key is a single-content audit row — a multi-line
+        # or control-char rationale would corrupt the line-based listing the
+        # same way a --from injection would corrupt the header.
+        rationale = body.get("rationale", "")
+        if INVALID_REF_CHARS_RE.search(rationale):
+            raise HTTPException(
+                status_code=400,
+                detail=_error(
+                    "bad_rationale",
+                    "rationale must be a single line (no newlines or control chars)",
+                ),
+            )
 
         # Server-side --from shape validation (loud 400). The client validates
         # too, but the server repeats the check — a malformed ref must be
@@ -582,8 +606,8 @@ def create_app(
 
         # Batch decision key (D2 named decision artifact):
         # decision/memdb-promotion-<YYYYMMDD>-<curator> lists promoted keys +
-        # their --from refs. Upserted (append-if-new) so a curation run
-        # accumulates its batch in one key.
+        # their --from refs + one-line rationale. Upserted (append-if-new) so
+        # a curation run accumulates its batch in one key.
         # The batch decision key is ALSO a store write — it rides the same
         # write-class guard (a reader must not be able to write the batch
         # key even if the promoted row's write were somehow allowed).
@@ -592,7 +616,12 @@ def create_app(
         reject = _write_guard(request, "PUT", batch_key)
         if reject is not None:
             return reject
-        line = f"- {key} --from {ref}"
+        # The D2 artifact line: key + --from ref + one-line rationale. The
+        # rationale is the curator's one-line 'why' (the 'auditable to a
+        # decision' part); an empty rationale still lands (the CLI may omit
+        # it) but the shape is always the same.
+        rationale_part = f" : {rationale}" if rationale else ""
+        line = f"- {key} --from {ref}{rationale_part}"
         existing = store.get(batch_key)
         if existing and line in existing["content"]:
             batch_content = existing["content"]
