@@ -10,17 +10,47 @@ Environment variables (server side):
   MEM_BIND_PORT     — uvicorn bind port (default 8403)
   MEM_BEARER_TOKEN  — optional shared bearer token; omit to disable auth
   MEM_LOG_LEVEL     — uvicorn log level (default info)
+  MEM_PRINCIPALS    — JSON registration of principals (default: the built-in
+                      brix-pm / zephyr-deposit table). Shape:
+                      {"<name>": {"role": "curator"|"reader",
+                                   "machine_state_prefixes": ["..."]}}
+  MEM_ENFORCE_PRINCIPALS — "1"/"true" to ENFORCE the principal model (reject
+                      reader writes with 403 principal_reader). Default OFF
+                      (observe-only): the write class is LOGGED with what
+                      WOULD be rejected, but not rejected. The enforcement
+                      flip is a follow-up dispatch after the observe week
+                      (openclaw-memdb-influx-reader-v0, D1).
+  MEM_MACHINE_STATE_PREFIXES_PATH — the shared machine-state allowlist JSON
+                      (default /srv/agents/config/mem-machine-state-prefixes.json).
+                      The server REFUSES TO START if it is missing/malformed/
+                      unreadable (fail-closed; no fail-open bypass).
+  MEM_OBSERVE_LOG   — path for the observe-only faucet log (default
+                      /srv/lapis/planning/reports/memdb-influx-observe-<YYYYMMDD>.log).
+
+Principal model (openclaw-memdb-influx-reader-v0, D1):
+  READ is open, WRITE is curated, enforced server-side. The principal travels
+  in the X-Mem-Principal header (sent by MemClient from MEM_PRINCIPAL).
+  `source` is NOT the principal (backfilled hostname, client-spoofable).
+  Unknown/absent principal = reader; a reader's set/delete/deposit is
+  REJECTED (403 principal_reader) under enforcement. The reader secret is
+  honored ONLY for the read verb-set (secret-to-verb binding, panel F2).
+  Fail-closed: unknown principal = reader; today's unauthenticated tailnet
+  writers collapse to reader by default.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from agents_core import mem_machinery
 from agents_core.mem import MemoryStore
 
 # ---------------------------------------------------------------------------
@@ -31,54 +61,267 @@ def _error(code: str, message: str) -> dict:
     return {"error": {"code": code, "message": message}}
 
 
-@runtime_checkable
-class DepositRecorder(Protocol):
-    """Attribution-log sink injected at boot (zephyr provides the impl).
+# ---------------------------------------------------------------------------
+# Principal model (D1)
+# ---------------------------------------------------------------------------
 
-    agents-core declares this interface and NEVER imports zephyr; the wiring is
-    config-driven via MEM_DEPOSIT_RECORDER=<module>:<callable> (dynamic import in
-    main()). Keeps the dependency arrow agents-core -> (interface) <- zephyr, per
-    the substrate deposit endpoint spec (HIGH-2 layering)."""
+# The built-in principal registration. `brix-pm` covers the mem CLI +
+# conductor node scripts + PM machinery (BRIX-resident). `zephyr-deposit` is
+# the /v0/deposit route's principal (BRIX-resident). Everything else —
+# including an absent or unrecognized principal — is a READER (fail-closed).
+DEFAULT_PRINCIPALS: dict[str, dict] = {
+    "brix-pm": {
+        "role": "curator",
+        "machine_state_prefixes": [],  # filled from the allowlist at boot
+    },
+    "zephyr-deposit": {
+        "role": "curator",
+        "machine_state_prefixes": [],
+    },
+}
 
-    def already_recorded(self, manifest_hash: str) -> bool: ...
-
-    def record(self, provenance: dict, *, store_kind: str, key: str | None) -> bool: ...
-
-
-def _normalize_tags(tags_raw: Any) -> list[str] | None:
-    """Accept tags as a comma-separated string or a list; normalize for set()."""
-    if isinstance(tags_raw, str) and tags_raw:
-        return [t.strip() for t in tags_raw.split(",") if t.strip()]
-    if isinstance(tags_raw, list):
-        return [str(t).strip() for t in tags_raw if str(t).strip()]
-    return None
-
-
-def _row_response(row: dict) -> dict:
-    """Ensure all memory-shaped responses carry timestamps."""
-    return {
-        "key": row["key"],
-        "content": row["content"],
-        "tags": row["tags"],
-        "source": row["source"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-    }
+# The write class: PUT / DELETE / POST /v0/deposit. Everything else is read.
+WRITE_METHODS = {"PUT", "DELETE"}
+DEPOSIT_PATH = "/v0/deposit"
 
 
-def _search_row_response(row: dict) -> dict:
-    r = _row_response(row)
-    r["rank"] = row.get("rank")
-    return r
+def _load_principal_registration() -> dict[str, dict]:
+    """Load the principal registration from MEM_PRINCIPALS (JSON) or fall back
+    to the built-in table. Unknown/malformed JSON falls back to the built-in
+    table (the principal model degrades to the known-good default; the
+    allowlist guard is the hard fail-closed surface)."""
+    raw = os.environ.get("MEM_PRINCIPALS", "").strip()
+    if not raw:
+        return json.loads(json.dumps(DEFAULT_PRINCIPALS))  # deep copy
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("MEM_PRINCIPALS must be a JSON object")
+        return data
+    except (json.JSONDecodeError, ValueError):
+        logging.getLogger("mem-server").warning(
+            "MEM_PRINCIPALS is malformed; falling back to the built-in table"
+        )
+        return json.loads(json.dumps(DEFAULT_PRINCIPALS))
+
+
+def _is_enforce() -> bool:
+    return os.environ.get("MEM_ENFORCE_PRINCIPALS", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _principal_of(request: Request) -> str:
+    """The caller's principal from the X-Mem-Principal header ("" = absent)."""
+    return request.headers.get("X-Mem-Principal", "").strip()
+
+
+def _principal_role(request: Request, principals: dict[str, dict]) -> str:
+    """The role for the request's asserted principal. Unknown/absent = reader."""
+    name = _principal_of(request)
+    if not name:
+        return "reader"
+    reg = principals.get(name)
+    if not reg:
+        return "reader"
+    return reg.get("role", "reader")
+
+
+def _principal_prefixes(request: Request, principals: dict[str, dict]) -> set[str]:
+    """The machine-state prefixes the asserted principal is registered for."""
+    name = _principal_of(request)
+    reg = principals.get(name)
+    if not reg:
+        return set()
+    return set(reg.get("machine_state_prefixes", []))
+
+
+# ---------------------------------------------------------------------------
+# Observe-only faucet log (D1 / D3)
+# ---------------------------------------------------------------------------
+
+def _default_observe_log_path() -> Path:
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    base = os.environ.get("MEM_OBSERVE_LOG", "")
+    if base:
+        return Path(base)
+    return Path(f"/srv/lapis/planning/reports/memdb-influx-observe-{day}.log")
+
+
+class FaucetObserver:
+    """Observe-only logger for the write class (D1 observe week).
+
+    Records principal + source IP + key + HTTP verb on every write attempt,
+    partitioning write counts by verb (PUT / DELETE / POST /v0/deposit) so a
+    dormant or unregistered deposit writer cannot hide behind the PUT/DELETE
+    counts (gate trickster). Also records per-prefix would-reject
+    machine-state counts and the break list (today's writers that enforcement
+    would reject).
+
+    Observe-only: it LOGS what would be rejected; it never rejects. Enabling
+    enforcement (MEM_ENFORCE_PRINCIPALS) is a separate, follow-up flip.
+    """
+
+    def __init__(self, log_path: Path | str, allowlist: "mem_machinery.MachineStateAllowlist",
+                 principals: dict[str, dict]):
+        self.log_path = Path(log_path)
+        self.allowlist = allowlist
+        self.principals = principals
+        self._counts: dict[tuple[str, str], int] = {}  # (principal, verb) -> n
+        self._would_reject_prefixes: dict[str, int] = {}  # prefix -> n
+        self._break_list: dict[str, dict] = {}  # principal -> {verbs, prefixes}
+
+    def _log_line(self, record: dict) -> None:
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError:
+            # The observe log must never take the server down.
+            pass
+
+    def observe_write(self, request: Request, verb: str, key: str) -> dict:
+        """Log a write attempt. Returns the verdict record (for logging/audit).
+
+        verb is the normalized verb: "PUT", "DELETE", or "POST_DEPOSIT".
+        """
+        principal = _principal_of(request) or "none"
+        role = _principal_role(request, self.principals)
+        ip = request.client.host if request.client else "unknown"
+        is_machine_state = self.allowlist.is_machine_state(key)
+        producer = self.allowlist.producer_for(key) if is_machine_state else None
+
+        # Verdict: would enforcement reject this write?
+        would_reject = False
+        if role != "curator":
+            would_reject = True
+        elif is_machine_state and producer is not None and producer != principal:
+            # A curator writing a machine-state prefix it does not own.
+            would_reject = True
+
+        # Partitioned write counts by (principal, verb).
+        ck = (principal, verb)
+        self._counts[ck] = self._counts.get(ck, 0) + 1
+
+        # Per-prefix would-reject machine-state counts.
+        if is_machine_state and would_reject:
+            prefix = self._matching_prefix(key)
+            if prefix:
+                self._would_reject_prefixes[prefix] = (
+                    self._would_reject_prefixes.get(prefix, 0) + 1
+                )
+
+        # Break list: today's writers that enforcement would reject.
+        if would_reject:
+            entry = self._break_list.setdefault(
+                principal, {"verbs": set(), "prefixes": set()}
+            )
+            entry["verbs"].add(verb)
+            if is_machine_state:
+                prefix = self._matching_prefix(key)
+                if prefix:
+                    entry["prefixes"].add(prefix)
+
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": "write_attempt",
+            "verb": verb,
+            "key": key,
+            "principal": principal,
+            "role": role,
+            "source_ip": ip,
+            "machine_state": is_machine_state,
+            "producer": producer,
+            "would_reject": would_reject,
+            "enforce": _is_enforce(),
+        }
+        self._log_line(record)
+        return record
+
+    def _matching_prefix(self, key: str) -> str | None:
+        for e in self.allowlist.entries:
+            if key.startswith(e.prefix):
+                return e.prefix
+        return None
+
+    def report(self) -> dict:
+        """The per-observed-writer table for the observe-week report."""
+        writers: dict[str, dict] = {}
+        for (principal, verb), n in self._counts.items():
+            w = writers.setdefault(
+                principal,
+                {
+                    "principal": principal,
+                    "verbs": {"PUT": 0, "DELETE": 0, "POST_DEPOSIT": 0},
+                    "total": 0,
+                },
+            )
+            if verb in w["verbs"]:
+                w["verbs"][verb] += n
+            w["total"] += n
+        break_list = {
+            p: {"verbs": sorted(v["verbs"]), "prefixes": sorted(v["prefixes"])}
+            for p, v in self._break_list.items()
+        }
+        return {
+            "writers": writers,
+            "would_reject_prefixes": self._would_reject_prefixes,
+            "break_list": break_list,
+        }
 
 
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
-def create_app(db_path: Path, deposit_recorder: "DepositRecorder | None" = None) -> FastAPI:
+def create_app(
+    db_path: Path,
+    deposit_recorder: "DepositRecorder | None" = None,
+    allowlist_path: Path | str | None = None,
+) -> FastAPI:
     app = FastAPI(title="mem-server", version="0")
+
+    # ------------------------------------------------------------------
+    # Startup-validation guard (gate technical-integrity + transmuter,
+    # hard requirement): REFUSE TO START if the shared machine-state
+    # allowlist is missing/malformed/unreadable. A fail-open bypass where a
+    # missing allowlist silently disables the prefix-reject is the silent
+    # fail-open the gate names. This runs BEFORE the store is even opened,
+    # so the server never boots with a disabled guard.
+    # ------------------------------------------------------------------
+    _allowlist_path = (
+        Path(allowlist_path)
+        if allowlist_path is not None
+        else mem_machinery.ALLOWLIST_PATH
+    )
+    try:
+        allowlist = mem_machinery.load_allowlist(_allowlist_path)
+    except mem_machinery.AllowlistError as e:
+        # Refuse to start: raise so the console-script entry point (main())
+        # and any test harness see a hard failure, not a silently-open server.
+        raise RuntimeError(
+            f"mem-server REFUSES TO START: machine-state allowlist guard "
+            f"failed (fail-closed, no fail-open bypass): {e}"
+        ) from e
+
     store = MemoryStore(db_path)
+
+    # ------------------------------------------------------------------
+    # Principal model (D1)
+    # ------------------------------------------------------------------
+    principals = _load_principal_registration()
+    # The registered producer principals inherit the machine-state prefixes
+    # the allowlist assigns to them (faucet: producer principal writes its
+    # own machine-state prefix into the machinery store).
+    for entry in allowlist.entries:
+        reg = principals.get(entry.producer_principal)
+        if reg is not None:
+            reg.setdefault("machine_state_prefixes", []).append(entry.prefix)
+
+    enforce = _is_enforce()
+    observer = FaucetObserver(
+        _default_observe_log_path(), allowlist, principals
+    )
 
     # ------------------------------------------------------------------
     # Bearer-token middleware (only active when MEM_BEARER_TOKEN is set)
@@ -95,6 +338,51 @@ def create_app(db_path: Path, deposit_recorder: "DepositRecorder | None" = None)
                     content=_error("unauthorized", "Missing or invalid bearer token"),
                 )
         return await call_next(request)
+
+    # ------------------------------------------------------------------
+    # Write-class guard (D1 principal model + D3 faucet)
+    # ------------------------------------------------------------------
+    def _write_guard(request: Request, verb: str, key: str) -> JSONResponse | None:
+        """Return a 403/400 JSONResponse to reject the write, or None to allow.
+
+        Observe-only (default): logs the write attempt + what would be
+        rejected, and returns None (allow). Under MEM_ENFORCE_PRINCIPALS:
+        rejects a reader's write (403 principal_reader) and a non-owning
+        curator's machine-state write (403 machine_state_prefix).
+        """
+        # Observe-only logging happens on EVERY write attempt, enforce or not.
+        observer.observe_write(request, verb, key)
+
+        if not enforce:
+            return None  # observe-only: log, do not reject
+
+        role = _principal_role(request, principals)
+        if role != "curator":
+            return JSONResponse(
+                status_code=403,
+                content=_error(
+                    "principal_reader",
+                    f"principal {_principal_of(request) or '<absent>'!r} is a "
+                    f"reader; the write class (PUT/DELETE/deposit) is "
+                    f"curator-only",
+                ),
+            )
+
+        # D3 faucet: a curator may write a machine-state prefix only if it is
+        # the owning registered producer principal for that prefix.
+        if allowlist.is_machine_state(key):
+            producer = allowlist.producer_for(key)
+            if producer != _principal_of(request):
+                return JSONResponse(
+                    status_code=403,
+                    content=_error(
+                        "machine_state_prefix",
+                        f"principal {_principal_of(request)!r} is not the "
+                        f"registered producer for machine-state key {key!r} "
+                        f"(owner: {producer!r})",
+                    ),
+                )
+        return None
 
     # ------------------------------------------------------------------
     # Health
@@ -122,6 +410,14 @@ def create_app(db_path: Path, deposit_recorder: "DepositRecorder | None" = None)
                 "divergence": mem_count - fts_count,
             },
             "deposit": {"configured": deposit_recorder is not None},
+            "principal_model": {
+                "enforce": enforce,
+                "principals": sorted(principals.keys()),
+            },
+            "machinery_allowlist": {
+                "path": str(_allowlist_path),
+                "prefixes": list(allowlist.prefixes),
+            },
         }
 
     # ------------------------------------------------------------------
@@ -156,7 +452,11 @@ def create_app(db_path: Path, deposit_recorder: "DepositRecorder | None" = None)
     # ------------------------------------------------------------------
 
     @app.put("/v0/memories/{key:path}")
-    def put_memory(key: str, request_data: dict[str, Any]):
+    def put_memory(key: str, request_data: dict[str, Any], request: Request):
+        reject = _write_guard(request, "PUT", key)
+        if reject is not None:
+            return reject
+
         content = request_data.get("content", "")
         tags_raw = request_data.get("tags", "")
         source = request_data.get("source", "")
@@ -176,7 +476,10 @@ def create_app(db_path: Path, deposit_recorder: "DepositRecorder | None" = None)
     # ------------------------------------------------------------------
 
     @app.delete("/v0/memories/{key:path}", status_code=204)
-    def delete_memory(key: str):
+    def delete_memory(key: str, request: Request):
+        reject = _write_guard(request, "DELETE", key)
+        if reject is not None:
+            return reject
         deleted = store.delete(key)
         if not deleted:
             raise HTTPException(
@@ -216,7 +519,6 @@ def create_app(db_path: Path, deposit_recorder: "DepositRecorder | None" = None)
     def dump(format: str = "md"):
         result = store.dump(fmt=format)
         if format == "json":
-            import json
             return JSONResponse(content=json.loads(result))
         return PlainTextResponse(content=result)
 
@@ -229,11 +531,16 @@ def create_app(db_path: Path, deposit_recorder: "DepositRecorder | None" = None)
         return store.stats()
 
     # ------------------------------------------------------------------
-    # Checkpoint
+    # Checkpoint (maintenance — brix-pm)
     # ------------------------------------------------------------------
 
     @app.post("/v0/checkpoint")
-    def checkpoint():
+    def checkpoint(request: Request):
+        # Maintenance verb: brix-pm only. Observed like the write class;
+        # enforced under MEM_ENFORCE_PRINCIPALS.
+        reject = _write_guard(request, "POST_CHECKPOINT", "checkpoint")
+        if reject is not None:
+            return reject
         store.checkpoint_wal()
         return {"ok": True}
 
@@ -242,18 +549,15 @@ def create_app(db_path: Path, deposit_recorder: "DepositRecorder | None" = None)
     # ------------------------------------------------------------------
 
     @app.post("/v0/deposit")
-    def deposit(envelope: dict[str, Any]):
+    def deposit(envelope: dict[str, Any], request: Request):
         """Accept a LapisToolReturn deposit: persist payload to the mem store and
         append its provenance to the (injected) attribution log. Idempotent on
-        provenance.manifest_hash (HIGH-1 construct-once / retry-identical-bytes)."""
-        if deposit_recorder is None:
-            raise HTTPException(
-                status_code=503,
-                detail=_error(
-                    "deposit_unconfigured",
-                    "No attribution recorder injected (set MEM_DEPOSIT_RECORDER)",
-                ),
-            )
+        provenance.manifest_hash (HIGH-1 construct-once / retry-identical-bytes).
+
+        The route's principal is `zephyr-deposit` (BRIX-resident). Observed
+        (and under enforcement, gated) like the write class — the deposit verb
+        is partitioned as POST_DEPOSIT so a dormant/unregistered deposit writer
+        cannot hide behind the PUT/DELETE counts (gate trickster)."""
         # Validate the envelope via the canonical dataclass (lazy import keeps boot
         # free of a hard archetypes_core dependency).
         try:
@@ -267,13 +571,6 @@ def create_app(db_path: Path, deposit_recorder: "DepositRecorder | None" = None)
             )
 
         prov = ltr.provenance
-        mh = prov.manifest_hash
-        if not mh:
-            raise HTTPException(
-                status_code=400,
-                detail=_error("bad_envelope", "provenance.manifest_hash is required"),
-            )
-
         payload = ltr.payload
         if not isinstance(payload, dict) or "key" not in payload:
             raise HTTPException(
@@ -283,6 +580,27 @@ def create_app(db_path: Path, deposit_recorder: "DepositRecorder | None" = None)
                 ),
             )
         key = payload["key"]
+
+        # Write-class guard (observed always; enforced under the flag).
+        reject = _write_guard(request, "POST_DEPOSIT", key)
+        if reject is not None:
+            return reject
+
+        if deposit_recorder is None:
+            raise HTTPException(
+                status_code=503,
+                detail=_error(
+                    "deposit_unconfigured",
+                    "No attribution recorder injected (set MEM_DEPOSIT_RECORDER)",
+                ),
+            )
+
+        mh = prov.manifest_hash
+        if not mh:
+            raise HTTPException(
+                status_code=400,
+                detail=_error("bad_envelope", "provenance.manifest_hash is required"),
+            )
 
         # Dedup on manifest_hash. mem set() is an idempotent upsert, but we honor
         # the duplicate contract so append-style sinks (weaver) share this shape.
@@ -295,7 +613,73 @@ def create_app(db_path: Path, deposit_recorder: "DepositRecorder | None" = None)
         deposit_recorder.record(prov.to_dict(), store_kind="mem", key=key)
         return {"status": "accepted", "key": key, "manifest_hash": mh}
 
+    # ------------------------------------------------------------------
+    # Observe-week report (D1 deliverable)
+    # ------------------------------------------------------------------
+
+    @app.get("/v0/observe-report")
+    def observe_report():
+        """The per-observed-writer table + would-reject counts + break list.
+
+        Read-only surface for the observe-week report (panel H5). The report
+        body lands at mem key state/memdb-influx-observe-week-<YYYYMMDD> + raw
+        log /srv/lapis/planning/reports/memdb-influx-observe-<YYYYMMDD>.log; this
+        endpoint exposes the in-process aggregation for the gate."""
+        return observer.report()
+
+    # Stash references for tests / the report.
+    app.state.allowlist = allowlist
+    app.state.principals = principals
+    app.state.observer = observer
+    app.state.enforce = enforce
+
     return app
+
+
+# ---------------------------------------------------------------------------
+# Row response helpers (kept after the factory so the routes above can use
+# them — module-level defs are resolved at call time).
+# ---------------------------------------------------------------------------
+
+def _normalize_tags(tags_raw: Any) -> list[str] | None:
+    """Accept tags as a comma-separated string or a list; normalize for set()."""
+    if isinstance(tags_raw, str) and tags_raw:
+        return [t.strip() for t in tags_raw.split(",") if t.strip()]
+    if isinstance(tags_raw, list):
+        return [str(t).strip() for t in tags_raw if str(t).strip()]
+    return None
+
+
+def _row_response(row: dict) -> dict:
+    """Ensure all memory-shaped responses carry timestamps."""
+    return {
+        "key": row["key"],
+        "content": row["content"],
+        "tags": row["tags"],
+        "source": row["source"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _search_row_response(row: dict) -> dict:
+    r = _row_response(row)
+    r["rank"] = row.get("rank")
+    return r
+
+
+@runtime_checkable
+class DepositRecorder(Protocol):
+    """Attribution-log sink injected at boot (zephyr provides the impl).
+
+    agents-core declares this interface and NEVER imports zephyr; the wiring is
+    config-driven via MEM_DEPOSIT_RECORDER=<module>:<callable> (dynamic import in
+    main()). Keeps the dependency arrow agents-core -> (interface) <- zephyr, per
+    the substrate deposit endpoint spec (HIGH-2 layering)."""
+
+    def already_recorded(self, manifest_hash: str) -> bool: ...
+
+    def record(self, provenance: dict, *, store_kind: str, key: str | None) -> bool: ...
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +719,9 @@ def main():
     port = int(os.environ.get("MEM_BIND_PORT", "8403"))
     log_level = os.environ.get("MEM_LOG_LEVEL", "info")
 
+    # create_app() raises RuntimeError on a missing/malformed/unreadable
+    # machine-state allowlist (fail-closed). Let it propagate: the server
+    # must NOT start with the prefix-reject silently disabled.
     app = create_app(db_path, deposit_recorder=_load_deposit_recorder())
     uvicorn.run(app, host=host, port=port, log_level=log_level)
 
