@@ -84,7 +84,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from agents_core import mem_exhaust
 from agents_core.mem import MemoryStore
