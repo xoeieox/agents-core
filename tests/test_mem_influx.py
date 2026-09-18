@@ -109,8 +109,13 @@ def test_accepts_valid_allowlist(tmp_db, allowlist_file, observe_log, no_enforce
         assert resp.status_code == 200
         body = resp.json()
         assert body["machinery_allowlist"]["prefixes"] == [
-            "elevator/", "weather/", "router/gw-review-divergence/", "test/",
+            "elevator/", "weather/", "router/gw-review-divergence/",
         ]
+        # 'test/' must NOT be a machinery prefix: it is a generic scratch
+        # namespace whose keys must keep landing in mem.db (reviewer
+        # 2026-09-18 [high] — the landmine that rerouted test/* writes to
+        # exhaust.db and broke the FTS-divergence test).
+        assert "test/" not in body["machinery_allowlist"]["prefixes"]
         assert body["principal_model"]["enforce"] is False
         assert "brix-pm" in body["principal_model"]["principals"]
 
@@ -166,38 +171,55 @@ def test_reader_delete_rejected_403(tmp_db, allowlist_file, observe_log, enforce
 
 
 def test_reader_secret_holder_rejected_on_write_class(tmp_db, allowlist_file, observe_log, enforce, monkeypatch):
-    """Secret-to-verb binding (panel F2): a holder of the (reader) secret is
-    rejected on the write class regardless of any asserted role. The reader
-    secret is honored ONLY for the read verb-set."""
+    """Secret-to-verb binding (panel F2): the write class is rejected for a
+    holder of the secret who does NOT assert a registered curator principal,
+    regardless of the secret. The read verb-set stays open to the secret holder.
+
+    v0 honesty limit (stated, not asserted away): with a SINGLE shared bearer
+    token the server cannot distinguish reader-secret from curator-secret by
+    value alone. The binding is enforced via the PRINCIPAL — a write requires
+    holding the BRIX secret AND asserting a registered curator principal. A
+    secret holder who asserts an absent/unknown/reader principal is rejected
+    on the write class (403 principal_reader) even though the secret is valid;
+    the secret alone (no curator principal) grants read-only access. This test
+    pins that guarantee with a hard 403 assertion (not a 200-or-403 escape).
+    """
     monkeypatch.setenv("MEM_BEARER_TOKEN", "reader-secret")
     app = create_app(tmp_db, allowlist_path=allowlist_file)
     with TestClient(app) as c:
         hdrs = {"Authorization": "Bearer reader-secret"}
         # Read verb-set is open to the secret holder.
         assert c.get("/healthz", headers=hdrs).status_code == 200
-        # Write class: rejected even though the secret is valid, and even with
-        # a curator asserted in the header (the secret is bound to reads).
+        # Write class: a secret holder with NO asserted principal is a reader
+        # and is REJECTED (hard 403) — the secret alone does not grant write.
         resp = c.put(
-            "/v0/memories/foo/bar",
-            json={"content": "x", "tags": "", "source": ""},
-            headers={**hdrs, "X-Mem-Principal": "brix-pm"},
-        )
-        # NOTE: with a single shared bearer token the server cannot distinguish
-        # reader-secret from curator-secret by value alone; the binding is that
-        # the *principal* must be a registered curator. An asserted brix-pm
-        # principal is a curator, so the honest v0 guarantee is "writes require
-        # holding the BRIX secret AND asserting a registered curator principal".
-        # The reader-default (absent/unknown principal) is what rejects readers.
-        assert resp.status_code in (200, 403)
-        # The decisive case: a reader (no curator principal) with the secret
-        # is still rejected on the write class.
-        resp2 = c.put(
             "/v0/memories/foo/bar2",
             json={"content": "x", "tags": "", "source": ""},
             headers={**hdrs},
         )
-        assert resp2.status_code == 403
-        assert resp2.json()["error"]["code"] == "principal_reader"
+        assert resp.status_code == 403
+        assert resp.json()["error"]["code"] == "principal_reader"
+        # A secret holder asserting an UNKNOWN principal is likewise a reader
+        # and rejected on the write class (fail-closed).
+        resp_unknown = c.put(
+            "/v0/memories/foo/bar3",
+            json={"content": "x", "tags": "", "source": ""},
+            headers={**hdrs, "X-Mem-Principal": "not-a-registered-principal"},
+        )
+        assert resp_unknown.status_code == 403
+        assert resp_unknown.json()["error"]["code"] == "principal_reader"
+        # The decisive contrast: the SAME valid secret + a registered curator
+        # principal IS allowed to write (the binding is principal-gated, not
+        # secret-gated — this is the documented v0 honesty limit).
+        resp_curator = c.put(
+            "/v0/memories/foo/bar",
+            json={"content": "x", "tags": "", "source": ""},
+            headers={**hdrs, "X-Mem-Principal": "brix-pm"},
+        )
+        assert resp_curator.status_code == 200
+        # Nothing landed for the rejected reader attempts.
+        assert c.get("/v0/memories/foo/bar2", headers=hdrs).status_code == 404
+        assert c.get("/v0/memories/foo/bar3", headers=hdrs).status_code == 404
 
 
 def test_deposit_verb_partitioned(tmp_db, allowlist_file, observe_log, no_enforce):
@@ -341,6 +363,38 @@ def test_machine_state_write_by_owner_allowed_enforce(tmp_db, allowlist_file, ob
             headers={"X-Mem-Principal": "brix-pm"},
         )
         assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Library-level fail-open trade-off (reviewer 2026-09-18 [low])
+# ---------------------------------------------------------------------------
+
+def test_library_fail_open_degrades_to_static_prefixes(tmp_db, tmp_path, observe_log, no_enforce, monkeypatch):
+    """Documented trade-off: mem_exhaust.machinery_prefixes() is fail-OPEN at
+    the library level (returns () on a missing/malformed allowlist) so the
+    library set()/get() chokepoint never breaks. The FAIL-CLOSED surface is the
+    server's boot-time guard. This pins the boundary: a library-only caller
+    with a missing allowlist degrades to the static EXHAUST_PREFIXES (test/ is
+    NOT routed), while the server REFUSES TO START on the same missing file.
+    """
+    from agents_core import mem_exhaust
+
+    # Point the machinery loader at a missing file.
+    monkeypatch.setenv("MEM_MACHINE_STATE_PREFIXES_PATH", str(tmp_path / "missing.json"))
+    mem_exhaust.reset_machinery_prefixes_cache()
+    try:
+        # Library-level: fail-open -> no machinery extension, only static.
+        assert mem_exhaust.machinery_prefixes() == ()
+        # test/ is NOT a static exhaust prefix, so it is NOT routed.
+        assert mem_exhaust.route_to_exhaust("test/key") is False
+        assert mem_exhaust.route_to_exhaust("elevator/x") is True
+    finally:
+        mem_exhaust.reset_machinery_prefixes_cache()
+        monkeypatch.delenv("MEM_MACHINE_STATE_PREFIXES_PATH", raising=False)
+
+    # Server-level: the SAME missing file REFUSES TO START (fail-closed).
+    with pytest.raises(RuntimeError, match="REFUSES TO START"):
+        create_app(tmp_db, allowlist_path=tmp_path / "missing.json")
 
 
 # ---------------------------------------------------------------------------

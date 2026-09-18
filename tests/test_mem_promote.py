@@ -185,25 +185,27 @@ BASE = "http://test-mem-server:8403"
 
 
 @respx.mock
-def test_client_promote_sends_header_source_tags():
+def test_client_promote_posts_promote_endpoint():
+    """The client posts to the server-side /v0/promote endpoint (D2), sending
+    the raw body (key/from/principal/content) + the X-Mem-Principal header.
+    The SERVER builds the provenance header/source/tags + batch key."""
     c = MemClient(base_url=BASE, principal="brix-pm")
-    route = respx.put(f"{BASE}/v0/memories/finding/x").mock(
+    route = respx.post(f"{BASE}/v0/promote").mock(
         return_value=httpx.Response(200, json={
             "key": "finding/x", "content": "h", "tags": "promoted",
             "source": "promoted:openclaw/gw", "created_at": "x", "updated_at": "y",
-            "created": True,
+            "batch_key": "decision/memdb-promotion-20260914-brix-pm",
         })
     )
     row = c.promote("finding/x", "openclaw/gw", "brix-pm", "the finding")
-    assert row["created"] is True
+    assert row["batch_key"] == "decision/memdb-promotion-20260914-brix-pm"
     sent = route.calls[0].request
     assert sent.headers["X-Mem-Principal"] == "brix-pm"
     body = json.loads(sent.content)
-    assert body["source"] == "promoted:openclaw/gw"
-    assert body["tags"] == "promoted"
-    assert body["content"].startswith("[promoted from openclaw/gw by brix-pm at ")
-    parsed = parse_promoted_header(body["content"])
-    assert parsed["agent"] == "openclaw" and parsed["store"] == "gw"
+    assert body["key"] == "finding/x"
+    assert body["from"] == "openclaw/gw"
+    assert body["principal"] == "brix-pm"
+    assert body["content"] == "the finding"
 
 
 @respx.mock
@@ -229,3 +231,89 @@ def test_client_no_principal_no_header(monkeypatch):
     route = respx.get(f"{BASE}/healthz").mock(return_value=httpx.Response(200, json={"status": "ok"}))
     c.healthz()
     assert "X-Mem-Principal" not in route.calls[0].request.headers
+
+
+# ---------------------------------------------------------------------------
+# Server-side /v0/promote endpoint (D2 — the server repeats the check, loud
+# 400; builds the provenance header; writes the batch decision key).
+# ---------------------------------------------------------------------------
+
+def test_server_promote_provenance_round_trip(tmp_db, allowlist_file, observe_log, no_enforce):
+    """POST /v0/promote writes the row with the exact provenance header,
+    source='promoted:<agent>/<store>', the 'promoted' tag, AND upserts the
+    batch decision key listing the promoted key + its --from ref."""
+    with _server_client(tmp_db, allowlist_file, observe_log, no_enforce) as c:
+        resp = c.post(
+            "/v0/promote",
+            json={
+                "key": "finding/openclaw-friction-cluster",
+                "from": "openclaw/gw",
+                "principal": "brix-pm",
+                "content": "the finding",
+                "tags": "openclaw",
+            },
+            headers={"X-Mem-Principal": "brix-pm"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["source"] == "promoted:openclaw/gw"
+        assert "promoted" in body["tags"].split(",")
+        parsed = parse_promoted_header(body["content"])
+        assert parsed is not None
+        assert parsed["agent"] == "openclaw" and parsed["store"] == "gw"
+        assert parsed["principal"] == "brix-pm"
+        # The body follows the header after a blank line.
+        assert body["content"].split("\n", 2)[2] == "the finding"
+        # The batch decision key is named and returned.
+        assert body["batch_key"].startswith("decision/memdb-promotion-")
+        assert body["batch_key"].endswith("-brix-pm")
+
+        # The batch decision key is written and lists the promoted key + ref.
+        batch = c.get(f"/v0/memories/{body['batch_key']}").json()
+        assert "finding/openclaw-friction-cluster" in batch["content"]
+        assert "--from openclaw/gw" in batch["content"]
+
+
+def test_server_promote_rejects_newline_ref_loud_400(tmp_db, allowlist_file, observe_log, no_enforce):
+    """The server repeats the --from shape check: a newline/control-char ref
+    is rejected with a loud 400 (panel security F6) — the client's
+    pre-validation is not the only line of defense."""
+    with _server_client(tmp_db, allowlist_file, observe_log, no_enforce) as c:
+        resp = c.post(
+            "/v0/promote",
+            json={
+                "key": "finding/x",
+                "from": "openclaw/gw\n[evil header]",
+                "principal": "brix-pm",
+                "content": "x",
+            },
+            headers={"X-Mem-Principal": "brix-pm"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"]["error"]["code"] == "bad_from_ref"
+        # The row must NOT have been written.
+        assert c.get("/v0/memories/finding/x").status_code == 404
+
+
+def test_server_promote_rejects_malformed_ref(tmp_db, allowlist_file, observe_log, no_enforce):
+    with _server_client(tmp_db, allowlist_file, observe_log, no_enforce) as c:
+        for bad in ("no-slash", "a/b/c", "/store", "agent/"):
+            resp = c.post(
+                "/v0/promote",
+                json={"key": "finding/x", "from": bad, "principal": "brix-pm",
+                      "content": "x"},
+                headers={"X-Mem-Principal": "brix-pm"},
+            )
+            assert resp.status_code == 400, f"ref {bad!r} must 400"
+            assert resp.json()["detail"]["error"]["code"] == "bad_from_ref"
+
+
+def test_server_promote_requires_principal(tmp_db, allowlist_file, observe_log, no_enforce):
+    """No curator principal (absent header + no body principal) = loud 400."""
+    with _server_client(tmp_db, allowlist_file, observe_log, no_enforce) as c:
+        resp = c.post(
+            "/v0/promote",
+            json={"key": "finding/x", "from": "openclaw/gw", "content": "x"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"]["error"]["code"] == "bad_request"

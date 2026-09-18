@@ -221,21 +221,30 @@ class MemClient:
 
         `ref` is the `--from` agent-store ref (`<agent>/<store>`); a ref with
         a newline or control char is rejected client-side (loud ValueError)
-        before any request is sent — the server repeats the check (loud 400).
+        before any request is sent — the server repeats the check (loud 400)
+        at the /v0/promote edge (panel security F6).
+
+        Uses the server-side POST /v0/promote endpoint: the server builds the
+        exact provenance header, sets source="promoted:<agent>/<store>", adds
+        the 'promoted' tag, and upserts the batch decision key. The client
+        still validates the ref up front so a bad ref never leaves the process.
         """
-        promoted_content = build_promoted_content(ref, principal, content)
-        agent, store = ref.split("/", 1)
-        source = f"promoted:{agent}/{store}"
-        tag_list = ["promoted"]
-        if tags:
-            tag_list.extend(t.strip() for t in tags.split(",") if t.strip())
+        # Client-side shape validation (loud ValueError) before any request.
+        validate_promote_source_ref(ref)
+        if ref.count("/") != 1 or not ref[0] or ref[-1] == "/":
+            raise ValueError(
+                f"--from ref must be '<agent>/<store>' (path-like, one slash): {ref!r}"
+            )
         body: dict[str, Any] = {
-            "content": promoted_content,
-            "tags": ",".join(tag_list),
-            "source": source,
+            "key": key,
+            "from": ref,
+            "principal": principal,
+            "content": content,
         }
+        if tags:
+            body["tags"] = tags
         return self._check(
-            self._client.put(f"/v0/memories/{key}", json=body)
+            self._client.post("/v0/promote", json=body)
         ).json()
 
     def checkpoint(self) -> dict:

@@ -52,6 +52,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from agents_core import mem_machinery
 from agents_core.mem import MemoryStore
+from agents_core.mem_client import build_promoted_content
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -246,18 +247,24 @@ class FaucetObserver:
 
     def report(self) -> dict:
         """The per-observed-writer table for the observe-week report."""
+        # The write-class verbs partitioned in the report. POST_CHECKPOINT is
+        # a maintenance verb (not the write class), but it is still observed —
+        # include it in the verbs dict so total == sum(verbs) always holds
+        # (a checkpoint writer must not show total > sum(verbs)).
+        known_verbs = ("PUT", "DELETE", "POST_DEPOSIT", "POST_CHECKPOINT")
         writers: dict[str, dict] = {}
         for (principal, verb), n in self._counts.items():
             w = writers.setdefault(
                 principal,
                 {
                     "principal": principal,
-                    "verbs": {"PUT": 0, "DELETE": 0, "POST_DEPOSIT": 0},
+                    "verbs": {v: 0 for v in known_verbs},
                     "total": 0,
                 },
             )
-            if verb in w["verbs"]:
-                w["verbs"][verb] += n
+            # Any observed verb is counted (defensive: a new verb never drops
+            # out of the report silently).
+            w["verbs"][verb] = w["verbs"].get(verb, 0) + n
             w["total"] += n
         break_list = {
             p: {"verbs": sorted(v["verbs"]), "prefixes": sorted(v["prefixes"])}
@@ -487,6 +494,105 @@ def create_app(
                 detail=_error("not_found", f"Memory '{key}' not found"),
             )
         return Response(status_code=204)
+
+    # ------------------------------------------------------------------
+    # Promote (D2 — explicit verb, server-side provenance shape)
+    # ------------------------------------------------------------------
+
+    @app.post("/v0/promote")
+    def promote(body: dict[str, Any], request: Request):
+        """Promote one row from an agent store into mem.db (D2).
+
+        Server-side endpoint: the client (MemClient.promote) may pre-validate,
+        but the SERVER repeats the --from shape check (loud 400, panel
+        security F6) and builds the exact provenance header + batch decision
+        key. The server is the source of truth for the provenance shape —
+        an auditor who cannot parse the shape cannot audit.
+
+        Body: {key, from, principal, content, tags?}
+          key       — the mem.db key to write
+          from      — the --from agent-store ref, '<agent>/<store>'
+          principal — the curator principal (X-Mem-Principal header is the
+                      identity; this is the provenance header's 'by')
+          content   — the promoted body (the header line is prepended)
+          tags      — extra tags (the 'promoted' tag is always added)
+
+        Writes with source="promoted:<agent>/<store>", tags 'promoted' +
+        curator-chosen tags, and the exact provenance header as the first
+        line of the content. Also upserts the batch decision key
+        decision/memdb-promotion-<YYYYMMDD>-<principal> listing the promoted
+        key + its --from ref (the auditable-to-a-decision artifact).
+        """
+        key = body.get("key", "")
+        ref = body.get("from", "")
+        principal = body.get("principal", "") or _principal_of(request)
+        content = body.get("content", "")
+
+        # Write-class guard first (observed always; enforced under the flag).
+        reject = _write_guard(request, "PUT", key)
+        if reject is not None:
+            return reject
+
+        # Server-side --from shape validation (loud 400). The client validates
+        # too, but the server repeats the check — a malformed ref must be
+        # rejected at the HTTP edge regardless of the client.
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail=_error("bad_request", "'key' is required"),
+            )
+        if not principal:
+            raise HTTPException(
+                status_code=400,
+                detail=_error(
+                    "bad_request",
+                    "a curator principal is required (X-Mem-Principal header "
+                    "or body 'principal')",
+                ),
+            )
+        try:
+            promoted_content = build_promoted_content(ref, principal, content)
+        except ValueError as e:
+            # Newline/control-char injection or a malformed <agent>/<store>
+            # ref — loud 400 (panel security F6).
+            raise HTTPException(
+                status_code=400,
+                detail=_error("bad_from_ref", str(e)),
+            )
+
+        agent, store_name = ref.split("/", 1)
+        source = f"promoted:{agent}/{store_name}"
+        tag_list = ["promoted"]
+        extra = body.get("tags", "")
+        if extra:
+            tag_list.extend(_normalize_tags(extra) or [])
+        # De-dup while preserving the 'promoted' tag first.
+        seen = set()
+        tags_final = [t for t in tag_list if not (t in seen or seen.add(t))]
+
+        store.set(key, promoted_content, tags=tags_final, source=source)
+        row = store.get(key)
+
+        # Batch decision key (D2 named decision artifact):
+        # decision/memdb-promotion-<YYYYMMDD>-<curator> lists promoted keys +
+        # their --from refs. Upserted (append-if-new) so a curation run
+        # accumulates its batch in one key.
+        day = datetime.now(timezone.utc).strftime("%Y%m%d")
+        batch_key = f"decision/memdb-promotion-{day}-{principal}"
+        line = f"- {key} --from {ref}"
+        existing = store.get(batch_key)
+        if existing and line in existing["content"]:
+            batch_content = existing["content"]
+        else:
+            base = existing["content"] if existing else ""
+            header = f"Promotion batch {day} by {principal}"
+            batch_content = (
+                f"{header}\n{line}\n" if not base else f"{base}\n{line}"
+            )
+        store.set(batch_key, batch_content, tags=["promoted-batch"],
+                  source=source)
+
+        return {**_row_response(row), "batch_key": batch_key}
 
     # ------------------------------------------------------------------
     # Search

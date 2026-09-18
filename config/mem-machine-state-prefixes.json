@@ -22,13 +22,12 @@
       "store": "machinery",
       "state": "live",
       "dead_since": null
-    },
+    }
+  ],
+  "excluded": [
     {
       "prefix": "test/",
-      "producer_principal": "brix-pm",
-      "store": "machinery",
-      "state": "dead",
-      "dead_since": "2026-09-14"
+      "reason": "NOT a machine-state prefix (reviewer 2026-09-18, PR #328 cycle 1, [high]): 'test/' is a generic scratch/test namespace used by existing tests and production code that expect test/* keys to land in mem.db (the atoms store). Adding it here made route_to_exhaust() (which merges machinery prefixes) silently reroute every test/* write to exhaust.db, breaking FTS-divergence and other mem.db assertions. The hygiene spec owns the historical test/ rows (2 rows, quarantine) — the FAUCET must not move them. If a genuine machine-state producer needs a test/ sub-prefix, it gets a LITERAL, more specific prefix (e.g. 'test/machine/'), never the bare 'test/'."
     }
   ]
 }
