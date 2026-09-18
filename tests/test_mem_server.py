@@ -48,15 +48,26 @@ def test_healthz_empty_db(client):
 
 
 def test_healthz_fts_divergence(tmp_db):
-    """Manually delete from memories_fts to simulate trigger failure."""
+    """Manually delete from memories_fts to simulate trigger failure.
+
+    NOTE (reviewer PR #328 cycle 1 [high], cycle 2 re-landed): the keys MUST
+    NOT collide with exhaust routing prefixes (elevator/, weather/,
+    router/gw-review-divergence/ — mem_exhaust.EXHAUST_PREFIXES, plus the
+    machinery allowlist extension). MemoryStore.set() routes such keys to the
+    sibling exhaust store (FTS-less by design), so a 'test/...' key that
+    collided with a routed prefix would silently land in exhaust.db and the
+    FTS-divergence assertion below would measure the wrong store. The 'test/'
+    namespace is deliberately NOT a machinery prefix (see the 'excluded'
+    entry in config/mem-machine-state-prefixes.json).
+    """
     app = create_app(tmp_db)
     with TestClient(app) as c:
-        c.put("/v0/memories/test/key", json={"content": "hello", "tags": "", "source": ""})
-        c.put("/v0/memories/test/key2", json={"content": "world", "tags": "", "source": ""})
+        c.put("/v0/memories/healthz/probe1", json={"content": "hello", "tags": "", "source": ""})
+        c.put("/v0/memories/healthz/probe2", json={"content": "world", "tags": "", "source": ""})
 
     # bypass triggers: directly delete from memories_fts
     conn = sqlite3.connect(str(tmp_db))
-    conn.execute("DELETE FROM memories_fts WHERE key='test/key'")
+    conn.execute("DELETE FROM memories_fts WHERE key='healthz/probe1'")
     conn.commit()
     conn.close()
 
