@@ -184,7 +184,11 @@ class FaucetObserver:
     def observe_write(self, request: Request, verb: str, key: str) -> dict:
         """Log a write attempt. Returns the verdict record (for logging/audit).
 
-        verb is the normalized verb: "PUT", "DELETE", or "POST_DEPOSIT".
+        verb is the normalized verb: "PUT", "DELETE", "POST_DEPOSIT", or
+        "POST_PROMOTE" (the /v0/promote verb is its OWN verb in the
+        per-writer table — it is a POST, not a PUT, so it must not be
+        conflated with the PUT write class in the observe log or the
+        report; gate trickster verb partitioning).
         """
         principal = _principal_of(request) or "none"
         role = _principal_role(request, self.principals)
@@ -251,7 +255,9 @@ class FaucetObserver:
         # a maintenance verb (not the write class), but it is still observed —
         # include it in the verbs dict so total == sum(verbs) always holds
         # (a checkpoint writer must not show total > sum(verbs)).
-        known_verbs = ("PUT", "DELETE", "POST_DEPOSIT", "POST_CHECKPOINT")
+        known_verbs = (
+            "PUT", "DELETE", "POST_DEPOSIT", "POST_PROMOTE", "POST_CHECKPOINT",
+        )
         writers: dict[str, dict] = {}
         for (principal, verb), n in self._counts.items():
             w = writers.setdefault(
@@ -515,11 +521,18 @@ def create_app(
         key. The server is the source of truth for the provenance shape —
         an auditor who cannot parse the shape cannot audit.
 
-        Body: {key, from, principal, content, tags?, rationale?}
+        Body: {key, from, principal?, content, tags?, rationale?}
           key       — the mem.db key to write
           from      — the --from agent-store ref, '<agent>/<store>'
-          principal — the curator principal (X-Mem-Principal header is the
-                      identity; this is the provenance header's 'by')
+          principal — the curator principal. The VERIFIED identity is the
+                      X-Mem-Principal header (the write-class guard keys off
+                      it); a body 'principal' that differs from the header
+                      is REJECTED (loud 400 principal_mismatch) — the audit
+                      artifact (provenance header 'by' + batch decision key)
+                      must never carry a client-supplied string the guard
+                      never checked (reviewer PR #333 cycle 1 [med]). When
+                      the body principal is absent or equals the header it
+                      is accepted (the header is what lands in the artifact).
           content   — the promoted body (the header line is prepended)
           tags      — extra tags (the 'promoted' tag is always added)
           rationale — one-line rationale (D2 named decision artifact: the
@@ -536,7 +549,32 @@ def create_app(
         """
         key = body.get("key", "")
         ref = body.get("from", "")
-        principal = body.get("principal", "") or _principal_of(request)
+        # The VERIFIED principal is the X-Mem-Principal header — the same
+        # identity the write-class guard below keys off. The body 'principal'
+        # is a client-supplied string: if it is present and differs from the
+        # header, REJECT (loud 400 principal_mismatch) — a caller must not be
+        # able to assert a reader header (the guard sees reader) while forging
+        # the provenance header's 'by' / the batch decision key to any name
+        # (reviewer PR #333 cycle 1 [med]; spec D2: --by is the curator
+        # principal and the guard is the principal check).
+        header_principal = _principal_of(request)
+        body_principal = body.get("principal", "")
+        if body_principal and body_principal != header_principal:
+            raise HTTPException(
+                status_code=400,
+                detail=_error(
+                    "principal_mismatch",
+                    f"body principal {body_principal!r} does not match the "
+                    f"X-Mem-Principal header {header_principal or '<absent>'!r}; "
+                    f"the verified identity is the header — the audit "
+                    f"artifact (provenance 'by' + batch decision key) must "
+                    f"carry the verified principal, not a client-supplied "
+                    f"string",
+                ),
+            )
+        # The artifact (provenance 'by' + batch decision key) carries the
+        # VERIFIED header principal — never a client-supplied string.
+        principal = header_principal
         content = body.get("content", "")
         # One-line rationale (D2 named decision artifact). Newline/control-char
         # rejection: the batch key is a single-content audit row — a multi-line
@@ -563,13 +601,33 @@ def create_app(
                 status_code=400,
                 detail=_error("bad_request", "'key' is required"),
             )
+
+        # Write-class guard (observed always; enforced under the flag), now on
+        # the validated key: the promote verb is in the write class and a
+        # reader's promote is rejected (403 principal_reader) exactly like a
+        # PUT — the guard is the principal check, and it must see the real
+        # key. Observed as POST_PROMOTE (its own verb in the per-writer table,
+        # gate trickster): a curator promote must not be mislabeled as a PUT
+        # in the observe log or the report (reviewer PR #333 cycle 1 [med]).
+        # The guard keys off the VERIFIED header principal — a body principal
+        # can never substitute for it (spec D2: the guard is the principal
+        # check).
+        reject = _write_guard(request, "POST_PROMOTE", key)
+        if reject is not None:
+            return reject
+
+        # The provenance artifact requires a curator principal. A guard pass
+        # under observe-only does NOT establish one (observe-only allows
+        # readers), so an absent header principal is a loud 400 — the
+        # artifact must never carry an empty or forged identity.
         if not principal:
             raise HTTPException(
                 status_code=400,
                 detail=_error(
                     "bad_request",
-                    "a curator principal is required (X-Mem-Principal header "
-                    "or body 'principal')",
+                    "a curator principal is required (X-Mem-Principal header; "
+                    "the body 'principal' must match it and never substitutes "
+                    "for it)",
                 ),
             )
         try:
@@ -581,15 +639,6 @@ def create_app(
                 status_code=400,
                 detail=_error("bad_from_ref", str(e)),
             )
-
-        # Write-class guard (observed always; enforced under the flag), now on
-        # the validated key: the promote verb is in the write class
-        # (PUT/DELETE/deposit) and a reader's promote is rejected
-        # (403 principal_reader) exactly like a PUT — the guard is the
-        # principal check, and it must see the real key.
-        reject = _write_guard(request, "PUT", key)
-        if reject is not None:
-            return reject
 
         agent, store_name = ref.split("/", 1)
         source = f"promoted:{agent}/{store_name}"
@@ -620,17 +669,23 @@ def create_app(
         # it) but the shape is always the same.
         rationale_part = f" : {rationale}" if rationale else ""
         line = f"- {key} --from {ref}{rationale_part}"
-        existing = store.get(batch_key)
-        if existing and line in existing["content"]:
-            batch_content = existing["content"]
-        else:
-            base = existing["content"] if existing else ""
-            header = f"Promotion batch {day} by {principal}"
-            batch_content = (
-                f"{header}\n{line}\n" if not base else f"{base}\n{line}"
-            )
-        store.set(batch_key, batch_content, tags=["promoted-batch"],
-                  source=source)
+        # Atomic read-modify-write (reviewer PR #333 cycle 1 [low]): the
+        # get-then-set upsert must hold the store lock across both, or
+        # concurrent promotes interleaving between the two would
+        # double-append or lose a line. Dedup is an exact LINE test (the
+        # line is newline-terminated), not a substring test — a key that is
+        # a substring of another line must not mis-dedup.
+        with store._lock:
+            existing = store.get(batch_key)
+            existing_lines = existing["content"].splitlines() if existing else []
+            if line not in existing_lines:
+                base = existing["content"] if existing else ""
+                header = f"Promotion batch {day} by {principal}"
+                batch_content = (
+                    f"{header}\n{line}\n" if not base else f"{base}\n{line}\n"
+                )
+                store.set(batch_key, batch_content, tags=["promoted-batch"],
+                          source=source)
 
         return {**_row_response(row), "batch_key": batch_key}
 

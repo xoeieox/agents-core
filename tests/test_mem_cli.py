@@ -84,7 +84,8 @@ def test_cli_promote_uses_mem_principal_env(monkeypatch):
             "updated_at": "y", "batch_key": "decision/memdb-promotion-20260914-zephyr-deposit",
         })
     )
-    rc = cli(["promote", "--from", "openclaw/gw", "finding/x", "the finding"])
+    rc = cli(["promote", "finding/x", "--from", "openclaw/gw",
+              "--content", "the finding"])
     assert rc == 0
     sent = route.calls[0].request
     # The MEM_PRINCIPAL env principal is sent as the X-Mem-Principal header.
@@ -105,7 +106,8 @@ def test_cli_promote_defaults_to_brix_pm_when_no_env(monkeypatch):
             "updated_at": "y", "batch_key": "decision/memdb-promotion-20260914-brix-pm",
         })
     )
-    rc = cli(["promote", "--from", "openclaw/gw", "finding/x", "the finding"])
+    rc = cli(["promote", "finding/x", "--from", "openclaw/gw",
+              "--content", "the finding"])
     assert rc == 0
     sent = route.calls[0].request
     assert sent.headers["X-Mem-Principal"] == "brix-pm"
@@ -123,8 +125,8 @@ def test_cli_promote_by_flag_wins_over_env(monkeypatch):
             "updated_at": "y", "batch_key": "decision/memdb-promotion-20260914-brix-pm",
         })
     )
-    rc = cli(["promote", "--from", "openclaw/gw", "finding/x", "the finding",
-              "--by", "brix-pm"])
+    rc = cli(["promote", "finding/x", "--from", "openclaw/gw",
+              "--content", "the finding", "--by", "brix-pm"])
     assert rc == 0
     sent = route.calls[0].request
     assert sent.headers["X-Mem-Principal"] == "brix-pm"
@@ -147,8 +149,8 @@ def test_cli_promote_accepts_store_machinery(monkeypatch):
             "updated_at": "y", "batch_key": "decision/memdb-promotion-20260914-brix-pm",
         })
     )
-    rc = cli(["promote", "--from", "openclaw/gw", "finding/x", "the finding",
-              "--store", "machinery"])
+    rc = cli(["promote", "finding/x", "--from", "openclaw/gw",
+              "--content", "the finding", "--store", "machinery"])
     assert rc == 0
 
 
@@ -158,8 +160,8 @@ def test_cli_promote_rejects_unknown_store(monkeypatch, capsys):
     monkeypatch.setenv("MEM_SERVER", BASE)
     monkeypatch.delenv("MEM_PRINCIPAL", raising=False)
     with pytest.raises(SystemExit) as exc:
-        cli(["promote", "--from", "openclaw/gw", "finding/x", "the finding",
-             "--store", "machinery-typo"])
+        cli(["promote", "finding/x", "--from", "openclaw/gw",
+             "--content", "the finding", "--store", "machinery-typo"])
     assert exc.value.code == 2
 
 
@@ -174,7 +176,8 @@ def test_cli_promote_refused_without_mem_server(monkeypatch, capsys):
     --from shape check + batch key (the side-effect the spec forbids)."""
     monkeypatch.delenv("MEM_SERVER", raising=False)
     monkeypatch.delenv("MEM_PRINCIPAL", raising=False)
-    rc = cli(["promote", "--from", "openclaw/gw", "finding/x", "the finding"])
+    rc = cli(["promote", "finding/x", "--from", "openclaw/gw",
+              "--content", "the finding"])
     assert rc == 2
     err = capsys.readouterr().err
     assert "MEM_SERVER" in err
@@ -189,8 +192,8 @@ def test_cli_promote_rejects_newline_ref(monkeypatch, capsys):
     the client validates before any request is sent (panel security F6)."""
     monkeypatch.setenv("MEM_SERVER", BASE)
     monkeypatch.delenv("MEM_PRINCIPAL", raising=False)
-    rc = cli(["promote", "--from", "openclaw/gw\n[evil]", "finding/x",
-              "the finding"])
+    rc = cli(["promote", "finding/x", "--from", "openclaw/gw\n[evil]",
+              "--content", "the finding"])
     assert rc == 2
     err = capsys.readouterr().err
     assert "path-like" in err or "control" in err or "newline" in err.lower()
@@ -202,12 +205,15 @@ def test_cli_promote_rejects_newline_ref(monkeypatch, capsys):
 
 def test_parser_promote_subcommand_exists():
     """The promote subcommand is wired into the parser (the conductor CLI
-    adds this subparser to its own `sub` group). The canonical invocation
-    puts --from BEFORE the positionals (argparse cannot handle a required
-    option sandwiched between positionals)."""
+    adds this subparser to its own `sub` group). The documented canonical
+    invocation — `mem promote <key> --from <agent>/<store>` with the body
+    as the --content option — parses (reviewer PR #333 cycle 1 [low]: the
+    old positional [content] forced --from BEFORE the positionals, so the
+    documented form failed to parse)."""
     parser = build_parser()
     args = parser.parse_args(
-        ["promote", "--from", "openclaw/gw", "finding/x", "the finding"]
+        ["promote", "finding/x", "--from", "openclaw/gw",
+         "--content", "the finding"]
     )
     assert args.command == "promote"
     assert args.key == "finding/x"
@@ -219,13 +225,42 @@ def test_parser_promote_subcommand_exists():
     assert args.store == STORE_ATOMS
 
 
-def test_parser_promote_optional_flags():
-    """The optional options (--by, --tags, --rationale, --store) must come
-    AFTER the positionals (key, content) on the command line (argparse
-    ordering constraint)."""
+def test_parser_promote_canonical_form_matches_docs():
+    """The EXACT documented form from docs/deploying-mem-server.md parses:
+    `mem promote <key> --from <agent>/<store> --by <curator-principal>`
+    (no body)."""
     parser = build_parser()
     args = parser.parse_args(
-        ["promote", "--from", "openclaw/gw", "finding/x", "the finding",
+        ["promote", "finding/x", "--from", "openclaw/gw", "--by", "brix-pm"]
+    )
+    assert args.key == "finding/x"
+    assert args.from_ref == "openclaw/gw"
+    assert args.by == "brix-pm"
+    assert args.content == ""
+
+
+def test_cli_promote_rejects_multi_line_rationale(monkeypatch, capsys):
+    """A multi-line/control-char --rationale is rejected client-side (loud
+    exit 2): the batch decision key is a line-based listing, so a
+    multi-line rationale must not leave the process (the server repeats
+    the check with a loud 400 bad_rationale)."""
+    monkeypatch.setenv("MEM_SERVER", BASE)
+    monkeypatch.delenv("MEM_PRINCIPAL", raising=False)
+    rc = cli(["promote", "finding/x", "--from", "openclaw/gw",
+              "--rationale", "line1\nline2"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "single line" in err
+
+
+def test_parser_promote_optional_flags():
+    """All optional options (--content, --by, --tags, --rationale, --store)
+    parse in any order after the positional key (the body is the --content
+    option, not a positional — no positional-sandwich constraint)."""
+    parser = build_parser()
+    args = parser.parse_args(
+        ["promote", "finding/x", "--from", "openclaw/gw",
+         "--content", "the finding",
          "--by", "brix-pm", "--tags", "openclaw,friction",
          "--rationale", "friction-cluster insight",
          "--store", "machinery"]

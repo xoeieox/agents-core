@@ -13,9 +13,12 @@ D1).
 
 The `promote` verb (D2):
 
-    mem promote <key> --from <agent-store-ref> --by <curator-principal>
-                 [--tags tag1,tag2] [--rationale one-line-why]
-                 [--store atoms|machinery]
+    mem promote <key> [--content <body>] --from <agent-store-ref>
+                      [--by <curator-principal>] [--tags tag1,tag2]
+                      [--rationale one-line-why] [--store atoms|machinery]
+
+    (argparse: all options come AFTER the positional <key>; the optional
+    body is the --content option, not a positional — see build_parser().)
 
 Routes through MemClient when MEM_SERVER is set (the HTTP path — the
 curation surface runs BRIX-side against the BRIX master). When MEM_SERVER
@@ -42,9 +45,9 @@ default to brix-pm (the panel call), so the default is keyed on the WRITE
 verb, not on the transport.
 
 Usage as CLI (this module):
-    mem promote <key> --from <agent>/<store> --by <curator-principal>
-                     [--tags tag1,tag2] [--rationale one-line-why]
-                     [--store atoms|machinery]
+    mem promote <key> [--content <body>] --from <agent>/<store>
+                      [--by <curator-principal>] [--tags tag1,tag2]
+                      [--rationale one-line-why] [--store atoms|machinery]
 """
 
 from __future__ import annotations
@@ -54,6 +57,7 @@ import os
 import sys
 
 from agents_core.mem_client import (
+    INVALID_REF_CHARS_RE,
     MemClient,
     MemHTTPError,
     STORE_ATOMS,
@@ -114,7 +118,23 @@ def _cmd_promote(args: argparse.Namespace) -> int:
 
     # Validate --store (loud ValueError on a typo) — the rescoped flag is
     # MOOT at the HTTP layer but must be a known value.
-    validate_store(args.store)
+    try:
+        validate_store(args.store)
+    except ValueError as e:
+        print(f"[mem] {e}", file=sys.stderr)
+        return 2
+
+    # Client-side one-line rationale check (the server repeats it with a
+    # loud 400 bad_rationale): the batch decision key is a line-based
+    # listing, so a multi-line/control-char rationale is rejected before
+    # any request is sent.
+    if INVALID_REF_CHARS_RE.search(args.rationale):
+        print(
+            "[mem] --rationale must be a single line (no newlines or "
+            "control chars)",
+            file=sys.stderr,
+        )
+        return 2
 
     try:
         client = MemClient(principal=principal)
@@ -160,56 +180,52 @@ def build_parser() -> argparse.ArgumentParser:
         "promote",
         help="Promote one row from an agent store into mem.db (D2)",
     )
-    # NOTE: argparse ordering constraint. A required option (--from) must
-    # come BEFORE the positionals (key, content), and the optional positional
-    # (content) must come BEFORE any optional option (--by, --tags, etc.) on
-    # the command line. argparse stops consuming positionals at the first
-    # unrecognized token, so an optional option sandwiched between positionals
-    # breaks parsing. The canonical invocation is:
-    #   mem promote --from <agent>/<store> <key> [content] [--by ...] [--tags ...]
-    # The optional options (--by, --tags, --rationale, --store) must come
-    # AFTER the positionals.
+    # NOTE: argparse ordering constraint. The promoted body is the --content
+    # OPTION (not a positional) so that the documented canonical invocation
+    #
+    #   mem promote <key> --from <agent>/<store> --by <curator> [--content ...]
+    #
+    # parses: argparse stops consuming positionals at the first unrecognized
+    # token, so with a positional [content] the optional options (--from,
+    # --by, ...) could only come AFTER the positionals — the documented form
+    # (`mem promote <key> --from ...`) then failed to parse (reviewer PR #333
+    # cycle 1 [low]). With a single positional (key) and all options, any
+    # option order after <key> works.
+    p_promote.add_argument("key", help="The mem.db key to write")
     p_promote.add_argument(
         "--from",
         dest="from_ref",
         required=True,
         help="The --from agent-store ref, '<agent>/<store>' (path-like, one "
-             "slash). MUST come before the positionals on the command line.",
+             "slash).",
     )
-    p_promote.add_argument("key", help="The mem.db key to write")
     p_promote.add_argument(
-        "content",
-        nargs="?",
+        "--content",
         default="",
         help="The promoted body (the provenance header line is prepended "
-             "server-side); omit to promote an empty body. MUST come before "
-             "any optional option on the command line.",
+             "server-side); omit to promote an empty body.",
     )
     p_promote.add_argument(
         "--by",
         default="",
-        help="The curator principal (defaults to MEM_PRINCIPAL, then brix-pm). "
-             "MUST come after the positionals on the command line.",
+        help="The curator principal (defaults to MEM_PRINCIPAL, then brix-pm).",
     )
     p_promote.add_argument(
         "--tags",
         default="",
-        help="Comma-separated extra tags (the 'promoted' tag is always added). "
-             "MUST come after the positionals on the command line.",
+        help="Comma-separated extra tags (the 'promoted' tag is always added).",
     )
     p_promote.add_argument(
         "--rationale",
         default="",
-        help="One-line rationale (the D2 named decision artifact). "
-             "MUST come after the positionals on the command line.",
+        help="One-line rationale (the D2 named decision artifact).",
     )
     p_promote.add_argument(
         "--store",
         default=STORE_ATOMS,
         choices=sorted((STORE_ATOMS, STORE_MACHINERY, "exhaust")),
         help="The target store (RESCOPED: MOOT at the HTTP layer — the server "
-             "routes machine-state keys transparently; validated for a loud typo). "
-             "MUST come after the positionals on the command line.",
+             "routes machine-state keys transparently; validated for a loud typo).",
     )
 
     return parser

@@ -39,10 +39,14 @@ forbids: "promotion is an explicit verb with a provenance shape, never a
 side effect").
 
 ```
-mem promote <key> --from <agent>/<store> --by <curator-principal>
-             [--tags tag1,tag2] [--rationale one-line-why]
-             [--store atoms|machinery]
+mem promote <key> [--content <body>] --from <agent>/<store>
+             [--by <curator-principal>] [--tags tag1,tag2]
+             [--rationale one-line-why] [--store atoms|machinery]
 ```
+
+(The promoted body is the `--content` option, not a positional — argparse
+stops consuming positionals at the first option, so the documented form
+with the body as a positional after `--from` would not parse.)
 
 - `--from` is shape-validated (path-like/ref-like token, no newlines or
   control chars, loud 400 — panel security F6).

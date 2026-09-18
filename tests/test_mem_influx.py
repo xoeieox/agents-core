@@ -191,6 +191,12 @@ def test_excluded_in_healthz(tmp_db, allowlist_file, observe_log, no_enforce):
 # D1 — principal fail-closed (enforce mode)
 # ---------------------------------------------------------------------------
 
+def _server_client_observe(tmp_db, allowlist_file, observe_log, no_enforce):
+    """An observe-only (non-enforce) TestClient for the promote tests."""
+    app = create_app(tmp_db, allowlist_path=allowlist_file)
+    return TestClient(app)
+
+
 def _enforce_client(tmp_db, allowlist_file, observe_log, enforce):
     app = create_app(tmp_db, allowlist_path=allowlist_file)
     return TestClient(app)
@@ -373,17 +379,20 @@ def test_promote_by_reader_rejected_403_enforce(tmp_db, allowlist_file, observe_
     key: a reader is rejected with 403 principal_reader and NOTHING is
     written (neither the promoted row nor the batch decision key).
 
-    The identity the GUARD sees is the X-Mem-Principal header (the
-    body 'principal' is only the provenance header's 'by'). So the reader
-    case is: no header (guard sees reader) + a body principal (passes the
-    loud-400 principal check, so the guard's 403 is what surfaces)."""
+    The identity the GUARD sees is the X-Mem-Principal header, and the
+    audit artifact (provenance 'by' + batch key) must carry that SAME
+    verified identity — a body 'principal' that differs from the header
+    is rejected first (400 principal_mismatch, reviewer PR #333 cycle 1
+    [med]), and a body principal can never substitute for the header
+    (the guard keys off the header). So the reader case is: NO header
+    (guard sees reader) + NO body principal — the guard's 403 is what
+    surfaces, not a forged artifact."""
     with _enforce_client(tmp_db, allowlist_file, observe_log, enforce) as c:
         resp = c.post(
             "/v0/promote",
             json={
                 "key": "finding/promote-reader",
                 "from": "openclaw/gw",
-                "principal": "brix-pm",
                 "content": "x",
             },
         )
@@ -411,6 +420,91 @@ def test_promote_by_curator_allowed_enforce(tmp_db, allowlist_file, observe_log,
         )
         assert resp.status_code == 200
         assert resp.json()["source"] == "promoted:openclaw/gw"
+
+
+def test_promote_body_principal_mismatch_rejected_400(tmp_db, allowlist_file, observe_log, no_enforce):
+    """The body 'principal' is a client-supplied string: when it differs
+    from the VERIFIED X-Mem-Principal header, the promote is rejected with
+    a loud 400 principal_mismatch and NOTHING is written (reviewer PR #333
+    cycle 1 [med]). The audit artifact (provenance header 'by' + batch
+    decision key) must carry the verified principal — a caller must not be
+    able to assert a reader header (the guard sees reader) while forging
+    the artifact to any name."""
+    with _server_client_observe(tmp_db, allowlist_file, observe_log, no_enforce) as c:
+        # Reader header + a body principal that is NOT the header.
+        resp = c.post(
+            "/v0/promote",
+            json={
+                "key": "finding/forge-attempt",
+                "from": "openclaw/gw",
+                "principal": "brix-pm",
+                "content": "x",
+            },
+            headers={"X-Mem-Principal": "some-reader"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"]["error"]["code"] == "principal_mismatch"
+        # Nothing landed: no promoted row, no batch decision key.
+        assert c.get("/v0/memories/finding/forge-attempt").status_code == 404
+        rows = c.get("/v0/memories", params={"tag": "promoted-batch", "limit": 50}).json()
+        assert rows == [], "no batch decision key may carry a forged principal"
+
+
+def test_promote_body_principal_absent_uses_header(tmp_db, allowlist_file, observe_log, no_enforce):
+    """When the body 'principal' is absent, the VERIFIED header principal
+    is used for the provenance artifact (spec D2: --by is the curator
+    principal; the guard is the principal check)."""
+    with _server_client_observe(tmp_db, allowlist_file, observe_log, no_enforce) as c:
+        resp = c.post(
+            "/v0/promote",
+            json={
+                "key": "finding/header-only",
+                "from": "openclaw/gw",
+                "content": "x",
+            },
+            headers={"X-Mem-Principal": "brix-pm"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["batch_key"].endswith("-brix-pm")
+        from agents_core.mem_client import parse_promoted_header
+        parsed = parse_promoted_header(body["content"])
+        assert parsed["principal"] == "brix-pm"
+
+
+def test_promote_verb_partitioned_post_promote(tmp_db, allowlist_file, observe_log, no_enforce):
+    """The /v0/promote verb is observed as POST_PROMOTE — its OWN verb in
+    the per-writer table, NOT a PUT (reviewer PR #333 cycle 1 [med]; gate
+    trickster verb partitioning): a curator promote must not be
+    mislabeled as a PUT in the observe log or the report."""
+    with _server_client_observe(tmp_db, allowlist_file, observe_log, no_enforce) as c:
+        resp = c.post(
+            "/v0/promote",
+            json={
+                "key": "finding/verb-partition",
+                "from": "openclaw/gw",
+                "principal": "brix-pm",
+                "content": "x",
+            },
+            headers={"X-Mem-Principal": "brix-pm"},
+        )
+        assert resp.status_code == 200
+
+        # The observe log labels the verb POST_PROMOTE, not PUT.
+        assert observe_log.exists()
+        for line in observe_log.read_text().splitlines():
+            import json as _json
+            rec = _json.loads(line)
+            if rec.get("key") == "finding/verb-partition":
+                assert rec["verb"] == "POST_PROMOTE"
+
+        # The report partitions the count under POST_PROMOTE; the PUT count
+        # for the same writer is 0 (no conflation with the PUT write class).
+        report = c.get("/v0/observe-report").json()
+        w = report["writers"]["brix-pm"]
+        assert w["verbs"]["POST_PROMOTE"] == 1
+        assert w["verbs"]["PUT"] == 0
+        assert w["total"] == 1
 
 
 # ---------------------------------------------------------------------------

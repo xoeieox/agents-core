@@ -132,7 +132,21 @@ def machinery_prefixes() -> tuple[str, ...]:
         from agents_core.mem_machinery import load_allowlist
 
         _machinery_prefixes_cache = load_allowlist().prefixes
-    except Exception:  # noqa: BLE001 — library-level fail-open (see block)
+    except Exception as e:  # noqa: BLE001 — library-level fail-open (see block)
+        # Log the degradation LOUDLY (reviewer PR #333 cycle 1 [low]): the
+        # fail-open is a deliberate trade-off (the server's boot-time guard
+        # is the fail-closed surface), but a library caller that silently
+        # degrades routing to the static prefixes — e.g. because the
+        # allowlist was removed mid-process and the cache was reset — would
+        # otherwise route machine-state keys into mem.db with no signal.
+        # Once per process per failure (the cache stays loaded, so this
+        # fires exactly once until reset_machinery_prefixes_cache()).
+        _cold_path_logger.warning(json.dumps({
+            "event": "machinery_allowlist_fail_open",
+            "error": str(e),
+            "effect": "machinery routing degraded to static EXHAUST_PREFIXES",
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }))
         _machinery_prefixes_cache = ()
     _machinery_prefixes_loaded = True
     return _machinery_prefixes_cache
