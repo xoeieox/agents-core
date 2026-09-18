@@ -268,13 +268,22 @@ DEFAULT_BATCH_CAP = 5000
 # D2(b) default age threshold (days) for the dead-stream predicate.
 DEFAULT_DEAD_STREAM_AGE_DAYS = 30
 
-# Prefixes whose last-write must be measured across BOTH stores (D2(b)
-# dual-store note): these are exactly the tier-1 exhaust-routed prefixes
-# (mem_exhaust.EXHAUST_PREFIXES) — the same producer kept writing the
-# exhaust twin past its mem.db last-write date (weather/ to 2026-08-22,
-# 9 days past the mem.db-only date), so single-store measurement makes the
+# D2(b) dual-store predicate — the NAMED pair the spec's dual-store note
+# names: elevator/ and weather/. The same producer (ops-primitives) kept
+# writing weather/ into the exhaust twin until 2026-08-22, 9 days past the
+# mem.db-only "last write" date, so single-store measurement makes the
 # predicate non-deterministic across implementation layers.
-DUAL_STORE_PREFIXES: tuple[str, ...] = mem_exhaust.EXHAUST_PREFIXES
+#
+# Deliberate divergence from mem_exhaust.EXHAUST_PREFIXES (reviewer high,
+# PR #329 cycle 1): EXHAUST_PREFIXES also carries
+# router/gw-review-divergence/ — a LIVE router/ sub-stream whose last-write
+# MUST be measured across both stores (the routing table in mem_exhaust.py
+# is the write-routing truth), but which is NOT on the dead-producer
+# registry (fail-closed, router/ stays live until its producer dies).
+# The DUAL_STORE set here is the CLASSIFIER's measurement set (dead-stream
+# allowlist members only); the two sets coincide today and must be kept in
+# sync when either changes.
+DUAL_STORE_PREFIXES: tuple[str, ...] = ("elevator/", "weather/")
 
 # Named default for the dry-run candidate artifact (D3). The conductor
 # node overrides this per run with <date>-<runid>.
