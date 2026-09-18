@@ -303,15 +303,20 @@ def test_observe_report_endpoint(tmp_db, allowlist_file, observe_log, no_enforce
 
 def test_promote_by_reader_rejected_403_enforce(tmp_db, allowlist_file, observe_log, enforce):
     """The /v0/promote endpoint runs the write-class guard on the validated
-    key: a reader (absent principal) is rejected with 403 principal_reader
-    and NOTHING is written (neither the promoted row nor the batch decision
-    key)."""
+    key: a reader is rejected with 403 principal_reader and NOTHING is
+    written (neither the promoted row nor the batch decision key).
+
+    The identity the GUARD sees is the X-Mem-Principal header (the
+    body 'principal' is only the provenance header's 'by'). So the reader
+    case is: no header (guard sees reader) + a body principal (passes the
+    loud-400 principal check, so the guard's 403 is what surfaces)."""
     with _enforce_client(tmp_db, allowlist_file, observe_log, enforce) as c:
         resp = c.post(
             "/v0/promote",
             json={
                 "key": "finding/promote-reader",
                 "from": "openclaw/gw",
+                "principal": "brix-pm",
                 "content": "x",
             },
         )
@@ -319,6 +324,8 @@ def test_promote_by_reader_rejected_403_enforce(tmp_db, allowlist_file, observe_
         assert resp.json()["error"]["code"] == "principal_reader"
         # Nothing landed: no promoted row, no batch decision key.
         assert c.get("/v0/memories/finding/promote-reader").status_code == 404
+        rows = c.get("/v0/memories", params={"tag": "promoted-batch", "limit": 50}).json()
+        assert rows == [], "no batch decision key may be written by a reader"
 
 
 def test_promote_by_curator_allowed_enforce(tmp_db, allowlist_file, observe_log, enforce):
