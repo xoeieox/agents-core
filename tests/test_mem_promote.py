@@ -86,6 +86,11 @@ def test_from_must_be_agent_slash_store():
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
+def tmp_db(tmp_path):
+    return tmp_path / "test_mem.db"
+
+
+@pytest.fixture
 def allowlist_file(tmp_path):
     p = tmp_path / "mem-machine-state-prefixes.json"
     p.write_text(SHARED_ALLOWLIST.read_text(encoding="utf-8"), encoding="utf-8")
