@@ -165,7 +165,7 @@ def test_reader_delete_rejected_403(tmp_db, allowlist_file, observe_log, enforce
         assert resp.json()["error"]["code"] == "principal_reader"
 
 
-def test_reader_secret_holder_rejected_on_write_class(tmp_db, tmp_path, observe_log, enforce, monkeypatch):
+def test_reader_secret_holder_rejected_on_write_class(tmp_db, allowlist_file, observe_log, enforce, monkeypatch):
     """Secret-to-verb binding (panel F2): a holder of the (reader) secret is
     rejected on the write class regardless of any asserted role. The reader
     secret is honored ONLY for the read verb-set."""
