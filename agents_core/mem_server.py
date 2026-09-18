@@ -528,14 +528,12 @@ def create_app(
         principal = body.get("principal", "") or _principal_of(request)
         content = body.get("content", "")
 
-        # Write-class guard first (observed always; enforced under the flag).
-        reject = _write_guard(request, "PUT", key)
-        if reject is not None:
-            return reject
-
         # Server-side --from shape validation (loud 400). The client validates
         # too, but the server repeats the check — a malformed ref must be
-        # rejected at the HTTP edge regardless of the client.
+        # rejected at the HTTP edge regardless of the client. Validate the
+        # key/principal FIRST so the write-class guard below runs on the
+        # validated key (a malformed key must not reach the guard's
+        # observe/prefix checks — reviewer PR #328 cycle 2 [med]).
         if not key:
             raise HTTPException(
                 status_code=400,
