@@ -205,6 +205,39 @@ class MemClient:
     def stats(self) -> dict:
         return self._check(self._client.get("/v0/stats")).json()
 
+    def promote(
+        self,
+        key: str,
+        ref: str,
+        principal: str,
+        content: str,
+        tags: str = "",
+    ) -> dict:
+        """Promote one row from an agent store into mem.db (D2).
+
+        Writes with `source="promoted:<agent>/<store>"`, tags `promoted` +
+        curator-chosen tags, and the exact provenance header as the first line
+        of the content. One-way: mem.db never writes back.
+
+        `ref` is the `--from` agent-store ref (`<agent>/<store>`); a ref with
+        a newline or control char is rejected client-side (loud ValueError)
+        before any request is sent — the server repeats the check (loud 400).
+        """
+        promoted_content = build_promoted_content(ref, principal, content)
+        agent, store = ref.split("/", 1)
+        source = f"promoted:{agent}/{store}"
+        tag_list = ["promoted"]
+        if tags:
+            tag_list.extend(t.strip() for t in tags.split(",") if t.strip())
+        body: dict[str, Any] = {
+            "content": promoted_content,
+            "tags": ",".join(tag_list),
+            "source": source,
+        }
+        return self._check(
+            self._client.put(f"/v0/memories/{key}", json=body)
+        ).json()
+
     def checkpoint(self) -> dict:
         return self._check(self._client.post("/v0/checkpoint")).json()
 
