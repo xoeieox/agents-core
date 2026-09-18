@@ -526,6 +526,20 @@ class MemHygieneRunner:
         ).fetchone()
         return row[0] if row and row[0] else None
 
+    def _exhaust_max_updated(self, prefix: str) -> str | None:
+        """(b) dual-store: the exhaust twin's MAX(updated_at) for `prefix`.
+
+        Read through the store's OWN ExhaustStore instance (its connection
+        AND its lock), never a fresh sqlite3.connect() on the exhaust path:
+        a raw second connection bypasses the sibling store's lock and, under
+        WAL mode with a live writer, could observe a torn WAL state (reviewer
+        high, PR #329 cycle 1). The sibling store is still direct SQL on the
+        exhaust file's `memories` table — never the fall-through store API.
+        """
+        es = self._store._exhaust_store()
+        with es._lock:
+            return self._max_updated(es._conn, prefix)
+
     def _prefix_sources(self, conn: sqlite3.Connection, prefix: str) -> set[str]:
         rows = conn.execute(
             "SELECT DISTINCT source FROM memories WHERE key LIKE ? ESCAPE '\\'",
