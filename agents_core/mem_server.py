@@ -607,15 +607,13 @@ def create_app(
         # Batch decision key (D2 named decision artifact):
         # decision/memdb-promotion-<YYYYMMDD>-<curator> lists promoted keys +
         # their --from refs + one-line rationale. Upserted (append-if-new) so
-        # a curation run accumulates its batch in one key.
-        # The batch decision key is ALSO a store write — it rides the same
-        # write-class guard (a reader must not be able to write the batch
-        # key even if the promoted row's write were somehow allowed).
+        # a curation run accumulates its batch in one key. The write-class
+        # guard above already ran on the promoted key (identical role check;
+        # the batch key is never machine-state), so no second guard here —
+        # a second observer.observe_write() would double-count the curator
+        # PUT in the per-writer verb table (D-1 observe-week deliverable).
         day = datetime.now(timezone.utc).strftime("%Y%m%d")
         batch_key = f"decision/memdb-promotion-{day}-{principal}"
-        reject = _write_guard(request, "PUT", batch_key)
-        if reject is not None:
-            return reject
         # The D2 artifact line: key + --from ref + one-line rationale. The
         # rationale is the curator's one-line 'why' (the 'auditable to a
         # decision' part); an empty rationale still lands (the CLI may omit

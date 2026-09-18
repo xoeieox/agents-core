@@ -119,10 +119,6 @@ class MemHTTPError(Exception):
 # --store plumbing (openclaw-memdb-influx-reader-v0, D2 / Files-changed)
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# --store plumbing (openclaw-memdb-influx-reader-v0, D2 / Files-changed)
-# ---------------------------------------------------------------------------
-
 # RESCOPED (rev-2, 2026-09-14 gate proceed-to-bind): the machinery store is
 # the EXISTING exhaust store (the route_to_exhaust mechanism in
 # mem_exhaust.py), not a second sqlite (no mem_machinery.db). 'machinery'
