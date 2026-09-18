@@ -4,6 +4,7 @@
   "dead_sources": {
     "elevator/": ["elevator_scheduler"],
     "weather/": ["ops-primitives"],
-    "test/": ["lapis-pm/opencode", "user-session-2026-06-07"]
+    "test/": ["lapis-pm/opencode", "user-session-2026-06-07"],
+    "arc-scratch-20260727/": ["arc-scratch-20260727"]
   }
 }
