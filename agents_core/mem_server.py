@@ -292,7 +292,7 @@ def create_app(
     _allowlist_path = (
         Path(allowlist_path)
         if allowlist_path is not None
-        else mem_machinery.ALLOWLIST_PATH
+        else mem_machinery.default_allowlist_path()
     )
     try:
         allowlist = mem_machinery.load_allowlist(_allowlist_path)
