@@ -435,20 +435,32 @@ def test_count_mismatch_aborts_and_rolls_back(tmp_path, monkeypatch):
     _seed_dead_stream(tmp_path, "elevator/", "elevator_scheduler", n=4, age_days=45)
     runner = _make_runner(tmp_path, cfg)
 
-    real_execute = runner._store._conn.execute
+    real_conn = runner._store._conn
 
-    def drift_execute(sql, *args):
-        # Simulate the store drifting mid-run: one candidate key vanishes
-        # from memories between enumeration and the DELETE.
-        if isinstance(sql, str) and sql.lstrip().startswith("DELETE FROM memories"):
-            conn = runner._store._conn
-            key = args[0][0]
-            conn.execute(
-                "DELETE FROM memories WHERE key = ?", (key,)
-            )
-        return real_execute(sql, *args)
+    class DriftConn:
+        """Proxy over the real connection that simulates the store
+        drifting mid-run: one candidate key vanishes from memories
+        between enumeration and the DELETE."""
 
-    monkeypatch.setattr(runner._store._conn, "execute", drift_execute)
+        def __init__(self, conn):
+            self._conn = conn
+            self._drifted = False
+
+        def execute(self, sql, *args):
+            if (not self._drifted
+                    and isinstance(sql, str)
+                    and sql.lstrip().startswith("DELETE FROM memories")):
+                self._drifted = True
+                key = args[0][0]
+                self._conn.execute(
+                    "DELETE FROM memories WHERE key = ?", (key,)
+                )
+            return self._conn.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(runner._store, "_conn", DriftConn(real_conn))
 
     with pytest.raises(HygieneAborted, match="count mismatch"):
         runner.run_quarantine(dry_run=False)
