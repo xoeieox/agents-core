@@ -688,13 +688,27 @@ class MemHygieneRunner:
             return False
 
     def _eligible_keys(self, conn: sqlite3.Connection, eligible: list[CandidatePrefix]) -> list[str]:
+        """Enumerate the candidate keys across all eligible prefixes.
+
+        DE-DUPLICATED (reviewer high, PR #329 cycle 1): the shipped
+        allowlist entries are disjoint prefixes, but a key can match two
+        allowlist prefixes in general (e.g. `elevator/` and a broader
+        `elevator` entry). A duplicate key would be enumerated twice but
+        DELETEd only once, tripping the count-mismatch guard with a false
+        abort. The key is the PRIMARY KEY of `memories`, so a key is a
+        single row no matter how many prefixes match it — dedup is exact.
+        """
+        seen: set[str] = set()
         keys: list[str] = []
         for p in eligible:
             rows = conn.execute(
                 "SELECT key FROM memories WHERE key LIKE ? ESCAPE '\\' ORDER BY key",
                 (_like_escape(p.prefix) + "%",),
             ).fetchall()
-            keys.extend(r[0] for r in rows)
+            for r in rows:
+                if r[0] not in seen:
+                    seen.add(r[0])
+                    keys.append(r[0])
         return keys
 
     def list_candidates(self, now: datetime | None = None) -> tuple[list[dict], list[CandidatePrefix]]:
