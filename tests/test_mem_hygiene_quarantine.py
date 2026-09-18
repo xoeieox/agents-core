@@ -401,6 +401,69 @@ def test_no_candidates_is_a_clean_run(tmp_path):
     assert verdict.aborted is False
 
 
+def test_quarantine_chunks_mutation_above_bound_parameter_cap(tmp_path):
+    """The first-pass shape: a candidate set larger than sqlite's 999
+    bound-parameter cap must not raise too-many-SQL-variables — the
+    mutation path chunks the IN-lists the way list_candidates does."""
+    cfg = _write_config(
+        tmp_path,
+        allowlist=["elevator/"],
+        dead_sources={"elevator/": ["elevator_scheduler"]},
+        batch_cap=5000,
+    )
+    _seed_dead_stream(tmp_path, "elevator/", "elevator_scheduler", n=1200, age_days=45)
+    runner = _make_runner(tmp_path, cfg)
+    verdict = runner.run_quarantine(dry_run=False)
+    assert verdict.quarantined == 1200
+    assert verdict.already_quarantined == 0
+    assert verdict.aborted is False
+    assert verdict.fts_integrity_ok is True
+    store = MemoryStore(db_path=tmp_path / "mem.db")
+    assert store.list_by_prefix("elevator/") == []
+    store.close()
+
+
+def test_count_mismatch_aborts_and_rolls_back(tmp_path, monkeypatch):
+    """The count-mismatch guard is on the DELETE rowcount (not a derived
+    tautology): if the store drifts mid-run so fewer rows delete than
+    were candidates, the run aborts and the whole batch rolls back."""
+    cfg = _write_config(
+        tmp_path,
+        allowlist=["elevator/"],
+        dead_sources={"elevator/": ["elevator_scheduler"]},
+    )
+    _seed_dead_stream(tmp_path, "elevator/", "elevator_scheduler", n=4, age_days=45)
+    runner = _make_runner(tmp_path, cfg)
+
+    real_execute = runner._store._conn.execute
+
+    def drift_execute(sql, *args):
+        # Simulate the store drifting mid-run: one candidate key vanishes
+        # from memories between enumeration and the DELETE.
+        if isinstance(sql, str) and sql.lstrip().startswith("DELETE FROM memories"):
+            conn = runner._store._conn
+            key = args[0][0]
+            conn.execute(
+                "DELETE FROM memories WHERE key = ?", (key,)
+            )
+        return real_execute(sql, *args)
+
+    monkeypatch.setattr(runner._store._conn, "execute", drift_execute)
+
+    with pytest.raises(HygieneAborted, match="count mismatch"):
+        runner.run_quarantine(dry_run=False)
+
+    # Full rollback: the quarantined rows are gone, the memories rows
+    # (minus the drifted one) are intact.
+    conn = runner._store._conn
+    assert conn.execute(
+        "SELECT COUNT(*) FROM memories_quarantine"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE key LIKE 'elevator/%'"
+    ).fetchone()[0] == 3
+
+
 def test_re_run_after_crash_is_idempotent(tmp_path):
     """A crashed run re-runs clean: the second run finds 0 candidates
     (the first committed) and quarantines nothing."""
