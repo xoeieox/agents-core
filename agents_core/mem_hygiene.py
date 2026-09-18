@@ -955,6 +955,7 @@ class MemHygieneRunner:
         cutoff = (
             datetime.now(timezone.utc) - timedelta(days=window)
         ).isoformat()
+        self.ensure_schema()
         with self._store._lock:
             conn = self._store._conn
             try:
