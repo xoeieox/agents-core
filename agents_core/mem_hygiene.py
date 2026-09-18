@@ -584,15 +584,14 @@ class MemHygieneRunner:
                 # exhaust twin is a separate file with its own memories
                 # table (direct SQL, never the fall-through API).
                 if prefix in DUAL_STORE_PREFIXES:
-                    exhaust_path = self._store._exhaust_db_path
-                    if exhaust_path.exists():
-                        econn = sqlite3.connect(str(exhaust_path))
-                        try:
-                            e_last = self._max_updated(econn, prefix)
-                        finally:
-                            econn.close()
-                        if e_last and (last_write is None or e_last > last_write):
-                            last_write = e_last
+                    # (b) dual-store: measure MAX(updated_at) across BOTH
+                    # stores. The exhaust twin is a separate file with its
+                    # own memories table — read it through the store's own
+                    # ExhaustStore instance + lock (no raw second
+                    # connection; see _exhaust_max_updated).
+                    e_last = self._exhaust_max_updated(prefix)
+                    if e_last and (last_write is None or e_last > last_write):
+                        last_write = e_last
 
                 if count == 0:
                     results.append(CandidatePrefix(
