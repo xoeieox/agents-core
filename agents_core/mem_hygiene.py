@@ -650,13 +650,19 @@ class MemHygieneRunner:
     # ------------------------------------------------------------------
 
     def _fts_integrity_ok(self, conn: sqlite3.Connection) -> bool:
-        """FTS integrity probe (the halt condition the Council agreed on)."""
+        """FTS integrity probe (the halt condition the Council agreed on).
+
+        A corrupted external-content FTS index raises
+        ``sqlite3.DatabaseError`` (``database disk image is malformed``),
+        not ``OperationalError`` — both are caught so the halt condition
+        fires on either failure mode.
+        """
         try:
             row = conn.execute(
                 "SELECT 'ok' FROM memories_fts WHERE memories_fts='integrity'"
             ).fetchone()
             return bool(row)
-        except sqlite3.OperationalError:
+        except (sqlite3.OperationalError, sqlite3.DatabaseError):
             return False
 
     def _eligible_keys(self, conn: sqlite3.Connection, eligible: list[CandidatePrefix]) -> list[str]:
