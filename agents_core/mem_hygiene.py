@@ -234,14 +234,12 @@ class RecencyGuard:
 # prefix set is the load-bearing backstop that keeps an operator mistake in
 # the config file from reaching an atom.
 #
-# NOTE: ``router/lapis-pm/`` is NOT a member. It is a LIVE stream with two
-# live readers (ratified to move separately, only after the exhaust store
-# is proven live — see mem_exhaust.EXHAUST_PREFIXES), and D6's
-# must-not-touch list is the ATOM classes (decision/, finding/,
-# correction/, ...). router/ stays live until ITS producer dies, guarded
-# by the (c) fail-closed registry (its sources are hostnames — brix/
-# starhouse — which can never satisfy the registered-dead test without
-# explicit manual registration).
+# NOTE: ``router/`` is NOT a member. It is a LIVE machine-state stream, not
+# an atom class, so it does not belong on this list — it is protected by
+# the D2(c) fail-closed registry instead (its sources are hostnames —
+# brix/starhouse — which can never satisfy the registered-dead test
+# without explicit manual registration). D6's must-not-touch list is the
+# ATOM classes (decision/, finding/, correction/, ...).
 ATOM_CLASS_PREFIXES: tuple[str, ...] = (
     "decision/",
     "finding/",
