@@ -751,39 +751,54 @@ class MemHygieneRunner:
             conn = self._store._conn
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                keys = [c["key"] for c in candidates]
                 # 1. Stage into the quarantine table (PK (key, run_id),
                 #    INSERT OR IGNORE — a crashed re-run is a clean no-op).
-                conn.execute(
-                    f"""
-                    INSERT OR IGNORE INTO memories_quarantine (
-                        key, content, tags, source, created_at, updated_at,
-                        quarantined_at, quarantine_reason, run_id
+                #    Chunked IN-lists: sqlite's bound-parameter cap is 999
+                #    (the first pass is ~14,043 keys); same 500-key chunk
+                #    size list_candidates uses. One transaction spans all
+                #    chunks — a crash mid-batch still rolls back cleanly.
+                for i in range(0, len(keys), 500):
+                    chunk = keys[i:i + 500]
+                    qmarks = ",".join("?" for _ in chunk)
+                    conn.execute(
+                        f"""
+                        INSERT OR IGNORE INTO memories_quarantine (
+                            key, content, tags, source, created_at, updated_at,
+                            quarantined_at, quarantine_reason, run_id
+                        )
+                        SELECT key, content, tags, source, created_at, updated_at,
+                               ?, ?, ?
+                        FROM memories
+                        WHERE key IN ({qmarks})
+                        """,
+                        [now.isoformat(), reason, self.run_id] + chunk,
                     )
-                    SELECT key, content, tags, source, created_at, updated_at,
-                           ?, ?, ?
-                    FROM memories
-                    WHERE key IN ({','.join('?' for _ in candidates)})
-                    """,
-                    [now.isoformat(), reason, self.run_id]
-                    + [c["key"] for c in candidates],
-                )
                 # 2. Delete from memories (trigger-covered: memories_ad
-                #    keeps memories_fts honest).
-                conn.execute(
-                    f"DELETE FROM memories WHERE key IN ({','.join('?' for _ in candidates)})",
-                    [c["key"] for c in candidates],
-                )
-                # 3. Count-mismatch abort (D3): quarantine count must equal
-                #    candidate count.
-                quarantined = int(conn.execute(
-                    "SELECT COUNT(*) FROM memories_quarantine WHERE run_id = ?",
-                    (self.run_id,),
-                ).fetchone()[0])
-                already = len(candidates) - quarantined
-                if quarantined + already != len(candidates):
+                #    keeps memories_fts honest). Chunked for the same
+                #    bound-parameter reason; the DELETE rowcount is the
+                #    load-bearing count-mismatch guard (step 3) — a
+                #    derived "already = candidates - quarantined" would
+                #    be a tautology that never fires.
+                deleted = 0
+                for i in range(0, len(keys), 500):
+                    chunk = keys[i:i + 500]
+                    qmarks = ",".join("?" for _ in chunk)
+                    cur = conn.execute(
+                        f"DELETE FROM memories WHERE key IN ({qmarks})",
+                        chunk,
+                    )
+                    deleted += cur.rowcount
+                # 3. Count-mismatch abort (D3): the DELETE rowcount must
+                #    equal the candidate count — the candidates were
+                #    enumerated from `memories` moments ago and no other
+                #    writer holds this connection (single-connection
+                #    store, BEGIN IMMEDIATE), so a mismatch means the
+                #    store drifted mid-run and the batch must roll back.
+                if deleted != len(candidates):
                     raise HygieneAborted(
-                        f"count mismatch: staged {quarantined} + already "
-                        f"{already} != {len(candidates)} candidates"
+                        f"count mismatch: deleted {deleted} != "
+                        f"{len(candidates)} candidates"
                     )
                 # 4. FTS integrity halt (the Council's agreed halt
                 #    condition): a failure rolls back the whole batch.
@@ -801,8 +816,30 @@ class MemHygieneRunner:
                 verdict.abort_reason = f"transaction rolled back: {exc}"
                 raise
 
-        verdict.quarantined = quarantined
-        verdict.already_quarantined = already
+        # 5. Post-commit provenance counts: quarantined = rows this run_id
+        #    staged (== deleted, the mismatch guard already enforced
+        #    equality with the candidate count); already_quarantined =
+        #    rows for the SAME keys from an EARLIER run_id (the
+        #    INSERT OR IGNORE path — a crashed re-run with the same
+        #    run_id is a clean no-op by construction, a different run_id
+        #    re-quarantining the same key is the restore-then-run case).
+        with self._store._lock:
+            conn = self._store._conn
+            quarantined = int(conn.execute(
+                "SELECT COUNT(*) FROM memories_quarantine WHERE run_id = ?",
+                (self.run_id,),
+            ).fetchone()[0])
+            already = 0
+            if keys:
+                for i in range(0, len(keys), 500):
+                    chunk = keys[i:i + 500]
+                    qmarks = ",".join("?" for _ in chunk)
+                    row = conn.execute(
+                        f"SELECT COUNT(*) FROM memories_quarantine "
+                        f"WHERE key IN ({qmarks}) AND run_id != ?",
+                        chunk + [self.run_id],
+                    ).fetchone()
+                    already += int(row[0])
         with self._store._lock:
             verdict.fts_integrity_ok = self._fts_integrity_ok(self._store._conn)
             verdict.db_row_count_after = int(
