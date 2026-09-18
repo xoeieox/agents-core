@@ -558,6 +558,15 @@ def create_app(
                 detail=_error("bad_from_ref", str(e)),
             )
 
+        # Write-class guard (observed always; enforced under the flag), now on
+        # the validated key: the promote verb is in the write class
+        # (PUT/DELETE/deposit) and a reader's promote is rejected
+        # (403 principal_reader) exactly like a PUT — the guard is the
+        # principal check, and it must see the real key.
+        reject = _write_guard(request, "PUT", key)
+        if reject is not None:
+            return reject
+
         agent, store_name = ref.split("/", 1)
         source = f"promoted:{agent}/{store_name}"
         tag_list = ["promoted"]
