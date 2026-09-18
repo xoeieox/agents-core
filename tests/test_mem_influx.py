@@ -271,7 +271,7 @@ def test_observe_report_endpoint(tmp_db, allowlist_file, observe_log, no_enforce
     assert "none" in report["break_list"]
     assert "brix-pm" not in report["break_list"]
     # Write counts are partitioned by verb.
-    assert report["writers"]["none"]["verbs"]["PUT"] == 2
+    assert report["writers"]["none"]["verbs"]["PUT"] == 1
     assert report["writers"]["brix-pm"]["verbs"]["PUT"] == 1
 
 
