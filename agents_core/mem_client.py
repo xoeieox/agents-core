@@ -116,6 +116,7 @@ class MemClient:
         base_url: str | None = None,
         token: str | None = None,
         timeout: float | None = None,
+        principal: str | None = None,
     ):
         self._base_url = (base_url or os.environ.get("MEM_SERVER", "")).rstrip("/")
         _token = token if token is not None else os.environ.get("MEM_BEARER_TOKEN", "")
