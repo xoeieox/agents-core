@@ -49,6 +49,23 @@ ALLOWLIST_PATH = Path(
     )
 )
 
+# The repo-shipped copy of the artifact (config/mem-machine-state-prefixes.json).
+# The live copy at ALLOWLIST_PATH is the deployment target; when it is not yet
+# present (e.g. a fresh clone, a test env, or pre-deploy), the guard falls back
+# to this repo artifact so the server can still boot. This is NOT a fail-open
+# bypass: the fallback is a VALID, concrete allowlist shipped in the PR, and a
+# missing/malformed file at EITHER path still refuses to start.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ALLOWLIST_PATH = _REPO_ROOT / "config" / "mem-machine-state-prefixes.json"
+
+
+def default_allowlist_path() -> Path:
+    """The effective default allowlist path: the live path if it exists, else
+    the repo-shipped copy. Used by create_app() when no explicit path is given."""
+    if ALLOWLIST_PATH.exists():
+        return ALLOWLIST_PATH
+    return REPO_ALLOWLIST_PATH
+
 # The store a machine-state write lands in. RESCOPED (rev-2, 2026-09-14
 # gate proceed-to-bind): the machinery store is the EXISTING exhaust store —
 # the ``route_to_exhaust`` mechanism — extended with a reconciled narrow
