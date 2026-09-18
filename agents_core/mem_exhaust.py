@@ -95,27 +95,95 @@ HOSTNAME = os.uname().nodename
 _cold_path_logger = logging.getLogger("agents_core.mem.cold_path")
 
 
+# ---------------------------------------------------------------------------
+# Machinery-store extension (openclaw-memdb-influx-reader-v0, D3 — RESCOPED
+# rev-2). The "machinery store" is NOT a second sqlite: it is this existing
+# exhaust store (the route_to_exhaust mechanism) extended with a reconciled
+# NARROW prefix list loaded from the shared allowlist artifact
+# (agents_core.mem_machinery). No fork, no mem_machinery.db.
+#
+# The extension is loaded lazily and cached, and it is deliberately FAIL-OPEN
+# at the library level: a missing/malformed allowlist here must NOT break the
+# library-level set()/get()/list_by_prefix() chokepoint (every mem CLI call
+# funnels through it). The FAIL-CLOSED guard lives in mem_server.create_app(),
+# which validates the allowlist at boot and refuses to start (the gate's
+# hard requirement). So the server can never run with a bad allowlist, and a
+# library-only caller (no server) degrades to the static EXHAUST_PREFIXES
+# rather than raising on every write.
+# ---------------------------------------------------------------------------
+
+_machinery_prefixes_cache: tuple[str, ...] | None = None
+_machinery_prefixes_loaded = False
+
+
+def machinery_prefixes() -> tuple[str, ...]:
+    """The reconciled narrow machine-state prefix list from the shared
+    allowlist artifact, cached after first load.
+
+    Fail-OPEN at the library level (see the block above): on
+    ``AllowlistError`` (missing/malformed/unreadable) returns ``()`` so the
+    library chokepoint keeps working; the server's boot-time guard is what
+    enforces fail-closed.
+    """
+    global _machinery_prefixes_cache, _machinery_prefixes_loaded
+    if _machinery_prefixes_loaded:
+        return _machinery_prefixes_cache
+    try:
+        from agents_core.mem_machinery import load_allowlist
+
+        _machinery_prefixes_cache = load_allowlist().prefixes
+    except Exception:  # noqa: BLE001 — library-level fail-open (see block)
+        _machinery_prefixes_cache = ()
+    _machinery_prefixes_loaded = True
+    return _machinery_prefixes_cache
+
+
+def reset_machinery_prefixes_cache() -> None:
+    """Clear the cache (tests / allowlist rotation)."""
+    global _machinery_prefixes_cache, _machinery_prefixes_loaded
+    _machinery_prefixes_cache = None
+    _machinery_prefixes_loaded = False
+
+
+def _all_exhaust_prefixes() -> tuple[str, ...]:
+    """Static tier-1 prefixes + the reconciled machinery extension."""
+    ext = machinery_prefixes()
+    if not ext:
+        return EXHAUST_PREFIXES
+    merged = list(EXHAUST_PREFIXES)
+    for p in ext:
+        if p not in merged:
+            merged.append(p)
+    return tuple(merged)
+
+
 def route_to_exhaust(key: str) -> bool:
-    """True if `key` belongs to one of the tier-1 exhaust prefixes.
+    """True if `key` belongs to a tier-1 exhaust prefix OR a reconciled
+    machinery-store prefix (openclaw-memdb-influx-reader-v0, D3).
 
     `str.startswith()` given a tuple checks each element with exact
     startswith semantics — equivalent to `any(key.startswith(p) for p in
-    EXHAUST_PREFIXES)`, never a substring or regex test.
+    EXHAUST_PREFIXES + machinery_prefixes())`, never a substring or regex
+    test.
     """
-    return key.startswith(EXHAUST_PREFIXES)
+    return key.startswith(_all_exhaust_prefixes())
 
 
 def could_overlap_exhaust(prefix: str) -> bool:
     """Cheap pre-filter for MemoryStore.list_by_prefix()'s fall-through.
 
     True if a `list_by_prefix(prefix)` query could possibly select any key
-    covered by EXHAUST_PREFIXES — in either direction: a broader query like
-    "elevator" as well as a narrower one like "elevator/proposals/". Lets
-    list_by_prefix() skip the sibling store entirely for the vast majority of
-    prefixes that share no root with the three routed families, instead of
-    adding a query (and a lazily-created exhaust.db) to every call site.
+    covered by the exhaust prefixes (tier-1 + machinery extension) — in
+    either direction: a broader query like "elevator" as well as a narrower
+    one like "elevator/proposals/". Lets list_by_prefix() skip the sibling
+    store entirely for the vast majority of prefixes that share no root with
+    the routed families, instead of adding a query (and a lazily-created
+    exhaust.db) to every call site.
     """
-    return any(p.startswith(prefix) or prefix.startswith(p) for p in EXHAUST_PREFIXES)
+    return any(
+        p.startswith(prefix) or prefix.startswith(p)
+        for p in _all_exhaust_prefixes()
+    )
 
 
 def log_cold_path_access(key: str) -> None:
