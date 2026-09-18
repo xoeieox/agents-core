@@ -152,8 +152,16 @@ def _run_pipeline(config: str, slots_dir: Path, dry_run: bool,
             return report, exit_code
 
         # Step 3: quarantine (one transaction; cap-bounded scheduled path).
+        # Pass the Step 1+2 enumeration THROUGH (reviewer medium, PR #329
+        # cycle 1): the mutation operates on the SAME candidate set the
+        # artifact was written from — no double-classification, so the
+        # store cannot drift between the artifact and the quarantine.
+        # (The count-mismatch guard still fires on mid-run drift.)
         try:
-            verdict = runner.run_quarantine(dry_run=False, allow_over_cap=False)
+            verdict = runner.run_quarantine(
+                dry_run=False, allow_over_cap=False,
+                candidates=candidates, prefixes=prefixes,
+            )
             report["steps"]["quarantine"] = {
                 "quarantined": verdict.quarantined,
                 "already_quarantined": verdict.already_quarantined,
