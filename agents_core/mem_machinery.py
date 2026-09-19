@@ -224,8 +224,12 @@ def _validate_entry(raw: Any, idx: int) -> MachineStateEntry:
     )
 
 
-def load_allowlist(path: Path | str = ALLOWLIST_PATH) -> MachineStateAllowlist:
+def load_allowlist(path: Path | str | None = None) -> MachineStateAllowlist:
     """Load and validate the shared allowlist artifact.
+
+    ``path=None`` resolves the env-overridable default FRESH (a mid-process
+    ``MEM_MACHINE_STATE_PREFIXES_PATH`` rotation takes effect; see
+    ``_default_allowlist_env_path``).
 
     Raises ``AllowlistError`` (fail-closed) when the file is missing,
     unreadable, not valid JSON, not a JSON object with a top-level ``"prefixes"``
@@ -233,7 +237,7 @@ def load_allowlist(path: Path | str = ALLOWLIST_PATH) -> MachineStateAllowlist:
     never silently disable the prefix-reject — that is the fail-open bypass
     the gate names.
     """
-    p = Path(path)
+    p = Path(path) if path is not None else _default_allowlist_env_path()
     try:
         raw_text = p.read_text(encoding="utf-8")
     except FileNotFoundError:
