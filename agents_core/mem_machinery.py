@@ -56,7 +56,8 @@ def _default_allowlist_env_path() -> Path:
     )
 
 # The repo-shipped copy of the artifact (config/mem-machine-state-prefixes.json).
-# The live copy at ALLOWLIST_PATH is the deployment target; when it is not yet
+# The live copy at the env-overridable default path
+# (_default_allowlist_env_path()) is the deployment target; when it is not yet
 # present (e.g. a fresh clone, a test env, or pre-deploy), the guard falls back
 # to this repo artifact so the server can still boot. This is NOT a fail-open
 # bypass: the fallback is a VALID, concrete allowlist shipped in the PR, and a
