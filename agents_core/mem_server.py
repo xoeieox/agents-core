@@ -674,27 +674,21 @@ def create_app(
         # Atomic read-modify-write (reviewer PR #333 cycle 1 [low]): the
         # get-then-set upsert must hold the store lock across both, or
         # concurrent promotes interleaving between the two would
-        # double-append or lose a line. Dedup is an exact LINE test (the
-        # line is newline-terminated), not a substring test — a key that is
-        # a substring of another line must not mis-dedup.
-        # Lock nesting note (reviewer PR #335 cycle 1 [med]): the store.set()
-        # below acquires store._lock AGAIN inside this outer `with` block.
-        # That nesting is intentional, not a bug: store._lock is a threading.RLock
-        # (re-entrant, mem.py), so the inner acquisition by the same thread
-        # succeeds; and the batch-key write MUST happen under the same store
-        # lock — the whole read-modify-write (get + set) is one atomic unit,
-        # so the nested re-entry is the correct shape, not a deadlock.
-        with store._lock:
-            existing = store.get(batch_key)
-            existing_lines = existing["content"].splitlines() if existing else []
-            if line not in existing_lines:
-                base = existing["content"] if existing else ""
-                header = f"Promotion batch {day} by {principal}"
-                batch_content = (
-                    f"{header}\n{line}\n" if not base else f"{base}\n{line}\n"
-                )
-                store.set(batch_key, batch_content, tags=["promoted-batch"],
-                          source=source)
+        # double-append or lose a line. store.upsert_line() does exactly
+        # that under a SINGLE lock acquisition — no nested acquisition
+        # (reviewer PR #337 cycle 1 [med]: the previous shape held
+        # store._lock and called store.set() inside it, which only worked
+        # because the lock is a threading.RLock; upsert_line removes the
+        # dependency on the lock being re-entrant). Dedup is an exact LINE
+        # test (the line is newline-terminated), not a substring test — a
+        # key that is a substring of another line must not mis-dedup.
+        store.upsert_line(
+            batch_key,
+            line,
+            header=f"Promotion batch {day} by {principal}",
+            tags=["promoted-batch"],
+            source=source,
+        )
 
         return {**_row_response(row), "batch_key": batch_key}
 
