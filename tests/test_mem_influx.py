@@ -307,7 +307,6 @@ def test_deposit_verb_partitioned(tmp_db, allowlist_file, observe_log, no_enforc
     guard' conditional. archetypes_core is a hard dep of this test (it
     already is for test_mem_deposit.py); a missing import fails the test
     loudly instead of silently skipping the verb-partition guarantee."""
-    import pytest as _pytest
     from archetypes_core.provenance import to_lapis_return
 
     class FakeRecorder:
