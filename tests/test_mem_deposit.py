@@ -78,3 +78,45 @@ def test_deposit_unconfigured_503(tmp_path):
     c = TestClient(app)
     assert c.post("/v0/deposit", json=_envelope()).status_code == 503
     assert c.get("/healthz").json()["deposit"]["configured"] is False
+
+
+def test_deposit_guard_ordering_403_before_503(tmp_path, monkeypatch):
+    """Guard ordering is by design (spec D-1: the principal model is the
+    OUTER gate): under MEM_ENFORCE_PRINCIPALS a reader/unknown-principal
+    deposit attempt gets 403 principal_reader EVEN WHEN the recorder is
+    unconfigured (which would otherwise 503) or the envelope is invalid
+    (which would otherwise 400 bad_envelope). This is a deliberate behavior
+    change vs the pre-PR ordering where 503/400 surfaced first — the
+    reviewer (PR #337 cycle 1 [med]) confirmed it against the spec's
+    intent: a reader must be rejected before any deposit-specific 503/400
+    can mask the principal failure. Under observe-only (the default) the
+    guard never rejects, so the pre-PR 503/400 precedence is preserved
+    (test_deposit_unconfigured_503 above pins that)."""
+    monkeypatch.setenv("MEM_ENFORCE_PRINCIPALS", "1")
+    try:
+        # Recorder unconfigured -> would be 503 pre-PR; the guard's 403
+        # surfaces first for a reader (no X-Mem-Principal header).
+        app = create_app(tmp_path / "mem.db", deposit_recorder=None)
+        c = TestClient(app)
+        resp = c.post("/v0/deposit", json=_envelope())
+        assert resp.status_code == 403
+        assert resp.json()["error"]["code"] == "principal_reader"
+
+        # An invalid envelope (would be 400 bad_envelope pre-PR) also
+        # surfaces the guard's 403 first for a reader.
+        resp_bad = c.post("/v0/deposit", json={"not": "a LapisToolReturn"})
+        assert resp_bad.status_code == 403
+        assert resp_bad.json()["error"]["code"] == "principal_reader"
+
+        # The registered curator principal passes the guard and reaches the
+        # deposit-specific 503 (recorder unconfigured) — the 503 is NOT
+        # masked for an authorized writer.
+        resp_curator = c.post(
+            "/v0/deposit",
+            json=_envelope(),
+            headers={"X-Mem-Principal": "zephyr-deposit"},
+        )
+        assert resp_curator.status_code == 503
+        assert resp_curator.json()["error"]["code"] == "deposit_unconfigured"
+    finally:
+        monkeypatch.delenv("MEM_ENFORCE_PRINCIPALS", raising=False)
