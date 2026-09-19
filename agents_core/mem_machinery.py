@@ -40,14 +40,20 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Default path of the shared allowlist artifact. Env-overridable (mirrors
-# MEM_DB_PATH's override convention) so tests point at a tmp file.
-ALLOWLIST_PATH = Path(
-    os.environ.get(
-        "MEM_MACHINE_STATE_PREFIXES_PATH",
-        "/srv/agents/config/mem-machine-state-prefixes.json",
+def _default_allowlist_env_path() -> Path:
+    """The env-overridable default allowlist path (mirrors MEM_DB_PATH's
+    override convention). Read fresh on every call so a mid-process
+    ``MEM_MACHINE_STATE_PREFIXES_PATH`` rotation takes effect — the
+    module-level constant this replaced was read ONCE at import, so a
+    rotation of the env var was silently ignored for the process lifetime
+    (the same stale-cache footgun as mem_exhaust's prefix cache; reviewer
+    PR #337 cycle 1 [low])."""
+    return Path(
+        os.environ.get(
+            "MEM_MACHINE_STATE_PREFIXES_PATH",
+            "/srv/agents/config/mem-machine-state-prefixes.json",
+        )
     )
-)
 
 # The repo-shipped copy of the artifact (config/mem-machine-state-prefixes.json).
 # The live copy at ALLOWLIST_PATH is the deployment target; when it is not yet
