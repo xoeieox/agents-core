@@ -292,6 +292,6 @@ def load_allowlist(path: Path | str | None = None) -> MachineStateAllowlist:
     return MachineStateAllowlist(entries=entries, excluded=excluded)
 
 
-def machine_state_prefixes(path: Path | str = ALLOWLIST_PATH) -> tuple[str, ...]:
+def machine_state_prefixes(path: Path | str | None = None) -> tuple[str, ...]:
     """Convenience: just the prefix tuple (raises AllowlistError as above)."""
     return load_allowlist(path).prefixes
