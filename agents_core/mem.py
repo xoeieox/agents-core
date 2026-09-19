@@ -159,6 +159,76 @@ class MemoryStore:
             self._conn.commit()
         return not existing
 
+    def upsert_line(self, key: str, line: str, header: str, tags: list[str] | None = None,
+                    source: str = "") -> bool:
+        """Atomic read-modify-write append of one line to a row's content.
+
+        Holds ``self._lock`` ONCE across the whole get-then-set sequence.
+        The inner write goes through ``_set_unlocked()`` — the same body as
+        ``set()`` minus the lock — so the batch-key upsert in
+        ``mem_server.promote`` never re-acquires the lock (no nested
+        acquisition, independent of the lock being re-entrant; reviewer
+        PR #337 cycle 1 [med]: the previous shape held ``store._lock`` and
+        called ``store.set()`` inside, which only worked because the lock
+        is an RLock).
+
+        Semantics: if the row does not exist, its content is
+        ``header + "\\n" + line + "\\n"``; if it exists, ``line`` is
+        appended on its own line unless it is already present (exact
+        line, newline-terminated — not a substring test, so a key that is
+        a substring of another line does not mis-dedup). Returns True if
+        the row was created, False if it already existed (updated or
+        deduped — the dedup case is an idempotent no-op write, which is
+        the correct semantics for a retrying curation run).
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT content FROM memories WHERE key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                base = ""
+                created = True
+            else:
+                base = row["content"]
+                created = False
+            existing_lines = base.splitlines() if base else []
+            if line not in existing_lines:
+                if not base:
+                    content = f"{header}\n{line}\n"
+                else:
+                    content = f"{base}\n{line}\n"
+                self._set_unlocked(key, content, tags, source)
+        return created
+
+    def _set_unlocked(self, key: str, content: str, tags: list[str] | None,
+                      source: str) -> bool:
+        """The body of ``set()`` WITHOUT the lock acquisition.
+
+        Caller MUST hold ``self._lock``. Kept as the single write path so
+        ``set()`` and ``upsert_line()`` cannot drift apart.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        tag_str = ",".join(sorted(tags)) if tags else ""
+        source = source or HOSTNAME
+
+        existing = self._conn.execute(
+            "SELECT 1 FROM memories WHERE key = ?", (key,)
+        ).fetchone()
+
+        if existing:
+            self._conn.execute(
+                "UPDATE memories SET content=?, tags=?, source=?, updated_at=? WHERE key=?",
+                (content, tag_str, source, now, key),
+            )
+        else:
+            self._conn.execute(
+                "INSERT INTO memories (key, content, tags, source, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (key, content, tag_str, source, now, now),
+            )
+        self._conn.commit()
+        return not existing
+
     def get(self, key: str) -> dict | None:
         """Exact key lookup.
 
