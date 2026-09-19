@@ -176,7 +176,13 @@ def machinery_prefixes() -> tuple[str, ...]:
 
 
 def reset_machinery_prefixes_cache() -> None:
-    """Clear the cache (tests / allowlist rotation)."""
+    """Clear the cache (tests / allowlist rotation).
+
+    REQUIRED after any mid-process allowlist change (file edit,
+    ``MEM_MACHINE_STATE_PREFIXES_PATH`` rotation) for the new value to
+    take effect — see ``machinery_prefixes()`` for the stale-prefix
+    footgun this reset is the antidote to (reviewer PR #337 cycle 1
+    [low])."""
     global _machinery_prefixes_cache, _machinery_prefixes_loaded
     _machinery_prefixes_cache = None
     _machinery_prefixes_loaded = False
