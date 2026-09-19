@@ -629,35 +629,40 @@ def test_machinery_prefixes_cache_stale_without_reset(tmp_db, tmp_path, observe_
     (2) the reset makes the new prefixes take effect."""
     from agents_core import mem_exhaust
 
-    # First allowlist: elevator/ is a machinery prefix.
+    # NOTE: both allowlists use a NON-STATIC prefix (pm/) — elevator/ and
+    # weather/ are static EXHAUST_PREFIXES, so routing them would not
+    # distinguish the machinery extension from the static list.
+    # First allowlist: pm/ is a machinery prefix.
     allowlist_a = tmp_path / "allowlist-a.json"
     allowlist_a.write_text(json.dumps({"prefixes": [
-        {"prefix": "elevator/", "producer_principal": "brix-pm",
+        {"prefix": "pm/", "producer_principal": "brix-pm",
          "store": "machinery", "state": "live", "dead_since": None},
     ]}), encoding="utf-8")
     monkeypatch.setenv("MEM_MACHINE_STATE_PREFIXES_PATH", str(allowlist_a))
     mem_exhaust.reset_machinery_prefixes_cache()
     try:
-        assert mem_exhaust.machinery_prefixes() == ("elevator/",)
+        assert mem_exhaust.machinery_prefixes() == ("pm/",)
 
         # Rotate the allowlist at runtime WITHOUT resetting the cache.
         allowlist_b = tmp_path / "allowlist-b.json"
         allowlist_b.write_text(json.dumps({"prefixes": [
-            {"prefix": "weather/", "producer_principal": "brix-pm",
+            {"prefix": "router/gw-review-divergence/", "producer_principal": "brix-pm",
              "store": "machinery", "state": "live", "dead_since": None},
         ]}), encoding="utf-8")
+        # (router/gw-review-divergence/ is static too — the point is that the
+        # NEW prefix is different from the cached one; the stale assertion
+        # below uses pm/, which is in NEITHER the static list nor the new
+        # allowlist.)
         monkeypatch.setenv("MEM_MACHINE_STATE_PREFIXES_PATH", str(allowlist_b))
 
         # STALE: the cache still serves the old prefix set (the footgun).
-        assert mem_exhaust.machinery_prefixes() == ("elevator/",)
-        assert mem_exhaust.route_to_exhaust("elevator/x") is True
-        assert mem_exhaust.route_to_exhaust("weather/x") is False
+        assert mem_exhaust.machinery_prefixes() == ("pm/",)
+        assert mem_exhaust.route_to_exhaust("pm/x") is True
 
         # The reset makes the new allowlist take effect.
         mem_exhaust.reset_machinery_prefixes_cache()
-        assert mem_exhaust.machinery_prefixes() == ("weather/",)
-        assert mem_exhaust.route_to_exhaust("weather/x") is True
-        assert mem_exhaust.route_to_exhaust("elevator/x") is False
+        assert mem_exhaust.machinery_prefixes() == ("router/gw-review-divergence/",)
+        assert mem_exhaust.route_to_exhaust("pm/x") is False
     finally:
         mem_exhaust.reset_machinery_prefixes_cache()
         monkeypatch.delenv("MEM_MACHINE_STATE_PREFIXES_PATH", raising=False)
