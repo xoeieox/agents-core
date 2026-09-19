@@ -102,9 +102,16 @@ def test_deposit_guard_ordering_403_before_503(tmp_path, monkeypatch):
         assert resp.status_code == 403
         assert resp.json()["error"]["code"] == "principal_reader"
 
-        # An invalid envelope (would be 400 bad_envelope pre-PR) also
-        # surfaces the guard's 403 first for a reader.
-        resp_bad = c.post("/v0/deposit", json={"not": "a LapisToolReturn"})
+        # A VALID envelope with a missing manifest_hash (would be 400
+        # bad_envelope pre-PR) also surfaces the guard's 403 first for a
+        # reader. (A structurally-invalid envelope — e.g. not a
+        # LapisToolReturn — is rejected by FastAPI's body parser with a
+        # 400 BEFORE the handler runs, so it cannot reach the guard at
+        # all; the manifest_hash case is the in-handler 400 the ordering
+        # note names.)
+        bad = _envelope()
+        bad["provenance"]["manifest_hash"] = ""
+        resp_bad = c.post("/v0/deposit", json=bad)
         assert resp_bad.status_code == 403
         assert resp_bad.json()["error"]["code"] == "principal_reader"
 
