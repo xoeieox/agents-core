@@ -81,9 +81,11 @@ DEFAULT_PRINCIPALS: dict[str, dict] = {
     },
 }
 
-# The write class: PUT / DELETE / POST /v0/deposit. Everything else is read.
-WRITE_METHODS = {"PUT", "DELETE"}
-DEPOSIT_PATH = "/v0/deposit"
+# The write class: PUT / DELETE / POST /v0/deposit (and POST /v0/promote,
+# POST /v0/checkpoint — maintenance). Everything else is read. The class is
+# enforced per-route via the _write_guard() calls in the route handlers
+# (each with its own normalized verb: "PUT", "DELETE", "POST_DEPOSIT",
+# "POST_PROMOTE", "POST_CHECKPOINT") — there is no central method table.
 
 
 def _load_principal_registration() -> dict[str, dict]:
