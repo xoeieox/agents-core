@@ -618,6 +618,51 @@ def test_library_fail_open_degrades_to_static_prefixes(tmp_db, tmp_path, observe
         create_app(tmp_db, allowlist_path=tmp_path / "missing.json")
 
 
+def test_machinery_prefixes_cache_stale_without_reset(tmp_db, tmp_path, observe_log, no_enforce, monkeypatch):
+    """Pins the documented latent footgun (reviewer PR #337 cycle 1
+    [low]): the machinery prefix cache is NOT invalidated by a
+    mid-process allowlist change. A caller that rotates the allowlist at
+    runtime (here: pointing MEM_MACHINE_STATE_PREFIXES_PATH at a new
+    file) silently keeps the STALE prefix set until it calls
+    reset_machinery_prefixes_cache(). This test proves both halves:
+    (1) a rotation WITHOUT the reset keeps the old prefixes, and
+    (2) the reset makes the new prefixes take effect."""
+    from agents_core import mem_exhaust
+
+    # First allowlist: elevator/ is a machinery prefix.
+    allowlist_a = tmp_path / "allowlist-a.json"
+    allowlist_a.write_text(json.dumps({"prefixes": [
+        {"prefix": "elevator/", "producer_principal": "brix-pm",
+         "store": "machinery", "state": "live", "dead_since": None},
+    ]}), encoding="utf-8")
+    monkeypatch.setenv("MEM_MACHINE_STATE_PREFIXES_PATH", str(allowlist_a))
+    mem_exhaust.reset_machinery_prefixes_cache()
+    try:
+        assert mem_exhaust.machinery_prefixes() == ("elevator/",)
+
+        # Rotate the allowlist at runtime WITHOUT resetting the cache.
+        allowlist_b = tmp_path / "allowlist-b.json"
+        allowlist_b.write_text(json.dumps({"prefixes": [
+            {"prefix": "weather/", "producer_principal": "brix-pm",
+             "store": "machinery", "state": "live", "dead_since": None},
+        ]}), encoding="utf-8")
+        monkeypatch.setenv("MEM_MACHINE_STATE_PREFIXES_PATH", str(allowlist_b))
+
+        # STALE: the cache still serves the old prefix set (the footgun).
+        assert mem_exhaust.machinery_prefixes() == ("elevator/",)
+        assert mem_exhaust.route_to_exhaust("elevator/x") is True
+        assert mem_exhaust.route_to_exhaust("weather/x") is False
+
+        # The reset makes the new allowlist take effect.
+        mem_exhaust.reset_machinery_prefixes_cache()
+        assert mem_exhaust.machinery_prefixes() == ("weather/",)
+        assert mem_exhaust.route_to_exhaust("weather/x") is True
+        assert mem_exhaust.route_to_exhaust("elevator/x") is False
+    finally:
+        mem_exhaust.reset_machinery_prefixes_cache()
+        monkeypatch.delenv("MEM_MACHINE_STATE_PREFIXES_PATH", raising=False)
+
+
 # ---------------------------------------------------------------------------
 # FTS integrity (machinery store FTS-less by design)
 # ---------------------------------------------------------------------------
