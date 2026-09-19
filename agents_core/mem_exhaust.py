@@ -124,6 +124,18 @@ def machinery_prefixes() -> tuple[str, ...]:
     ``AllowlistError`` (missing/malformed/unreadable) returns ``()`` so the
     library chokepoint keeps working; the server's boot-time guard is what
     enforces fail-closed.
+
+    PROCESS-GLOBAL CACHE (reviewer PR #334 cycle 1 [low]): the cache is
+    module-level, shared across ALL MemoryStore instances in the process,
+    and is NOT invalidated by a mid-process allowlist change (env-var
+    rotation, file edit). A test that mutates
+    ``MEM_MACHINE_STATE_PREFIXES_PATH`` — or any caller that rotates the
+    allowlist at runtime — MUST call ``reset_machinery_prefixes_cache()``
+    before the change takes effect (tests/test_mem_influx.py::
+    test_library_fail_open_degrades_to_static_prefixes does exactly this).
+    In production the allowlist is static for the process lifetime (the
+    server's boot-time guard pins it at start; a rotation is a restart),
+    so the cache is a deliberate trade-off, not an oversight.
     """
     global _machinery_prefixes_cache, _machinery_prefixes_loaded
     if _machinery_prefixes_loaded:
