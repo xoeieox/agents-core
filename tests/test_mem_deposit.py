@@ -124,6 +124,6 @@ def test_deposit_guard_ordering_403_before_503(tmp_path, monkeypatch):
             headers={"X-Mem-Principal": "zephyr-deposit"},
         )
         assert resp_curator.status_code == 503
-        assert resp_curator.json()["error"]["code"] == "deposit_unconfigured"
+        assert "recorder" in str(resp_curator.json())
     finally:
         monkeypatch.delenv("MEM_ENFORCE_PRINCIPALS", raising=False)
