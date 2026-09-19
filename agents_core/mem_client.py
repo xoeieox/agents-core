@@ -42,8 +42,6 @@ PROMOTED_HEADER_RE = re.compile(
 # check (a multi-line/control-char rationale would corrupt the batch decision
 # key's line-based listing the same way).
 INVALID_REF_CHARS_RE = re.compile(r"[\n\r\x00-\x1f\x7f]")
-# Back-compat alias (pre-rename name; kept so existing imports/tests still work).
-_FROM_INVALID_RE = INVALID_REF_CHARS_RE
 
 
 def validate_promote_source_ref(ref: str) -> str:
