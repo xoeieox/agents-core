@@ -136,28 +136,8 @@ class MemoryStore:
         if mem_exhaust.route_to_exhaust(key):
             return self._exhaust_store().set(key, content, tags=tags, source=source)
 
-        now = datetime.now(timezone.utc).isoformat()
-        tag_str = ",".join(sorted(tags)) if tags else ""
-        source = source or HOSTNAME
-
         with self._lock:
-            existing = self._conn.execute(
-                "SELECT 1 FROM memories WHERE key = ?", (key,)
-            ).fetchone()
-
-            if existing:
-                self._conn.execute(
-                    "UPDATE memories SET content=?, tags=?, source=?, updated_at=? WHERE key=?",
-                    (content, tag_str, source, now, key),
-                )
-            else:
-                self._conn.execute(
-                    "INSERT INTO memories (key, content, tags, source, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (key, content, tag_str, source, now, now),
-                )
-            self._conn.commit()
-        return not existing
+            return self._set_unlocked(key, content, tags, source)
 
     def upsert_line(self, key: str, line: str, header: str, tags: list[str] | None = None,
                     source: str = "") -> bool:
