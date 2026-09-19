@@ -297,11 +297,19 @@ def test_reader_secret_holder_rejected_on_write_class(tmp_db, allowlist_file, ob
 
 def test_deposit_verb_partitioned(tmp_db, allowlist_file, observe_log, no_enforce):
     """The deposit verb is observed as POST_DEPOSIT (gate trickster): a
-    dormant/unregistered deposit writer cannot hide behind PUT/DELETE counts."""
-    from agents_core.mem_server import _load_deposit_recorder
+    dormant/unregistered deposit writer cannot hide behind PUT/DELETE counts.
 
-    # No recorder configured -> deposit 503s AFTER the guard; but the guard
-    # observes the attempt first. Use a fake recorder to get past the guard.
+    Deterministic (reviewer PR #334 cycle 1 [med]): the envelope is built via
+    archetypes_core.provenance.to_lapis_return (the same helper
+    tests/test_mem_deposit.py uses), so LapisToolReturn.from_dict in the
+    route is guaranteed to parse it and the guard RUNS — the assertion below
+    is on a guaranteed log line, not a vacuous 'if the route reached the
+    guard' conditional. archetypes_core is a hard dep of this test (it
+    already is for test_mem_deposit.py); a missing import fails the test
+    loudly instead of silently skipping the verb-partition guarantee."""
+    import pytest as _pytest
+    from archetypes_core.provenance import to_lapis_return
+
     class FakeRecorder:
         def already_recorded(self, mh):
             return False
@@ -311,23 +319,27 @@ def test_deposit_verb_partitioned(tmp_db, allowlist_file, observe_log, no_enforc
 
     app = create_app(tmp_db, deposit_recorder=FakeRecorder(), allowlist_path=allowlist_file)
     with TestClient(app) as c:
-        envelope = {
-            "provenance": {"manifest_hash": "abc123", "agent_id": "zephyr"},
-            "payload": {"key": "work/record/1", "value": "v"},
-        }
-        # archetypes_core may not be importable in the test env; the deposit
-        # route validates the envelope via LapisToolReturn.from_dict. If that
-        # import fails the route 400s — which still means the guard did not
-        # reject. We assert the observe log captured the attempt if the route
-        # reached the guard, else the 400 is the contract.
-        resp = c.post("/v0/deposit", json=envelope)
-        assert resp.status_code in (200, 400, 503)
-    # The observe log, if any lines, must label the verb POST_DEPOSIT.
-    if observe_log.exists():
-        for line in observe_log.read_text().splitlines():
-            rec = json.loads(line)
-            if rec.get("event") == "write_attempt" and rec.get("key") == "work/record/1":
-                assert rec["verb"] == "POST_DEPOSIT"
+        envelope = to_lapis_return(
+            {"key": "work/record/1", "value": "v"},
+            agent_id="zephyr",
+            tool="pytest",
+            summary="deposit verb-partition test",
+        )
+        resp = c.post("/v0/deposit", json=json.loads(envelope.to_json()))
+        # A valid envelope + a configured recorder must be ACCEPTED — if this
+        # 400s, the guard never ran and the verb-partition assertion below
+        # would be vacuous; fail loudly instead.
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "accepted"
+    # The observe log MUST contain the attempt, labeled POST_DEPOSIT.
+    assert observe_log.exists(), "observe log must exist after a write attempt"
+    lines = [json.loads(l) for l in observe_log.read_text().splitlines()]
+    deposit_lines = [
+        r for r in lines
+        if r.get("event") == "write_attempt" and r.get("key") == "work/record/1"
+    ]
+    assert deposit_lines, "observe log must record the deposit attempt"
+    assert all(r["verb"] == "POST_DEPOSIT" for r in deposit_lines)
 
 
 # ---------------------------------------------------------------------------
