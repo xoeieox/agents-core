@@ -49,11 +49,13 @@ Usage as CLI (this module):
                       [--by <curator-principal>] [--tags tag1,tag2]
                       [--rationale one-line-why] [--store atoms|machinery]
 
-DEAD-IN-REPO NOTE (reviewer PR #334 cycle 1 [low]): build_parser()/cli() in
-this module are NOT wired into any live entry point in agents-core — the
-live CLI surface is conductor/scripts/mem.py (a separate repo), which the
-conductor PR dispatches to this module. Until that lands, this module is
-exercised only by tests/test_mem_cli.py. That is acceptable per the spec's
+DEAD-IN-REPO NOTE (reviewer PR #334 cycle 1 [low]; re-confirmed by
+reviewer PR #337 cycle 1 [low]): build_parser()/cli() in this module are
+NOT wired into any live entry point in agents-core (no console_scripts
+entry in pyproject.toml points at this module) — the live CLI surface is
+conductor/scripts/mem.py (a separate repo), which the conductor PR
+dispatches to this module. Until that lands, this module is exercised
+only by tests/test_mem_cli.py. That is acceptable per the spec's
 Files-changed split (agents-core ships the wiring + the MEM_PRINCIPAL env
 default; conductor ships the live surface); it is documented here so a
 future reader does not mistake the in-repo module for a live binary.
