@@ -68,8 +68,9 @@ REPO_ALLOWLIST_PATH = _REPO_ROOT / "config" / "mem-machine-state-prefixes.json"
 def default_allowlist_path() -> Path:
     """The effective default allowlist path: the live path if it exists, else
     the repo-shipped copy. Used by create_app() when no explicit path is given."""
-    if ALLOWLIST_PATH.exists():
-        return ALLOWLIST_PATH
+    live = _default_allowlist_env_path()
+    if live.exists():
+        return live
     return REPO_ALLOWLIST_PATH
 
 # The store a machine-state write lands in. RESCOPED (rev-2, 2026-09-14
