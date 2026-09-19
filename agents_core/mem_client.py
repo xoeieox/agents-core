@@ -229,7 +229,14 @@ class MemClient:
         key still lands in mem.db) — the server does not honor a
         client-selected store for a key that is not machine-state, because
         that would let a client move an arbitrary key out of the ledger of
-        record (influx, not merge: mem.db is the single ledger of record)."""
+        record (influx, not merge: mem.db is the single ledger of record).
+
+        Reviewer PR #337 cycle 1 [low] confirmation: the flag is
+        effectively a NO-OP at the HTTP layer — it is validated (loud
+        ValueError on a typo) but does not change routing, and exists
+        only to honor the spec's Files-changed line until a future
+        non-rescoped second-sqlite deployment gives it real meaning.
+        """
         validate_store(store)
         body: dict[str, Any] = {"content": content, "tags": tags, "source": source}
         return self._check(self._client.put(f"/v0/memories/{key}", json=body)).json()
