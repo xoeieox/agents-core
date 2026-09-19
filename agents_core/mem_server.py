@@ -677,6 +677,13 @@ def create_app(
         # double-append or lose a line. Dedup is an exact LINE test (the
         # line is newline-terminated), not a substring test — a key that is
         # a substring of another line must not mis-dedup.
+        # Lock nesting note (reviewer PR #335 cycle 1 [med]): the store.set()
+        # below acquires store._lock AGAIN inside this outer `with` block.
+        # That nesting is intentional, not a bug: store._lock is a threading.RLock
+        # (re-entrant, mem.py), so the inner acquisition by the same thread
+        # succeeds; and the batch-key write MUST happen under the same store
+        # lock — the whole read-modify-write (get + set) is one atomic unit,
+        # so the nested re-entry is the correct shape, not a deadlock.
         with store._lock:
             existing = store.get(batch_key)
             existing_lines = existing["content"].splitlines() if existing else []
@@ -785,6 +792,14 @@ def create_app(
         key = payload["key"]
 
         # Write-class guard (observed always; enforced under the flag).
+        # Ordering note (reviewer PR #335 cycle 1 [med]): this guard runs
+        # BEFORE the deposit_recorder-503 and manifest_hash-400 checks
+        # below, deliberately. An unknown/absent principal gets 403
+        # principal_reader regardless of whether the curator (recorder) is
+        # even configured or the envelope is otherwise valid — the D-1
+        # principal model is the outer gate; a reader must be rejected
+        # before any deposit-specific 503/400 can mask it. The ordering is
+        # by design, not an oversight.
         reject = _write_guard(request, "POST_DEPOSIT", key)
         if reject is not None:
             return reject
