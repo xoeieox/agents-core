@@ -305,8 +305,14 @@ def test_deposit_verb_partitioned(tmp_db, allowlist_file, observe_log, no_enforc
     route is guaranteed to parse it and the guard RUNS — the assertion below
     is on a guaranteed log line, not a vacuous 'if the route reached the
     guard' conditional. archetypes_core is a hard dep of this test (it
-    already is for test_mem_deposit.py); a missing import fails the test
-    loudly instead of silently skipping the verb-partition guarantee."""
+    already is for test_mem_deposit.py; the mem_server.py route imports it
+    lazily, so the package stays importable without it). It is NOT declared
+    in pyproject.toml [project.optional-dependencies] test (reviewer PR
+    #339 cycle 1 [med]) — the gate environment has it installed (the
+    existing test_mem_deposit.py suite depends on it), but the undeclared
+    hard test dependency is named here so a future environment without it
+    fails LOUDLY at import (a clear, actionable error) instead of silently
+    skipping the verb-partition guarantee."""
     from archetypes_core.provenance import to_lapis_return
 
     class FakeRecorder:

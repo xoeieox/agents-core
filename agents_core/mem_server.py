@@ -88,7 +88,8 @@ DEFAULT_PRINCIPALS: dict[str, dict] = {
 # POST /v0/checkpoint — maintenance). Everything else is read. The class is
 # enforced per-route via the _write_guard() calls in the route handlers
 # (each with its own normalized verb: "PUT", "DELETE", "POST_DEPOSIT",
-# "POST_PROMOTE", "POST_CHECKPOINT") — there is no central method table.
+# "POST_PROMOTE", "POST_CHECKPOINT", "POST_LAND") — there is no central
+# method table.
 
 
 def _load_principal_registration() -> dict[str, dict]:
@@ -196,11 +197,11 @@ class FaucetObserver:
     def observe_write(self, request: Request, verb: str, key: str) -> dict:
         """Log a write attempt. Returns the verdict record (for logging/audit).
 
-        verb is the normalized verb: "PUT", "DELETE", "POST_DEPOSIT", or
-        "POST_PROMOTE" (the /v0/promote verb is its OWN verb in the
-        per-writer table — it is a POST, not a PUT, so it must not be
-        conflated with the PUT write class in the observe log or the
-        report; gate trickster verb partitioning).
+        verb is the normalized verb: "PUT", "DELETE", "POST_DEPOSIT",
+        "POST_PROMOTE", "POST_CHECKPOINT", or "POST_LAND" (each POST route
+        is its OWN verb in the per-writer table — a POST is not a PUT, so
+        it must not be conflated with the PUT write class in the observe
+        log or the report; gate trickster verb partitioning).
         """
         principal = _principal_of(request) or "none"
         role = _principal_role(request, self.principals)
@@ -324,11 +325,14 @@ class FaucetObserver:
         must escalate to Erah on that; spec D-1 hard requirement).
         """
         # The write-class verbs partitioned in the report. POST_CHECKPOINT is
-        # a maintenance verb (not the write class), but it is still observed —
-        # include it in the verbs dict so total == sum(verbs) always holds
-        # (a checkpoint writer must not show total > sum(verbs)).
+        # a maintenance verb (not the write class), and POST_LAND is the
+        # observe-report landing verb (a write, but not the deposit/promote
+        # write class) — both are still observed, so all observed verbs are
+        # pre-initialized here and total == sum(verbs) always holds with no
+        # reliance on the defensive .get() fallback.
         known_verbs = (
             "PUT", "DELETE", "POST_DEPOSIT", "POST_PROMOTE", "POST_CHECKPOINT",
+            "POST_LAND",
         )
         writers: dict[str, dict] = {}
         for (principal, verb), n in self._counts.items():

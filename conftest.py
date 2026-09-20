@@ -43,3 +43,41 @@ def _gw_handshake_precached():
 @pytest.fixture(autouse=True)
 def _locality_ledger_isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALITY_LEDGER_ROOT", str(tmp_path / "locality-ledger"))
+
+
+@pytest.fixture(autouse=True)
+def _mem_allowlist_isolated(tmp_path, monkeypatch):
+    """Point the machine-state allowlist at the REPO-SHIPPED artifact for
+    every test (openclaw-memdb-influx-reader-v0, reviewer PR #339 cycle 1
+    [high]).
+
+    mem_server.create_app() hard-requires a valid machine-state allowlist
+    (REFUSES TO START on missing/malformed/unreadable — the fail-open
+    bypass the gate names). Its default resolution is
+    mem_machinery.default_allowlist_path(): the live path
+    (MEM_MACHINE_STATE_PREFIXES_PATH, default
+    /srv/agents/config/mem-machine-state-prefixes.json) if it exists, else
+    the repo-shipped copy (config/mem-machine-state-prefixes.json). On this
+    host the live path happens to exist, so pre-existing tests that call
+    create_app() with NO explicit allowlist_path (tests/test_mem_server.py,
+    tests/test_mem_deposit.py) pass — but in a clean CI/clone where only
+    the repo copy exists, the resolution is environment-dependent and the
+    suite is not deterministic.
+
+    This fixture removes the ambient dependence: it points
+    MEM_MACHINE_STATE_PREFIXES_PATH at a per-test copy of the repo-shipped
+    artifact, so the default resolution ALWAYS finds a valid allowlist
+    regardless of what (if anything) exists at the live path. It does NOT
+    weaken the fail-closed guard: tests that exercise the refuse-to-start
+    behavior (tests/test_mem_influx.py) pass an explicit allowlist_path
+    (missing/malformed) or override the env var themselves, and an explicit
+    path bypasses this default resolution by design.
+    """
+    from agents_core import mem_machinery
+
+    src = mem_machinery.REPO_ALLOWLIST_PATH
+    if src.exists():
+        p = tmp_path / "mem-machine-state-prefixes.json"
+        p.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        monkeypatch.setenv("MEM_MACHINE_STATE_PREFIXES_PATH", str(p))
+    yield
