@@ -222,12 +222,9 @@ def test_rejection_envelope_is_flat_error(tmp_db, allowlist_file, observe_log, e
         assert body["error"]["code"] == "bad_request"
         assert "detail" not in body
 
-        # 400 bad_request (promote without a curator principal): a body
-        # principal that differs from the VERIFIED header is rejected
-        # before the guard runs (400 bad_request — 'key' is present but
-        # the body principal is absent while the header asserts one...
-        # no: the loud 400 here is the empty-key bad_request). Use the
-        # empty-key case instead: it is unambiguous and guard-free.
+        # 400 bad_request (promote with an empty key): the in-handler
+        # key check is guard-free (it runs before the write-class guard),
+        # so it is unambiguous under enforcement.
         resp = c.post(
             "/v0/promote",
             json={"key": "", "from": "openclaw/gw", "content": "x"},
