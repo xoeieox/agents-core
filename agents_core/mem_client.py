@@ -111,6 +111,42 @@ class MemClient:
     def checkpoint(self) -> dict:
         return self._check(self._client.post("/v0/checkpoint")).json()
 
+    # --- Hygiene (mem-hygiene-automation-v0) ---
+    # The server holds the store; these are the thin-client half of the
+    # `mem hygiene run|ageout|list|restore` subcommands. The
+    # MEM_SERVER-unset direct-sqlite fallback in the conductor CLI is a
+    # named NON-PATH for hygiene.
+
+    def hygiene_run(
+        self,
+        *,
+        dry_run: bool = False,
+        allow_over_cap: bool = False,
+        run_id: str | None = None,
+    ) -> dict:
+        body: dict[str, Any] = {"dry_run": dry_run, "allow_over_cap": allow_over_cap}
+        if run_id:
+            body["run_id"] = run_id
+        return self._check(
+            self._client.post("/v0/hygiene/run", json=body)
+        ).json()
+
+    def hygiene_ageout(self, window: int | None = None) -> dict:
+        body: dict[str, Any] = {}
+        if window is not None:
+            body["window"] = window
+        return self._check(
+            self._client.post("/v0/hygiene/ageout", json=body)
+        ).json()
+
+    def hygiene_list(self) -> dict:
+        return self._check(self._client.get("/v0/hygiene/list")).json()
+
+    def hygiene_restore(self, prefix: str) -> dict:
+        return self._check(
+            self._client.post("/v0/hygiene/restore", json={"prefix": prefix})
+        ).json()
+
     def close(self):
         self._client.close()
 

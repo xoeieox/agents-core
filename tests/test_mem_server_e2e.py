@@ -20,6 +20,10 @@ def e2e_env(tmp_path_factory):
     """Spin up mem-server subprocess against a temp DB. Yield (client, store)."""
     db_path = tmp_path_factory.mktemp("e2e") / "mem_e2e.db"
 
+    # D4 write-guard (mem-hygiene-automation-v0) is default-ON: the e2e
+    # writes carry test-provenance sources (pytest-e2e), so the server
+    # subprocess runs with MEM_ALLOW_TEST_WRITE=1. The guard mapping itself
+    # is covered by test_mem_hygiene_server.py.
     proc = subprocess.Popen(
         [sys.executable, "-m", "agents_core.mem_server"],
         env={
@@ -27,6 +31,7 @@ def e2e_env(tmp_path_factory):
             "MEM_BIND_HOST": "127.0.0.1",
             "MEM_BIND_PORT": str(E2E_PORT),
             "MEM_LOG_LEVEL": "error",
+            "MEM_ALLOW_TEST_WRITE": "1",
             "PATH": "/usr/local/bin:/usr/bin:/bin",
         },
         stdout=subprocess.PIPE,
