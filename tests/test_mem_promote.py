@@ -347,7 +347,11 @@ def test_server_promote_rejects_multi_line_rationale(tmp_db, allowlist_file, obs
             headers={"X-Mem-Principal": "brix-pm"},
         )
         assert resp.status_code == 400
-        assert resp.json()["detail"]["error"]["code"] == "bad_rationale"
+        # Flat rejection envelope {"error":{...}} — the uniform contract
+        # pinned by test_mem_influx.py::test_rejection_envelope_is_flat_error
+        # (the server's _http_error() serializes top-level "error", never a
+        # FastAPI "detail" wrapper).
+        assert resp.json()["error"]["code"] == "bad_rationale"
         # The row must NOT have been written.
         assert c.get("/v0/memories/finding/x").status_code == 404
 
@@ -368,7 +372,9 @@ def test_server_promote_rejects_newline_ref_loud_400(tmp_db, allowlist_file, obs
             headers={"X-Mem-Principal": "brix-pm"},
         )
         assert resp.status_code == 400
-        assert resp.json()["detail"]["error"]["code"] == "bad_from_ref"
+        # Flat rejection envelope {"error":{...}} (uniform contract, see
+        # test_rejection_envelope_is_flat_error).
+        assert resp.json()["error"]["code"] == "bad_from_ref"
         # The row must NOT have been written.
         assert c.get("/v0/memories/finding/x").status_code == 404
 
@@ -383,7 +389,8 @@ def test_server_promote_rejects_malformed_ref(tmp_db, allowlist_file, observe_lo
                 headers={"X-Mem-Principal": "brix-pm"},
             )
             assert resp.status_code == 400, f"ref {bad!r} must 400"
-            assert resp.json()["detail"]["error"]["code"] == "bad_from_ref"
+            # Flat rejection envelope {"error":{...}} (uniform contract).
+            assert resp.json()["error"]["code"] == "bad_from_ref"
 
 
 def test_server_promote_requires_principal(tmp_db, allowlist_file, observe_log, no_enforce):
@@ -394,4 +401,5 @@ def test_server_promote_requires_principal(tmp_db, allowlist_file, observe_log, 
             json={"key": "finding/x", "from": "openclaw/gw", "content": "x"},
         )
         assert resp.status_code == 400
-        assert resp.json()["detail"]["error"]["code"] == "bad_request"
+        # Flat rejection envelope {"error":{...}} (uniform contract).
+        assert resp.json()["error"]["code"] == "bad_request"
