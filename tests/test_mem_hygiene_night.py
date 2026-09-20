@@ -88,14 +88,14 @@ def _run(env: dict, *extra: str) -> tuple[int, str]:
     # PYTHONPATH -> the staged tree so the night script imports the
     # DEPLOYED agents_core (this worktree), not whatever else is importable
     # (e.g. a stale /srv/agents checkout on sys.path).
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(Path(mhn.__file__).parent.parent)
+    sub_env = dict(os.environ)
+    sub_env["PYTHONPATH"] = str(Path(mhn.__file__).parent.parent)
     proc = subprocess.run(
         ["python3", str(Path(mhn.__file__)),
          "--config", str(env["config"]),
          "--slots-dir", str(env["slots"]),
          "--mem-cli", env["cli"], *extra],
-        capture_output=True, text=True, timeout=120, env=env,
+        capture_output=True, text=True, timeout=120, env=sub_env,
     )
     return proc.returncode, proc.stdout + proc.stderr
 
