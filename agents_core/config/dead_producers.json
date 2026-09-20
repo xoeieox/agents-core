@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "comment": "D2(c) dead-producer registry (mem-hygiene-automation-v0). prefix -> exact source-value-set that proves the producer behind the prefix is dead. A prefix whose observed sources are a SUPERSET of its set (a new source appeared) or that is not registered at all FAILS CLOSED (ineligible). Hostname sources (brix/starhouse) are never registered here — that is exactly how router/ stays live until its producer dies. EXCEPTION (reviewer low, PR #329 cycle 1): arc-scratch-20260727/ is a dated SCRATCH SNAPSHOT (spec §2: ~duplicating live arc/, 659 rows), not a live stream — its rows carry the hostname source 'brix' (verified live 2026-09-18), and the hostname IS the dead-producer proof for a dated snapshot that is never written again; the fail-closed hostname rule above still governs every LIVE stream (router/). Adding a prefix is a deliberate config edit, never auto-inference.",
+  "dead_sources": {
+    "elevator/": ["elevator_scheduler"],
+    "weather/": ["ops-primitives"],
+    "test/": ["lapis-pm/opencode", "user-session-2026-06-07"],
+    "arc-scratch-20260727/": ["brix"]
+  }
+}

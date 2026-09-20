@@ -19,7 +19,12 @@ def tmp_db(tmp_path):
 
 
 @pytest.fixture
-def client(tmp_db):
+def client(tmp_db, monkeypatch):
+    # D4 write-guard (mem-hygiene-automation-v0) is default-ON: test-source
+    # writes are rejected with 409 unless MEM_ALLOW_TEST_WRITE=1. The
+    # endpoint tests here exercise routing/round-trips, not the guard
+    # (test_mem_hygiene_server.py covers the guard mapping explicitly).
+    monkeypatch.setenv("MEM_ALLOW_TEST_WRITE", "1")
     app = create_app(tmp_db)
     with TestClient(app) as c:
         yield c

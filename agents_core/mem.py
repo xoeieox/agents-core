@@ -44,6 +44,38 @@ STARHOUSE_SSH = "user@203.0.113.12"
 # divergent local sqlite. Env-overridable; default is the BRIX tailscale address.
 MEM_MASTER_URL = os.environ.get("MEM_MASTER_URL", "http://203.0.113.10:8404")
 
+# --- D4 write-path guard (mem-hygiene-automation-v0) ---
+#
+# The guard sits at this library chokepoint (MemoryStore.set), NOT at the
+# HTTP layer: the break-glass scar writes are in-process
+# (MemoryStore().set() from conductor tests / gw_topology reach()), never
+# reach mem_server.py, and a source-pattern filter cannot distinguish test
+# from production — the production gw_topology path's own source is
+# "gw_topology", the same value its test scars carry. The writer-side scar
+# fix (finding/gw-topology-tests-write-breakglass-scars-to-prod-mem-2026-08-11)
+# is what lets the guard default ON: once the scar writer stops writing
+# through the chokepoint, the pattern below matches nothing in production.
+#
+# MEM_ALLOW_TEST_WRITE=1 disables the guard (the conductor test suite sets
+# it; the maintenance path never needs it — restore/purge bypass set()
+# entirely, the named F6 exception).
+#
+# Pattern strictness (reviewer low, PR #331 cycle 1): the pattern matches
+# the test-provenance SEGMENTS (test|tests|_test|mock|fake|fixture)
+# delimited by -, _, / or a string boundary — a source like
+# "production_test_data" matches (the "test" segment), which is the
+# intended behavior: a source that names test provenance anywhere in its
+# value is rejected unless MEM_ALLOW_TEST_WRITE=1. A production source
+# that happens to embed a test segment and must write is the operator's
+# choice to flag via the env var, not a pattern hole.
+_TEST_SOURCE_PATTERN = re.compile(r"(^|[-_/])(test|tests|_test|mock|fake|fixture)([-_/]|$)")
+
+
+class TestWriteRejected(Exception):
+    """D4: a write with a test-provenance source was rejected by the
+    MemoryStore.set() guard. mem_server maps this to a 4xx (not a bare
+    500); the CLI exits non-zero."""
+
 
 # --- Database Schema ---
 
@@ -132,7 +164,23 @@ class MemoryStore:
         every exhaust writer (elevator_scheduler, ops_primitives, lapis-pm's
         spec_review via the mem CLI) already funnels through here, so no
         caller needs to change.
+
+        D4 write-path guard (mem-hygiene-automation-v0): a `source` that
+        matches the test-provenance pattern is rejected with
+        TestWriteRejected unless MEM_ALLOW_TEST_WRITE=1. The guard is on
+        the EXPLICIT source argument only — the empty-source hostname
+        default (source or HOSTNAME) is never pattern-matched, so a
+        production writer that omits source on a test host is not
+        silently locked out.
         """
+        if source and _TEST_SOURCE_PATTERN.search(source):
+            if os.environ.get("MEM_ALLOW_TEST_WRITE") != "1":
+                raise TestWriteRejected(
+                    f"test-provenance source {source!r} rejected at the "
+                    f"MemoryStore.set() chokepoint (D4 write-path guard); "
+                    f"set MEM_ALLOW_TEST_WRITE=1 to allow (test harnesses "
+                    f"only)"
+                )
         if mem_exhaust.route_to_exhaust(key):
             return self._exhaust_store().set(key, content, tags=tags, source=source)
 

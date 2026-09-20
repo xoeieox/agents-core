@@ -441,3 +441,31 @@ def test_iter_keys_completeness():
     known = set(iter_keys())
     for key in GOLDEN:
         assert key in known, f"GOLDEN key {key!r} missing from iter_keys()"
+
+
+# ---------------------------------------------------------------------------
+# machinery-vigilance-friction-key-v0: friction key resolves against the REAL registry
+# ---------------------------------------------------------------------------
+
+def test_friction_key_resolves_against_real_registry(monkeypatch):
+    """The `friction` key (machinery-vigilance-v0 D2 ledger) resolves against the
+    real classmap — no stub. Guards against a future key regression surfacing
+    at first live cycle instead of test time.
+
+    - default root: room_path("friction", "queue.jsonl") == /srv/lapis/friction/queue.jsonl
+    - ROOM_ROOT override honored: ROOM_ROOT=/tmp/x -> /tmp/x/friction/queue.jsonl
+    - path_class("friction") is Class.B
+    - "friction" in iter_keys()
+    """
+    from agents_core.room_paths import room_path, path_class, iter_keys, Class
+
+    # default /room root (autouse clean_env strips ROOM_ROOT + all per-key vars)
+    assert str(room_path("friction", "queue.jsonl")) == "/srv/lapis/friction/queue.jsonl"
+
+    # ROOM_ROOT override re-roots the key (friction has no per-key env_var)
+    monkeypatch.setenv("ROOM_ROOT", "/tmp/x")
+    assert str(room_path("friction", "queue.jsonl")) == "/tmp/x/friction/queue.jsonl"
+
+    # class + enumeration
+    assert path_class("friction") is Class.B
+    assert "friction" in iter_keys()
