@@ -367,11 +367,19 @@ def test_deposit_verb_partitioned(tmp_db, allowlist_file, observe_log, no_enforc
     lazily, so the package stays importable without it). It is NOT declared
     in pyproject.toml [project.optional-dependencies] test (reviewer PR
     #339 cycle 1 [med]) — the gate environment has it installed (the
-    existing test_mem_deposit.py suite depends on it), but the undeclared
-    hard test dependency is named here so a future environment without it
-    fails LOUDLY at import (a clear, actionable error) instead of silently
-    skipping the verb-partition guarantee."""
-    from archetypes_core.provenance import to_lapis_return
+    existing test_mem_deposit.py suite depends on it). Reviewer PR #342
+    cycle 1 [low] fix: the import is now GUARDED — a clean environment
+    without archetypes_core skips this test (with a named reason) instead of
+    failing at import; the deposit path is still covered by
+    test_mem_deposit.py in the gate env (which has the dep)."""
+    try:
+        from archetypes_core.provenance import to_lapis_return
+    except ImportError:
+        pytest.skip(
+            "archetypes_core not installed (undeclared hard test dependency, "
+            "named in the docstring; the gate env has it — test_mem_deposit.py "
+            "covers the deposit path there)"
+        )
 
     class FakeRecorder:
         def already_recorded(self, mh):
