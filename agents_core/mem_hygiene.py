@@ -550,6 +550,14 @@ class MemHygieneRunner:
         WAL mode with a live writer, could observe a torn WAL state (reviewer
         high, PR #329 cycle 1). The sibling store is still direct SQL on the
         exhaust file's `memories` table — never the fall-through store API.
+
+        Lock ordering (reviewer low, PR #331 cycle 1): this acquires
+        es._lock while classify_prefixes already holds self._store._lock
+        (store lock -> exhaust lock). The ordering is documented here so
+        any future code path that acquires them in reverse (exhaust lock
+        -> store lock) is a known deadlock hazard; no such reverse path
+        exists in the codebase today. Both locks are RLocks, so the
+        hazard is cross-path, not same-thread-reentrant.
         """
         es = self._store._exhaust_store()
         with es._lock:
@@ -654,16 +662,24 @@ class MemHygieneRunner:
         self,
         candidates: list[dict],
         eligible: list[CandidatePrefix],
+        mode: str = "dry-run",
     ) -> str:
-        """Write the dry-run candidate list as a named artifact (atomic).
-        Returns the path (recorded in the decision/ line)."""
+        """Write the candidate list as a named artifact (atomic).
+        Returns the path (recorded in the decision/ line).
+
+        The artifact is the DRY-RUN snapshot of the candidate set even
+        when it is written ahead of a real run (the night node writes it
+        BEFORE any mutation and then quarantines the same enumeration) —
+        but the ``mode`` field records the CALLER's run mode so a real
+        run's artifact does not claim it was a dry-run (reviewer medium,
+        PR #331 cycle 1: the field said 'dry-run' on real runs)."""
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         path = self._artifact_dir / f"mem-hygiene-candidates-{date}-{self.run_id}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "run_id": self.run_id,
             "ts_utc": datetime.now(timezone.utc).isoformat(),
-            "mode": "dry-run",
+            "mode": mode,
             "eligible_prefixes": [p.prefix for p in eligible],
             "candidate_count": len(candidates),
             "candidates": candidates,
@@ -693,12 +709,18 @@ class MemHygieneRunner:
         ``sqlite3.DatabaseError`` (``database disk image is malformed``),
         not ``OperationalError`` — both are caught so the halt condition
         fires on either failure mode.
+
+        The integrity command returns ZERO rows on a healthy index (it
+        only raises on corruption), so the probe is the exception path,
+        not the row count: no exception = OK. (A row-count check would
+        make this probe always-False and every real run would abort —
+        the bug this wording exists to keep from regressing.)
         """
         try:
-            row = conn.execute(
+            conn.execute(
                 "SELECT 'ok' FROM memories_fts WHERE memories_fts='integrity'"
-            ).fetchone()
-            return bool(row)
+            ).fetchall()
+            return True
         except (sqlite3.OperationalError, sqlite3.DatabaseError):
             return False
 
@@ -888,10 +910,17 @@ class MemHygieneRunner:
         # 5. Post-commit provenance counts: quarantined = rows this run_id
         #    staged (== deleted, the mismatch guard already enforced
         #    equality with the candidate count); already_quarantined =
-        #    rows for the SAME keys from an EARLIER run_id (the
-        #    INSERT OR IGNORE path — a crashed re-run with the same
-        #    run_id is a clean no-op by construction, a different run_id
-        #    re-quarantining the same key is the restore-then-run case).
+        #    rows for the SAME keys from an EARLIER run_id still sitting
+        #    in memories_quarantine (the INSERT OR IGNORE path — a
+        #    crashed re-run with the same run_id is a clean no-op by
+        #    construction).
+        #
+        # Reviewer medium (PR #331 cycle 1): restore_prefix DRAINS the
+        # quarantine table for the restored prefix, so after a
+        # restore-then-run cycle the earlier run's rows are gone and this
+        # count is 0 for that path. The count is informational only (the
+        # verdict field, not a guard); it is NOT a restore-then-run
+        # detector.
         with self._store._lock:
             conn = self._store._conn
             quarantined = int(conn.execute(
@@ -909,6 +938,8 @@ class MemHygieneRunner:
                         chunk + [self.run_id],
                     ).fetchone()
                     already += int(row[0])
+        verdict.quarantined = quarantined
+        verdict.already_quarantined = already
         with self._store._lock:
             verdict.fts_integrity_ok = self._fts_integrity_ok(self._store._conn)
             verdict.db_row_count_after = int(

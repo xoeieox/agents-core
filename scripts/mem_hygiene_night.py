@@ -143,7 +143,16 @@ def _run_pipeline(config: str, slots_dir: Path, dry_run: bool,
             ],
             "candidate_count": len(candidates),
         }
-        artifact = runner.write_candidate_artifact(candidates, eligible)
+        # The artifact is the dry-run snapshot of the candidate set, but
+        # its mode field records THIS run's mode — on a real run the
+        # artifact is written ahead of the mutation and the mutation
+        # quarantines this exact enumeration, so the artifact is the
+        # pre-mutation snapshot of a run, not a dry-run (reviewer medium,
+        # PR #331 cycle 1).
+        artifact = runner.write_candidate_artifact(
+            candidates, eligible,
+            mode="dry-run" if dry_run else "run",
+        )
         report["steps"]["candidate_artifact"] = artifact
         _log(f"candidate artifact: {artifact} ({len(candidates)} rows)")
 

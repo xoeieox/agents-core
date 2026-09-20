@@ -315,11 +315,14 @@ def test_quarantine_pk_key_run_id_allows_re_quarantine_after_restore(tmp_path):
     runner2.run_id = "test-run-2"
     v2 = runner2.run_quarantine(dry_run=False)
     assert v2.quarantined == 2
-    # Two (key, run_id) pairs coexist in the quarantine table.
+    # restore_prefix DRAINS the quarantine table for the restored prefix
+    # (INSERT..SELECT + DELETE pair), so the first run's rows are gone.
+    # Only the second run's (key, run_id) pairs remain: 2 keys x 1 run_id.
     rows = runner2._store._conn.execute(
         "SELECT key, run_id FROM memories_quarantine ORDER BY run_id"
     ).fetchall()
-    assert len(rows) == 4  # 2 keys x 2 run_ids
+    assert len(rows) == 2  # 2 keys x 1 run_id (test-run-2)
+    assert all(r["run_id"] == "test-run-2" for r in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +348,10 @@ def test_dry_run_writes_artifact_and_mutates_nothing(tmp_path):
     assert artifact["candidate_count"] == 4
     assert len(artifact["candidates"]) == 4
     assert artifact["eligible_prefixes"] == ["elevator/"]
+    # Default artifact mode is 'dry-run' (the snapshot is written
+    # dry-run-style); a real run passes mode="run" explicitly (reviewer
+    # medium, PR #331 cycle 1).
+    assert artifact["mode"] == "dry-run"
 
     # No mutation: everything still in memories, quarantine table empty.
     store = MemoryStore(db_path=tmp_path / "mem.db")
@@ -465,15 +472,18 @@ def test_count_mismatch_aborts_and_rolls_back(tmp_path, monkeypatch):
     with pytest.raises(HygieneAborted, match="count mismatch"):
         runner.run_quarantine(dry_run=False)
 
-    # Full rollback: the quarantined rows are gone, the memories rows
-    # (minus the drifted one) are intact.
+    # Full rollback: the quarantined rows are gone, and the memories
+    # rows are fully intact — the drift DELETE happened INSIDE the
+    # transaction (it was issued on the same connection, before the
+    # batch DELETE), so ROLLBACK undoes it too. The count is 4, not 3:
+    # the drift is a mid-run artifact, not a committed external write.
     conn = runner._store._conn
     assert conn.execute(
         "SELECT COUNT(*) FROM memories_quarantine"
     ).fetchone()[0] == 0
     assert conn.execute(
         "SELECT COUNT(*) FROM memories WHERE key LIKE 'elevator/%'"
-    ).fetchone()[0] == 3
+    ).fetchone()[0] == 4
 
 
 def test_re_run_after_crash_is_idempotent(tmp_path):

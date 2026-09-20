@@ -59,6 +59,15 @@ MEM_MASTER_URL = os.environ.get("MEM_MASTER_URL", "http://203.0.113.10:8404")
 # MEM_ALLOW_TEST_WRITE=1 disables the guard (the conductor test suite sets
 # it; the maintenance path never needs it — restore/purge bypass set()
 # entirely, the named F6 exception).
+#
+# Pattern strictness (reviewer low, PR #331 cycle 1): the pattern matches
+# the test-provenance SEGMENTS (test|tests|_test|mock|fake|fixture)
+# delimited by -, _, / or a string boundary — a source like
+# "production_test_data" matches (the "test" segment), which is the
+# intended behavior: a source that names test provenance anywhere in its
+# value is rejected unless MEM_ALLOW_TEST_WRITE=1. A production source
+# that happens to embed a test segment and must write is the operator's
+# choice to flag via the env var, not a pattern hole.
 _TEST_SOURCE_PATTERN = re.compile(r"(^|[-_/])(test|tests|_test|mock|fake|fixture)([-_/]|$)")
 
 

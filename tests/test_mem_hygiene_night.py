@@ -115,6 +115,9 @@ def test_dry_run_writes_artifact_no_mutation_no_deposit(env):
     assert artifact.exists()
     payload = json.loads(artifact.read_text())
     assert payload["candidate_count"] == 4
+    # The artifact's mode field records the caller's run mode (reviewer
+    # medium, PR #331 cycle 1): a dry-run artifact says 'dry-run'.
+    assert payload["mode"] == "dry-run"
 
     # No mutation.
     from agents_core.mem import MemoryStore
@@ -149,6 +152,12 @@ def test_real_run_quarantines_and_deposits(env):
     # The candidate artifact exists.
     artifacts = list(env["slots"].glob("mem-hygiene-candidates-*.json"))
     assert len(artifacts) == 1
+    # The artifact is the pre-mutation snapshot of THIS run, so its mode
+    # field records the run mode, not 'dry-run' (reviewer medium,
+    # PR #331 cycle 1: it used to say 'dry-run' on a real run).
+    payload = json.loads(artifacts[0].read_text())
+    assert payload["mode"] == "run"
+    assert payload["candidate_count"] == 4
 
     # The provenance line was deposited via the mem CLI with the right
     # key shape, the per-RUN key, and the lapis-pm,mem-hygiene tags.

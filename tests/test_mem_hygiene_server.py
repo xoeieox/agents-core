@@ -43,15 +43,29 @@ def cfg_pair(tmp_path: Path):
 
 
 def _seed_dead_stream(tmp_path: Path, n: int = 4) -> None:
+    """Seed dead-stream rows into mem.db directly (bypassing store.set()
+    which would route elevator/ to the exhaust twin). The quarantine
+    runner classifies the mem.db `memories` table, so the fixture must
+    land there — the spec's own counts (elevator/ 10,975) are mem.db rows.
+    """
+    from agents_core import mem_exhaust
     store = MemoryStore(db_path=tmp_path / "mem.db")
-    for i in range(n):
-        store.set(f"elevator/row-{i}", f"machine state {i}",
-                  tags=["machine"], source="elevator_scheduler")
     ts = (NOW - timedelta(days=45)).isoformat()
-    store._conn.execute(
-        "UPDATE memories SET created_at=?, updated_at=? WHERE key LIKE 'elevator/%'",
-        (ts, ts),
-    )
+    for i in range(n):
+        key = f"elevator/row-{i}"
+        if mem_exhaust.route_to_exhaust(key):
+            store._conn.execute(
+                "INSERT INTO memories (key, content, tags, source, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (key, f"machine state {i}", "machine", "elevator_scheduler", ts, ts),
+            )
+        else:
+            store.set(key, f"machine state {i}", tags=["machine"],
+                      source="elevator_scheduler")
+            store._conn.execute(
+                "UPDATE memories SET created_at=?, updated_at=? WHERE key=?",
+                (ts, ts, key),
+            )
     store._conn.commit()
     store.close()
 
