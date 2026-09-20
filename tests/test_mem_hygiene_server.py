@@ -153,7 +153,7 @@ def test_hygiene_list_empty_then_after_run(client, tmp_path):
     client.post("/v0/hygiene/run", json={"dry_run": False, "run_id": "t3"})
     body = client.get("/v0/hygiene/list").json()
     assert body["total"] == 4
-    assert body["by_prefix"][0]["prefix"] == "elevator"
+    assert body["by_prefix"][0]["prefix"] == "elevator/"
     assert body["by_prefix"][0]["rows"] == 4
     assert body["by_run"][0]["run_id"] == "t3"
 
