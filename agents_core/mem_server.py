@@ -317,7 +317,9 @@ def create_app(db_path: Path, deposit_recorder: "DepositRecorder | None" = None)
         """Purge quarantined rows past the rollback window (D1)."""
         runner = _hygiene_runner()
         window = request_data.get("window")
-        purged = runner.ageout(window_days=int(window) if window else None)
+        # is-not-None, not truthiness: window=0 is a legal value (purge
+        # everything) and must not be coerced to the 14-day default.
+        purged = runner.ageout(window_days=int(window) if window is not None else None)
         return {"purged": purged, "run_id": runner.run_id}
 
     @app.get("/v0/hygiene/list")
