@@ -188,6 +188,64 @@ def test_excluded_in_healthz(tmp_db, allowlist_file, observe_log, no_enforce):
 
 
 # ---------------------------------------------------------------------------
+# Uniform rejection envelope (spec D-1 named rejection contract)
+# ---------------------------------------------------------------------------
+
+def test_rejection_envelope_is_flat_error(tmp_db, allowlist_file, observe_log, enforce):
+    """The spec's named rejection contract is the FLAT envelope
+    {"error": {"code", "message"}} — the 403 principal_reader path is the
+    reference shape, and EVERY other mem-server error path must match it.
+
+    Reviewer PR #342 cycle 1 [med]: the 400 promote/land paths previously
+    raised HTTPException(detail=_error(...)), which FastAPI serializes as
+    {"detail":{"error":{...}}} — a DIFFERENT envelope than the spec's named
+    contract. This test pins the uniform envelope across the error classes:
+    404 not_found, 400 bad_request (search), 400 bad_request (promote
+    requires a principal), and 400 bad_disposition (observe-report/land).
+    The server-side chokepoint is _http_error() in mem_server.py — a new
+    HTTPException(detail=...) would break this test.
+    """
+    app = create_app(tmp_db, allowlist_path=allowlist_file)
+    with TestClient(app) as c:
+        # 404 not_found (GET a missing key).
+        resp = c.get("/v0/memories/does/not/exist")
+        assert resp.status_code == 404
+        body = resp.json()
+        assert body["error"]["code"] == "not_found"
+        assert "message" in body["error"]
+        assert "detail" not in body, "must be the flat {error:{...}} envelope"
+
+        # 400 bad_request (search with empty q).
+        resp = c.get("/v0/search", params={"q": ""})
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["error"]["code"] == "bad_request"
+        assert "detail" not in body
+
+        # 400 bad_request (promote without a curator principal).
+        resp = c.post(
+            "/v0/promote",
+            json={"key": "finding/x", "from": "openclaw/gw", "content": "x"},
+        )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["error"]["code"] == "bad_request"
+        assert "detail" not in body
+
+        # 400 bad_disposition (observe-report/land with a bad disposition).
+        c.put("/v0/memories/a/1", json={"content": "x", "tags": "", "source": ""})
+        resp = c.post(
+            "/v0/observe-report/land",
+            json={"disposition": {"none": "not-a-real-disposition"}},
+            headers={"X-Mem-Principal": "brix-pm"},
+        )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["error"]["code"] == "bad_disposition"
+        assert "detail" not in body
+
+
+# ---------------------------------------------------------------------------
 # D1 — principal fail-closed (enforce mode)
 # ---------------------------------------------------------------------------
 
@@ -525,7 +583,7 @@ def test_observe_report_disposition_bare_migration_line_rejected(tmp_db, allowli
             headers={"X-Mem-Principal": "brix-pm"},
         )
         assert resp.status_code == 400
-        assert resp.json()["detail"]["error"]["code"] == "bad_disposition"
+        assert resp.json()["error"]["code"] == "bad_disposition"
 
 
 def test_observe_report_disposition_unknown_rejected(tmp_db, allowlist_file, observe_log, no_enforce):
@@ -540,7 +598,7 @@ def test_observe_report_disposition_unknown_rejected(tmp_db, allowlist_file, obs
             headers={"X-Mem-Principal": "brix-pm"},
         )
         assert resp.status_code == 400
-        assert resp.json()["detail"]["error"]["code"] == "bad_disposition"
+        assert resp.json()["error"]["code"] == "bad_disposition"
 
 
 def test_observe_report_disposition_unobserved_writer_rejected(tmp_db, allowlist_file, observe_log, no_enforce):
@@ -555,7 +613,7 @@ def test_observe_report_disposition_unobserved_writer_rejected(tmp_db, allowlist
             headers={"X-Mem-Principal": "brix-pm"},
         )
         assert resp.status_code == 400
-        assert resp.json()["detail"]["error"]["code"] == "bad_disposition"
+        assert resp.json()["error"]["code"] == "bad_disposition"
 
 
 # ---------------------------------------------------------------------------
@@ -631,7 +689,7 @@ def test_promote_body_principal_mismatch_rejected_400(tmp_db, allowlist_file, ob
             headers={"X-Mem-Principal": "some-reader"},
         )
         assert resp.status_code == 400
-        assert resp.json()["detail"]["error"]["code"] == "principal_mismatch"
+        assert resp.json()["error"]["code"] == "principal_mismatch"
         # Nothing landed: no promoted row, no batch decision key.
         assert c.get("/v0/memories/finding/forge-attempt").status_code == 404
         rows = c.get("/v0/memories", params={"tag": "promoted-batch", "limit": 50}).json()
