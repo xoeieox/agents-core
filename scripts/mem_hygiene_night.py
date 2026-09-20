@@ -53,6 +53,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -95,7 +96,10 @@ def _mem_set(key: str, content: str, tags: str, mem_cli: str) -> None:
     The CLI routes through mem-server (MEM_SERVER) or the direct store;
     either way the row lands in the store the morning brief reads.
     """
-    cmd = [mem_cli, "set", key, content, "--tags", tags]
+    # mem_cli may be a shell string ("python3 /path/to/fake_mem.py") as well
+    # as a bare path — split into argv, otherwise the whole string lands as
+    # argv0 and the deposit fails with "No such file or directory".
+    cmd = shlex.split(mem_cli) + ["set", key, content, "--tags", tags]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if proc.returncode != 0:
         raise RuntimeError(
