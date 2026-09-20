@@ -104,8 +104,11 @@ def test_dry_run_writes_artifact_no_mutation_no_deposit(env):
     assert rc == 0, out
 
     # The report is printed as the last JSON document on stdout (after the
-    # [mem-hygiene-night] log lines).
-    report_text = out[out.rindex("{"):]
+    # [mem-hygiene-night] log lines). Start at the last newline-brace
+    # boundary — a bare rindex("{") can land inside a log line's JSON
+    # fragment and json.loads() blows up.
+    idx = out.rfind("\n{")
+    report_text = out[idx + 1:] if idx != -1 else out[out.rindex("{"):]
     report = json.loads(report_text)
     assert report["mode"] == "dry-run"
     assert report["steps"]["classify"]["candidate_count"] == 4
