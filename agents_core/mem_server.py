@@ -50,12 +50,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from agents_core import mem_machinery
-from agents_core.mem import MemoryStore
+from agents_core.mem import MemoryStore, TestWriteRejected
 from agents_core.mem_client import INVALID_REF_CHARS_RE, build_promoted_content
+from agents_core.mem_hygiene import (
+    HygieneAborted,
+    HygieneConfig,
+    MemHygieneRunner,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -494,6 +499,27 @@ def create_app(
         }
 
     # ------------------------------------------------------------------
+    # Error envelope (mem-hygiene-automation-v0 directive 5f61cad3, fix 1):
+    # routes raise HTTPException(detail=_error(code, message)); the default
+    # FastAPI handler would wrap that dict in {"detail": {...}}. Unwrap it so
+    # every error response is the top-level {"error": {"code", "message"}}
+    # envelope the _error() helper and the test suite contract on.
+    # ------------------------------------------------------------------
+
+    @app.exception_handler(HTTPException)
+    async def _http_exception_handler(request: Request, exc: HTTPException):
+        detail = exc.detail
+        if isinstance(detail, dict) and isinstance(detail.get("error"), dict):
+            content = detail
+        else:
+            content = _error("error", str(detail))
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=content,
+            headers=getattr(exc, "headers", None),
+        )
+
+    # ------------------------------------------------------------------
     # Bearer-token middleware (only active when MEM_BEARER_TOKEN is set)
     # ------------------------------------------------------------------
     _token = os.environ.get("MEM_BEARER_TOKEN", "")
@@ -632,7 +658,15 @@ def create_app(
 
         tags_list = _normalize_tags(tags_raw)
 
-        created = store.set(key, content, tags=tags_list, source=source)
+        try:
+            created = store.set(key, content, tags=tags_list, source=source)
+        except TestWriteRejected as exc:
+            # D4 (mem-hygiene-automation-v0): a dedicated 4xx, not a bare
+            # 500 — the write was refused by the guard, not a server fault.
+            raise HTTPException(
+                status_code=409,
+                detail=_error("test_write_rejected", str(exc)),
+            )
         row = store.get(key)
         # `created` is PUT-only: the store.set() return is the in-lock
         # pre-existence check (True = just created, False = updated). A read
@@ -880,6 +914,85 @@ def create_app(
             return reject
         store.checkpoint_wal()
         return {"ok": True}
+
+    # ------------------------------------------------------------------
+    # Hygiene (mem-hygiene-automation-v0) — server-side run surface.
+    #
+    # The CLI (conductor scripts/mem.py `mem hygiene ...`) is a thin HTTP
+    # client over these endpoints; the server holds the store. The
+    # MEM_SERVER-unset direct-sqlite fallback path in the conductor CLI is
+    # a NAMED NON-PATH for hygiene (the guard + quarantine are
+    # server-side). Config comes from MEM_HYGIENE_CONFIG (named config
+    # file) — never auto-inferred.
+    # ------------------------------------------------------------------
+
+    def _hygiene_runner(run_id: str | None = None) -> MemHygieneRunner:
+        # MEM_HYGIENE_CONFIG is read per-call (not at boot) so a config
+        # rotation does not require a mem-server restart.
+        try:
+            config = HygieneConfig.from_env()
+        except Exception as exc:  # noqa: BLE001 - any config failure -> 503
+            raise HTTPException(
+                status_code=503,
+                detail=_error("hygiene_unconfigured",
+                              f"MEM_HYGIENE_CONFIG not loadable: {exc}"),
+            )
+        return MemHygieneRunner(store, config, run_id=run_id)
+
+    @app.post("/v0/hygiene/run")
+    def hygiene_run(request_data: dict[str, Any]):
+        """One bounded hygiene run (D1 + D3). dry_run=true writes the
+        candidate artifact and returns the verdict without mutating."""
+        runner = _hygiene_runner(request_data.get("run_id"))
+        try:
+            verdict = runner.run_quarantine(
+                dry_run=bool(request_data.get("dry_run", False)),
+                allow_over_cap=bool(request_data.get("allow_over_cap", False)),
+            )
+        except HygieneAborted as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=_error("hygiene_aborted", str(exc)),
+            )
+        return verdict.to_dict()
+
+    @app.post("/v0/hygiene/ageout")
+    def hygiene_ageout(request_data: dict[str, Any]):
+        """Purge quarantined rows past the rollback window (D1)."""
+        runner = _hygiene_runner()
+        window = request_data.get("window")
+        # is-not-None, not truthiness: window=0 is a legal value (purge
+        # everything) and must not be coerced to the 14-day default.
+        purged = runner.ageout(window_days=int(window) if window is not None else None)
+        return {"purged": purged, "run_id": runner.run_id}
+
+    @app.get("/v0/hygiene/list")
+    def hygiene_list():
+        """Quarantine census (D-2 `mem hygiene list` surface)."""
+        runner = _hygiene_runner()
+        return runner.quarantine_stats()
+
+    @app.post("/v0/hygiene/restore")
+    def hygiene_restore(request_data: dict[str, Any]):
+        """Restore a quarantined prefix back into memories (D-2:
+        INSERT..SELECT + DELETE pair; the memories_ai trigger re-indexes
+        FTS). Named F6 exception: a direct store write from the
+        maintenance path, bypassing the D4 set-guard by design."""
+        prefix = (request_data.get("prefix") or "").strip()
+        if not prefix:
+            raise HTTPException(
+                status_code=400,
+                detail=_error("bad_request", "'prefix' is required"),
+            )
+        runner = _hygiene_runner()
+        try:
+            restored = runner.restore_prefix(prefix)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=_error("bad_request", str(exc)),
+            )
+        return {"restored": restored, "prefix": prefix, "run_id": runner.run_id}
 
     # ------------------------------------------------------------------
     # Deposit (Zephyr work-record envelope) - rides LapisToolReturn

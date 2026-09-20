@@ -64,7 +64,14 @@ def _envelope(key="pm/test", value="v", tags=None):
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
+    # D4 write-path guard (mem-hygiene-automation-v0, merged on main):
+    # the deposit route persists with source=prov.agent_id, and this
+    # fixture's self-contained envelope uses agent_id "test-agent" — a
+    # test-provenance source the guard rejects at the MemoryStore.set()
+    # chokepoint unless MEM_ALLOW_TEST_WRITE=1. The test suite sets it
+    # (same convention as tests/test_mem_server.py).
+    monkeypatch.setenv("MEM_ALLOW_TEST_WRITE", "1")
     rec = _FakeRecorder()
     app = create_app(tmp_path / "mem.db", deposit_recorder=rec)
     c = TestClient(app)
