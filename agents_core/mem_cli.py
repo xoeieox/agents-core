@@ -267,7 +267,16 @@ def main() -> None:
     2 = error). The spec's Files-changed line names conductor/scripts/mem.py
     (a separate repo) as the LIVE curation surface; the conductor PR
     dispatches to this module. Until that lands, `mem-cli` is the live
-    surface shipped in THIS repo (reviewer PR #338 cycle 1 [med])."""
+    surface shipped in THIS repo (reviewer PR #338 cycle 1 [med]).
+
+    Reviewer PR #342 cycle 1 [low]: the live `mem promote` surface is NOT
+    yet reachable from the conductor CLI in this PR — the conductor-side
+    dispatch (the thin `import` + `add_parser` into this module) is
+    deferred to the separate conductor PR, which is ACCEPTABLE per this
+    PR's own wiring note (the module ships the argparse wiring + HTTP
+    dispatch + the MEM_PRINCIPAL default so the conductor PR is a thin
+    dispatch, and `mem-cli` is the live surface in the meantime). The
+    deferral is named here so the gap is deliberate, not accidental."""
     sys.exit(cli() or 0)
 
 
