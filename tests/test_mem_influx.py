@@ -379,6 +379,177 @@ def test_observe_report_endpoint(tmp_db, allowlist_file, observe_log, no_enforce
     # Write counts are partitioned by verb.
     assert report["writers"]["none"]["verbs"]["PUT"] == 1
     assert report["writers"]["brix-pm"]["verbs"]["PUT"] == 1
+    # The break-list entry carries a disposition (the escalation-path
+    # signal) — default "none" (undispositioned = a silent deferral).
+    assert report["break_list"]["none"]["disposition"] == "none"
+    # The escalation verdict: a non-empty break list with an
+    # undispositioned writer escalates (the flip gate escalates to Erah).
+    assert report["escalate"] is True
+
+
+def test_observe_report_land_named_key(tmp_db, allowlist_file, observe_log, no_enforce):
+    """The observe-week report LANDS at the named mem key
+    state/memdb-influx-observe-week-<YYYYMMDD> (report body) + the raw
+    log (D-1 / D-4 named deliverable; reviewer PR #338 cycle 1 [high]).
+
+    The /v0/observe-report endpoint returning the in-process aggregation
+    is NOT the landing artifact — landing writes the report body through
+    store.upsert_line() into the named key. The landing is a WRITE
+    (POST /v0/observe-report/land, observed as POST_LAND) and is
+    curator-gated under enforcement."""
+    app = create_app(tmp_db, allowlist_path=allowlist_file)
+    with TestClient(app) as c:
+        # A reader write (break-list entry) + a curator write.
+        c.put("/v0/memories/a/1", json={"content": "x", "tags": "", "source": ""})
+        c.put("/v0/memories/b/2", json={"content": "y", "tags": "", "source": ""},
+              headers={"X-Mem-Principal": "brix-pm"})
+
+        # Land the report (curator principal — the landing is a write).
+        resp = c.post(
+            "/v0/observe-report/land",
+            json={},
+            headers={"X-Mem-Principal": "brix-pm"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+    # The named key shape: state/memdb-influx-observe-week-<YYYYMMDD>.
+    from datetime import datetime, timezone
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    assert body["key"] == f"state/memdb-influx-observe-week-{day}"
+    # The raw log path is the named landing artifact's raw log.
+    assert body["raw_log"] == str(observe_log)
+
+    # The report body landed in the named mem key (read it back).
+    app2 = create_app(tmp_db, allowlist_path=allowlist_file)
+    with TestClient(app2) as c2:
+        row = c2.get(f"/v0/memories/{body['key']}").json()
+    assert row["key"] == body["key"]
+    # The content is the header line + a JSON report line (upsert_line
+    # shape: header + line).
+    lines = row["content"].splitlines()
+    assert lines[0].startswith(f"Observe-week report {day}")
+    # The report line is valid JSON carrying the per-writer table +
+    # break list + escalation verdict.
+    report_line = json.loads(lines[1])
+    assert report_line["writers"]["none"]["verbs"]["PUT"] == 1
+    assert "none" in report_line["break_list"]
+    assert report_line["break_list"]["none"]["disposition"] == "none"
+    assert report_line["escalate"] is True
+
+
+def test_observe_report_land_reader_rejected_enforce(tmp_db, allowlist_file, observe_log, enforce):
+    """The landing is a WRITE (write class): a reader cannot land the
+    report under enforcement (403 principal_reader) — the landing key is
+    machine-state-free, so the guard's role check is the whole gate."""
+    app = create_app(tmp_db, allowlist_path=allowlist_file)
+    with TestClient(app) as c:
+        # A reader write (break-list entry).
+        c.put("/v0/memories/a/1", json={"content": "x", "tags": "", "source": ""})
+        # Reader attempts to land the report — rejected.
+        resp = c.post("/v0/observe-report/land", json={})
+        assert resp.status_code == 403
+        assert resp.json()["error"]["code"] == "principal_reader"
+        # Nothing landed: the named key does not exist.
+        from datetime import datetime, timezone
+        day = datetime.now(timezone.utc).strftime("%Y%m%d")
+        assert c.get(f"/v0/memories/state/memdb-influx-observe-week-{day}").status_code == 404
+
+
+def test_observe_report_land_observed_as_post_land(tmp_db, allowlist_file, observe_log, no_enforce):
+    """The landing verb is observed as POST_LAND — its OWN verb in the
+    per-writer table (gate trickster verb partitioning): a curator
+    landing the report must not be mislabeled as a PUT."""
+    app = create_app(tmp_db, allowlist_path=allowlist_file)
+    with TestClient(app) as c:
+        resp = c.post(
+            "/v0/observe-report/land",
+            json={},
+            headers={"X-Mem-Principal": "brix-pm"},
+        )
+        assert resp.status_code == 200
+    assert observe_log.exists()
+    for line in observe_log.read_text().splitlines():
+        rec = json.loads(line)
+        if rec.get("verb") == "POST_LAND":
+            assert rec["principal"] == "brix-pm"
+            break
+    else:
+        raise AssertionError("observe log must record the landing as POST_LAND")
+
+
+def test_observe_report_disposition_migrations_line(tmp_db, allowlist_file, observe_log, no_enforce):
+    """The escalation path (spec D-1 hard requirement): a 'migration
+    line' is a dispositioned OBLIGATION, not a silent deferral. The
+    landing accepts a disposition mapping; a dispositioned writer does
+    NOT escalate, but an undispositioned one does."""
+    app = create_app(tmp_db, allowlist_path=allowlist_file)
+    with TestClient(app) as c:
+        # Two reader writes (two break-list entries: 'none').
+        c.put("/v0/memories/a/1", json={"content": "x", "tags": "", "source": ""})
+        c.put("/v0/memories/b/2", json={"content": "y", "tags": "", "source": ""})
+
+        # Disposition the break-list writer 'none' as a named migration
+        # line (the obligation text).
+        resp = c.post(
+            "/v0/observe-report/land",
+            json={"disposition": {"none": "migration-line:migrate to registered bot by 2026-09-21"}},
+            headers={"X-Mem-Principal": "brix-pm"},
+        )
+        assert resp.status_code == 200, resp.text
+        report = resp.json()["report"]
+
+    # The disposition is recorded on the break-list entry.
+    assert report["break_list"]["none"]["disposition"] == "migration-line:migrate to registered bot by 2026-09-21"
+    # A dispositioned writer does NOT escalate (the migration line is the
+    # obligation; the gate does not escalate on a dispositioned writer).
+    assert report["escalate"] is False
+
+
+def test_observe_report_disposition_bare_migration_line_rejected(tmp_db, allowlist_file, observe_log, no_enforce):
+    """A bare 'migration-line' (no line text) is a silent deferral
+    disguised as a migration line — REJECTED with a loud 400 (the gate
+    must not accept a silent deferral as a dispositioned obligation)."""
+    app = create_app(tmp_db, allowlist_path=allowlist_file)
+    with TestClient(app) as c:
+        c.put("/v0/memories/a/1", json={"content": "x", "tags": "", "source": ""})
+        resp = c.post(
+            "/v0/observe-report/land",
+            json={"disposition": {"none": "migration-line"}},
+            headers={"X-Mem-Principal": "brix-pm"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"]["error"]["code"] == "bad_disposition"
+
+
+def test_observe_report_disposition_unknown_rejected(tmp_db, allowlist_file, observe_log, no_enforce):
+    """An unknown disposition value is rejected with a loud 400 (fail-
+    closed: a typo in the disposition must not silently land)."""
+    app = create_app(tmp_db, allowlist_path=allowlist_file)
+    with TestClient(app) as c:
+        c.put("/v0/memories/a/1", json={"content": "x", "tags": "", "source": ""})
+        resp = c.post(
+            "/v0/observe-report/land",
+            json={"disposition": {"none": "not-a-real-disposition"}},
+            headers={"X-Mem-Principal": "brix-pm"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"]["error"]["code"] == "bad_disposition"
+
+
+def test_observe_report_disposition_unobserved_writer_rejected(tmp_db, allowlist_file, observe_log, no_enforce):
+    """A disposition for a writer that was never observed is a
+    configuration error (nothing to disposition) — loud 400, not silent."""
+    app = create_app(tmp_db, allowlist_path=allowlist_file)
+    with TestClient(app) as c:
+        # No writes at all — 'ghost' is not in the break list.
+        resp = c.post(
+            "/v0/observe-report/land",
+            json={"disposition": {"ghost": "brix-pm"}},
+            headers={"X-Mem-Principal": "brix-pm"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"]["error"]["code"] == "bad_disposition"
 
 
 # ---------------------------------------------------------------------------

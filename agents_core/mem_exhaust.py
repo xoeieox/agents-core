@@ -138,15 +138,28 @@ def machinery_prefixes() -> tuple[str, ...]:
     so the cache is a deliberate trade-off, not an oversight.
 
     LATENT FOOTGUN for non-server callers (reviewer PR #337 cycle 1
-    [low]): any library caller that rotates the allowlist at runtime —
-    editing the file or changing ``MEM_MACHINE_STATE_PREFIXES_PATH`` —
-    MUST call ``reset_machinery_prefixes_cache()`` first, or every
+    [low]; re-confirmed by reviewer PR #338 cycle 1 [low]): any library
+    caller that rotates the allowlist at runtime — editing the file or
+    changing ``MEM_MACHINE_STATE_PREFIXES_PATH`` — MUST call
+    ``reset_machinery_prefixes_cache()`` first, or every
     ``route_to_exhaust()`` / ``could_overlap_exhaust()`` / ``set()``
     call in the process silently keeps using the STALE prefix set for
     the rest of the process lifetime. There is no mtime check and no
     signal; the staleness is invisible from the outside. The reset
     helper exists precisely for this; a rotation that forgets it is a
     silent routing change, not a loud one.
+
+    This is a DELIBERATE trade-off, not an oversight: the cache exists
+    because the allowlist is static for the process lifetime in the
+    production path (the server's boot-time guard pins it at start; a
+    rotation is a restart). An mtime-based invalidation was considered
+    and rejected — it would add a filesystem stat to every
+    ``route_to_exhaust()`` call (the set() chokepoint, i.e. EVERY mem
+    write) to defend against a path (mid-process rotation in a
+    non-server caller) that the production path never takes. The
+    footgun is documented here + pinned by
+    tests/test_mem_influx.py::test_machinery_prefixes_cache_stale_without_reset
+    so a future reader who hits it can find the reset helper by name.
     """
     global _machinery_prefixes_cache, _machinery_prefixes_loaded
     if _machinery_prefixes_loaded:

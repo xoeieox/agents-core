@@ -49,16 +49,18 @@ Usage as CLI (this module):
                       [--by <curator-principal>] [--tags tag1,tag2]
                       [--rationale one-line-why] [--store atoms|machinery]
 
-DEAD-IN-REPO NOTE (reviewer PR #334 cycle 1 [low]; re-confirmed by
-reviewer PR #337 cycle 1 [low]): build_parser()/cli() in this module are
-NOT wired into any live entry point in agents-core (no console_scripts
-entry in pyproject.toml points at this module) — the live CLI surface is
-conductor/scripts/mem.py (a separate repo), which the conductor PR
-dispatches to this module. Until that lands, this module is exercised
-only by tests/test_mem_cli.py. That is acceptable per the spec's
-Files-changed split (agents-core ships the wiring + the MEM_PRINCIPAL env
-default; conductor ships the live surface); it is documented here so a
-future reader does not mistake the in-repo module for a live binary.
+WIRING (reviewer PR #338 cycle 1 [med] — the dead-in-repo module is no
+longer dead): this module IS wired into a live entry point in agents-core:
+the `mem-cli` console_scripts entry in pyproject.toml
+(`agents_core.mem_cli:main`) exposes the promote subcommand + --store flag
++ MEM_PRINCIPAL default as a standalone binary. The spec's Files-changed
+line names conductor/scripts/mem.py (a separate repo) as the LIVE curation
+surface — the conductor PR adds a thin dispatch to this module (one
+`import` + one `add_parser`) so the conductor `mem` binary and this
+`mem-cli` binary share the same argparse wiring + HTTP dispatch. Until the
+conductor PR lands, `mem-cli` (this entry point) is the live surface
+shipped in THIS repo; the module is exercised by tests/test_mem_cli.py AND
+by the console-script entry point.
 """
 
 from __future__ import annotations
@@ -258,5 +260,16 @@ def cli(argv: list[str] | None = None) -> int:
     return 1
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """The console-script entry point (pyproject.toml: mem-cli).
+
+    Exits with the CLI's exit code (0 = success, 1 = no/unknown command,
+    2 = error). The spec's Files-changed line names conductor/scripts/mem.py
+    (a separate repo) as the LIVE curation surface; the conductor PR
+    dispatches to this module. Until that lands, `mem-cli` is the live
+    surface shipped in THIS repo (reviewer PR #338 cycle 1 [med])."""
     sys.exit(cli() or 0)
+
+
+if __name__ == "__main__":
+    main()

@@ -26,6 +26,9 @@ Environment variables (server side):
                       unreadable (fail-closed; no fail-open bypass).
   MEM_OBSERVE_LOG   — path for the observe-only faucet log (default
                       /srv/lapis/planning/reports/memdb-influx-observe-<YYYYMMDD>.log).
+                      The observe-week report also LANDS at mem key
+                      state/memdb-influx-observe-week-<YYYYMMDD> (report
+                      body) — the named landing artifact (D-1 / D-4).
 
 Principal model (openclaw-memdb-influx-reader-v0, D1):
   READ is open, WRITE is curated, enforced server-side. The principal travels
@@ -163,6 +166,13 @@ class FaucetObserver:
 
     Observe-only: it LOGS what would be rejected; it never rejects. Enabling
     enforcement (MEM_ENFORCE_PRINCIPALS) is a separate, follow-up flip.
+
+    Escalation path (spec D-1 hard requirement): the break list carries a
+    per-writer `disposition` (set_disposition()). At the enforcement-flip
+    gate, if the break list is non-empty AND any writer is undispositioned
+    (disposition == "none"), the flip gate ESCALATES to Erah — a 'migration
+    line' is a dispositioned obligation, not a silent deferral, and the
+    report's `escalate` flag is the machine-readable signal for that.
     """
 
     def __init__(self, log_path: Path | str, allowlist: "mem_machinery.MachineStateAllowlist",
@@ -172,7 +182,7 @@ class FaucetObserver:
         self.principals = principals
         self._counts: dict[tuple[str, str], int] = {}  # (principal, verb) -> n
         self._would_reject_prefixes: dict[str, int] = {}  # prefix -> n
-        self._break_list: dict[str, dict] = {}  # principal -> {verbs, prefixes}
+        self._break_list: dict[str, dict] = {}  # principal -> {verbs, prefixes, disposition}
 
     def _log_line(self, record: dict) -> None:
         try:
@@ -219,9 +229,16 @@ class FaucetObserver:
                 )
 
         # Break list: today's writers that enforcement would reject.
+        # Each entry carries a `disposition` field (the escalation-path
+        # signal, spec D-1 hard requirement): "none" = undispositioned
+        # (a SILENT DEFERRAL — the gate must escalate to Erah on this),
+        # or a named disposition: "registered-bot" / "brix-pm" /
+        # "migration-line:<line>". A 'migration line' is a dispositioned
+        # OBLIGATION, not a silent deferral — the gate cannot tell the two
+        # apart without this field (reviewer PR #338 cycle 1 [med]).
         if would_reject:
             entry = self._break_list.setdefault(
-                principal, {"verbs": set(), "prefixes": set()}
+                principal, {"verbs": set(), "prefixes": set(), "disposition": "none"}
             )
             entry["verbs"].add(verb)
             if is_machine_state:
@@ -251,8 +268,61 @@ class FaucetObserver:
                 return e.prefix
         return None
 
+    def set_disposition(self, principal: str, disposition: str) -> None:
+        """Record a named disposition for a break-list writer.
+
+        The escalation path (spec D-1 hard requirement): at the
+        enforcement-flip gate, if the break list is non-empty AND any writer
+        is NOT dispositioned (registered-bot / brix-pm / a named migration
+        line), the flip gate ESCALATES to Erah. A 'migration line' is a
+        dispositioned obligation, not a silent deferral — this field is what
+        lets the gate distinguish the two.
+
+        Accepted values:
+          "none"            — reset to undispositioned (the default)
+          "registered-bot"  — the writer is (or will be) a registered bot
+                              principal in the allowlist/registration
+          "brix-pm"         — the writer is the BRIX-side curator principal
+          "migration-line:<line>" — a NAMED migration line (the obligation
+                              text). Must be non-empty after the prefix; a
+                              bare "migration-line" is rejected (loud
+                              ValueError) so a silent deferral cannot be
+                              disguised as a migration line.
+        """
+        if not principal:
+            raise ValueError("principal is required")
+        if disposition == "migration-line":
+            raise ValueError(
+                "a bare 'migration-line' is a silent deferral, not a "
+                "dispositioned obligation: use 'migration-line:<line>' "
+                "with the named line"
+            )
+        if disposition == "migration-line:" or not disposition:
+            raise ValueError("disposition must be non-empty")
+        if disposition not in ("none", "registered-bot", "brix-pm") and not (
+            disposition.startswith("migration-line:") and len(disposition) > len("migration-line:")
+        ):
+            raise ValueError(
+                f"unknown disposition {disposition!r} (accepted: 'none', "
+                f"'registered-bot', 'brix-pm', 'migration-line:<line>')"
+            )
+        entry = self._break_list.get(principal)
+        if entry is None:
+            # A disposition for a writer that was never observed is a
+            # configuration error (nothing to disposition) — loud, not silent.
+            raise ValueError(
+                f"no observed break-list writer {principal!r} to disposition"
+            )
+        entry["disposition"] = disposition
+
     def report(self) -> dict:
-        """The per-observed-writer table for the observe-week report."""
+        """The per-observed-writer table for the observe-week report.
+
+        The report carries the per-writer disposition (the escalation-path
+        signal) + the escalation verdict: `escalate` is True iff the break
+        list is non-empty AND any writer is undispositioned (the flip gate
+        must escalate to Erah on that; spec D-1 hard requirement).
+        """
         # The write-class verbs partitioned in the report. POST_CHECKPOINT is
         # a maintenance verb (not the write class), but it is still observed —
         # include it in the verbs dict so total == sum(verbs) always holds
@@ -275,13 +345,23 @@ class FaucetObserver:
             w["verbs"][verb] = w["verbs"].get(verb, 0) + n
             w["total"] += n
         break_list = {
-            p: {"verbs": sorted(v["verbs"]), "prefixes": sorted(v["prefixes"])}
+            p: {
+                "verbs": sorted(v["verbs"]),
+                "prefixes": sorted(v["prefixes"]),
+                "disposition": v["disposition"],
+            }
             for p, v in self._break_list.items()
         }
+        # The escalation signal (spec D-1 hard requirement): escalate to
+        # Erah iff the break list is non-empty AND any writer is
+        # undispositioned (a 'migration line' is a dispositioned obligation,
+        # not a silent deferral — 'none' is the silent deferral).
+        escalate = any(v["disposition"] == "none" for v in self._break_list.values())
         return {
             "writers": writers,
             "would_reject_prefixes": self._would_reject_prefixes,
             "break_list": break_list,
+            "escalate": escalate,
         }
 
 
@@ -337,6 +417,53 @@ def create_app(
     observer = FaucetObserver(
         _default_observe_log_path(), allowlist, principals
     )
+
+    # ------------------------------------------------------------------
+    # Observe-week report landing (D-1 / D-4 named deliverable).
+    # The report must LAND at the NAMED mem key
+    # state/memdb-influx-observe-week-<YYYYMMDD> (report body) + the raw
+    # log (the default MEM_OBSERVE_LOG path). The /v0/observe-report
+    # endpoint returning the in-process aggregation is NOT the landing
+    # artifact (reviewer PR #338 cycle 1 [high]): landing writes the
+    # report body through store.upsert_line() (the same atomic
+    # read-modify-write the promote batch key uses) so a re-landing of the
+    # same day is an idempotent dedup, not a double-append.
+    # ------------------------------------------------------------------
+    def _observe_report_key() -> str:
+        day = datetime.now(timezone.utc).strftime("%Y%m%d")
+        return f"state/memdb-influx-observe-week-{day}"
+
+    def _render_report(report: dict) -> str:
+        """Render the report body (the per-writer table + would-reject
+        counts + break list with dispositions + the escalation verdict)
+        as a single line of JSON — the content of the named mem key."""
+        return json.dumps(report, sort_keys=True)
+
+    def land_observe_report() -> dict:
+        """Land the observe-week report at the named mem key (D-1 / D-4).
+
+        Writes the report body as a single JSON line into
+        state/memdb-influx-observe-week-<YYYYMMDD> (upsert_line: idempotent
+        dedup on re-landing the same day; a re-landing after the report
+        CHANGED appends the new line — the key is a line-based listing of
+        report snapshots, like the promotion batch key). Returns the
+        landing record (key, raw log path, report).
+        """
+        report = observer.report()
+        day = datetime.now(timezone.utc).strftime("%Y%m%d")
+        key = f"state/memdb-influx-observe-week-{day}"
+        store.upsert_line(
+            key,
+            _render_report(report),
+            header=f"Observe-week report {day} (raw log: {observer.log_path})",
+            tags=["observe-week"],
+            source="mem-server",
+        )
+        return {
+            "key": key,
+            "raw_log": str(observer.log_path),
+            "report": report,
+        }
 
     # ------------------------------------------------------------------
     # Bearer-token middleware (only active when MEM_BEARER_TOKEN is set)
@@ -831,19 +958,97 @@ def create_app(
 
     @app.get("/v0/observe-report")
     def observe_report():
-        """The per-observed-writer table + would-reject counts + break list.
+        """The per-observed-writer table + would-reject counts + break list
+        (with per-writer disposition) + the escalation verdict.
 
-        Read-only surface for the observe-week report (panel H5). The report
-        body lands at mem key state/memdb-influx-observe-week-<YYYYMMDD> + raw
-        log /srv/lapis/planning/reports/memdb-influx-observe-<YYYYMMDD>.log; this
-        endpoint exposes the in-process aggregation for the gate."""
+        Read-only surface for the observe-week report (panel H5). The named
+        landing artifact (D-1 / D-4) is the mem key
+        state/memdb-influx-observe-week-<YYYYMMDD> (report body) + the raw
+        log; this endpoint exposes the in-process aggregation for the gate.
+
+        INFO SURFACE NOTE (reviewer PR #338 cycle 1 [low]): this endpoint is
+        unauthenticated (read-open) and exposes per-writer principal names,
+        source IPs, and key prefixes. That is acceptable under the stated v0
+        threat model (READ is open; the trust boundary is tailnet reach to
+        the port, and the adversary is a tailnet principal WITHOUT the
+        curator secret) — the report contains no secrets, only what a
+        tailnet reader can already observe from the observe log's existence.
+        It is named here so the info surface is deliberate, not accidental."""
         return observer.report()
+
+    @app.post("/v0/observe-report/land")
+    async def observe_report_land(request: Request):
+        """Land the observe-week report at the NAMED mem key (D-1 / D-4).
+
+        POST (not GET): landing is a WRITE (it upserts the report body into
+        mem.db) and is therefore in the write class — the write-class guard
+        runs on it (observed as POST_LAND; enforced under
+        MEM_ENFORCE_PRINCIPALS, so a reader cannot land the report). The
+        landing key is machine-state-free by construction (state/ is not an
+        allowlist prefix), so the guard's role check is the whole gate.
+
+        Body (all optional):
+          disposition — {"<principal>": "<disposition>"} mapping to
+                        FaucetObserver.set_disposition() (the
+                        escalation-path signal: registered-bot / brix-pm /
+                        migration-line:<line>; 'none' resets). A malformed
+                        disposition is a loud 400 (a silent deferral
+                        disguised as a migration line must not land).
+        Returns the landing record: {key, raw_log, report} — report carries
+        the break list WITH dispositions + the `escalate` verdict (the flip
+        gate escalates to Erah iff escalate is true)."""
+        # Validate the body principal first (the guard runs on the validated
+        # landing key — a malformed key must not reach the guard's
+        # observe/prefix checks).
+        key = _observe_report_key()
+        reject = _write_guard(request, "POST_LAND", key)
+        if reject is not None:
+            return reject
+
+        # Read the request body. starlette Request.body is a plain method
+        # (not a property) in this starlette version — call it. An empty
+        # body (no JSON) is a valid landing (the report lands with the
+        # current dispositions; no new disposition is applied).
+        try:
+            raw = await request.body()
+        except Exception:
+            raw = b""
+        body: dict[str, Any] = {}
+        if raw:
+            try:
+                body = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                body = {}
+        if not isinstance(body, dict):
+            body = {}
+        dispositions = body.get("disposition", {})
+        if not isinstance(dispositions, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=_error(
+                    "bad_disposition",
+                    "'disposition' must be an object mapping principal -> "
+                    "disposition (registered-bot / brix-pm / "
+                    "migration-line:<line> / none)",
+                ),
+            )
+        for principal, disp in dispositions.items():
+            try:
+                observer.set_disposition(str(principal), str(disp))
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=_error("bad_disposition", str(e)),
+                )
+        return land_observe_report()
 
     # Stash references for tests / the report.
     app.state.allowlist = allowlist
     app.state.principals = principals
     app.state.observer = observer
     app.state.enforce = enforce
+    app.state.land_observe_report = land_observe_report
+    app.state.observe_report_key = _observe_report_key
 
     return app
 
