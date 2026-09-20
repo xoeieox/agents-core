@@ -503,9 +503,8 @@ def create_app(
         if _token:
             auth = request.headers.get("Authorization", "")
             if not auth.startswith("Bearer ") or auth[len("Bearer "):] != _token:
-                return JSONResponse(
-                    status_code=401,
-                    content=_error("unauthorized", "Missing or invalid bearer token"),
+                return _http_error(
+                    401, "unauthorized", "Missing or invalid bearer token"
                 )
         return await call_next(request)
 
@@ -528,14 +527,12 @@ def create_app(
 
         role = _principal_role(request, principals)
         if role != "curator":
-            return JSONResponse(
-                status_code=403,
-                content=_error(
-                    "principal_reader",
-                    f"principal {_principal_of(request) or '<absent>'!r} is a "
-                    f"reader; the write class (PUT/DELETE/deposit) is "
-                    f"curator-only",
-                ),
+            return _http_error(
+                403,
+                "principal_reader",
+                f"principal {_principal_of(request) or '<absent>'!r} is a "
+                f"reader; the write class (PUT/DELETE/deposit) is "
+                f"curator-only",
             )
 
         # D3 faucet: a curator may write a machine-state prefix only if it is
@@ -543,14 +540,12 @@ def create_app(
         if allowlist.is_machine_state(key):
             producer = allowlist.producer_for(key)
             if producer != _principal_of(request):
-                return JSONResponse(
-                    status_code=403,
-                    content=_error(
-                        "machine_state_prefix",
-                        f"principal {_principal_of(request)!r} is not the "
-                        f"registered producer for machine-state key {key!r} "
-                        f"(owner: {producer!r})",
-                    ),
+                return _http_error(
+                    403,
+                    "machine_state_prefix",
+                    f"principal {_principal_of(request)!r} is not the "
+                    f"registered producer for machine-state key {key!r} "
+                    f"(owner: {producer!r})",
                 )
         return None
 
