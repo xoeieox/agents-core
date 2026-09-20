@@ -617,10 +617,7 @@ def create_app(
     def get_memory(key: str):
         row = store.get(key)
         if row is None:
-            raise HTTPException(
-                status_code=404,
-                detail=_error("not_found", f"Memory '{key}' not found"),
-            )
+            return _http_error(404, "not_found", f"Memory '{key}' not found")
         return _row_response(row)
 
     # ------------------------------------------------------------------
@@ -658,10 +655,7 @@ def create_app(
             return reject
         deleted = store.delete(key)
         if not deleted:
-            raise HTTPException(
-                status_code=404,
-                detail=_error("not_found", f"Memory '{key}' not found"),
-            )
+            return _http_error(404, "not_found", f"Memory '{key}' not found")
         return Response(status_code=204)
 
     # ------------------------------------------------------------------
