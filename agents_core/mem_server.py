@@ -86,6 +86,27 @@ def create_app(db_path: Path, deposit_recorder: "DepositRecorder | None" = None)
     store = MemoryStore(db_path)
 
     # ------------------------------------------------------------------
+    # Error envelope (mem-hygiene-automation-v0 directive 5f61cad3, fix 1):
+    # routes raise HTTPException(detail=_error(code, message)); the default
+    # FastAPI handler would wrap that dict in {"detail": {...}}. Unwrap it so
+    # every error response is the top-level {"error": {"code", "message"}}
+    # envelope the _error() helper and the test suite contract on.
+    # ------------------------------------------------------------------
+
+    @app.exception_handler(HTTPException)
+    async def _http_exception_handler(request: Request, exc: HTTPException):
+        detail = exc.detail
+        if isinstance(detail, dict) and isinstance(detail.get("error"), dict):
+            content = detail
+        else:
+            content = _error("error", str(detail))
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=content,
+            headers=getattr(exc, "headers", None),
+        )
+
+    # ------------------------------------------------------------------
     # Bearer-token middleware (only active when MEM_BEARER_TOKEN is set)
     # ------------------------------------------------------------------
     _token = os.environ.get("MEM_BEARER_TOKEN", "")
