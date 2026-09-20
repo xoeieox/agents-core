@@ -115,6 +115,18 @@ def test_deposit_guard_ordering_403_before_503(tmp_path, monkeypatch):
         assert resp_bad.status_code == 403
         assert resp_bad.json()["error"]["code"] == "principal_reader"
 
+        # A MALFORMED envelope (structurally a dict, but not a valid
+        # LapisToolReturn — LapisToolReturn.from_dict raises, so the
+        # handler's own 400 bad_envelope path is the pre-PR behavior) also
+        # surfaces the guard's 403 first for a reader: the write-class
+        # guard is the outer gate and runs before envelope validation
+        # (reviewer PR #344 cycle 1 [med]: this case was the one not
+        # pinned by a test).
+        malformed = {"payload": {"key": "pm/test-x"}, "summary": "s"}
+        resp_malformed = c.post("/v0/deposit", json=malformed)
+        assert resp_malformed.status_code == 403
+        assert resp_malformed.json()["error"]["code"] == "principal_reader"
+
         # The registered curator principal passes the guard and reaches the
         # deposit-specific 503 (recorder unconfigured) — the 503 is NOT
         # masked for an authorized writer.
@@ -125,5 +137,55 @@ def test_deposit_guard_ordering_403_before_503(tmp_path, monkeypatch):
         )
         assert resp_curator.status_code == 503
         assert "recorder" in str(resp_curator.json())
+
+        # ...and reaches the deposit-specific 400 bad_envelope for the
+        # MALFORMED envelope (the guard does not mask the envelope's own
+        # error for an authorized writer either — the guard is the outer
+        # gate, not a replacement for validation).
+        resp_curator_malformed = c.post(
+            "/v0/deposit",
+            json=malformed,
+            headers={"X-Mem-Principal": "zephyr-deposit"},
+        )
+        assert resp_curator_malformed.status_code == 400
+        assert resp_curator_malformed.json()["error"]["code"] == "bad_envelope"
     finally:
         monkeypatch.delenv("MEM_ENFORCE_PRINCIPALS", raising=False)
+
+
+def test_deposit_guard_ordering_403_before_bad_envelope(tmp_path, monkeypatch):
+    """The guard's 403 beats the handler's 400 bad_envelope for a reader
+    (reviewer PR #344 cycle 1 [med]): under MEM_ENFORCE_PRINCIPALS a
+    malformed-envelope deposit from a reader gets 403 principal_reader,
+    not the pre-PR 400 bad_envelope. The principal model is the outer
+    gate (spec D-1); the malformed-envelope case was the one the
+    503-before-403 test did not pin."""
+    monkeypatch.setenv("MEM_ENFORCE_PRINCIPALS", "1")
+    try:
+        # Recorder configured: the only pre-PR outcome for a malformed
+        # envelope is the handler's 400 bad_envelope (no 503 in play).
+        app = create_app(tmp_path / "mem.db", deposit_recorder=_FakeRecorder())
+        c = TestClient(app)
+        malformed = {"payload": {"key": "pm/test-x"}, "summary": "s"}
+        resp = c.post("/v0/deposit", json=malformed)
+        assert resp.status_code == 403
+        assert resp.json()["error"]["code"] == "principal_reader"
+    finally:
+        monkeypatch.delenv("MEM_ENFORCE_PRINCIPALS", raising=False)
+
+
+def test_deposit_bad_envelope_400_observe_only(client):
+    """Under observe-only (the default) the pre-PR precedence is
+    preserved for the malformed-envelope case: a reader's malformed
+    envelope gets the handler's 400 bad_envelope (the guard logs the
+    attempt but never rejects), and a curator's malformed envelope gets
+    the same 400 — the guard is a no-op under observe-only."""
+    malformed = {"payload": {"key": "pm/test-x"}, "summary": "s"}
+    resp_reader = client.post("/v0/deposit", json=malformed)
+    assert resp_reader.status_code == 400
+    assert resp_reader.json()["error"]["code"] == "bad_envelope"
+    resp_curator = client.post(
+        "/v0/deposit", json=malformed, headers={"X-Mem-Principal": "zephyr-deposit"}
+    )
+    assert resp_curator.status_code == 400
+    assert resp_curator.json()["error"]["code"] == "bad_envelope"
