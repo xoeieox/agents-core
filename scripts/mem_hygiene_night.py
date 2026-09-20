@@ -229,9 +229,20 @@ def _run_pipeline(config: str, slots_dir: Path, dry_run: bool,
             f"quarantine_total: {stats['total']}\n"
             f"fts_integrity_ok: {report['steps']['quarantine']['fts_integrity_ok']}"
         )
-        _mem_set(decision_key, content, "lapis-pm,mem-hygiene", mem_cli)
-        report["steps"]["deposit"] = decision_key
-        _log(f"provenance line deposited: {decision_key}")
+            # The provenance deposit is the RUN's record: a run with zero
+        # candidates (nothing eligible, nothing quarantined) has nothing to
+        # record — skipping the deposit keeps the morning-brief surface clean
+        # and makes the no-op run's "no deposit" observable (the test
+        # contract: a no-candidate real run leaves no deposit line).
+        if report["steps"]["quarantine"]["quarantined"] > 0:
+            _mem_set(decision_key, content, "lapis-pm,mem-hygiene", mem_cli)
+            report["steps"]["deposit"] = decision_key
+            _log(f"provenance line deposited: {decision_key}")
+        else:
+            report["steps"]["deposit"] = (
+                "skipped (zero candidates — nothing to record)"
+            )
+            _log("no candidates: provenance deposit skipped")
     except Exception as exc:  # noqa: BLE001 - the node maps any failure to rc=1
         report["steps"]["error"] = f"{type(exc).__name__}: {exc}"
         _log(f"FAILED: {exc}")
