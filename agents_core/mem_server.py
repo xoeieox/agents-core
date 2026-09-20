@@ -917,14 +917,24 @@ def create_app(
         key = payload["key"]
 
         # Write-class guard (observed always; enforced under the flag).
-        # Ordering note (reviewer PR #335 cycle 1 [med]): this guard runs
-        # BEFORE the deposit_recorder-503 and manifest_hash-400 checks
-        # below, deliberately. An unknown/absent principal gets 403
+        # Ordering note (reviewer PR #335 cycle 1 [med]; CONFIRMED intended
+        # by the fixer, PR #341 cycle 1): this guard runs BEFORE the
+        # deposit_recorder-503 and manifest_hash-400 checks below,
+        # deliberately. An unknown/absent principal gets 403
         # principal_reader regardless of whether the curator (recorder) is
         # even configured or the envelope is otherwise valid — the D-1
         # principal model is the outer gate; a reader must be rejected
         # before any deposit-specific 503/400 can mask it. The ordering is
-        # by design, not an oversight.
+        # by design, not an oversight. It IS a real semantic shift in the
+        # live /v0/deposit contract (a reader previously saw 503/400
+        # before any principal check could exist), so it is named here
+        # even though the spec's Files-changed line does not call it out
+        # explicitly. Under observe-only (the default, MEM_ENFORCE_PRINCIPALS
+        # unset) the guard never rejects, so the pre-PR 503/400 precedence
+        # is preserved for the default deployment (pinned by
+        # test_deposit_unconfigured_503 in tests/test_mem_deposit.py).
+        # test_deposit_guard_ordering_403_before_503 pins the enforced
+        # ordering.
         reject = _write_guard(request, "POST_DEPOSIT", key)
         if reject is not None:
             return reject

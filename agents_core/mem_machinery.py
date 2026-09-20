@@ -39,6 +39,14 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+# NOTE (reviewer PR #341 cycle 1 [low]): `Any` is used in the
+# _validate_entry / _validate_excluded_entry signatures. The import is
+# explicit even though `from __future__ import annotations` makes the
+# annotations strings (never evaluated) — a future edit that adds runtime
+# annotation evaluation (typing.get_type_hints, a pydantic model, or
+# removing the future import) must not NameError.
 
 def _default_allowlist_env_path() -> Path:
     """The env-overridable default allowlist path (mirrors MEM_DB_PATH's

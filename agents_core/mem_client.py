@@ -231,11 +231,15 @@ class MemClient:
         that would let a client move an arbitrary key out of the ledger of
         record (influx, not merge: mem.db is the single ledger of record).
 
-        Reviewer PR #337 cycle 1 [low] confirmation: the flag is
-        effectively a NO-OP at the HTTP layer — it is validated (loud
-        ValueError on a typo) but does not change routing, and exists
-        only to honor the spec's Files-changed line until a future
-        non-rescoped second-sqlite deployment gives it real meaning.
+        Reviewer PR #337 cycle 1 [low] confirmation (re-confirmed by the
+        fixer, PR #341 cycle 1): the flag is effectively a NO-OP at the
+        HTTP layer — it is validated (loud ValueError on a typo) but does
+        NOT change routing, and exists only to honor the spec's
+        Files-changed line until a future non-rescoped second-sqlite
+        deployment gives it real meaning. A future reader should not
+        misread the flag as functional: the server's route_to_exhaust is
+        the single source of truth for where a key lands, and no
+        client-selected store can move a key out of the ledger of record.
         """
         validate_store(store)
         body: dict[str, Any] = {"content": content, "tags": tags, "source": source}
