@@ -512,7 +512,8 @@ def create_app(
     # Write-class guard (D1 principal model + D3 faucet)
     # ------------------------------------------------------------------
     def _write_guard(request: Request, verb: str, key: str) -> JSONResponse | None:
-        """Return a 403/400 JSONResponse to reject the write, or None to allow.
+        """Return a 403 rejection (the uniform {"error":{...}} envelope, via
+        _http_error) to reject the write, or None to allow.
 
         Observe-only (default): logs the write attempt + what would be
         rejected, and returns None (allow). Under MEM_ENFORCE_PRINCIPALS:
