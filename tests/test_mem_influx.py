@@ -359,29 +359,18 @@ def test_deposit_verb_partitioned(tmp_db, allowlist_file, observe_log, no_enforc
     """The deposit verb is observed as POST_DEPOSIT (gate trickster): a
     dormant/unregistered deposit writer cannot hide behind PUT/DELETE counts.
 
-    Deterministic (reviewer PR #334 cycle 1 [med]): the envelope is built via
-    archetypes_core.provenance.to_lapis_return (the same helper
-    tests/test_mem_deposit.py uses), so LapisToolReturn.from_dict in the
-    route is guaranteed to parse it and the guard RUNS — the assertion below
-    is on a guaranteed log line, not a vacuous 'if the route reached the
-    guard' conditional. archetypes_core is a hard dep of this test (it
-    already is for test_mem_deposit.py; the mem_server.py route imports it
-    lazily, so the package stays importable without it). It is NOT declared
-    in pyproject.toml [project.optional-dependencies] test (reviewer PR
-    #339 cycle 1 [med]) — the gate environment has it installed (the
-    existing test_mem_deposit.py suite depends on it). Reviewer PR #342
-    cycle 1 [low] fix: the import is now GUARDED — a clean environment
-    without archetypes_core skips this test (with a named reason) instead of
-    failing at import; the deposit path is still covered by
-    test_mem_deposit.py in the gate env (which has the dep)."""
-    try:
-        from archetypes_core.provenance import to_lapis_return
-    except ImportError:
-        pytest.skip(
-            "archetypes_core not installed (undeclared hard test dependency, "
-            "named in the docstring; the gate env has it — test_mem_deposit.py "
-            "covers the deposit path there)"
-        )
+    Deterministic (reviewer PR #334 cycle 1 [med], made self-contained PR
+    #346 cycle 1 [med]): the envelope is HAND-BUILT (no archetypes_core
+    import — the same fix tests/test_mem_deposit.py got in f904287), so
+    LapisToolReturn.from_dict in the route is guaranteed to parse it and the
+    guard RUNS — the assertion below is on a guaranteed log line, not a
+    vacuous 'if the route reached the guard' conditional. archetypes_core is
+    NOT a declared dependency of agents-core (pyproject.toml), so a clean
+    gate env without it would previously have silently SKIPPED this test and
+    lost the deposit-path verb-partition coverage; the hand-built envelope
+    exercises the exact same from_dict -> payload/provenance path the real
+    to_lapis_return() factory produces (the server reads only the provenance
+    fields it needs and treats manifest_hash as an opaque dedup token)."""
 
     class FakeRecorder:
         def already_recorded(self, mh):
@@ -392,13 +381,18 @@ def test_deposit_verb_partitioned(tmp_db, allowlist_file, observe_log, no_enforc
 
     app = create_app(tmp_db, deposit_recorder=FakeRecorder(), allowlist_path=allowlist_file)
     with TestClient(app) as c:
-        envelope = to_lapis_return(
-            {"key": "work/record/1", "value": "v"},
-            agent_id="zephyr",
-            tool="pytest",
-            summary="deposit verb-partition test",
-        )
-        resp = c.post("/v0/deposit", json=json.loads(envelope.to_json()))
+        envelope = {
+            "payload": {"key": "work/record/1", "value": "v", "tags": []},
+            "summary": "deposit verb-partition test",
+            "provenance": {
+                "schema_version": "lapis-provenance-v0",
+                "agent_id": "zephyr",
+                "tool": "pytest",
+                "timestamp": "2026-01-01T00:00:00+00:00",
+                "manifest_hash": "sha256:work/record/1-v",
+            },
+        }
+        resp = c.post("/v0/deposit", json=envelope)
         # A valid envelope + a configured recorder must be ACCEPTED — if this
         # 400s, the guard never ran and the verb-partition assertion below
         # would be vacuous; fail loudly instead.
