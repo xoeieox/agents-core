@@ -120,7 +120,19 @@ def _run_pipeline(config: str, slots_dir: Path, dry_run: bool,
         MemHygieneRunner,
     )
 
-    cfg = HygieneConfig.load(config)
+    try:
+        cfg = HygieneConfig.load(config)
+    except Exception as exc:  # noqa: BLE001 - a missing/unloadable config is
+        # a step failure (rc=1 with the FAILED log line), not an uncaught
+        # traceback: the operator gets the exit-code contract, not a stack
+        # trace.
+        report = {
+            "mode": "dry-run" if dry_run else "run",
+            "config": config,
+            "steps": {"error": f"config load failed: {type(exc).__name__}: {exc}"},
+        }
+        _log(f"FAILED: config load failed: {exc}")
+        return report, 1
     run_id = "hyg-night-" + _utcnow().strftime("%Y%m%dT%H%M%SZ")
     date = _utcnow().strftime("%Y-%m-%d")
     store = MemoryStore()
