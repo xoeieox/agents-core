@@ -789,6 +789,63 @@ def test_machine_state_write_lands_in_machinery_store(tmp_db, tmp_path, allowlis
     assert row2 is not None and row2[0] == "v"
 
 
+def test_machinery_row_covered_by_checkpoint_wal(tmp_db, tmp_path, allowlist_file, observe_log, no_enforce):
+    """The checkpoint mechanism covers the machinery (exhaust) store
+    (spec D-3: the mem.py:371-373 checkpoint pattern + mem-checkpoint.service).
+
+    RESCOPED (rev-2): the machinery store IS the existing exhaust store, so
+    the D-3 'extend the checkpoint mechanism' requirement is satisfied by
+    MemoryStore.checkpoint_wal() checkpointing the exhaust sibling
+    (mem.py:420-424). This test PINS that coverage (reviewer PR #342 cycle
+    1 [med]: the rescoping was documented in comments only, not pinned by a
+    test): a machine-state (elevator/) row written through the server is
+    covered by store.checkpoint_wal() — the WAL is truncated (checkpoint
+    returns (0, 0, 0): busy=0, log=0, remaining=0) and the row survives the
+    checkpoint in the machinery store.
+    """
+    from agents_core.mem import MemoryStore
+
+    exhaust_db = tmp_path / "exhaust.db"
+    app = create_app(tmp_db, allowlist_path=allowlist_file)
+    with TestClient(app) as c:
+        resp = c.put(
+            "/v0/memories/elevator/checkpoint/p1",
+            json={"content": "v", "tags": "", "source": "elevator-scheduler"},
+            headers={"X-Mem-Principal": "brix-pm"},
+        )
+        assert resp.status_code == 200
+
+    # A fresh store instance on the same db (the mem-checkpoint.service
+    # pattern: a fresh MemoryStore() every firing) checkpoints the WAL.
+    store = MemoryStore(tmp_db)
+    try:
+        # The machinery row must be in the exhaust sibling (not mem.db).
+        assert exhaust_db.exists()
+        import sqlite3
+        conn = sqlite3.connect(str(exhaust_db))
+        before = conn.execute(
+            "SELECT content FROM memories WHERE key = ?",
+            ("elevator/checkpoint/p1",),
+        ).fetchone()
+        conn.close()
+        assert before is not None and before[0] == "v"
+
+        # checkpoint_wal() covers the machinery (exhaust) sibling: the WAL
+        # is truncated (busy=0, log=0, remaining=0) and the row survives.
+        result = store.checkpoint_wal()
+        assert result == (0, 0, 0)
+
+        conn = sqlite3.connect(str(exhaust_db))
+        after = conn.execute(
+            "SELECT content FROM memories WHERE key = ?",
+            ("elevator/checkpoint/p1",),
+        ).fetchone()
+        conn.close()
+        assert after is not None and after[0] == "v"
+    finally:
+        store.close()
+
+
 def test_machine_state_write_by_non_owner_rejected_enforce(tmp_db, allowlist_file, observe_log, enforce):
     """Under enforcement, a curator that is NOT the owning producer for a
     machine-state prefix is rejected (403 machine_state_prefix)."""
