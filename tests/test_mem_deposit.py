@@ -1,9 +1,19 @@
 """Tests for the /v0/deposit endpoint (LapisToolReturn -> mem store + attribution).
 
 Uses a self-contained fake DepositRecorder so agents-core tests stay free of any
-zephyr import (the real recorder is injected at boot via MEM_DEPOSIT_RECORDER)."""
+zephyr import (the real recorder is injected at boot via MEM_DEPOSIT_RECORDER).
 
-import json
+The envelope is ALSO self-contained (no archetypes_core import): archetypes_core
+is NOT a declared dependency of agents-core (see pyproject.toml), so importing
+it here made this file fail in any clean CI/clone environment where
+archetypes_core is not installed (the gate's concluded_gate_rejected: the
+reviewer's most-likely-failure hypothesis, PR #345 cycle 1 [med]). The server's
+LapisToolReturn.from_dict only requires the provenance fields it reads
+(schema_version / agent_id / tool / timestamp / manifest_hash) — the
+manifest_hash is an opaque dedup token to the server (it never recomputes it),
+so a hand-built envelope with a fixed manifest_hash exercises the exact same
+from_dict -> payload/provenance path without the import.
+"""
 
 import pytest
 from fastapi.testclient import TestClient
@@ -29,16 +39,28 @@ class _FakeRecorder:
 
 
 def _envelope(key="pm/test", value="v", tags=None):
-    """A LapisToolReturn dict with a real manifest_hash (construct-once)."""
-    from archetypes_core.provenance import to_lapis_return
+    """A LapisToolReturn-shaped dict with a fixed manifest_hash.
 
-    ltr = to_lapis_return(
-        {"key": key, "value": value, "tags": tags or []},
-        agent_id="test-agent",
-        tool="pytest",
-        summary="deposit test",
-    )
-    return json.loads(ltr.to_json())
+    Hand-built (no archetypes_core import): the server's
+    LapisToolReturn.from_dict reads only the provenance fields below and treats
+    manifest_hash as an opaque dedup token (it never recomputes it), so this
+    exercises the same from_dict -> payload/provenance path the real
+    to_lapis_return() factory would produce, without a dependency agents-core
+    does not declare. The manifest_hash is FIXED (not computed) so a
+    construct-once / retry-identical-bytes dedup test (test_deposit_accept_
+    then_dedup) is deterministic across calls.
+    """
+    return {
+        "payload": {"key": key, "value": value, "tags": tags or []},
+        "summary": "deposit test",
+        "provenance": {
+            "schema_version": "lapis-provenance-v0",
+            "agent_id": "test-agent",
+            "tool": "pytest",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "manifest_hash": f"sha256:{key}-{value}",
+        },
+    }
 
 
 @pytest.fixture
