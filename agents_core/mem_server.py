@@ -836,9 +836,9 @@ def create_app(
     @app.get("/v0/search")
     def search_memories(q: str = "", tag: str = "", limit: int = 20):
         if not q:
-            raise HTTPException(
-                status_code=400,
-                detail=_error("bad_request", "Query parameter 'q' is required and must not be empty"),
+            return _http_error(
+                400, "bad_request",
+                "Query parameter 'q' is required and must not be empty",
             )
         rows = store.search(q, tag=tag, limit=limit)
         return [_search_row_response(r) for r in rows]
@@ -906,19 +906,14 @@ def create_app(
 
             ltr = LapisToolReturn.from_dict(envelope)
         except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=_error("bad_envelope", f"Invalid LapisToolReturn: {e}"),
-            )
+            return _http_error(400, "bad_envelope", f"Invalid LapisToolReturn: {e}")
 
         prov = ltr.provenance
         payload = ltr.payload
         if not isinstance(payload, dict) or "key" not in payload:
-            raise HTTPException(
-                status_code=400,
-                detail=_error(
-                    "bad_payload", "mem deposit payload must be {key, value, tags?}"
-                ),
+            return _http_error(
+                400, "bad_payload",
+                "mem deposit payload must be {key, value, tags?}",
             )
         key = payload["key"]
 
@@ -946,20 +941,14 @@ def create_app(
             return reject
 
         if deposit_recorder is None:
-            raise HTTPException(
-                status_code=503,
-                detail=_error(
-                    "deposit_unconfigured",
-                    "No attribution recorder injected (set MEM_DEPOSIT_RECORDER)",
-                ),
+            return _http_error(
+                503, "deposit_unconfigured",
+                "No attribution recorder injected (set MEM_DEPOSIT_RECORDER)",
             )
 
         mh = prov.manifest_hash
         if not mh:
-            raise HTTPException(
-                status_code=400,
-                detail=_error("bad_envelope", "provenance.manifest_hash is required"),
-            )
+            return _http_error(400, "bad_envelope", "provenance.manifest_hash is required")
 
         # Dedup on manifest_hash. mem set() is an idempotent upsert, but we honor
         # the duplicate contract so append-style sinks (weaver) share this shape.
