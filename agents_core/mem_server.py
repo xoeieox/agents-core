@@ -65,6 +65,30 @@ def _error(code: str, message: str) -> dict:
     return {"error": {"code": code, "message": message}}
 
 
+def _http_error(status_code: int, code: str, message: str) -> JSONResponse:
+    """Uniform rejection envelope (spec D-1 named rejection contract).
+
+    EVERY server-originated error response — 400 bad_request / bad_from_ref /
+    bad_rationale / principal_mismatch / bad_disposition, 401 unauthorized,
+    403 principal_reader / machine_state_prefix, 404 not_found, 503
+    deposit_unconfigured — is serialized as a top-level
+    {"error": {"code", "message"}} body via this helper (JSONResponse).
+
+    Reviewer PR #342 cycle 1 [med]: the spec names the rejection contract as
+    HTTP 403 {"error":{"code":"principal_reader",...}} and the 403 guard
+    paths already met it, but the 400 promote/land paths raised
+    HTTPException(detail=_error(...)) which FastAPI serializes as
+    {"detail":{"error":{...}}} — a DIFFERENT envelope than the spec's named
+    contract. Raising HTTPException is the FastAPI idiom for
+    detail-wrapped bodies (which is why the sibling slot_server/gpu_server
+    tests assert resp.json()["detail"]["error"]["code"]); the mem-server
+    contract is the flat {"error":{...}} shape, so ALL its error paths go
+    through this one helper (a single chokepoint keeps the contract
+    uniform — no new HTTPException(detail=...) may be introduced).
+    """
+    return JSONResponse(status_code=status_code, content=_error(code, message))
+
+
 # ---------------------------------------------------------------------------
 # Principal model (D1)
 # ---------------------------------------------------------------------------
