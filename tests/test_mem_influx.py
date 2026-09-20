@@ -222,10 +222,15 @@ def test_rejection_envelope_is_flat_error(tmp_db, allowlist_file, observe_log, e
         assert body["error"]["code"] == "bad_request"
         assert "detail" not in body
 
-        # 400 bad_request (promote without a curator principal).
+        # 400 bad_request (promote without a curator principal). The
+        # header principal must be a REGISTERED one (brix-pm) so the
+        # write-class guard passes and the in-handler principal check
+        # surfaces — an absent header would 403 principal_reader under
+        # enforcement instead.
         resp = c.post(
             "/v0/promote",
             json={"key": "finding/x", "from": "openclaw/gw", "content": "x"},
+            headers={"X-Mem-Principal": "brix-pm"},
         )
         assert resp.status_code == 400
         body = resp.json()
