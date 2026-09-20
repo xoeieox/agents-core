@@ -182,7 +182,8 @@ def test_real_run_quarantines_and_deposits(env):
     lines = [json.loads(l) for l in env["deposits"].read_text().splitlines()]
     assert len(lines) == 1
     argv = lines[0]
-    assert argv[:2] == ["set", "decision/mem-hygiene-run-"]
+    assert argv[0] == "set"
+    assert argv[1].startswith("decision/mem-hygiene-run-")
     assert argv[3:5] == ["--tags", "lapis-pm,mem-hygiene"]
     content = argv[2]
     # The one-liner budget: <=120 chars on the first line.
