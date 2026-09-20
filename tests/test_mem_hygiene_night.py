@@ -10,6 +10,7 @@ JSONL file). No live mem.db, no live /data/slots, no network.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -206,13 +207,16 @@ def test_real_run_cap_breach_fails(env):
 
 def test_real_run_config_missing_fails(env):
     rc, out = _run(env)
-    # Point at a nonexistent config via a fresh invocation.
+    # Point at a nonexistent config via a fresh invocation (same PYTHONPATH
+    # as _run so the staged agents_core is the one the script imports).
+    sub_env = dict(os.environ)
+    sub_env["PYTHONPATH"] = str(Path(mhn.__file__).parent.parent)
     proc = subprocess.run(
         ["python3", str(Path(mhn.__file__)),
          "--config", str(env["slots"] / "nope.json"),
          "--slots-dir", str(env["slots"]),
          "--mem-cli", env["cli"]],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=120, env=sub_env,
     )
     assert proc.returncode == 1
     assert "FAILED" in proc.stdout + proc.stderr
