@@ -711,17 +711,15 @@ def create_app(
         header_principal = _principal_of(request)
         body_principal = body.get("principal", "")
         if body_principal and body_principal != header_principal:
-            raise HTTPException(
-                status_code=400,
-                detail=_error(
-                    "principal_mismatch",
-                    f"body principal {body_principal!r} does not match the "
-                    f"X-Mem-Principal header {header_principal or '<absent>'!r}; "
-                    f"the verified identity is the header — the audit "
-                    f"artifact (provenance 'by' + batch decision key) must "
-                    f"carry the verified principal, not a client-supplied "
-                    f"string",
-                ),
+            return _http_error(
+                400,
+                "principal_mismatch",
+                f"body principal {body_principal!r} does not match the "
+                f"X-Mem-Principal header {header_principal or '<absent>'!r}; "
+                f"the verified identity is the header — the audit "
+                f"artifact (provenance 'by' + batch decision key) must "
+                f"carry the verified principal, not a client-supplied "
+                f"string",
             )
         # The artifact (provenance 'by' + batch decision key) carries the
         # VERIFIED header principal — never a client-supplied string.
@@ -733,12 +731,10 @@ def create_app(
         # same way a --from injection would corrupt the header.
         rationale = body.get("rationale", "")
         if INVALID_REF_CHARS_RE.search(rationale):
-            raise HTTPException(
-                status_code=400,
-                detail=_error(
-                    "bad_rationale",
-                    "rationale must be a single line (no newlines or control chars)",
-                ),
+            return _http_error(
+                400,
+                "bad_rationale",
+                "rationale must be a single line (no newlines or control chars)",
             )
 
         # Server-side --from shape validation (loud 400). The client validates
@@ -748,10 +744,7 @@ def create_app(
         # validated key (a malformed key must not reach the guard's
         # observe/prefix checks — reviewer PR #328 cycle 2 [med]).
         if not key:
-            raise HTTPException(
-                status_code=400,
-                detail=_error("bad_request", "'key' is required"),
-            )
+            return _http_error(400, "bad_request", "'key' is required")
 
         # Write-class guard (observed always; enforced under the flag), now on
         # the validated key: the promote verb is in the write class and a
@@ -772,24 +765,19 @@ def create_app(
         # readers), so an absent header principal is a loud 400 — the
         # artifact must never carry an empty or forged identity.
         if not principal:
-            raise HTTPException(
-                status_code=400,
-                detail=_error(
-                    "bad_request",
-                    "a curator principal is required (X-Mem-Principal header; "
-                    "the body 'principal' must match it and never substitutes "
-                    "for it)",
-                ),
+            return _http_error(
+                400,
+                "bad_request",
+                "a curator principal is required (X-Mem-Principal header; "
+                "the body 'principal' must match it and never substitutes "
+                "for it)",
             )
         try:
             promoted_content = build_promoted_content(ref, principal, content)
         except ValueError as e:
             # Newline/control-char injection or a malformed <agent>/<store>
             # ref — loud 400 (panel security F6).
-            raise HTTPException(
-                status_code=400,
-                detail=_error("bad_from_ref", str(e)),
-            )
+            return _http_error(400, "bad_from_ref", str(e))
 
         agent, store_name = ref.split("/", 1)
         source = f"promoted:{agent}/{store_name}"
