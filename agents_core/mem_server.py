@@ -1032,23 +1032,18 @@ def create_app(
             body = {}
         dispositions = body.get("disposition", {})
         if not isinstance(dispositions, dict):
-            raise HTTPException(
-                status_code=400,
-                detail=_error(
-                    "bad_disposition",
-                    "'disposition' must be an object mapping principal -> "
-                    "disposition (registered-bot / brix-pm / "
-                    "migration-line:<line> / none)",
-                ),
+            return _http_error(
+                400,
+                "bad_disposition",
+                "'disposition' must be an object mapping principal -> "
+                "disposition (registered-bot / brix-pm / "
+                "migration-line:<line> / none)",
             )
         for principal, disp in dispositions.items():
             try:
                 observer.set_disposition(str(principal), str(disp))
             except ValueError as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=_error("bad_disposition", str(e)),
-                )
+                return _http_error(400, "bad_disposition", str(e))
         return land_observe_report()
 
     # Stash references for tests / the report.
