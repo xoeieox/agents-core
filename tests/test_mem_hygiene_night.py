@@ -70,16 +70,25 @@ def env(tmp_path, monkeypatch):
 
 
 def _seed_dead_stream(db: Path, n: int = 4, age_days: float = 45) -> None:
+    """Seed mem.db's `memories` table with an aged elevator/ stream.
+
+    Direct SQL, NOT store.set(): `elevator/` is a tier-1 exhaust-routed
+    prefix (mem_exhaust.EXHAUST_PREFIXES), so store.set() would route the
+    rows to the sibling exhaust store — but the classifier counts rows in
+    mem.db's `memories` table (the spec's own counts, elevator/ 10,975,
+    are mem.db rows), so the fixture must land them there (same shape as
+    _seed_dead_stream in tests/test_mem_hygiene_quarantine.py).
+    """
     from agents_core.mem import MemoryStore
     store = MemoryStore(db_path=db)
-    for i in range(n):
-        store.set(f"elevator/row-{i}", f"machine state {i}",
-                  tags=["machine"], source="elevator_scheduler")
     ts = (NOW - timedelta(days=age_days)).isoformat()
-    store._conn.execute(
-        "UPDATE memories SET created_at=?, updated_at=? WHERE key LIKE 'elevator/%'",
-        (ts, ts),
-    )
+    for i in range(n):
+        store._conn.execute(
+            "INSERT INTO memories (key, content, tags, source, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (f"elevator/row-{i}", f"machine state {i}", "machine",
+             "elevator_scheduler", ts, ts),
+        )
     store._conn.commit()
     store.close()
 
