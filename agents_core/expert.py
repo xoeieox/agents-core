@@ -99,15 +99,11 @@ def _atomic_write_text(path: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
-        try:
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        os.replace(tmp, path)
     except BaseException:
+        # Write or replace failed: remove the temp file, then re-raise.
+        # After a successful os.replace, tmp no longer exists, so this
+        # block only runs on the failure paths.
         try:
             os.unlink(tmp)
         except OSError:
