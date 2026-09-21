@@ -10,7 +10,9 @@ spec: expert-substrate-v0
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -68,7 +70,12 @@ class ExpertDispatchInput:
 class ExpertDispatchResult:
     """Result returned by dispatch_expert()."""
     task_id: str
-    outcome: str          # completed | abandoned | post_mortem_failed
+    # completed | abandoned | crashed | post_mortem_failed
+    #   abandoned — deadline reached while the spec JSON still existed (the
+    #               runner never picked up the dispatch / timed out)
+    #   crashed   — shaped_runner finished (spec JSON deleted) but output.md
+    #               was never written
+    outcome: str
     intent_path: Path
     notepad_path: Path    # may not exist if dispatch crashed before write
     output_path: Path | None  # None if dispatch crashed before output.md
@@ -79,6 +86,34 @@ class ExpertDispatchResult:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write text to path atomically (mkstemp in the same dir + os.replace).
+
+    Used for intent.yaml, spec JSON, and post-mortem files, which other
+    services (shaped_runner, the memory-layer loader) may read concurrently
+    with the write. Cleanup on BaseException before re-raising.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        try:
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
 
 def _generate_task_id(expert_id: str) -> str:
     """Generate expert_<YYYYMMDD>_<HHMMSS>_<usec>_<expert-id> (UTC)."""
@@ -149,24 +184,32 @@ def _poll_for_output(
     spec_json_path: Path,
     deadline: float,
     poll_interval: float = 5.0,
-) -> bool:
-    """Return True if output.md appears with content before deadline.
+) -> tuple[bool, bool]:
+    """Poll for dispatch completion.
 
-    Two completion signals:
-    - output.md has content → dispatch succeeded (return True immediately)
-    - spec JSON deleted (shaped_runner finished) → dispatch ran; check output
+    Returns (succeeded, spec_deleted_at_deadline):
+    - succeeded: output.md appeared with content (dispatch produced output)
+    - spec_deleted_at_deadline: the spec JSON is gone at the moment the
+      completion signal is evaluated. shaped_runner deletes the spec when it
+      has finished, so a deleted spec with no output means the runner crashed
+      (outcome "crashed"), while a still-present spec with no output means the
+      dispatch was abandoned/timed out before the runner ever picked it up
+      (outcome "abandoned"). The two failure modes are no longer conflated.
     """
+    def _has_output() -> bool:
+        return output_path.exists() and output_path.stat().st_size > 0
+
     while time.monotonic() < deadline:
-        if output_path.exists() and output_path.stat().st_size > 0:
-            return True
+        if _has_output():
+            return True, not spec_json_path.exists()
         if not spec_json_path.exists():
             # shaped_runner ran and deleted the spec — give a brief grace period
             # in case output.md is still being flushed to disk
             time.sleep(min(2.0, poll_interval))
-            return output_path.exists() and output_path.stat().st_size > 0
+            return _has_output(), True
         time.sleep(poll_interval)
     # Deadline reached — check one last time
-    return output_path.exists() and output_path.stat().st_size > 0
+    return _has_output(), not spec_json_path.exists()
 
 
 def _run_post_mortem(
@@ -221,8 +264,9 @@ def _run_post_mortem(
     # Short-circuit: if nothing was written, skip LLM call
     if notepad_content == "(no notepad)" and output_content == "(no output)":
         full_data = {**dispatch_block, "records": []}
-        pm_yaml_path.write_text(
-            yaml.dump(full_data, default_flow_style=False, allow_unicode=True)
+        _atomic_write_text(
+            pm_yaml_path,
+            yaml.dump(full_data, default_flow_style=False, allow_unicode=True),
         )
         return dispatch_outcome, pm_yaml_path
 
@@ -286,8 +330,9 @@ def _run_post_mortem(
                 )
 
         full_data = {**dispatch_block, "records": records}
-        pm_yaml_path.write_text(
-            yaml.dump(full_data, default_flow_style=False, allow_unicode=True)
+        _atomic_write_text(
+            pm_yaml_path,
+            yaml.dump(full_data, default_flow_style=False, allow_unicode=True),
         )
         return dispatch_outcome, pm_yaml_path
 
@@ -299,8 +344,9 @@ def _run_post_mortem(
             failed_block["dispatch"]["outcome"] = "post_mortem_failed"
         failed_block["error"] = str(exc)
         failed_block["error_at"] = datetime.now(timezone.utc).isoformat()
-        pm_failed_path.write_text(
-            yaml.dump(failed_block, default_flow_style=False, allow_unicode=True)
+        _atomic_write_text(
+            pm_failed_path,
+            yaml.dump(failed_block, default_flow_style=False, allow_unicode=True),
         )
         return "post_mortem_failed", pm_failed_path
 
@@ -317,6 +363,16 @@ def dispatch_expert(
     _poll_interval: float = 5.0,
 ) -> ExpertDispatchResult:
     """Dispatch an Expert and block until dispatch + post-mortem complete.
+
+    Blocking contract (reviewer debt 88b4c99bd1): this call is synchronous and
+    unbounded-by-design — it holds the caller's thread for up to
+    ``timeout_s + 60`` (dispatch poll window) plus the post-mortem step
+    (a 120s-capped LLM call and its own file writes), i.e. up to
+    ``timeout_s + 60 + 120`` seconds in the worst case, with no cancellation
+    hook. Callers that cannot afford to block a worker thread for that
+    duration should run dispatch_expert() in their own worker/thread; the
+    substrate deliberately provides no async path (no second consumer has
+    asked for one — see the no-new-abstractions invariant).
 
     Args:
         inp: Validated dispatch input.
@@ -381,8 +437,9 @@ def dispatch_expert(
         "timeout_s": inp.timeout_s,
         "dispatched_at": dispatched_at,
     }
-    intent_path.write_text(
-        yaml.dump(intent_data, default_flow_style=False, allow_unicode=True)
+    _atomic_write_text(
+        intent_path,
+        yaml.dump(intent_data, default_flow_style=False, allow_unicode=True),
     )
 
     # -----------------------------------------------------------------------
@@ -411,7 +468,7 @@ def dispatch_expert(
         "worktree_required": False,
         "capture_meta": False,
     }
-    spec_json_path.write_text(json.dumps(spec, ensure_ascii=False))
+    _atomic_write_text(spec_json_path, json.dumps(spec, ensure_ascii=False))
 
     q = ClaudeQueue(queue_dir)
     q.submit(
@@ -435,7 +492,7 @@ def dispatch_expert(
     output_file = dispatch_cwd / "output.md"
     poll_deadline = time.monotonic() + inp.timeout_s + 60
 
-    dispatch_succeeded = _poll_for_output(
+    dispatch_succeeded, spec_deleted = _poll_for_output(
         output_file, spec_json_path, poll_deadline, _poll_interval
     )
 
@@ -444,10 +501,24 @@ def dispatch_expert(
     # -----------------------------------------------------------------------
     # Step 7: Run post-mortem step (synchronous; always runs)
     # -----------------------------------------------------------------------
-    dispatch_outcome = "completed" if dispatch_succeeded else "abandoned"
+    # Failure-mode distinction (reviewer debt 07d0a98d08): at the completion
+    # signal, a deleted spec JSON means shaped_runner finished (crashed before
+    # writing output.md) — outcome "crashed". A spec that still exists means
+    # the runner never ran / timed out — outcome "abandoned".
+    if dispatch_succeeded:
+        dispatch_outcome = "completed"
+    elif spec_deleted:
+        dispatch_outcome = "crashed"
+    else:
+        dispatch_outcome = "abandoned"
     dispatch_error = (
         None if dispatch_succeeded
-        else f"Expert dispatch abandoned: no output.md after {inp.timeout_s + 60}s"
+        else (
+            f"Expert dispatch crashed: shaped_runner finished (spec deleted) "
+            f"but no output.md after {inp.timeout_s + 60}s"
+            if spec_deleted
+            else f"Expert dispatch abandoned: no output.md after {inp.timeout_s + 60}s"
+        )
     )
 
     final_outcome, pm_path = _run_post_mortem(

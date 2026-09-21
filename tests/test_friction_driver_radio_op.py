@@ -176,3 +176,29 @@ def test_run_scenario_with_harvest(fake_foyer):
 
     urls = [c["url"] for c in obs.http_calls]
     assert any("/session/harvest" in u for u in urls)
+
+
+# ---------------------------------------------------------------------------
+# Path injection (reviewer debt aa9404adc1): drivers must accept tmp_path
+# overrides for the production path constants so tests can be hermetic.
+# ---------------------------------------------------------------------------
+
+def test_radio_op_accepts_tmp_path_dirs(tmp_path):
+    consult = tmp_path / "consults"
+    harvest = tmp_path / "harvest"
+    consult.mkdir()
+    harvest.mkdir()
+    driver = RadioOpDriver(
+        base_url="http://127.0.0.1:1",  # never contacted in this test
+        consult_log_dir=consult,
+        harvest_queue_dir=harvest,
+    )
+    assert driver._consult_log_dir == consult
+    assert driver._harvest_queue_dir == harvest
+
+
+def test_radio_op_defaults_to_production_constants(tmp_path):
+    from agents_core.friction_test import driver as drv_mod
+    driver = RadioOpDriver(base_url="http://127.0.0.1:1")
+    assert driver._consult_log_dir == drv_mod.CONSULT_LOG_DIR
+    assert driver._harvest_queue_dir == drv_mod.HARVEST_QUEUE_DIR

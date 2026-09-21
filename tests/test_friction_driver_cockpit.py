@@ -156,3 +156,33 @@ def test_observation_has_right_shape(fake_cockpit):
     for key in ("scenario_id", "started_at", "finished_at", "http_calls",
                 "sse_events", "mem_writes", "vault_writes", "log_appends", "errors"):
         assert key in d
+
+
+# ---------------------------------------------------------------------------
+# Path injection (reviewer debt aa9404adc1): drivers must accept tmp_path
+# overrides for the production path constants so tests can be hermetic.
+# ---------------------------------------------------------------------------
+
+def test_cockpit_accepts_tmp_path_dirs(tmp_path):
+    mem_db = tmp_path / "mem.db"
+    vault_audit = tmp_path / "vault-audit"
+    comments = tmp_path / "comments"
+    vault_audit.mkdir()
+    comments.mkdir()
+    driver = CockpitDriver(
+        base_url="http://127.0.0.1:1",  # never contacted in this test
+        mem_db_path=mem_db,
+        vault_audit_dir=vault_audit,
+        comment_store_dir=comments,
+    )
+    assert driver._mem_db_path == mem_db
+    assert driver._vault_audit_dir == vault_audit
+    assert driver._comment_store_dir == comments
+
+
+def test_cockpit_defaults_to_production_constants():
+    from agents_core.friction_test import driver as drv_mod
+    driver = CockpitDriver(base_url="http://127.0.0.1:1")
+    assert driver._mem_db_path == drv_mod.MEM_DB_PATH
+    assert driver._vault_audit_dir == drv_mod.VAULT_AUDIT_DIR
+    assert driver._comment_store_dir == drv_mod.COMMENT_STORE_DIR

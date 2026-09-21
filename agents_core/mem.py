@@ -27,7 +27,11 @@ from agents_core import mem_exhaust
 # --- Configuration ---
 
 DB_DIR = Path("/data/memory")
-DB_PATH = Path(os.environ.get("MEM_DB_PATH", DB_DIR / "mem.db"))
+# Static module-level constant (reviewer debt b1683758dc): the MEM_DB_PATH env
+# override is read in MemoryStore.__init__ (and by mem_server.py), NOT at
+# import time, so this constant stays overridable in tests via the constructor
+# argument without monkeypatching the module attribute.
+DB_PATH = DB_DIR / "mem.db"
 HOSTNAME = os.uname().nodename
 # Master (read-write) host for the mem substrate. Single deliberate value, NOT an
 # env toggle — so the designation cannot drift per-host into a dual-master
@@ -119,7 +123,13 @@ END;
 class MemoryStore:
     """SQLite-backed memory store with FTS5 full-text search."""
 
-    def __init__(self, db_path: Path = DB_PATH, exhaust_db_path: Path | None = None):
+    def __init__(self, db_path: Path | None = None, exhaust_db_path: Path | None = None):
+        # MEM_DB_PATH env override (reviewer debt b1683758dc): resolved at
+        # construction time, not import time, so DB_PATH stays a static
+        # constant and tests can inject tmp_path via the constructor argument.
+        if db_path is None:
+            env_override = os.environ.get("MEM_DB_PATH")
+            db_path = Path(env_override) if env_override else DB_PATH
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)

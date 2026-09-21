@@ -432,8 +432,9 @@ class TestOutcomeSemantics:
         assert result.post_mortem_path.suffix == ".yaml"
         assert not result.post_mortem_path.name.endswith(".yaml.failed")
 
-    def test_abandoned_outcome_produces_yaml(self, experts_root, queue_root):
-        """When Expert crashes (no output.md), outcome is 'abandoned'."""
+    def test_crashed_outcome_produces_yaml(self, experts_root, queue_root):
+        """When the runner deleted the spec but wrote no output.md, outcome
+        is 'crashed' (reviewer debt 07d0a98d08)."""
         inp = ExpertDispatchInput(
             expert_id="test-stub", intent="test", layers=("persona",),
             timeout_s=1,
@@ -441,7 +442,7 @@ class TestOutcomeSemantics:
         result = _dispatch_with_mock_expert(
             inp, experts_root, queue_root, simulate_crash=True
         )
-        assert result.outcome == "abandoned"
+        assert result.outcome == "crashed"
         assert result.output_path is None
         # Post-mortem runs on empty notepad → records: []
         assert result.post_mortem_path.exists()
@@ -800,7 +801,8 @@ class TestPostMortemFailurePath:
 class TestAbandonedDispatchPath:
     """Expert subprocess crashes without writing output.md."""
 
-    def test_abandoned_outcome_set(self, experts_root, queue_root):
+    def test_crashed_outcome_set(self, experts_root, queue_root):
+        """Spec deleted + no output → 'crashed' (the runner ran and died)."""
         inp = ExpertDispatchInput(
             expert_id="test-stub",
             intent="test",
@@ -810,14 +812,14 @@ class TestAbandonedDispatchPath:
         result = _dispatch_with_mock_expert(
             inp, experts_root, queue_root, simulate_crash=True
         )
-        assert result.outcome == "abandoned"
+        assert result.outcome == "crashed"
         assert result.output_path is None
         assert result.error is not None
 
-    def test_abandoned_post_mortem_runs_on_partial_notepad(
+    def test_crashed_post_mortem_runs_on_partial_notepad(
         self, experts_root, queue_root
     ):
-        """Even when abandoned, post-mortem runs on whatever notepad exists."""
+        """Even when crashed, post-mortem runs on whatever notepad exists."""
         captured_pm_prompts: list[str] = []
 
         def _fake_submit_crash_with_notepad(task, task_id=None):
@@ -853,7 +855,7 @@ class TestAbandonedDispatchPath:
                 _poll_interval=0.05,
             )
 
-        assert result.outcome == "abandoned"
+        assert result.outcome == "crashed"
         # Post-mortem LLM was called with the partial notepad
         assert len(captured_pm_prompts) == 1
         assert "Partial notes before crash." in captured_pm_prompts[0]
@@ -907,11 +909,88 @@ class TestAbandonedDispatchPath:
                 _poll_interval=0.05,
             )
 
-        assert result.outcome == "abandoned"
+        assert result.outcome == "crashed"
         # LLM should NOT have been called (short-circuit for empty notepad+output)
         assert len(pm_llm_called) == 0
         pm_data = yaml.safe_load(result.post_mortem_path.read_text())
         assert pm_data["records"] == []
+
+
+# ===========================================================================
+# Failure-mode distinction: abandoned (timeout) vs crashed (runner died)
+# ===========================================================================
+# Reviewer debt 07d0a98d08: 'abandoned' (timeout, spec still present, no
+# output) must not be conflated with 'crashed' (spec deleted by
+# shaped_runner, no output).
+
+class TestCrashedVsAbandoned:
+    def test_crashed_outcome_when_spec_deleted_without_output(
+        self, experts_root, queue_root
+    ):
+        """shaped_runner deleted the spec (it ran) but wrote no output.md →
+        outcome is 'crashed', not 'abandoned'."""
+        inp = ExpertDispatchInput(
+            expert_id="test-stub",
+            intent="test",
+            layers=("persona",),
+            timeout_s=1,
+        )
+        result = _dispatch_with_mock_expert(
+            inp, experts_root, queue_root, simulate_crash=True
+        )
+        assert result.outcome == "crashed"
+        assert result.output_path is None
+        assert result.error is not None
+        assert "crashed" in result.error
+
+    def test_abandoned_outcome_when_spec_still_present(
+        self, experts_root, queue_root
+    ):
+        """Deadline reached while the spec JSON still exists (runner never
+        picked it up) → outcome is 'abandoned'."""
+
+        def _fake_submit_never_runs(task, task_id=None):
+            # Do NOT delete the spec — the runner never ran.
+            return task_id
+
+        with (
+            patch("agents_core.expert.ClaudeQueue") as MockQueue,
+            patch("agents_core.expert.call_claude_cli", return_value="records: []"),
+        ):
+            mock_q = MagicMock()
+            mock_q.submit.side_effect = _fake_submit_never_runs
+            MockQueue.return_value = mock_q
+
+            result = dispatch_expert(
+                inp := ExpertDispatchInput(
+                    expert_id="test-stub",
+                    intent="test",
+                    layers=("persona",),
+                    timeout_s=1,
+                ),
+                _experts_root=experts_root,
+                _queue_dir=queue_root,
+                _poll_interval=0.05,
+            )
+
+        assert result.outcome == "abandoned"
+        assert result.output_path is None
+        assert result.error is not None
+        assert "abandoned" in result.error
+
+    def test_post_mortem_records_crashed_outcome(self, experts_root, queue_root):
+        """The post-mortem dispatch block records the 'crashed' outcome."""
+        inp = ExpertDispatchInput(
+            expert_id="test-stub",
+            intent="test",
+            layers=("persona",),
+            timeout_s=1,
+        )
+        result = _dispatch_with_mock_expert(
+            inp, experts_root, queue_root, simulate_crash=True
+        )
+        pm_data = yaml.safe_load(result.post_mortem_path.read_text())
+        assert pm_data["dispatch"]["outcome"] == "crashed"
 
 
 # ===========================================================================
@@ -968,7 +1047,7 @@ def test_smoke_real_dispatch(tmp_path):
     )
 
     assert result.task_id.startswith("expert_")
-    assert result.outcome in ("completed", "abandoned", "post_mortem_failed")
+    assert result.outcome in ("completed", "abandoned", "crashed", "post_mortem_failed")
 
     pm_data = yaml.safe_load(result.post_mortem_path.read_text())
     assert "dispatch" in pm_data

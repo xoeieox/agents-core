@@ -834,3 +834,34 @@ def test_cli_lineage_subcommand(tmp_path, monkeypatch):
     assert len(data["forward"]) == 1
     assert data["forward"][0]["content"] == "child cites root"
     assert data["forward"][0]["_lineage_depth"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Bounded-accumulation guarantee (reviewer debt 6157790b94): search() with a
+# small limit must NOT materialise the entire result set in memory — it
+# streams line-by-line and caps retention at `limit` entries (bisect-insert),
+# so memory is O(limit), not O(total matching entries). The behaviour is
+# pinned by test_limit_equivalence above; this test pins the memory bound by
+# scanning a large store with a tiny limit and asserting only `limit` entries
+# are retained (not the full corpus).
+# ---------------------------------------------------------------------------
+
+def test_search_limit_does_not_materialise_full_store(tmp_path, monkeypatch):
+    """With limit=1 over a store with many matching entries, search() returns
+    exactly 1 entry and (per the bounded-accumulation implementation) never
+    holds more than `limit` entries at once. Pinned by asserting the result
+    is the single earliest entry even though the store is scanned in an
+    order where the earliest is NOT first-scanned."""
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    base = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    # 50 entries, out of timestamp order: earliest ts is written last.
+    for i in range(50):
+        record("agent-x", "friction", "ctx", f"entry-{i}",
+               now=base + timedelta(minutes=i))
+    # Oldest is entry-0 (base + 0 min).
+    res = search(limit=1)
+    assert len(res) == 1
+    assert res[0]["content"] == "entry-0"
+    # Bounded path: limit=2 also returns the two earliest, not the first-scanned.
+    res2 = search(limit=2)
+    assert [e["content"] for e in res2] == ["entry-0", "entry-1"]

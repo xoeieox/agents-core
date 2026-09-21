@@ -1,14 +1,32 @@
-"""Tests for friction-test CLI argument parsing and exit codes."""
+"""Tests for friction-test CLI argument parsing and exit codes.
+
+The CLI itself lives OUTSIDE the package (Library Purity invariant):
+/srv/agents/scripts/friction_test.py is the argparse entry point and
+agents_core.friction_test is library-only. This test loads the shim via
+importlib (it is not an importable module name) and patches the shim's own
+`run` symbol — the one the shim's main() calls into.
+"""
+import importlib.util
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from agents_core.friction_test.cli import main
 from agents_core.friction_test.observe import Observation
 from agents_core.friction_test.report import FrictionReport
 from agents_core.friction_test.scenario import Scenario, _make_scenario_id
+
+_SHIM_PATH = Path("/srv/agents/scripts/friction_test.py")
+
+
+@pytest.fixture
+def shim(monkeypatch):
+    """Load the /srv/agents/scripts/friction_test.py shim as a module."""
+    spec = importlib.util.spec_from_file_location("friction_test_shim", _SHIM_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _make_mock_report(with_harness_error: bool = False) -> FrictionReport:
@@ -38,88 +56,87 @@ def _make_mock_report(with_harness_error: bool = False) -> FrictionReport:
     )
 
 
-def test_no_command_exits_1():
-    rc = main([])
-    assert rc == 1
+def test_no_command_exits_1(shim):
+    assert shim.main([]) == 1
 
 
-def test_run_exits_0_on_success(tmp_path):
-    mock_report = _make_mock_report()
-    with patch("agents_core.friction_test.cli.run", return_value=mock_report):
-        rc = main(["run", "--target", "radio-op", "--scenario-set", "smoke",
-                   "--out-dir", str(tmp_path)])
+def test_run_exits_0_on_success(shim, tmp_path, monkeypatch):
+    monkeypatch.setattr(shim, "run", lambda **kw: _make_mock_report())
+    rc = shim.main(["run", "--target", "radio-op", "--scenario-set", "smoke",
+                    "--out-dir", str(tmp_path)])
     assert rc == 0
 
 
-def test_run_with_invariant_mode_declared(tmp_path):
-    mock_report = _make_mock_report()
+def test_run_with_invariant_mode_declared(shim, tmp_path, monkeypatch):
     captured_kwargs = {}
 
     def fake_run(**kwargs):
         captured_kwargs.update(kwargs)
-        return mock_report
+        return _make_mock_report()
 
-    with patch("agents_core.friction_test.cli.run", side_effect=fake_run):
-        rc = main(["run", "--target", "radio-op", "--invariant-mode", "declared",
-                   "--out-dir", str(tmp_path)])
+    monkeypatch.setattr(shim, "run", fake_run)
+    rc = shim.main(["run", "--target", "radio-op", "--invariant-mode", "declared",
+                    "--out-dir", str(tmp_path)])
 
     assert rc == 0
     assert captured_kwargs["invariant_mode"] == "declared"
 
 
-def test_run_with_invariant_mode_both(tmp_path):
-    mock_report = _make_mock_report()
+def test_run_with_invariant_mode_both(shim, tmp_path, monkeypatch):
     captured_kwargs = {}
 
     def fake_run(**kwargs):
         captured_kwargs.update(kwargs)
-        return mock_report
+        return _make_mock_report()
 
-    with patch("agents_core.friction_test.cli.run", side_effect=fake_run):
-        rc = main(["run", "--target", "cockpit", "--invariant-mode", "both",
-                   "--out-dir", str(tmp_path)])
+    monkeypatch.setattr(shim, "run", fake_run)
+    rc = shim.main(["run", "--target", "cockpit", "--invariant-mode", "both",
+                    "--out-dir", str(tmp_path)])
 
+    assert rc == 0
     assert captured_kwargs["invariant_mode"] == "both"
 
 
-def test_run_exits_0_even_with_dissonances(tmp_path):
+def test_run_exits_0_even_with_dissonances(shim, tmp_path, monkeypatch):
     """Dissonant invariants are information, not CLI failures."""
-    mock_report = _make_mock_report()
-    mock_report.n_dissonances = {"system_likely": 2, "model_likely": 1, "total": 3}
-
-    with patch("agents_core.friction_test.cli.run", return_value=mock_report):
-        rc = main(["run", "--target", "radio-op", "--out-dir", str(tmp_path)])
-
+    report = _make_mock_report()
+    report.n_dissonances = {"system_likely": 2, "model_likely": 1, "total": 3}
+    monkeypatch.setattr(shim, "run", lambda **kw: report)
+    rc = shim.main(["run", "--target", "radio-op", "--out-dir", str(tmp_path)])
     assert rc == 0
 
 
-def test_run_exits_1_on_harness_error_with_strict(tmp_path):
+def test_run_exits_1_on_harness_error_with_strict(shim, tmp_path, monkeypatch):
     """With --strict, harness errors cause exit 1."""
-    mock_report = _make_mock_report(with_harness_error=True)
-
-    with patch("agents_core.friction_test.cli.run", return_value=mock_report):
-        rc = main(["run", "--target", "radio-op", "--strict",
-                   "--out-dir", str(tmp_path)])
-
+    monkeypatch.setattr(shim, "run", lambda **kw: _make_mock_report(with_harness_error=True))
+    rc = shim.main(["run", "--target", "radio-op", "--strict",
+                    "--out-dir", str(tmp_path)])
     assert rc == 1
 
 
-def test_run_exits_0_on_harness_error_without_strict(tmp_path):
+def test_run_exits_0_on_harness_error_without_strict(shim, tmp_path, monkeypatch):
     """Without --strict, harness errors are warnings, not failures."""
-    mock_report = _make_mock_report(with_harness_error=True)
-
-    with patch("agents_core.friction_test.cli.run", return_value=mock_report):
-        rc = main(["run", "--target", "radio-op", "--out-dir", str(tmp_path)])
-
+    monkeypatch.setattr(shim, "run", lambda **kw: _make_mock_report(with_harness_error=True))
+    rc = shim.main(["run", "--target", "radio-op", "--out-dir", str(tmp_path)])
     assert rc == 0
 
 
-def test_strict_exits_1_when_run_raises(tmp_path):
+def test_strict_exits_1_when_run_raises(shim, tmp_path, monkeypatch):
     """If run() raises with --strict, exit 1."""
-    with patch("agents_core.friction_test.cli.run", side_effect=RuntimeError("down")):
-        rc = main(["run", "--target", "radio-op", "--strict",
-                   "--out-dir", str(tmp_path)])
+
+    def _raise(**kw):
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(shim, "run", _raise)
+    rc = shim.main(["run", "--target", "radio-op", "--strict",
+                    "--out-dir", str(tmp_path)])
     assert rc == 1
+
+
+def test_cli_lives_outside_package():
+    """Library Purity: the friction-test CLI must not live inside agents_core."""
+    assert not (Path("agents_core") / "friction_test" / "cli.py").exists()
+    assert _SHIM_PATH.exists()
 
 
 def test_no_anthropic_api_key_reference():
