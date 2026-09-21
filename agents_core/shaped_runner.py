@@ -34,6 +34,12 @@ from typing import Callable
 
 from agents_core.llm import call_claude_cli
 from agents_core.room_paths import room_path
+from agents_core.repro_gate import (
+    salvage_label_decision as _salvage_label_decision,
+    repro_verdict_title_tag as _repro_verdict_title_tag,
+    parse_failed_node_ids_full as _parse_failed_node_ids_full,
+    build_provenance_block as _build_provenance_block,
+)
 
 # Opt-in stream-json log dir for spec_reviewer shaped-runner tasks
 # (agents-core-shaped-runner-stream-log-v0). mkdir'd explicitly before first
@@ -797,6 +803,8 @@ def _open_wip_salvage_pr(
     transcript_path: Path,
     concluded: bool = False,
     repo_cwd: str = "",
+    title_tag: str = "",
+    body_block: str = "",
 ) -> str:
     """Push the WIP ref (or HEAD for concluded worktree salvage) to a
     per-task-unique <slug>-salvage branch and open an advisory [SALVAGE] PR
@@ -941,15 +949,46 @@ def _open_wip_salvage_pr(
         f"<!-- lapis-tid: {target_id} -->\n"
         f"<!-- lapis-salvage: true -->\n"
     )
+    # D5 (lapis-pm-test-gate-hermeticity-v0): the repro verdict block
+    # rides in the PR body (the fixer sees the actual failing
+    # invocation). Absent ("" - the off/shadow modes) the body is
+    # byte-identical to the pre-spec shape.
+    if body_block:
+        pr_body += f"\n{body_block}\n"
+
+    # D5: the repro verdict in the title ([REPRO-RED] / [REPRO-GREEN] /
+    # [REPRO-ERROR]). Absent ("" - the off/shadow modes) the title is
+    # byte-identical to the pre-spec shape.
+    _title_tag_prefix = f"{title_tag} " if title_tag else ""
 
     try:
         pr = _forgejo.create_pr(
             repo=bare_repo,
-            title=f"[SALVAGE] fix({target_id}): {stop_reason} at step {step_count}",
+            title=f"[SALVAGE] {_title_tag_prefix}fix({target_id}): {stop_reason}",
             head=salvage_branch,
             base="main",
             body=pr_body,
         )
+        # D5 (lapis-pm-test-gate-hermeticity-v0): bump the persistent
+        # per-target salvage-chain counter at salvage-open (the mem
+        # counter PRIMARY - update-in-place, bounded rows, no network
+        # on the hot path). The Forgejo marker count is a
+        # RECONCILIATION-ONLY fallback (a periodic consistency check),
+        # never the hot-path read. Best-effort: a bump failure never
+        # blocks the PR (the PR is already open).
+        try:
+            from agents_core.repro_gate import bump_salvage_chain
+            _new_depth = bump_salvage_chain(target_id)
+            if _new_depth:
+                _tail_log(
+                    task_id,
+                    f"salvage-chain-depth {target_id} -> {_new_depth}",
+                )
+        except Exception as exc:
+            print(
+                f"WARN: wip-salvage: salvage-chain bump failed: {exc}",
+                file=sys.stderr,
+            )
         print(
             f"INFO: wip-salvage: [SALVAGE] PR opened: {pr.get('html_url', '')} "
             f"(branch={salvage_branch}, WIP head={wip_head_sha})",
@@ -1366,6 +1405,121 @@ def tail_finalize(
             f"rc={last_test_outcome.get('returncode')})"
         )
 
+    # D2 (lapis-pm-test-gate-hermeticity-v0): the salvage-labeling
+    # enforcement seam. The decision is computed LAZILY - only when a
+    # salvage partition actually needs it (the class-4a shape or the
+    # gate-RED salvage partition). The repro runs in a FRESH THROWAWAY
+    # CLONE at the gate-run's provenance head SHA (P1) - the gate's
+    # worktree is the model's live worktree (the WIP hook moves the
+    # index, the model's final state is at HEAD), so the repro seeds
+    # from the worktree's HEAD (the re-fetch-and-verify:
+    # current_head_sha is re-read at repro time - the gate's recorded
+    # head is a stale capture).
+    #
+    # Mode discipline (the activation switch):
+    #   off = today's behavior byte-identically (no repro run, no
+    #         observation - the decision is the legacy shape).
+    #   shadow (the DEFAULT post-merge) = observe-only: the repro runs
+    #         + the would-be disposition is recorded as an observation,
+    #         but the salvage path behaves EXACTLY AS IT DOES TODAY
+    #         (the concluded_gate_rejected label emits as before).
+    #   on = full enforcement: the decision drives the partitions
+    #         (clean-push routing, the [REPRO-*] title tags + body
+    #         block, the run_not_concluded refusal, the chain-stop).
+    #
+    # The decision is {} when the repro seam is unreachable (a
+    # harness exception) - the partitions fall through to today's
+    # behavior (the conservative direction - never a silent drop).
+    _salvage_decision: dict = {}
+    _salvage_decision_computed = False
+
+    def _compute_salvage_decision() -> dict:
+        """Compute the salvage-labeling decision (lazy - the repro
+        runs only when a salvage partition needs it)."""
+        nonlocal _salvage_decision, _salvage_decision_computed
+        if _salvage_decision_computed:
+            return _salvage_decision
+        _salvage_decision_computed = True
+        try:
+            _repro_head_sha = _git("rev-parse", "HEAD").stdout.strip()
+            # D2 (lapis-pm-test-gate-hermeticity-v0) cycle-2 fix: the
+            # gate-RED salvage path must feed the repro the FULL gate
+            # output (the complete pytest output the gate captured), NOT
+            # the 20-line output_tail the spec (H2) explicitly rejects -
+            # and the failed node-ids must come from repro_gate's full
+            # short-test-summary-section parser, NOT the legacy
+            # 20-line _extract_failed_node_ids (which silently drops
+            # failure lists longer than 20 lines and returns [] for the
+            # collection-error / rc=4 / rc=5 / 180s-timeout shapes).
+            #
+            # The gate's deciding outcome is the model's last run_tests
+            # outcome (capped at the tool-output cap in gw_agent) or the
+            # D1 targeted re-run (which parses the FULL subprocess
+            # output, structurally bypassing the cap). The deciding
+            # outcome's output_tail is the best full-output source the
+            # seam has (the re-run's tail is the full output; the model
+            # outcome's tail is its capped output) - the legacy
+            # 20-line truncation is what H2 kills.
+            _gate_full_output = (
+                (last_test_outcome or {}).get("output_tail") or ""
+            )
+            _repro_failed_node_ids = _parse_failed_node_ids_full(
+                _gate_full_output
+            )
+            # The per-repo full-suite test paths (the touched-test set +
+            # the per-repo test baseline the gate itself uses) - the
+            # empty-input fallback re-runs the FULL gate suite in the
+            # fresh clone instead of erroring. Without this the
+            # fallback's run_paths is empty and repro_gate returns
+            # VERDICT_ERROR (unknown subcode) for every real gate-red.
+            _full_suite_paths = (
+                sorted(model_touched_tests)
+                if model_touched_tests else ["tests/"]
+            )
+            # D3 (lapis-pm-test-gate-hermeticity-v0) cycle-2 fix: pass
+            # the gate run's provenance block through the seam so the
+            # on-mode run_not_concluded refusal (an unaudited gate run
+            # cannot conclude) is reachable in the live path. The
+            # provenance block is the D3 build_provenance_block output
+            # the gate assembles for THIS run (the gate's own cwd + the
+            # gate's recorded head).
+            _gate_provenance_block = _build_provenance_block(
+                repo=bare_repo,
+                head_sha=_repro_head_sha,
+                cwd=cwd,
+                confcutdir=cwd,
+            )
+            _salvage_decision = _salvage_label_decision(
+                target=target_id,
+                head_sha=_repro_head_sha,
+                gate_passed=gate_passed,
+                last_test_outcome=last_test_outcome,
+                gate_output=_gate_full_output,
+                failed_node_ids=_repro_failed_node_ids,
+                full_suite_paths=_full_suite_paths,
+                wip_commit_count=wip_commit_count,
+                empty_diff=not final_diff.strip(),
+                head_past_base=bool(base_sha) and _repro_head_sha != base_sha,
+                worktree=str(worktree_path) if worktree_path else cwd,
+                wip_ref=wip_ref,
+                current_head_sha=_repro_head_sha,
+                repo=bare_repo,
+                provenance_block=_gate_provenance_block,
+                log=lambda m: print(m, file=sys.stderr),
+            )
+        except Exception as exc:
+            print(
+                f"WARN: local-fixer: salvage-labeling decision failed: {exc}",
+                file=sys.stderr,
+            )
+            _salvage_decision = {}
+        return _salvage_decision
+
+    def _salvage_field(field: str) -> str:
+        """Read a field from the salvage decision (computing it
+        lazily)."""
+        return _compute_salvage_decision().get(field, "")
+
     if gate_bypassed is None:
         if gate_passed:
             _tail_log(
@@ -1575,6 +1729,153 @@ def tail_finalize(
             if (concluded and wip_commit_count > 0
                     and base_sha
                     and _empty_diff_recovery_rederive(cwd, base_sha) is not None):
+                # D2 (lapis-pm-test-gate-hermeticity-v0): the class-4a
+                # shape (gate-PASSED + concluded + WIP + empty-diff).
+                # In on mode the CLEAN-PUSH disposition routes this
+                # shape to the normal-PR path (the work is DONE and
+                # GREEN - the concluded_gate_rejected label is the
+                # 09-18 mislabel, never earned). In shadow/off modes
+                # the salvage path behaves EXACTLY AS IT DOES TODAY
+                # (the mislabel quantified live by the shadow
+                # observation).
+                _salvage_decision = _compute_salvage_decision()
+                _salvage_enforce_mode = _salvage_decision.get("enforce_mode", "")
+                _salvage_disposition = _salvage_decision.get("disposition", "")
+                _class4a_clean_push = (
+                    _salvage_enforce_mode == "on"
+                    and _salvage_disposition == "clean-push"
+                )
+                if _class4a_clean_push:
+                    print(
+                        "INFO: local-fixer: concluded, empty in-tail "
+                        "diff, HEAD past base (the model self-committed), "
+                        "gate PASSED - clean-push disposition (the "
+                        "concluded_gate_rejected label is not earned - "
+                        "the 09-18 class-4a mislabel is dead)",
+                        file=sys.stderr,
+                    )
+                    _tail_log(
+                        task_id,
+                        "concluded, empty diff, HEAD past base, gate "
+                        "passed - clean-push disposition (no salvage "
+                        "PR)",
+                    )
+                    # The clean-push disposition: the normal-PR path
+                    # below (the gate-PASSED + concluded shape skips
+                    # the if-not-gate_passed salvage partition and
+                    # reaches the normal-PR commit/push/PR path - the
+                    # deliverable is the committed work, the PR is the
+                    # normal PR, never a [SALVAGE] twin).
+                    #
+                    # The normal-PR path's `git commit` on a clean
+                    # index returns rc=1 (the model self-committed -
+                    # the index-vs-HEAD diff is empty by
+                    # construction). The clean-push disposition
+                    # SKIPS the commit step (the gate-verified
+                    # worktree state IS the deliverable - the same
+                    # push-HEAD-as-is pattern the self-commit
+                    # recovery uses) and pushes HEAD as-is.
+                    _clean_push_head_sha = _git("rev-parse", "HEAD").stdout.strip()
+                    r = _git("checkout", "-B", branch)
+                    if r.returncode != 0:
+                        print(
+                            f"WARN: local-fixer: git checkout -B failed "
+                            f"(clean-push disposition): "
+                            f"{r.stderr.strip()}",
+                            file=sys.stderr,
+                        )
+                        _tail_log(
+                            task_id,
+                            f"clean-push: git checkout -B failed "
+                            f"rc={r.returncode}: {r.stderr.strip()[:500]}",
+                        )
+                        return ""
+                    r = _git("push", "origin", f"HEAD:{branch}")
+                    if r.returncode != 0:
+                        print(
+                            f"ERROR: local-fixer: git push failed "
+                            f"(clean-push disposition) - command: git "
+                            f"push origin HEAD:{branch} (rc="
+                            f"{r.returncode}): {r.stderr.strip()}",
+                            file=sys.stderr,
+                        )
+                        _tail_log(
+                            task_id,
+                            f"pm:push-failed rc={r.returncode} "
+                            f"branch={branch} (clean-push disposition) "
+                            f"stderr={r.stderr.strip()[:500]}",
+                        )
+                        return ""
+                    if branch:
+                        try:
+                            for _pr in _forgejo.get_open_prs(repo=bare_repo):
+                                if (_pr.get("head") or {}).get("ref") == branch:
+                                    _pr_url = _pr.get("html_url", "")
+                                    _tail_log(
+                                        task_id,
+                                        f"open PR already exists on "
+                                        f"{branch!r} (clean-push "
+                                        f"disposition) - head advanced: "
+                                        f"{_pr_url}",
+                                    )
+                                    return _pr_url
+                        except Exception as exc:
+                            print(
+                                f"WARN: local-fixer: open-PR scan failed "
+                                f"(clean-push disposition): {exc} - "
+                                f"falling through to create_pr",
+                                file=sys.stderr,
+                            )
+                    _clean_push_body = (
+                        f"**[SALVAGE] advisory PR - the run is LOST "
+                        f"(concluded, test gate passed the work).\n\n"
+                        f"## Task\n\n"
+                        f"- task_id: `{task_id}`\n"
+                        f"- target_id: `{target_id}`\n"
+                        f"- stop_reason: `clean-push`\n"
+                        f"- wall time: "
+                        f"{datetime.now(timezone.utc).isoformat()}\n"
+                        f"- salvage commit sha: `{_clean_push_head_sha}`\n\n"
+                        f"## What remains\n\n"
+                        f"The model self-committed its work (the "
+                        f"in-tail diff is empty by construction) and "
+                        f"the gate PASSED - the work is DONE and "
+                        f"GREEN. This PR carries the committed work "
+                        f"(the clean-push disposition - the "
+                        f"concluded_gate_rejected label is not "
+                        f"earned).\n\n"
+                        f"## Transcript\n\n"
+                        f"`{transcript_path}`\n\n"
+                        f"<!-- lapis-gpu-id: {task_id} -->\n"
+                        f"<!-- lapis-tid: {target_id} -->\n"
+                    )
+                    try:
+                        pr = _forgejo.create_pr(
+                            repo=bare_repo,
+                            title=f"fix({target_id}): local-fixer "
+                                  f"(clean-push)",
+                            head=branch,
+                            base="main",
+                            body=_clean_push_body,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"WARN: local-fixer: create_pr failed "
+                            f"(clean-push disposition): {exc}",
+                            file=sys.stderr,
+                        )
+                        _tail_log(
+                            task_id,
+                            f"create_pr FAILED (clean-push disposition): "
+                            f"{exc}",
+                        )
+                        return ""
+                    _tail_log(
+                        task_id,
+                        f"create_pr OK (clean-push disposition) "
+                        f"url={pr.get('html_url', '')}",
+                    )
+                    return pr.get("html_url", "")
                 print(
                     "WARN: local-fixer: concluded, empty in-tail diff, "
                     "HEAD past base (the model self-committed) - opening "
@@ -1877,13 +2178,98 @@ def tail_finalize(
             )
             return ""
         if not gate_passed:
-            # D1 (agents-core-local-fixer-harness-fix-v0): the positive-only
-            # gate (or its fail-closed legacy fallback) rejected this run.
-            # S3 (agents-core-local-fixer-salvage-on-discard-v0): salvage
-            # the WORKTREE's final state (not the WIP ref) - a concluded
-            # run's final state is exactly what the gate tested, and it is
-            # at least as complete as any WIP snapshot. Fail closed: any
-            # git failure below falls through to the original return "".
+            # D2 (lapis-pm-test-gate-hermeticity-v0): the on-mode
+            # enforcement dispositions. The repro verdict (the fresh-
+            # clone reproduction at the gate-run's provenance head
+            # SHA) gates the concluded_gate_rejected label:
+            #   run-not-concluded: the D3 provenance refusal (an
+            #       unaudited gate run cannot conclude) - NO PR, NO
+            #       label (the mislabel is killed at the source).
+            #   chain-stop: the D5 chain-depth guard (> 3) - NO PR,
+            #       NO label (one Matrix page per target per chain).
+            #   defer-sha-moved / defer-inconclusive: the repro
+            #       defers to the next tick (no PR this tick).
+            #   salvage-error: the repro itself could not run (the
+            #       ERROR class) - infra-noise: NO salvage PR with a
+            #       defect label, NO review cycle consumed.
+            #   salvage-red: the label is EARNED (the repro proved
+            #       the red at the head AND the gate outcome is red)
+            #       - the [REPRO-RED] title tag + the repro verdict
+            #       block in the PR body.
+            #   salvage-green: the gate-RED-but-repro-GREEN shape -
+            #       the [SALVAGE] PR with the [REPRO-GREEN] title
+            #       tag (the advisory PR is NEVER auto-merged - the
+            #       merge is a PM act).
+            # In shadow/off modes the salvage path behaves EXACTLY AS
+            # IT DOES TODAY (the mislabel quantified live by the
+            # shadow observation - the disposition is the legacy
+            # concluded-gate-rejected-legacy shape).
+            _salvage_decision = _compute_salvage_decision()
+            _salvage_enforce_mode = _salvage_decision.get("enforce_mode", "")
+            _salvage_disposition = _salvage_decision.get("disposition", "")
+            _salvage_title_tag = _salvage_decision.get("title_tag", "")
+            _salvage_body_block = _salvage_decision.get("body_block", "")
+            if _salvage_enforce_mode == "on":
+                if _salvage_disposition == "run-not-concluded":
+                    print(
+                        "WARN: local-fixer: test gate failed - "
+                        "run_not_concluded (the D3 provenance refusal "
+                        "- the unaudited gate run cannot conclude; "
+                        "no salvage PR, no label)",
+                        file=sys.stderr,
+                    )
+                    _tail_log(
+                        task_id,
+                        "test gate failed - run_not_concluded (D3 "
+                        "provenance refusal; no PR, no label)",
+                    )
+                    return ""
+                if _salvage_disposition == "chain-stop":
+                    print(
+                        "WARN: local-fixer: test gate failed - "
+                        "chain-stop (the D5 chain-depth guard > 3 - "
+                        "no salvage PR, no label; one Matrix page per "
+                        "target per chain)",
+                        file=sys.stderr,
+                    )
+                    _tail_log(
+                        task_id,
+                        "test gate failed - chain-stop (D5 chain-depth "
+                        "guard; no PR, no label)",
+                    )
+                    return ""
+                if _salvage_disposition in (
+                        "defer-sha-moved", "defer-inconclusive"):
+                    print(
+                        f"WARN: local-fixer: test gate failed - "
+                        f"{_salvage_disposition} (the repro defers to "
+                        f"the next tick; no PR this tick)",
+                        file=sys.stderr,
+                    )
+                    _tail_log(
+                        task_id,
+                        f"test gate failed - {_salvage_disposition} "
+                        f"(the repro defers to the next tick; no PR)",
+                    )
+                    return ""
+                if _salvage_disposition == "salvage-error":
+                    _subcode = ""
+                    _repro_verdict = _salvage_decision.get("repro") or {}
+                    _subcode = _repro_verdict.get("subcode") or "unknown"
+                    print(
+                        f"WARN: local-fixer: test gate failed - "
+                        f"salvage-error (the repro itself could not "
+                        f"run - subcode={_subcode}; infra-noise: no "
+                        f"salvage PR with a defect label, no review "
+                        f"cycle consumed)",
+                        file=sys.stderr,
+                    )
+                    _tail_log(
+                        task_id,
+                        f"test gate failed - salvage-error (subcode="
+                        f"{_subcode}; infra-noise; no PR, no cycle)",
+                    )
+                    return ""
             print(
                 "WARN: local-fixer: test gate failed "
                 f"(model_touched_tests={sorted(model_touched_tests) if model_touched_tests else '[] (legacy gate)'}; "
@@ -1943,6 +2329,8 @@ def tail_finalize(
                 branch=branch, slug=slug,
                 step_count=step_count,
                 transcript_path=transcript_path,
+                title_tag=_salvage_title_tag,
+                body_block=_salvage_body_block,
             )
 
     # (_git is defined at tail entry - see above.)
