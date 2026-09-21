@@ -6,7 +6,8 @@ Requires:
 
 Run with:  pytest -m smoke tests/test_gravitywell_smoke.py
 
-Excluded from the default suite (no -m smoke flag).
+Excluded from the default suite via addopts (pyproject [tool.pytest.ini_options]); run
+explicitly with pytest -m smoke (an explicit -m overrides addopts).
 """
 
 import json
