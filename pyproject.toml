@@ -50,3 +50,4 @@ markers = [
     "integration: real backend calls (mem, chub, *-rag); run with -m integration",
     "smoke: real end-to-end dispatch through live ClaudeQueue; run with -m smoke",
 ]
+addopts = "-m 'not smoke'"
