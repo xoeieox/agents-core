@@ -2,17 +2,20 @@
 
 The CLI itself lives OUTSIDE the package (Library Purity invariant):
 /srv/agents/scripts/friction_test.py is the argparse entry point and
-agents_core.friction_test is library-only. The shim is a cross-repo
-artifact: it is committed/pushed in the /srv/agents deploy clone
-(separate from this PR's diff), so tests that depend on it are skipped
-on checkouts/CI runners where the shim file is not present. The
-in-package library-purity check (no agents_core/friction_test/cli.py)
-always runs.
+agents_core.friction_test is library-only.
 
-Shim-load failures (stale or broken shim: syntax error, missing
-attribute, import error) are treated as skip, not error: the shim is
-outside this repo's diff, so a broken shim is a deploy problem, not a
-test failure of this PR.
+Cross-repo flag (debt 5e5827ffef + 632c059de4): the shim file is a
+cross-repo artifact that lives in the /srv/agents deploy clone
+(Erah/agents-core repo, scripts/friction_test.py), NOT in this repo's
+diff. It was committed there on 2026-09-21 (commit 1b81b9d, "fix
+(cr-bundle-agents-core-2026-09-21): commit friction_test CLI shim") and
+is deployed at /srv/agents/scripts/friction_test.py on the agent host.
+On checkouts/CI runners where that deploy clone is absent, the
+shim-dependent tests below skip (the shim's absence is a deploy
+condition, not a failure of this PR's in-repo diff). The in-repo
+library-purity checks — no agents_core/friction_test/cli.py, and
+orchestrator.run() accepting the CLI's kwargs — always run, so the
+shim/library contract is guarded even when the shim file is absent.
 """
 import importlib.util
 from pathlib import Path
