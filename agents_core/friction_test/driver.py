@@ -318,6 +318,12 @@ class RadioOpDriver:
 # ---------------------------------------------------------------------------
 
 COCKPIT_BASE = "http://localhost:8400"
+# The cockpit service's OWN mem.db — intentionally distinct from
+# agents_core.mem.DB_PATH (/data/memory/mem.db, the mem-substrate store).
+# The cockpit driver snapshots pm/* keys from the cockpit's local db
+# (schema: `memory` table), NOT the mem-substrate store (schema: `memories`
+# + FTS5). Pre-existing; out of scope for the aa9404adc1 injectable-paths
+# fix, but noted here so the two paths are not conflated.
 MEM_DB_PATH = Path("/srv/agents/mem.db")
 VAULT_AUDIT_DIR = Path("/data/vault-audit")
 COMMENT_STORE_DIR = room_path("targets.comments")

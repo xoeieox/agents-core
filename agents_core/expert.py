@@ -183,14 +183,16 @@ def _poll_for_output(
 ) -> tuple[bool, bool]:
     """Poll for dispatch completion.
 
-    Returns (succeeded, spec_deleted_at_deadline):
+    Returns (succeeded, spec_deleted):
     - succeeded: output.md appeared with content (dispatch produced output)
-    - spec_deleted_at_deadline: the spec JSON is gone at the moment the
-      completion signal is evaluated. shaped_runner deletes the spec when it
-      has finished, so a deleted spec with no output means the runner crashed
-      (outcome "crashed"), while a still-present spec with no output means the
-      dispatch was abandoned/timed out before the runner ever picked it up
-      (outcome "abandoned"). The two failure modes are no longer conflated.
+    - spec_deleted: the spec JSON is gone at the moment the completion signal
+      is evaluated — i.e. when output.md appears, when the spec is first
+      observed deleted (early-exit path), or at the deadline check. shaped_runner
+      deletes the spec when it has finished, so a deleted spec with no output
+      means the runner crashed (outcome "crashed"), while a still-present spec
+      with no output means the dispatch was abandoned/timed out before the
+      runner ever picked it up (outcome "abandoned"). The two failure modes
+      are no longer conflated.
     """
     def _has_output() -> bool:
         return output_path.exists() and output_path.stat().st_size > 0

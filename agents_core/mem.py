@@ -28,9 +28,11 @@ from agents_core import mem_exhaust
 
 DB_DIR = Path("/data/memory")
 # Static module-level constant (reviewer debt b1683758dc): the MEM_DB_PATH env
-# override is read in MemoryStore.__init__ (and by mem_server.py), NOT at
-# import time, so this constant stays overridable in tests via the constructor
-# argument without monkeypatching the module attribute.
+# override is read in MemoryStore.__init__ at construction time, NOT at import
+# time, so this constant stays overridable in tests via the constructor
+# argument without monkeypatching the module attribute. (mem_server.main()
+# still resolves MEM_DB_PATH itself and passes the path explicitly — the
+# library's own default resolution is the one pinned here.)
 DB_PATH = DB_DIR / "mem.db"
 HOSTNAME = os.uname().nodename
 # Master (read-write) host for the mem substrate. Single deliberate value, NOT an
@@ -127,6 +129,8 @@ class MemoryStore:
         # MEM_DB_PATH env override (reviewer debt b1683758dc): resolved at
         # construction time, not import time, so DB_PATH stays a static
         # constant and tests can inject tmp_path via the constructor argument.
+        # Explicit db_path always wins (mem_server.main() passes one); the
+        # env var only applies to bare MemoryStore() construction.
         if db_path is None:
             env_override = os.environ.get("MEM_DB_PATH")
             db_path = Path(env_override) if env_override else DB_PATH
