@@ -176,11 +176,11 @@ def test_strict_exits_1_when_run_raises(shim, tmp_path, monkeypatch):
 def test_cli_lives_outside_package():
     """Library Purity: the friction-test CLI must not live inside agents_core.
 
-    Only the in-repo half of the check runs unconditionally: the
-    in-package cli.py must not exist. The shim's existence at
-    /srv/agents/scripts/friction_test.py is a cross-repo artifact
-    (committed in the /srv/agents deploy clone), so that half is
-    skipped on checkouts without the deploy clone.
+    The in-repo half always runs: the in-package cli.py must not exist.
+    The shim's existence at /srv/agents/scripts/friction_test.py is a
+    cross-repo artifact (committed in the /srv/agents deploy clone,
+    Erah/agents-core commit 1b81b9d), so that half is skipped on
+    checkouts without the deploy clone.
     """
     assert not (Path("agents_core") / "friction_test" / "cli.py").exists()
     if not _SHIM_PATH.exists():
