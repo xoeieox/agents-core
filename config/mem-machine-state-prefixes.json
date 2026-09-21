@@ -1,0 +1,34 @@
+{
+  "spec": "openclaw-memdb-influx-reader-v0 (D3) + mem-hygiene-automation-v0 (shared)",
+  "note": "Shared machine-state prefix allowlist. ONE file both specs read (panel 2026-09-14 F6). Faucet reads prefix/producer_principal/store; hygiene reads state/dead_since. Prefixes are LITERAL trailing-slash strings (startswith-only convention, mem_exhaust.py:64-71) — no globs. On a prefix present in both this file and EXHAUST_PREFIXES (mem_exhaust.py:72-76), the ROUTING table wins for where new rows land and this file wins for quarantine/death state; the safe desync direction is the hygiene list as SUPERSET of the faucet list. The live copy ships at /srv/agents/config/mem-machine-state-prefixes.json (mem_server loads it there by default; MEM_MACHINE_STATE_PREFIXES_PATH overrides). RESCOPED rev-2: the machinery store is the EXISTING exhaust store (route_to_exhaust), not a second sqlite — 'store' is 'machinery' == 'exhaust' for every entry. router/lapis-pm/ is EXCLUDED (two live readers, deliberate non-move, mem_exhaust.py:16-17,66-69).",
+  "prefixes": [
+    {
+      "prefix": "elevator/",
+      "producer_principal": "brix-pm",
+      "store": "machinery",
+      "state": "live",
+      "dead_since": null
+    },
+    {
+      "prefix": "weather/",
+      "producer_principal": "brix-pm",
+      "store": "machinery",
+      "state": "live",
+      "dead_since": null
+    },
+    {
+      "prefix": "router/gw-review-divergence/",
+      "producer_principal": "brix-pm",
+      "store": "machinery",
+      "state": "live",
+      "dead_since": null
+    }
+  ],
+  "excluded": [
+    {
+      "prefix": "test/",
+      "state": "excluded",
+      "reason": "NOT a machine-state prefix (reviewer 2026-09-18, PR #328 cycle 1, [high]): 'test/' is a generic scratch/test namespace used by existing tests and production code that expect test/* keys to land in mem.db (the atoms store). Adding it here made route_to_exhaust() (which merges machinery prefixes) silently reroute every test/* write to exhaust.db, breaking FTS-divergence and other mem.db assertions. The hygiene spec owns the historical test/ rows (2 rows, quarantine) — the FAUCET must not move them. If a genuine machine-state producer needs a test/ sub-prefix, it gets a LITERAL, more specific prefix (e.g. 'test/machine/'), never the bare 'test/'."
+    }
+  ]
+}

@@ -95,27 +95,151 @@ HOSTNAME = os.uname().nodename
 _cold_path_logger = logging.getLogger("agents_core.mem.cold_path")
 
 
+# ---------------------------------------------------------------------------
+# Machinery-store extension (openclaw-memdb-influx-reader-v0, D3 — RESCOPED
+# rev-2). The "machinery store" is NOT a second sqlite: it is this existing
+# exhaust store (the route_to_exhaust mechanism) extended with a reconciled
+# NARROW prefix list loaded from the shared allowlist artifact
+# (agents_core.mem_machinery). No fork, no mem_machinery.db.
+#
+# The extension is loaded lazily and cached, and it is deliberately FAIL-OPEN
+# at the library level: a missing/malformed allowlist here must NOT break the
+# library-level set()/get()/list_by_prefix() chokepoint (every mem CLI call
+# funnels through it). The FAIL-CLOSED guard lives in mem_server.create_app(),
+# which validates the allowlist at boot and refuses to start (the gate's
+# hard requirement). So the server can never run with a bad allowlist, and a
+# library-only caller (no server) degrades to the static EXHAUST_PREFIXES
+# rather than raising on every write.
+# ---------------------------------------------------------------------------
+
+_machinery_prefixes_cache: tuple[str, ...] | None = None
+_machinery_prefixes_loaded = False
+
+
+def machinery_prefixes() -> tuple[str, ...]:
+    """The reconciled narrow machine-state prefix list from the shared
+    allowlist artifact, cached after first load.
+
+    Fail-OPEN at the library level (see the block above): on
+    ``AllowlistError`` (missing/malformed/unreadable) returns ``()`` so the
+    library chokepoint keeps working; the server's boot-time guard is what
+    enforces fail-closed.
+
+    PROCESS-GLOBAL CACHE (reviewer PR #334 cycle 1 [low]): the cache is
+    module-level, shared across ALL MemoryStore instances in the process,
+    and is NOT invalidated by a mid-process allowlist change (env-var
+    rotation, file edit). A test that mutates
+    ``MEM_MACHINE_STATE_PREFIXES_PATH`` — or any caller that rotates the
+    allowlist at runtime — MUST call ``reset_machinery_prefixes_cache()``
+    before the change takes effect (tests/test_mem_influx.py::
+    test_library_fail_open_degrades_to_static_prefixes does exactly this).
+    In production the allowlist is static for the process lifetime (the
+    server's boot-time guard pins it at start; a rotation is a restart),
+    so the cache is a deliberate trade-off, not an oversight.
+
+    LATENT FOOTGUN for non-server callers (reviewer PR #337 cycle 1
+    [low]; re-confirmed by reviewer PR #338 cycle 1 [low]): any library
+    caller that rotates the allowlist at runtime — editing the file or
+    changing ``MEM_MACHINE_STATE_PREFIXES_PATH`` — MUST call
+    ``reset_machinery_prefixes_cache()`` first, or every
+    ``route_to_exhaust()`` / ``could_overlap_exhaust()`` / ``set()``
+    call in the process silently keeps using the STALE prefix set for
+    the rest of the process lifetime. There is no mtime check and no
+    signal; the staleness is invisible from the outside. The reset
+    helper exists precisely for this; a rotation that forgets it is a
+    silent routing change, not a loud one.
+
+    This is a DELIBERATE trade-off, not an oversight: the cache exists
+    because the allowlist is static for the process lifetime in the
+    production path (the server's boot-time guard pins it at start; a
+    rotation is a restart). An mtime-based invalidation was considered
+    and rejected — it would add a filesystem stat to every
+    ``route_to_exhaust()`` call (the set() chokepoint, i.e. EVERY mem
+    write) to defend against a path (mid-process rotation in a
+    non-server caller) that the production path never takes. The
+    footgun is documented here + pinned by
+    tests/test_mem_influx.py::test_machinery_prefixes_cache_stale_without_reset
+    so a future reader who hits it can find the reset helper by name.
+    """
+    global _machinery_prefixes_cache, _machinery_prefixes_loaded
+    if _machinery_prefixes_loaded:
+        return _machinery_prefixes_cache
+    try:
+        from agents_core.mem_machinery import load_allowlist
+
+        _machinery_prefixes_cache = load_allowlist().prefixes
+    except Exception as e:  # noqa: BLE001 — library-level fail-open (see block)
+        # Log the degradation LOUDLY (reviewer PR #333 cycle 1 [low]): the
+        # fail-open is a deliberate trade-off (the server's boot-time guard
+        # is the fail-closed surface), but a library caller that silently
+        # degrades routing to the static prefixes — e.g. because the
+        # allowlist was removed mid-process and the cache was reset — would
+        # otherwise route machine-state keys into mem.db with no signal.
+        # Once per process per failure (the cache stays loaded, so this
+        # fires exactly once until reset_machinery_prefixes_cache()).
+        _cold_path_logger.warning(json.dumps({
+            "event": "machinery_allowlist_fail_open",
+            "error": str(e),
+            "effect": "machinery routing degraded to static EXHAUST_PREFIXES",
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }))
+        _machinery_prefixes_cache = ()
+    _machinery_prefixes_loaded = True
+    return _machinery_prefixes_cache
+
+
+def reset_machinery_prefixes_cache() -> None:
+    """Clear the cache (tests / allowlist rotation).
+
+    REQUIRED after any mid-process allowlist change (file edit,
+    ``MEM_MACHINE_STATE_PREFIXES_PATH`` rotation) for the new value to
+    take effect — see ``machinery_prefixes()`` for the stale-prefix
+    footgun this reset is the antidote to (reviewer PR #337 cycle 1
+    [low])."""
+    global _machinery_prefixes_cache, _machinery_prefixes_loaded
+    _machinery_prefixes_cache = None
+    _machinery_prefixes_loaded = False
+
+
+def _all_exhaust_prefixes() -> tuple[str, ...]:
+    """Static tier-1 prefixes + the reconciled machinery extension."""
+    ext = machinery_prefixes()
+    if not ext:
+        return EXHAUST_PREFIXES
+    merged = list(EXHAUST_PREFIXES)
+    for p in ext:
+        if p not in merged:
+            merged.append(p)
+    return tuple(merged)
+
+
 def route_to_exhaust(key: str) -> bool:
-    """True if `key` belongs to one of the tier-1 exhaust prefixes.
+    """True if `key` belongs to a tier-1 exhaust prefix OR a reconciled
+    machinery-store prefix (openclaw-memdb-influx-reader-v0, D3).
 
     `str.startswith()` given a tuple checks each element with exact
     startswith semantics — equivalent to `any(key.startswith(p) for p in
-    EXHAUST_PREFIXES)`, never a substring or regex test.
+    EXHAUST_PREFIXES + machinery_prefixes())`, never a substring or regex
+    test.
     """
-    return key.startswith(EXHAUST_PREFIXES)
+    return key.startswith(_all_exhaust_prefixes())
 
 
 def could_overlap_exhaust(prefix: str) -> bool:
     """Cheap pre-filter for MemoryStore.list_by_prefix()'s fall-through.
 
     True if a `list_by_prefix(prefix)` query could possibly select any key
-    covered by EXHAUST_PREFIXES — in either direction: a broader query like
-    "elevator" as well as a narrower one like "elevator/proposals/". Lets
-    list_by_prefix() skip the sibling store entirely for the vast majority of
-    prefixes that share no root with the three routed families, instead of
-    adding a query (and a lazily-created exhaust.db) to every call site.
+    covered by the exhaust prefixes (tier-1 + machinery extension) — in
+    either direction: a broader query like "elevator" as well as a narrower
+    one like "elevator/proposals/". Lets list_by_prefix() skip the sibling
+    store entirely for the vast majority of prefixes that share no root with
+    the routed families, instead of adding a query (and a lazily-created
+    exhaust.db) to every call site.
     """
-    return any(p.startswith(prefix) or prefix.startswith(p) for p in EXHAUST_PREFIXES)
+    return any(
+        p.startswith(prefix) or prefix.startswith(p)
+        for p in _all_exhaust_prefixes()
+    )
 
 
 def log_cold_path_access(key: str) -> None:

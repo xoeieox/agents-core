@@ -26,6 +26,44 @@ master. StarHouse and MacBook are read-only mirrors. The master is set by the
 | `MEM_SERVER` | (unset) | When set, CLI routes through HTTP; unset means local DB |
 | `MEM_BEARER_TOKEN` | (unset) | Must match server token |
 | `MEM_CLIENT_TIMEOUT` | `5.0` | Per-request timeout in seconds |
+| `MEM_PRINCIPAL` | (unset) | The caller's principal name, sent as the `X-Mem-Principal` header on every request (openclaw-memdb-influx-reader-v0, D1). Unset = no header = the server treats the caller as a reader (fail-closed). The BRIX-side mem CLI defaults to `brix-pm` for write verbs (promote) when this is unset (D1 / panel F7). |
+
+## Promote verb (openclaw-memdb-influx-reader-v0, D2)
+
+The `mem promote` subcommand promotes one row from an agent store into
+mem.db with a provenance shape the server owns (the exact header line +
+the batch decision key). It is an explicit, server-side verb — a local
+MemoryStore-only promote is refused (loud exit 2) because it would bypass
+the server's `--from` shape check + batch key (the side-effect the spec
+forbids: "promotion is an explicit verb with a provenance shape, never a
+side effect").
+
+```
+mem promote <key> [--content <body>] --from <agent>/<store>
+             [--by <curator-principal>] [--tags tag1,tag2]
+             [--rationale one-line-why] [--store atoms|machinery]
+```
+
+(The promoted body is the `--content` option, not a positional — argparse
+stops consuming positionals at the first option, so the documented form
+with the body as a positional after `--from` would not parse.)
+
+- `--from` is shape-validated (path-like/ref-like token, no newlines or
+  control chars, loud 400 — panel security F6).
+- `--by` is the curator principal (defaults to `MEM_PRINCIPAL`, then
+  `brix-pm` for the BRIX-side CLI).
+- `--rationale` is the one-line rationale the D2 named decision artifact
+  requires per promoted key (the batch decision key
+  `decision/memdb-promotion-<YYYYMMDD>-<curator>` lists promoted keys +
+  their `--from` refs + one-line rationale).
+- `--store` is RESCOPED (rev-2): the machinery store is the EXISTING
+  exhaust store, so the flag is MOOT at the HTTP layer (the server routes
+  machine-state keys transparently). It is validated (loud ValueError on a
+  typo) but does NOT change routing.
+
+The named weekly audit command:
+`mem list --tag promoted --since <7-days-ago> --limit 500` (explicit limit
+— the default 50 silently truncates).
 
 ## Linux - systemd (user mode)
 

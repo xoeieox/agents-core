@@ -4,7 +4,13 @@ import pytest
 import respx
 import httpx
 
-from agents_core.mem_client import MemClient, MemHTTPError
+from agents_core.mem_client import (
+    MemClient,
+    MemHTTPError,
+    STORE_ATOMS,
+    STORE_MACHINERY,
+    validate_store,
+)
 
 
 BASE = "http://test-mem-server:8403"
@@ -141,3 +147,46 @@ def test_error_raises_mem_http_error(client):
     with pytest.raises(MemHTTPError) as exc:
         client.stats()
     assert exc.value.status_code == 500
+
+
+# ---------------------------------------------------------------------------
+# --store plumbing (openclaw-memdb-influx-reader-v0, D2 / Files-changed)
+# ---------------------------------------------------------------------------
+
+def test_validate_store_known_values():
+    assert validate_store(STORE_ATOMS) == STORE_ATOMS
+    assert validate_store(STORE_MACHINERY) == STORE_MACHINERY
+    # 'exhaust' is an alias for 'machinery' (the rescoped store name).
+    assert validate_store("exhaust") == STORE_MACHINERY
+
+
+def test_validate_store_rejects_typo():
+    with pytest.raises(ValueError, match="unknown --store"):
+        validate_store("machinery-typo")
+    with pytest.raises(ValueError, match="unknown --store"):
+        validate_store("")
+
+
+@respx.mock
+def test_set_accepts_store_machinery():
+    """The --store machinery flag is accepted (rescoped MOOT at the HTTP
+    layer — the server routes machine-state keys transparently). The flag
+    is validated (loud ValueError on a typo) but does NOT change routing."""
+    c = MemClient(base_url=BASE)
+    route = respx.put(f"{BASE}/v0/memories/elevator/proposals/p1").mock(
+        return_value=httpx.Response(200, json={
+            "key": "elevator/proposals/p1", "content": "v", "tags": "",
+            "source": "s", "created_at": "x", "updated_at": "y", "created": True,
+        })
+    )
+    row = c.set("elevator/proposals/p1", "v", store=STORE_MACHINERY)
+    assert row["key"] == "elevator/proposals/p1"
+
+
+@respx.mock
+def test_set_rejects_unknown_store():
+    """An unknown --store value is rejected client-side (loud ValueError):
+    a typo is loud, not silently ignored (fail-closed at the client edge)."""
+    c = MemClient(base_url=BASE)
+    with pytest.raises(ValueError, match="unknown --store"):
+        c.set("foo/bar", "v", store="machinery-typo")

@@ -25,6 +25,7 @@ test = ["pytest", "respx", "pytest-asyncio", "httpx"]
 [project.scripts]
 narrative-emit = "agents_core.narrative.emit:main"
 mem-server = "agents_core.mem_server:main"
+mem-cli = "agents_core.mem_cli:main"
 gpu-queue-server = "agents_core.gpu_server:main"
 slot-server = "agents_core.slot_server:main"
 keeper-query = "agents_core.keeper_query:main"
