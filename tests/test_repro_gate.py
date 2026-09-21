@@ -51,7 +51,7 @@ from typing import Any
 
 import pytest
 
-from agents_core import repro_gate
+from agents_core import repro_gate, shaped_runner
 from agents_core.repro_gate import (
     ENFORCE_OFF,
     ENFORCE_ON,
@@ -1300,3 +1300,369 @@ class TestRunRepro:
         # The artifact is kept.
         assert result["artifact"] != ""
         assert Path(result["artifact"]).is_file()
+
+
+# ---------------------------------------------------------------------------
+# The D2 SEAM (shaped_runner._compute_salvage_decision ->
+# salvage_label_decision): the on-mode live path must feed the repro the
+# FULL gate output + the full-summary-parser node-ids + the per-repo
+# full-suite paths + the D3 provenance block. The cycle-2 defect: the
+# seam passed the 20-line output_tail + the legacy 20-line extractor +
+# NO full_suite_paths + NO provenance_block, so every real gate-red
+# routed to the salvage-error partition with NO PR / NO label / NO
+# reviewer cycle (the empty-input fallback returned VERDICT_ERROR).
+# ---------------------------------------------------------------------------
+
+def _make_wt_with_origin(tmp_path: Path) -> tuple[Path, Path]:
+    """A worktree whose origin is a bare repo (mirrors the fixture
+    pattern in test_shaped_runner_tail_fail_closed.py). The tail's
+    salvage path pushes to origin, so the worktree needs a reachable
+    origin remote."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", str(origin)],
+        capture_output=True, text=True, check=True,
+    )
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main"], cwd=wt,
+        capture_output=True, text=True, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=wt,
+        capture_output=True, text=True, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "test"], cwd=wt,
+        capture_output=True, text=True, check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", "base"], cwd=wt,
+        capture_output=True, text=True, check=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(origin)], cwd=wt,
+        capture_output=True, text=True, check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-q", "origin", "main"], cwd=wt,
+        capture_output=True, text=True, check=True,
+    )
+    return wt, origin
+
+
+def _seam_kwargs(wt_dir: Path, **overrides) -> dict:
+    """Build the tail_finalize kwargs for the gate-RED salvage path
+    (the "test gate failed" partition - the D2 enforcement seam's
+    live carrier: concluded, NON-WIP-salvage-eligible, no guard
+    flags, a non-empty in-tail diff, a RED gate). That shape reaches
+    the `if not gate_passed:` partition where _compute_salvage_decision
+    runs and the on-mode dispositions (run-not-concluded / chain-stop /
+    defer / salvage-error / salvage-red / salvage-green) are applied.
+
+    The shape is deliberately NOT the class-4a shape (concluded + WIP +
+    empty-diff + head-past-base): that shape routes to the class-4a
+    salvage partition (the "concluded, gate passed" [SALVAGE] PR) which
+    opens the concluded_gate_rejected label directly and does NOT
+    consult the salvage decision (the class-4a on-mode clean-push
+    routing is a separate, pre-existing path - out of scope for the
+    cycle-2 gate-RED wiring fix)."""
+    kwargs = {
+        "task_id": "task-seam",
+        "target_id": "tgt-seam",
+        "bare_repo": "agents-core",
+        "branch": "lapis/tgt-seam/local",
+        "slug": "local",
+        "cwd": str(wt_dir),
+        "worktree_path": str(wt_dir),
+        # A non-empty in-tail diff: the gate-RED salvage partition
+        # commits the worktree state (the empty-diff bail would fire
+        # before it otherwise).
+        "final_diff": "diff --git a/x.py b/x.py\n+1\n",
+        "concluded": True,
+        "last_test_outcome": None,
+        "max_steps_hit": False,
+        "no_progress_hit": False,
+        "stop_reason": "concluded",
+        "step_count": 5,
+        "transcript_path": wt_dir / "transcript.json",
+        "gate_passed": False,
+        "gate_bypassed": None,
+        "model_touched_tests": set(),
+        "gate_rerun_fired": False,
+        "wip_ref": "",
+        "wip_commit_count": 0,  # NOT WIP-salvage-eligible
+        "wip_head_sha": "",
+        "wip_steps": [],
+        "_wip_git": None,
+        "base_sha": "",
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _red_outcome_full_output(n_fail: int) -> dict:
+    """A red gate outcome whose output_tail carries the FULL short
+    test summary section (n_fail FAILED lines - >20 lines for the
+    >20-line truncation test) + the summary line."""
+    failed_lines = "\n".join(
+        f"FAILED tests/test_{i}.py::test_{i}" for i in range(n_fail)
+    )
+    output = (
+        "============================= short test summary info "
+        "=============================\n"
+        f"{failed_lines}\n"
+        f"{n_fail} failed in 5.0s"
+    )
+    return {
+        "passed": 0,
+        "failed": n_fail,
+        "errors": 0,
+        "returncode": 1,
+        "summary": f"{n_fail} failed in 5.0s",
+        "output_tail": output,
+    }
+
+
+class TestSalvageSeam:
+    """The D2 seam (shaped_runner._compute_salvage_decision) - the
+    on-mode live path must wire the full gate output, the
+    full-summary-parser node-ids, the full-suite paths, and the D3
+    provenance block through to salvage_label_decision. The cycle-2
+    defect: the seam passed the 20-line output_tail + the legacy
+    20-line extractor + NO full_suite_paths + NO provenance_block, so
+    every real gate-red routed to the salvage-error partition with NO
+    PR / NO label / NO reviewer cycle (the empty-input fallback
+    returned VERDICT_ERROR).
+
+    The tests exercise the SEAM (not just the repro_gate functions):
+    tail_finalize is driven end-to-end through the gate-RED salvage
+    partition, with the seam's repro dependency (repro_gate.run_repro)
+    and provenance dependency (shaped_runner._build_provenance_block)
+    patched so the seam's wiring is observable in the captured
+    arguments."""
+
+    def _run_seam(self, tmp_path: Path, monkeypatch, capsys,
+                  **overrides) -> str:
+        wt_dir, _ = _make_wt_with_origin(tmp_path)
+        # Stage a file so the gate-RED salvage partition's
+        # `git add -A` + `git commit` succeed (the partition commits
+        # the worktree state before opening the [SALVAGE] PR - a clean
+        # index would make the commit rc=1 and the PR never open).
+        (wt_dir / "work.py").write_text("work\n")
+        subprocess.run(
+            ["git", "add", "-A"], cwd=wt_dir,
+            capture_output=True, text=True, check=True,
+        )
+        kwargs = _seam_kwargs(wt_dir)
+        kwargs["last_test_outcome"] = _red_outcome_full_output(2)
+        kwargs.update(overrides)
+        # Patch the seam's PR-open dependency (the gate-RED salvage
+        # partition's carrier) so the test does not hit the network.
+        monkeypatch.setattr(
+            shaped_runner, "_open_wip_salvage_pr",
+            lambda *a, **k: "https://forge.example/pr/seam",
+        )
+        return shaped_runner.tail_finalize(**kwargs)
+
+    def test_on_mode_gate_red_produces_repro_verdict_not_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        """On mode: a real gate-red with a >20-line failure list must
+        produce a repro verdict from the PARSED node-ids (the full
+        short-summary parse), NOT VERDICT_ERROR (the legacy 20-line
+        extractor returned [] for a >20-line list -> the empty-input
+        fallback -> the salvage-error partition with no PR)."""
+        monkeypatch.setenv("LAPIS_PM_REPRO_ENFORCE", "on")
+        # A >20-line failure list (25 FAILED lines).
+        outcome = _red_outcome_full_output(25)
+        captured: dict = {}
+
+        def _fake_repro(**kw):
+            captured.update(kw)
+            return {
+                "verdict": VERDICT_RED, "subcode": "", "full_suite": False,
+                "node_ids": kw.get("failed_node_ids") or [],
+                "artifact": "", "provenance": {}, "ts": "2026-09-21T00:00:00Z",
+            }
+
+        # The seam's repro dependency: salvage_label_decision's default
+        # run_repro_fn is repro_gate.run_repro (resolved at call time) -
+        # patch the module attribute the seam's repro_fn resolves.
+        monkeypatch.setattr(repro_gate, "run_repro", _fake_repro,
+                            raising=False)
+        out = self._run_seam(
+            tmp_path, monkeypatch, capsys, last_test_outcome=outcome,
+        )
+        # The repro verdict is RED (from the parsed node-ids), NOT
+        # VERDICT_ERROR - the label is EARNED and the [SALVAGE] PR
+        # opens with the [REPRO-RED] title tag (no salvage-error
+        # partition, no silent drop).
+        assert captured, "the repro was never invoked through the seam"
+        # The seam fed the FULL gate output (the complete short-summary
+        # section), NOT the 20-line tail.
+        assert "short test summary info" in captured["gate_output"]
+        # The failed node-ids come from the FULL parser (all 25), NOT
+        # the legacy 20-line extractor (which would return [] for a
+        # >20-line list).
+        assert len(captured["failed_node_ids"]) == 25
+        assert captured["failed_node_ids"][0] == "tests/test_0.py::test_0"
+        # The full-suite paths are threaded (the empty-input fallback
+        # re-runs the full gate suite instead of erroring).
+        assert captured["full_suite_paths"] == ["tests/"]
+        # The PR opened (the repro verdict is RED, not ERROR).
+        assert out == "https://forge.example/pr/seam"
+        err = capsys.readouterr().err
+        assert "salvage-error" not in err
+
+    def test_on_mode_empty_summary_triggers_full_suite_fallback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        """On mode: a gate-red whose summary parse comes back EMPTY
+        (the collection-error / rc=4 / rc=5 / timeout shapes) must
+        trigger the full-suite fallback in the fresh clone - never a
+        vacuous GREEN, never VERDICT_ERROR (the legacy seam passed no
+        full_suite_paths -> the fallback's run_paths was empty ->
+        VERDICT_ERROR)."""
+        monkeypatch.setenv("LAPIS_PM_REPRO_ENFORCE", "on")
+        # A red outcome whose output_tail carries NO failure lines
+        # (the rc=4 touched-path-missing shape - the full parser
+        # returns []).
+        outcome = {
+            "passed": 0, "failed": 0, "errors": 0, "returncode": 4,
+            "summary": "no tests ran",
+            "output_tail": "ERROR: file or directory not found: tests/x.py",
+        }
+        captured: dict = {}
+
+        def _fake_repro(**kw):
+            captured.update(kw)
+            # The full-suite fallback: run_paths == full_suite_paths
+            # (the per-repo baseline) - the repro re-runs the FULL gate
+            # suite in the fresh clone (a RED verdict from the full
+            # suite - never a vacuous GREEN).
+            return {
+                "verdict": VERDICT_RED, "subcode": "", "full_suite": True,
+                "node_ids": kw.get("full_suite_paths") or [],
+                "artifact": "", "provenance": {}, "ts": "2026-09-21T00:00:00Z",
+            }
+
+        monkeypatch.setattr(repro_gate, "run_repro", _fake_repro,
+                            raising=False)
+        out = self._run_seam(
+            tmp_path, monkeypatch, capsys, last_test_outcome=outcome,
+        )
+        assert captured, "the repro was never invoked through the seam"
+        # The full-summary parse came back empty -> the failed node-ids
+        # are [] (the empty-input shape).
+        assert captured["failed_node_ids"] == []
+        # The full-suite paths are threaded (the per-repo baseline) -
+        # the empty-input fallback re-runs the full gate suite instead
+        # of erroring.
+        assert captured["full_suite_paths"] == ["tests/"]
+        # The repro verdict is RED (the full-suite fallback proved the
+        # red), NOT VERDICT_ERROR / VERDICT_GREEN - the PR opens.
+        assert out == "https://forge.example/pr/seam"
+        err = capsys.readouterr().err
+        assert "salvage-error" not in err
+
+    def test_on_mode_incomplete_provenance_returns_run_not_concluded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        """On mode: a gate run whose provenance block is
+        missing/incomplete must return run_not_concluded (no PR, no
+        label, no cycle) - the D3 refusal must be REACHABLE in the
+        live path (the legacy seam never passed provenance_block, so
+        the refusal was dead code)."""
+        monkeypatch.setenv("LAPIS_PM_REPRO_ENFORCE", "on")
+        # Force the gate's provenance block to be incomplete (a missing
+        # resolved_package_path - the unaudited shape).
+        monkeypatch.setattr(
+            shaped_runner, "_build_provenance_block",
+            lambda **kw: {
+                "repo": kw.get("repo", ""),
+                "head_sha": kw.get("head_sha", ""),
+                "cwd": kw.get("cwd", ""),
+                "resolved_package_path": "",  # incomplete
+                "sys_path_shadow_check": [],
+                "confcutdir": kw.get("confcutdir", ""),
+                "quarantine_state": "",
+                "ts": "2026-09-21T00:00:00Z",
+            },
+            raising=False,
+        )
+        out = self._run_seam(tmp_path, monkeypatch, capsys)
+        # No PR (the run_not_concluded refusal - the unaudited gate run
+        # cannot conclude).
+        assert out == ""
+        err = capsys.readouterr().err
+        assert "run_not_concluded" in err
+        # No salvage PR was opened (the refusal fires before the
+        # concluded_gate_rejected label).
+        assert "opening advisory [SALVAGE] PR" not in err
+
+    def test_shadow_mode_seam_stays_today_behavior(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        """Shadow mode: the seam still emits the today-behavior
+        concluded_gate_rejected label (the mislabel quantified live) -
+        the shadow path is byte-identical to today (the repro verdict
+        + the would-be disposition are observations only)."""
+        monkeypatch.setenv("LAPIS_PM_REPRO_ENFORCE", "shadow")
+        captured: dict = {}
+
+        def _fake_repro(**kw):
+            captured.update(kw)
+            return {
+                "verdict": VERDICT_RED, "subcode": "", "full_suite": False,
+                "node_ids": kw.get("failed_node_ids") or [],
+                "artifact": "", "provenance": {}, "ts": "2026-09-21T00:00:00Z",
+            }
+
+        monkeypatch.setattr(repro_gate, "run_repro", _fake_repro,
+                            raising=False)
+        out = self._run_seam(tmp_path, monkeypatch, capsys)
+        # The shadow path opens the today-behavior [SALVAGE] PR
+        # (concluded_gate_rejected label stands - the mislabel is
+        # quantified live by the shadow observation).
+        assert out == "https://forge.example/pr/seam"
+        assert captured, "the repro ran (the shadow observation is written)"
+        err = capsys.readouterr().err
+        assert "concluded, gate rejected" in err
+        # The shadow path does NOT enforce (no run_not_concluded
+        # refusal, no salvage-error partition).
+        assert "run_not_concluded" not in err
+        assert "salvage-error" not in err
+
+    def test_off_mode_seam_is_byte_identical(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        """Off mode: the seam is byte-identical to today's behavior
+        (no repro run, no observation - the salvage path is
+        untouched)."""
+        monkeypatch.setenv("LAPIS_PM_REPRO_ENFORCE", "off")
+        called = {"n": 0}
+
+        def _fake_repro(**kw):
+            called["n"] += 1
+            return {
+                "verdict": VERDICT_RED, "subcode": "", "full_suite": False,
+                "node_ids": [], "artifact": "", "provenance": {},
+                "ts": "2026-09-21T00:00:00Z",
+            }
+
+        monkeypatch.setattr(repro_gate, "run_repro", _fake_repro,
+                            raising=False)
+        out = self._run_seam(tmp_path, monkeypatch, capsys)
+        # The off path opens the today-behavior [SALVAGE] PR and NEVER
+        # runs the repro (no observation).
+        assert out == "https://forge.example/pr/seam"
+        assert called["n"] == 0, "off mode must not run the repro"
+        err = capsys.readouterr().err
+        assert "concluded, gate rejected" in err

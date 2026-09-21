@@ -37,6 +37,8 @@ from agents_core.room_paths import room_path
 from agents_core.repro_gate import (
     salvage_label_decision as _salvage_label_decision,
     repro_verdict_title_tag as _repro_verdict_title_tag,
+    parse_failed_node_ids_full as _parse_failed_node_ids_full,
+    build_provenance_block as _build_provenance_block,
 )
 
 # Opt-in stream-json log dir for spec_reviewer shaped-runner tasks
@@ -1440,15 +1442,61 @@ def tail_finalize(
         _salvage_decision_computed = True
         try:
             _repro_head_sha = _git("rev-parse", "HEAD").stdout.strip()
+            # D2 (lapis-pm-test-gate-hermeticity-v0) cycle-2 fix: the
+            # gate-RED salvage path must feed the repro the FULL gate
+            # output (the complete pytest output the gate captured), NOT
+            # the 20-line output_tail the spec (H2) explicitly rejects -
+            # and the failed node-ids must come from repro_gate's full
+            # short-test-summary-section parser, NOT the legacy
+            # 20-line _extract_failed_node_ids (which silently drops
+            # failure lists longer than 20 lines and returns [] for the
+            # collection-error / rc=4 / rc=5 / 180s-timeout shapes).
+            #
+            # The gate's deciding outcome is the model's last run_tests
+            # outcome (capped at the tool-output cap in gw_agent) or the
+            # D1 targeted re-run (which parses the FULL subprocess
+            # output, structurally bypassing the cap). The deciding
+            # outcome's output_tail is the best full-output source the
+            # seam has (the re-run's tail is the full output; the model
+            # outcome's tail is its capped output) - the legacy
+            # 20-line truncation is what H2 kills.
+            _gate_full_output = (
+                (last_test_outcome or {}).get("output_tail") or ""
+            )
+            _repro_failed_node_ids = _parse_failed_node_ids_full(
+                _gate_full_output
+            )
+            # The per-repo full-suite test paths (the touched-test set +
+            # the per-repo test baseline the gate itself uses) - the
+            # empty-input fallback re-runs the FULL gate suite in the
+            # fresh clone instead of erroring. Without this the
+            # fallback's run_paths is empty and repro_gate returns
+            # VERDICT_ERROR (unknown subcode) for every real gate-red.
+            _full_suite_paths = (
+                sorted(model_touched_tests)
+                if model_touched_tests else ["tests/"]
+            )
+            # D3 (lapis-pm-test-gate-hermeticity-v0) cycle-2 fix: pass
+            # the gate run's provenance block through the seam so the
+            # on-mode run_not_concluded refusal (an unaudited gate run
+            # cannot conclude) is reachable in the live path. The
+            # provenance block is the D3 build_provenance_block output
+            # the gate assembles for THIS run (the gate's own cwd + the
+            # gate's recorded head).
+            _gate_provenance_block = _build_provenance_block(
+                repo=bare_repo,
+                head_sha=_repro_head_sha,
+                cwd=cwd,
+                confcutdir=cwd,
+            )
             _salvage_decision = _salvage_label_decision(
                 target=target_id,
                 head_sha=_repro_head_sha,
                 gate_passed=gate_passed,
                 last_test_outcome=last_test_outcome,
-                gate_output=(
-                    (last_test_outcome or {}).get("output_tail") or ""
-                ),
-                failed_node_ids=_extract_failed_node_ids(last_test_outcome),
+                gate_output=_gate_full_output,
+                failed_node_ids=_repro_failed_node_ids,
+                full_suite_paths=_full_suite_paths,
                 wip_commit_count=wip_commit_count,
                 empty_diff=not final_diff.strip(),
                 head_past_base=bool(base_sha) and _repro_head_sha != base_sha,
@@ -1456,6 +1504,7 @@ def tail_finalize(
                 wip_ref=wip_ref,
                 current_head_sha=_repro_head_sha,
                 repo=bare_repo,
+                provenance_block=_gate_provenance_block,
                 log=lambda m: print(m, file=sys.stderr),
             )
         except Exception as exc:
