@@ -840,28 +840,58 @@ def test_cli_lineage_subcommand(tmp_path, monkeypatch):
 # Bounded-accumulation guarantee (reviewer debt 6157790b94): search() with a
 # small limit must NOT materialise the entire result set in memory — it
 # streams line-by-line and caps retention at `limit` entries (bisect-insert),
-# so memory is O(limit), not O(total matching entries). The behaviour is
-# pinned by test_limit_equivalence above; this test pins the memory bound by
-# scanning a large store with a tiny limit and asserting only `limit` entries
-# are retained (not the full corpus).
+# so memory is O(limit), not O(total matching entries). test_limit_equivalence
+# above pins the output behaviour; the test below pins the MEMORY BOUND
+# directly with tracemalloc: a bounded scan's peak allocation must stay
+# small (O(limit)) while the unbounded scan of the same store holds the
+# full corpus. A regression to full-scan-then-slice would pass the
+# behaviour tests but fail this one.
 # ---------------------------------------------------------------------------
 
 def test_search_limit_does_not_materialise_full_store(tmp_path, monkeypatch):
-    """With limit=1 over a store with many matching entries, search() returns
-    exactly 1 entry and (per the bounded-accumulation implementation) never
-    holds more than `limit` entries at once. Pinned by asserting the result
-    is the single earliest entry even though the store is scanned in an
-    order where the earliest is NOT first-scanned."""
+    """Memory bound: with limit=1 over a store with many matching entries,
+    search() never holds more than O(limit) entries at once. Pinned by
+    asserting (a) the result is the single earliest entry even though the
+    store is scanned in an order where the earliest is NOT first-scanned,
+    and (b) the bounded scan's peak traced allocation is a small fraction
+    of the unbounded scan's peak over the same store."""
+    import tracemalloc
+
     monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
     base = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-    # 50 entries, out of timestamp order: earliest ts is written last.
-    for i in range(50):
-        record("agent-x", "friction", "ctx", f"entry-{i}",
+    # 500 entries, each ~1 KiB of content, out of timestamp order:
+    # earliest ts is written last. Unbounded scan holds ~500 KiB.
+    filler = "x" * 1000
+    for i in range(500):
+        record("agent-x", "friction", "ctx", f"entry-{i}-{filler}",
                now=base + timedelta(minutes=i))
-    # Oldest is entry-0 (base + 0 min).
+
+    # Warm up (module imports, json codecs, dir listing) outside tracing.
+    search(limit=1)
+
+    tracemalloc.start()
     res = search(limit=1)
+    _, bounded_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    tracemalloc.start()
+    res_unbounded = search(limit=None)
+    _, unbounded_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    # Oldest is entry-0 (base + 0 min).
     assert len(res) == 1
-    assert res[0]["content"] == "entry-0"
-    # Bounded path: limit=2 also returns the two earliest, not the first-scanned.
-    res2 = search(limit=2)
-    assert [e["content"] for e in res2] == ["entry-0", "entry-1"]
+    assert res[0]["content"].startswith("entry-0-")
+    assert len(res_unbounded) == 500
+
+    # The unbounded scan must actually hold the corpus (sanity: the
+    # comparison is meaningful, not both tiny).
+    assert unbounded_peak > 100_000
+
+    # The bounded scan must hold far less than the full corpus —
+    # O(limit) retention, not O(total matching entries).
+    assert bounded_peak < unbounded_peak // 4, (
+        f"bounded scan peak {bounded_peak} B is not much smaller than "
+        f"unbounded peak {unbounded_peak} B — search(limit=1) appears to "
+        "materialise the full result set"
+    )
