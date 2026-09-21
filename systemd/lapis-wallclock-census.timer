@@ -1,0 +1,11 @@
+[Unit]
+Description=Lapis PM wall-clock census - daily fixer/fixer_retry wall-clock aggregate (lapis-pm-test-gate-hermeticity-v0 D6)
+
+[Timer]
+OnCalendar=*-*-* 06:00:00 America/Los_Angeles
+RandomizedDelaySec=120s
+Persistent=true
+Unit=lapis-wallclock-census.service
+
+[Install]
+WantedBy=timers.target

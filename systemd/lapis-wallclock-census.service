@@ -1,0 +1,16 @@
+[Unit]
+Description=Lapis PM wall-clock census - aggregate the day's fixer/fixer_retry wall-clock from the claude-queue completed ledger and write state/fixer-wallclock-census-<date> (lapis-pm-test-gate-hermeticity-v0 D6)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=user
+WorkingDirectory=/srv/agents
+ExecStart=/usr/bin/python3 -m agents_core.repro_gate census
+EnvironmentFile=-/srv/agents/config/conductor.env
+Environment=PYTHONPATH=/srv/agents:/home/user/.local/lib/python3.12/site-packages
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin:/home/user/.local/bin
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

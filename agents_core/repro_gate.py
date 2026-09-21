@@ -126,12 +126,15 @@ PREEXISTING_LABEL_EXPIRY_DAYS = 7
 # The env keys the repro subprocess must NEVER carry (two-phase env,
 # rev 2 H5 + rev 3 fail-closed runtime assertion). The clone step is
 # credentialed; the repro pytest subprocess runs on an explicit allow-list
-# WITHOUT these.
+# WITHOUT these. The git-cred marker (the parent-clone's credential
+# helper env - the spec names "the parent-clone git creds" alongside
+# the token keys) is included so the child-side guard re-checks it.
 REPRO_DISALLOWED_ENV_KEYS: tuple[str, ...] = (
     "FORGEJO_TOKEN",
     "DOORMAN_BEARER_TOKEN",
     "PHALA_API_KEY",
     "GPU_QUEUE_BEARER_TOKEN",
+    "GIT_CREDENTIALS",
 )
 
 # The 5-class partition verdicts.
@@ -208,6 +211,7 @@ def read_enforce_mode(env: dict | None = None) -> str:
 
 _FAILED_LINE_RE = re.compile(r"^(FAILED|ERROR)\s+(\S+)")
 _ERROR_AT_RE = re.compile(r"^ERROR at (setup|teardown) of (\S+)")
+_SUMMARY_HEADER_RE = re.compile(r"^=+\s*short test summary info\s*=+$")
 
 
 def parse_failed_node_ids_full(output: str) -> list[str]:
@@ -215,13 +219,28 @@ def parse_failed_node_ids_full(output: str) -> list[str]:
     legacy extractor reads - it silently drops failure lists longer than
     20 lines) for short-test-summary failure lines.
 
+    Scope (the stale-summary guard): only the LAST
+    ``short test summary info`` section is parsed - a stale
+    'previously failed' summary line from an earlier pytest invocation in
+    the same output (the gate's re-run shapes concatenate outputs) must
+    NOT drive a subset run. When NO summary header is present, the whole
+    output is scanned (the legacy shape - the collection-error / rc=4 /
+    rc=5 outputs that carry failure lines without the header).
+
     Returns the node-ids in first-seen order (deduped). Returns [] when
     no failure lines are visible (the collection-error / rc=4 touched-
     path-missing / rc=5 no-tests-ran / 180s-timeout shapes - the caller
     falls back to the full gate suite, never a vacuous GREEN).
     """
+    lines = (output or "").splitlines()
+    # The LAST summary section only (a stale earlier section is ignored).
+    header_idx = -1
+    for i, line in enumerate(lines):
+        if _SUMMARY_HEADER_RE.match(line.strip()):
+            header_idx = i
+    scan_from = header_idx + 1 if header_idx >= 0 else 0
     node_ids: list[str] = []
-    for line in (output or "").splitlines():
+    for line in lines[scan_from:]:
         line = line.strip()
         m = _ERROR_AT_RE.match(line)
         if m:
@@ -497,6 +516,11 @@ def build_repro_env(
     for key in REPRO_DISALLOWED_ENV_KEYS:
         if key in env:
             raise ValueError(f"repro env allow-list carries {key!r}")
+    # The git-cred marker (the parent-clone's credential helper env):
+    # the two-phase env spec names it as disallowed alongside the
+    # token keys. The allow-list never carries it (it is not in the
+    # explicit allow-list above), but the child-side guard re-checks
+    # its own os.environ for it (the fail-closed runtime assertion).
     return env
 
 
@@ -581,20 +605,55 @@ def run_repro_pytest(
             "timed_out": False,
             "subcode": SUBCODE_UNKNOWN,
         }
-    # Per-scope MemoryMax (best-effort cgroup v2): a 12GB ballooned
-    # process oom-killed the whole box on 2026-09-19; one oom-kill takes
-    # the fixer legs, the queue, and everything down. An unsupported
-    # cgroup write degrades to the unbounded shape (WARN, not crash).
+    # Per-scope MemoryMax (the OOM-lane guard - finding/fixer-oom-
+    # 12gb-bundle-wave-2026-09-19: a 12GB ballooned process oom-killed
+    # the whole box; one oom-kill takes the fixer legs, the queue, and
+    # everything down). FAIL-CLOSED (the spec's M5 promotion): a cgroup
+    # write failure degrades to the concurrency=1 fallback - the caller
+    # gates repro concurrency to 1 while any bundle wave is active, so
+    # the UNBOUNDED shape (an unbounded repro racing a bundle wave) is
+    # never the live shape. The cgroup write is attempted AFTER the
+    # spawn (the process must exist to be moved into the scope); a
+    # failure kills the process and returns the named ERROR subcode.
     cgroup_path: str | None = None
-    try:
-        cg = Path(f"/sys/fs/cgroup/lapis-repro-{os.getpid()}-{proc.pid}")
-        cg.mkdir(parents=True, exist_ok=True)
-        (cg / "memory.max").write_text(f"{memory_max_kb}K")
-        (cg / "cgroup.procs").write_text(str(proc.pid))
-        cgroup_path = str(cg)
-    except Exception as exc:
-        _log(log, f"WARN: repro: MemoryMax cgroup unavailable ({exc}) - "
-                  "unbounded shape")
+    memory_limited = False
+    if memory_max_kb > 0:
+        try:
+            cg = Path(f"/sys/fs/cgroup/lapis-repro-{os.getpid()}-{proc.pid}")
+            cg.mkdir(parents=True, exist_ok=True)
+            (cg / "memory.max").write_text(f"{memory_max_kb}K")
+            (cg / "cgroup.procs").write_text(str(proc.pid))
+            cgroup_path = str(cg)
+            memory_limited = True
+        except Exception as exc:
+            _log(log, f"WARN: repro: MemoryMax cgroup unavailable ({exc}) - "
+                      "concurrency=1 fallback (the unbounded shape is "
+                      "never live while a bundle wave is active)")
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+            try:
+                shutil.rmtree(str(cg), ignore_errors=True)
+            except Exception:
+                pass
+            return {
+                "returncode": -1,
+                "output": f"memory-max unavailable: {exc}",
+                "timed_out": False,
+                "subcode": SUBCODE_UNKNOWN,
+                "memory_limited": False,
+            }
+    else:
+        # memory_max_kb == 0: the caller explicitly opted into the
+        # concurrency=1 fallback (a bundle wave is active).
+        _log(log, "WARN: repro: memory_max_kb=0 - concurrency=1 fallback "
+                  "(the unbounded shape is never live while a bundle "
+                  "wave is active)")
     subcode = SUBCODE_UNKNOWN
     timed_out = False
     try:
@@ -630,7 +689,30 @@ def run_repro_pytest(
         "output": output,
         "timed_out": timed_out,
         "subcode": subcode,
+        "memory_limited": memory_limited,
     }
+
+
+# The concurrency=1-under-bundle-waves fallback (the spec's M5 guard,
+# fail-closed shape): while a bundle wave is active, repro concurrency
+# is 1 so an unbounded repro (a cgroup write failure) can never race the
+# wave. The wave flag is set by the bundle dispatcher (or the caller)
+# for the duration of the wave.
+_BUNDLE_WAVE_ACTIVE: bool = False
+
+
+def set_bundle_wave_active(active: bool) -> None:
+    """Set the bundle-wave flag (the caller sets True at wave start,
+    False at wave end). The repro path consults it to decide the
+    concurrency=1 fallback when the cgroup write is unavailable."""
+    global _BUNDLE_WAVE_ACTIVE
+    _BUNDLE_WAVE_ACTIVE = active
+
+
+def bundle_wave_active() -> bool:
+    """True while a bundle wave is active (the concurrency=1 fallback
+    is in force)."""
+    return _BUNDLE_WAVE_ACTIVE
 
 
 # ---------------------------------------------------------------------------
@@ -834,34 +916,58 @@ def _sha_moved(
     wip_ref: str,
     head_sha: str,
     log: Callable[[str], None] | None,
+    current_head_sha: str = "",
 ) -> bool:
     """SHA identity (rev 2 H4): at repro time, re-fetch and verify the
     repro SHA == the current head (or the salvage branch head if
     pre-adopt). SHA-MOVED is its own class: defer to the next tick and
     re-probe the new head; NEVER classify the old gate-red from a
     moved-SHA repro (the misclassification direction is the
-    merge-direction one)."""
-    if not worktree:
-        return False
-    candidates: list[str] = []
-    if wip_ref:
-        candidates.append(wip_ref)
-    try:
-        for ref in candidates:
+    merge-direction one).
+
+    Sources of the CURRENT head, in priority order:
+    1. ``current_head_sha`` - the caller's own re-read of the worktree
+       HEAD at repro time (the re-fetch-and-verify the spec requires -
+       the gate's recorded ``head_sha`` is a STALE capture from gate
+       time and must not be the only source of truth).
+    2. the WIP ref (``refs/wip/<task_id>``) resolved in the worktree -
+       the ref the salvage path already resolves; it moves as the model
+       self-commits.
+    An unresolvable / absent source is NOT a move (the repro proceeds on
+    the gate's recorded head - the fail-open direction; a moved head
+    that leaves NO trace is unobservable by construction).
+    """
+    current = ""
+    if worktree:
+        try:
             r = subprocess.run(
-                ["git", "-C", str(worktree), "rev-parse",
-                 f"{ref}^{{commit}}"],
+                ["git", "-C", str(worktree), "rev-parse", "HEAD"],
                 capture_output=True, text=True, timeout=30,
             )
             if r.returncode == 0:
                 current = r.stdout.strip()
-                if current and current != head_sha:
-                    _log(log, f"WARN: repro: SHA-MOVED {head_sha[:12]} "
-                              f"-> {current[:12]}")
-                    return True
-                return False
-    except Exception:
-        pass
+        except Exception:
+            current = ""
+    if not current and wip_ref and worktree:
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(worktree), "rev-parse",
+                 f"{wip_ref}^{{commit}}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                current = r.stdout.strip()
+        except Exception:
+            current = ""
+    if current_head_sha:
+        # The caller's own re-read wins (it is the freshest observation).
+        current = current_head_sha
+    if not current:
+        return False
+    if current != head_sha:
+        _log(log, f"WARN: repro: SHA-MOVED {head_sha[:12]} "
+                  f"-> {current[:12]}")
+        return True
     return False
 
 
@@ -906,8 +1012,11 @@ def run_repro(
     epoch = int(time.time())
     clone_dest = root / f"{target}-{head_sha[:12]}-{epoch}"
     # SHA identity check FIRST (a moved head poisons every downstream
-    # classification).
-    if _sha_moved(worktree, wip_ref, head_sha, log):
+    # classification). The re-fetch-and-verify: current_head_sha is the
+    # caller's own re-read of the worktree HEAD at repro time (the
+    # gate's recorded head_sha is a stale capture).
+    if _sha_moved(worktree, wip_ref, head_sha, log,
+                  current_head_sha=current_head_sha):
         return {
             "verdict": VERDICT_SHA_MOVED, "subcode": "", "full_suite": False,
             "node_ids": list(failed_node_ids or []), "artifact": "",
@@ -1100,7 +1209,13 @@ def reset_repro_budget() -> None:
 
 
 def repro_budget_available(target: str) -> bool:
-    """True when the target has repro budget left this tick (2/tick)."""
+    """True when the target has repro budget left this tick (2/tick).
+
+    Check-only (does NOT consume) - the atomic check-and-consume is
+    ``try_consume_repro_budget`` (the race-free shape: a tick-boundary
+    reset between a separate check and a separate consume could let two
+    callers both pass the check and both consume, exceeding the cap).
+    """
     tick = _tick_id()
     if tick != _REPRO_TICK:
         # A new tick: the budget resets.
@@ -1109,8 +1224,28 @@ def repro_budget_available(target: str) -> bool:
     return used < REPRO_BUDGET_PER_TARGET_PER_TICK
 
 
+def try_consume_repro_budget(target: str) -> bool:
+    """Atomic check-and-consume: True when one unit of the target's
+    repro budget was consumed this tick; False when the budget is
+    exhausted (the caller defers to the next tick). The tick-boundary
+    reset and the consume happen in one step, so two callers cannot
+    both pass the check and both consume across the boundary."""
+    global _REPRO_TICK
+    tick = _tick_id()
+    if tick != _REPRO_TICK:
+        _REPRO_TICK = tick
+        _REPRO_BUDGET.clear()
+    used = _REPRO_BUDGET.get(target, 0)
+    if used >= REPRO_BUDGET_PER_TARGET_PER_TICK:
+        return False
+    _REPRO_BUDGET[target] = used + 1
+    return True
+
+
 def consume_repro_budget(target: str) -> None:
-    """Consume one unit of the target's repro budget this tick."""
+    """Consume one unit of the target's repro budget this tick (no
+    availability check - the caller already checked or the consume is
+    unconditional)."""
     global _REPRO_TICK
     tick = _tick_id()
     if tick != _REPRO_TICK:
@@ -1367,6 +1502,206 @@ def day_surface_line(
 
 
 # ---------------------------------------------------------------------------
+# D6: the daily wall-clock census (the named timer owner).
+#
+# The spec's D6 deliverable: a versioned BRIX-side
+# ``lapis-wallclock-census.timer`` unit (the in-repo unit files are
+# systemd/lapis-wallclock-census.{timer,service} - PM-side post-land
+# enable, the same Q3 pattern as the sibling autopilot spec) runs
+# ``python3 -m agents_core.repro_gate census`` daily and writes
+# ``state/fixer-wallclock-census-<date>`` (the state/ dir under the
+# repo - the same method as the 09-19 day census). The aggregation is
+# mechanical (no judgment): the claude-queue completed ledger
+# (history.jsonl) is the source of truth for fixer / fixer_retry
+# count + avg + max wall-clock.
+#
+# Miss-visibility (the Nzinga loud-trace pattern): an absent
+# ``state/fixer-wallclock-census-<date>`` key renders as a VISIBLE GAP
+# on the day surface (census_gap_for_day returns the gap marker; the
+# day-surface line carries it).
+# ---------------------------------------------------------------------------
+
+def _census_state_dir() -> Path:
+    """The state/ dir under the repo (the census artifact surface)."""
+    return Path(os.environ.get("LAPIS_CENSUS_STATE_DIR",
+                               str(Path(__file__).resolve().parent.parent
+                                   / "state")))
+
+
+def _census_history_path() -> Path:
+    """The claude-queue completed ledger (the day census's source of
+    truth - the same method as the 09-19 day census)."""
+    try:
+        from agents_core.room_paths import room_path
+        return room_path("claude_queue.history")
+    except Exception:
+        return Path("/srv/lapis/claude-queue/history.jsonl")
+
+
+def aggregate_wallclock_census(
+    date: str,
+    *,
+    history_path: Path | None = None,
+) -> dict:
+    """Aggregate the day's fixer / fixer_retry wall-clock from the
+    claude-queue completed ledger (history.jsonl).
+
+    Mechanical aggregation (no judgment): completed events whose
+    timestamp is on ``date`` (YYYY-MM-DD), classified by task id
+    (``fixer_retry`` in the id -> fixer_retry; ``fixer`` in the id but
+    not ``fixer_retry`` -> fixer). Returns:
+      {"date": date,
+       "fixer": {"count": n, "avg_s": f, "max_s": f},
+       "fixer_retry": {"count": n, "avg_s": f, "max_s": f},
+       "repro_verdict_counts": {...},   # from pm/repro-shadow rows
+       "repro_green_rate": f,
+       "gate_noise": {repo: count},     # from pm/gate-noise/<repo>
+       "env_dirty_aborts": int,
+       "enforce_mode": <the current LAPIS_PM_REPRO_ENFORCE value>}
+    Never raises (a read failure degrades to zero counts - the census
+    still lands, the day-surface line renders the gap).
+    """
+    result: dict = {
+        "date": date,
+        "fixer": {"count": 0, "avg_s": 0.0, "max_s": 0.0},
+        "fixer_retry": {"count": 0, "avg_s": 0.0, "max_s": 0.0},
+        "repro_verdict_counts": {},
+        "repro_green_rate": 0.0,
+        "gate_noise": {},
+        "env_dirty_aborts": 0,
+        "enforce_mode": read_enforce_mode(),
+    }
+    hist = history_path or _census_history_path()
+    durs: dict[str, list[int]] = {"fixer": [], "fixer_retry": []}
+    try:
+        for line in hist.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if e.get("event") != "completed":
+                continue
+            ts = str(e.get("timestamp") or "")
+            if not ts.startswith(date):
+                continue
+            tid = str(e.get("id") or "")
+            if "fixer_retry" in tid:
+                kind = "fixer_retry"
+            elif "fixer" in tid:
+                kind = "fixer"
+            else:
+                continue
+            durs[kind].append(int(e.get("duration_seconds") or 0))
+    except OSError:
+        pass
+    for kind in ("fixer", "fixer_retry"):
+        vals = durs[kind]
+        if vals:
+            result[kind] = {
+                "count": len(vals),
+                "avg_s": round(sum(vals) / len(vals), 1),
+                "max_s": max(vals),
+            }
+    # The repro-verdict distribution + the gate-noise count (the mem
+    # ledger - the shadow observations + the ERROR/INCONCLUSIVE/
+    # SHA-MOVED observations). Best-effort: a mem read failure degrades
+    # to empty (the census still lands).
+    try:
+        from agents_core.mem import MemoryStore
+        store = MemoryStore()
+        try:
+            vcounts: dict[str, int] = {}
+            env_dirty = 0
+            for row in store.list_by_prefix("pm/repro-shadow/", limit=500):
+                try:
+                    row_json = json.loads(row.get("content") or "{}")
+                except (ValueError, TypeError):
+                    continue
+                v = str(row_json.get("verdict") or "")
+                if v:
+                    vcounts[v] = vcounts.get(v, 0) + 1
+                if str(row_json.get("subcode") or "") == SUBCODE_ENV_DIRTY:
+                    env_dirty += 1
+            result["repro_verdict_counts"] = vcounts
+            result["env_dirty_aborts"] = env_dirty
+            total = sum(vcounts.values())
+            result["repro_green_rate"] = (
+                round(vcounts.get(VERDICT_GREEN, 0) / total, 4)
+                if total else 0.0
+            )
+            noise: dict[str, int] = {}
+            for row in store.list_by_prefix("pm/gate-noise/", limit=100):
+                key = str(row.get("key") or "")
+                repo = key.rsplit("/", 1)[-1]
+                try:
+                    noise[repo] = int(
+                        json.loads(row.get("content") or "{}")
+                        .get("count") or 0
+                    )
+                except (ValueError, TypeError):
+                    continue
+            result["gate_noise"] = noise
+        finally:
+            store.close()
+    except Exception:
+        pass
+    return result
+
+
+def write_census(
+    date: str,
+    census: dict,
+    *,
+    state_dir: Path | None = None,
+) -> str:
+    """Write ``state/fixer-wallclock-census-<date>`` (the D6 census
+    artifact - the same method as the 09-19 day census). Returns the
+    artifact path ("" on write failure - the miss renders as a visible
+    gap on the day surface)."""
+    d = state_dir or _census_state_dir()
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        artifact = d / f"fixer-wallclock-census-{date}"
+        artifact.write_text(
+            json.dumps(census, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return str(artifact)
+    except OSError:
+        return ""
+
+
+def census_gap_for_day(date: str, *, state_dir: Path | None = None) -> str:
+    """The day-surface gap marker for a missing census artifact (the
+    Nzinga loud-trace pattern - a silent miss either fails the DoD
+    mysteriously or invites fudging). Returns the marker string when
+    the artifact is absent, "" when present."""
+    d = state_dir or _census_state_dir()
+    artifact = d / f"fixer-wallclock-census-{date}"
+    if artifact.is_file():
+        return ""
+    return f"lapis-repro: census-gap {date} (state/fixer-wallclock-census-{date} missing)"
+
+
+def run_census_main(date: str = "") -> int:
+    """The ``python3 -m agents_core.repro_gate census`` entrypoint (the
+    timer's ExecStart). Aggregates the day's census and writes the
+    artifact. Exit 0 = the artifact landed; 1 = the write failed (the
+    miss renders as a visible gap)."""
+    date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    census = aggregate_wallclock_census(date)
+    artifact = write_census(date, census)
+    if not artifact:
+        print(f"ERROR: census: write failed for {date}", file=sys.stderr)
+        return 1
+    print(f"INFO: census: {artifact}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # D2: the salvage-labeling enforcement (the orchestration entrypoint).
 # ---------------------------------------------------------------------------
 
@@ -1388,6 +1723,9 @@ def salvage_label_decision(
     mem_db_path: Path | None = None,
     log: Callable[[str], None] | None = None,
     run_repro_fn: Callable[..., dict] | None = None,
+    provenance_block: dict | None = None,
+    repo: str = "",
+    page_fn: Callable[[str], None] | None = None,
 ) -> dict:
     """D2: the enforcement at the SALVAGE-LABELING moment.
 
@@ -1401,7 +1739,9 @@ def salvage_label_decision(
                        concluded-gate-rejected-legacy>,
        "repro": <the repro verdict dict or {}>,
        "shadow_observation": <the observation key or "">,
-       "enforce_mode": <shadow|on|off>}
+       "enforce_mode": <shadow|on|off>,
+       "chain_depth": <the mem counter at salvage-open time>,
+       "chain_stop": <True when the chain-depth guard fired>}
 
     The gate_passed branch (class 4a fix): gate-PASSED + concluded +
     WIP + empty-diff routes to the CLEAN-PUSH disposition, NEVER
@@ -1418,8 +1758,17 @@ def salvage_label_decision(
 
     In on mode the full P1/P2/P3 enforcement applies: no
     concluded_gate_rejected label without [REPRO-RED]; the red-outcome
-    predicate gates the label; the 2-per-target-per-tick budget defers
-    to the next tick; the chain-depth guard stops at > 3.
+    predicate (gate_is_red) gates the label; the 2-per-target-per-tick
+    budget defers to the next tick (the atomic check-and-consume); the
+    chain-depth guard (the mem counter PRIMARY) stops at > 3 (one
+    Matrix page per target per chain); the D3 provenance refusal
+    (provenance_complete) yields run_not_concluded for an unaudited
+    gate run; the D4 preexisting-failure ledger filter (failure-at-head
+    re-entry) records its decision in the provenance block.
+
+    The gate-noise counter is keyed by REPO (pm/gate-noise/<repo> - the
+    spec's D5 key), not by target: ``repo`` names the repo (default:
+    the target - the caller should pass the bare repo name).
     """
     mode = read_enforce_mode()
     decision: dict = {
@@ -1430,6 +1779,8 @@ def salvage_label_decision(
         "repro": {},
         "shadow_observation": "",
         "enforce_mode": mode,
+        "chain_depth": 0,
+        "chain_stop": False,
     }
 
     # The class-4a shape: gate-PASSED + concluded + WIP + empty-diff.
@@ -1448,8 +1799,11 @@ def salvage_label_decision(
         # run, no observation - the salvage path is untouched).
         return decision
 
-    # shadow + on: run the repro (budget permitting).
-    if not repro_budget_available(target):
+    # shadow + on: run the repro (budget permitting). The atomic
+    # check-and-consume (the race-free shape: a tick-boundary reset
+    # between a separate check and a separate consume could let two
+    # callers both pass the check and both consume, exceeding the cap).
+    if not try_consume_repro_budget(target):
         # Budget exhaustion: defer to the next tick (the observation is
         # written; no PR, no label decision this tick).
         decision["disposition"] = "defer-budget"
@@ -1457,8 +1811,6 @@ def salvage_label_decision(
         _log(log, f"WARN: repro: budget exhausted for {target} - "
                   "defer to next tick")
         return decision
-
-    consume_repro_budget(target)
     repro_fn = run_repro_fn or run_repro
     try:
         verdict = repro_fn(
@@ -1503,9 +1855,10 @@ def salvage_label_decision(
         would_be = "concluded-gate-rejected-legacy"
 
     # The gate-noise counter (ERROR / INCONCLUSIVE / SHA-MOVED count
-    # toward it with the named subcode).
+    # toward it with the named subcode). The key is by REPO
+    # (pm/gate-noise/<repo> - the spec's D5 key), not by target.
     if v in (VERDICT_ERROR, VERDICT_INCONCLUSIVE, VERDICT_SHA_MOVED):
-        gate_noise_count(target, mem_db_path=mem_db_path)
+        gate_noise_count(repo or target, mem_db_path=mem_db_path)
 
     if mode == ENFORCE_SHADOW:
         # Observe-only: the salvage path behaves EXACTLY AS IT DOES
@@ -1520,6 +1873,73 @@ def salvage_label_decision(
         return decision
 
     # mode == ENFORCE_ON: full enforcement.
+    #
+    # D3: the provenance refusal (an unaudited gate run cannot
+    # conclude - run_not_concluded, never concluded_*). The provenance
+    # block is the gate's own D3 block (the caller passes it through);
+    # absent or incomplete -> the gate run is unaudited -> the refusal
+    # fires BEFORE any verdict classification (the mislabel is killed
+    # at the source).
+    if provenance_block is not None and not provenance_complete(
+            provenance_block):
+        decision["disposition"] = "run-not-concluded"
+        decision["stop_reason"] = "run_not_concluded"
+        decision["title_tag"] = ""
+        _log(log, f"WARN: repro: provenance incomplete for {target} - "
+                  "run_not_concluded (the unaudited gate run cannot "
+                  "conclude)")
+        return decision
+
+    # D5: the chain-depth guard (the mem counter PRIMARY - the
+    # reconciliation-only Forgejo marker count is a periodic
+    # consistency check, never the hot-path read). The guard reads the
+    # mem counter at salvage-open time (EXPLICITLY not title parsing);
+    # > 3 => stop + brief + one Matrix page per target per chain
+    # (never Pushover).
+    depth = salvage_chain_depth(target, mem_db_path=mem_db_path)
+    decision["chain_depth"] = depth
+    if chain_depth_exceeded(target, depth=depth,
+                            mem_db_path=mem_db_path):
+        decision["disposition"] = "chain-stop"
+        decision["stop_reason"] = "chain-stop"
+        decision["title_tag"] = ""
+        decision["chain_stop"] = True
+        _log(log, f"WARN: repro: chain-depth {depth} > "
+                  f"{CHAIN_DEPTH_STOP} for {target} - stop + page "
+                  "(one Matrix page per target per chain)")
+        if page_fn is not None:
+            try:
+                page_fn(f"salvage chain-depth {depth} for {target} "
+                        f"> {CHAIN_DEPTH_STOP} - stopped (one page per "
+                        f"target per chain)")
+            except Exception:
+                pass
+        return decision
+
+    # D4: the preexisting-failure ledger filter (failure-at-head
+    # re-entry - a filtered node-id that FAILS in the P1 repro
+    # re-enters the retry trigger; the benign green-at-head direction
+    # is a no-op). The decision is recorded in the provenance block
+    # (stale-deferred-to-repro for the 7d-expired labels).
+    if v in (VERDICT_RED, VERDICT_GREEN) and (
+            failed_node_ids or parse_failed_node_ids_full(gate_output)):
+        _ledger_nodes = (failed_node_ids
+                         or parse_failed_node_ids_full(gate_output))
+        _filter = preexisting_ledger_filter(
+            list(_ledger_nodes), mem_db_path=mem_db_path,
+            repo=repo or target,
+        )
+        _prov = verdict.get("provenance")
+        if isinstance(_prov, dict):
+            _prov["preexisting_filter"] = _filter
+        # A RED verdict with ALL failed node-ids filtered (preexisting)
+        # is a no-op for the label (the label stands until re-verify -
+        # the benign direction); the filter decision is recorded.
+        # (A filtered node-id that FAILS at head re-enters the retry
+        # trigger - failure-at-head is the trigger; the repro proved
+        # the failure, so the label is earned regardless of the
+        # preexisting label.)
+
     if v == VERDICT_SHA_MOVED:
         decision["disposition"] = "defer-sha-moved"
         decision["stop_reason"] = "defer-sha-moved"
@@ -1549,7 +1969,21 @@ def salvage_label_decision(
         decision["title_tag"] = ""
         return decision
     if v == VERDICT_RED:
-        # The label is EARNED: the repro proved the red at the head.
+        # P3: the red-outcome predicate gates the label. A repro-RED
+        # verdict with a NON-RED gate outcome is a mislabel direction
+        # (the repro proved a red the gate never showed - the
+        # conservative direction is the run_not_concluded refusal,
+        # never the concluded_gate_rejected label).
+        if not gate_is_red(last_test_outcome):
+            decision["disposition"] = "run-not-concluded"
+            decision["stop_reason"] = "run_not_concluded"
+            decision["title_tag"] = ""
+            _log(log, f"WARN: repro: repro-RED but the gate outcome is "
+                      f"NOT red for {target} - run_not_concluded (the "
+                      f"label is not earned)")
+            return decision
+        # The label is EARNED: the repro proved the red at the head AND
+        # the gate outcome is red (the predicate).
         decision["disposition"] = "salvage-red"
         decision["stop_reason"] = "concluded_gate_rejected"
         decision["title_tag"] = repro_verdict_title_tag(v)
@@ -1569,3 +2003,30 @@ def salvage_label_decision(
     # direction is the today-behavior label (never a silent drop).
     decision["disposition"] = "concluded-gate-rejected-legacy"
     return decision
+
+
+# ---------------------------------------------------------------------------
+# Module entrypoint (the D6 census timer's ExecStart):
+#   python3 -m agents_core.repro_gate census [--date YYYY-MM-DD]
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import argparse
+
+    _parser = argparse.ArgumentParser(
+        prog="agents_core.repro_gate",
+        description="P1 reproduce-before-retry harness (D6 census entrypoint)",
+    )
+    _sub = _parser.add_subparsers(dest="cmd", required=True)
+    _census_p = _sub.add_parser(
+        "census",
+        help="aggregate the day's fixer wall-clock census and write "
+             "state/fixer-wallclock-census-<date>",
+    )
+    _census_p.add_argument(
+        "--date", default="",
+        help="the census date (YYYY-MM-DD; default: today UTC)",
+    )
+    _args = _parser.parse_args()
+    if _args.cmd == "census":
+        sys.exit(run_census_main(_args.date))
