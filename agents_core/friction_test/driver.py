@@ -93,8 +93,18 @@ class RadioOpDriver:
 
     name = "radio-op"
 
-    def __init__(self, base_url: str = FOYER_BASE) -> None:
+    def __init__(
+        self,
+        base_url: str = FOYER_BASE,
+        consult_log_dir: Path = CONSULT_LOG_DIR,
+        harvest_queue_dir: Path = HARVEST_QUEUE_DIR,
+    ) -> None:
+        # Paths default to the production constants but are injectable so
+        # tests can pass tmp_path (repo test-isolation convention; reviewer
+        # debt aa9404adc1).
         self._base = base_url.rstrip("/")
+        self._consult_log_dir = consult_log_dir
+        self._harvest_queue_dir = harvest_queue_dir
         self._client: httpx.Client | None = None
         # Track open sessions so teardown can close them
         self._open_sessions: list[str] = []
@@ -176,7 +186,7 @@ class RadioOpDriver:
                 self._open_sessions.append(session_id)
 
             # Snapshot consult-log BEFORE ingests
-            consult_path = CONSULT_LOG_DIR / f"{session_id}.jsonl"
+            consult_path = self._consult_log_dir / f"{session_id}.jsonl"
             lines_before = _read_jsonl_lines(consult_path)
 
             # 2. Open SSE stream in background thread BEFORE ingests so events
@@ -262,7 +272,7 @@ class RadioOpDriver:
                 })
 
             # 7. Check harvest queue marker
-            harvest_marker_path = HARVEST_QUEUE_DIR / f"{session_id}.json"
+            harvest_marker_path = self._harvest_queue_dir / f"{session_id}.json"
             harvest_marker_exists = harvest_marker_path.exists()
             harvest_marker_data = None
             if harvest_marker_exists:
@@ -308,6 +318,12 @@ class RadioOpDriver:
 # ---------------------------------------------------------------------------
 
 COCKPIT_BASE = "http://localhost:8400"
+# The cockpit service's OWN mem.db — intentionally distinct from
+# agents_core.mem.DB_PATH (/data/memory/mem.db, the mem-substrate store).
+# The cockpit driver snapshots pm/* keys from the cockpit's local db
+# (schema: `memory` table), NOT the mem-substrate store (schema: `memories`
+# + FTS5). Pre-existing; out of scope for the aa9404adc1 injectable-paths
+# fix, but noted here so the two paths are not conflated.
 MEM_DB_PATH = Path("/srv/agents/mem.db")
 VAULT_AUDIT_DIR = Path("/data/vault-audit")
 COMMENT_STORE_DIR = room_path("targets.comments")
@@ -318,8 +334,20 @@ class CockpitDriver:
 
     name = "cockpit"
 
-    def __init__(self, base_url: str = COCKPIT_BASE) -> None:
+    def __init__(
+        self,
+        base_url: str = COCKPIT_BASE,
+        mem_db_path: Path = MEM_DB_PATH,
+        vault_audit_dir: Path = VAULT_AUDIT_DIR,
+        comment_store_dir: Path = COMMENT_STORE_DIR,
+    ) -> None:
+        # Paths default to the production constants but are injectable so
+        # tests can pass tmp_path (repo test-isolation convention; reviewer
+        # debt aa9404adc1).
         self._base = base_url.rstrip("/")
+        self._mem_db_path = mem_db_path
+        self._vault_audit_dir = vault_audit_dir
+        self._comment_store_dir = comment_store_dir
         self._client: httpx.Client | None = None
 
     def setup(self) -> None:
@@ -352,10 +380,10 @@ class CockpitDriver:
             url = f"{self._base}{path}"
 
             # Snapshot mem.db pm/* keys before
-            mem_before = _snapshot_mem_db(MEM_DB_PATH)
+            mem_before = _snapshot_mem_db(self._mem_db_path)
 
             # Snapshot vault audit count before
-            vault_before = _snapshot_vault_audit(VAULT_AUDIT_DIR)
+            vault_before = _snapshot_vault_audit(self._vault_audit_dir)
 
             # Snapshot comment-store line counts before (for directive tests)
             tid = s.inputs.get("tid")
@@ -363,7 +391,7 @@ class CockpitDriver:
             comment_path: Path | None = None
             comment_write_ts: float | None = None
             if tid:
-                comment_path = COMMENT_STORE_DIR / f"{tid}.jsonl"
+                comment_path = self._comment_store_dir / f"{tid}.jsonl"
                 comment_lines_before = _count_jsonl_lines(comment_path)
 
             t0 = time.monotonic()
@@ -394,13 +422,13 @@ class CockpitDriver:
                 time.sleep(settle_s)
 
             # Snapshot mem.db after
-            mem_after = _snapshot_mem_db(MEM_DB_PATH)
+            mem_after = _snapshot_mem_db(self._mem_db_path)
             mem_diff = _diff_dicts(mem_before, mem_after)
             if mem_diff:
                 mem_writes.append({"before": mem_before, "after": mem_after, "diff": mem_diff})
 
             # Snapshot vault audit after
-            vault_after = _snapshot_vault_audit(VAULT_AUDIT_DIR)
+            vault_after = _snapshot_vault_audit(self._vault_audit_dir)
             vault_diff = vault_after - vault_before
             if vault_diff:
                 vault_writes.append({"new_entries": vault_diff})

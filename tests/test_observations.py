@@ -834,3 +834,95 @@ def test_cli_lineage_subcommand(tmp_path, monkeypatch):
     assert len(data["forward"]) == 1
     assert data["forward"][0]["content"] == "child cites root"
     assert data["forward"][0]["_lineage_depth"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Bounded-accumulation guarantee (reviewer debt 6157790b94): search() with a
+# small limit must NOT materialise the entire result set in memory — it
+# streams line-by-line and caps retention at `limit` entries (bisect-insert),
+# so memory is O(limit), not O(total matching entries). test_limit_equivalence
+# above pins the output behaviour; the test below pins the bounded path
+# STRUCTURALLY: it instruments the module's own retention list (`kept`) so a
+# regression to full-scan-then-slice is caught without a flaky tracemalloc
+# peak-allocation comparison (which is sensitive to platform, CPython
+# version, GC timing, and json codec caching).
+# ---------------------------------------------------------------------------
+
+def test_search_limit_retention_capped_structurally(tmp_path, monkeypatch):
+    """Structural bound: with limit=1 over a store with many matching entries,
+    the bounded path's internal retention list never holds more than `limit`
+    entries at any point during the scan — the scan streams line-by-line and
+    evicts the largest kept entry as soon as it exceeds `limit`. Pinned by
+    instrumenting the module's retention list with a size-tracking wrapper
+    that records the maximum observed length during the scan (no
+    tracemalloc peak-allocation comparison, which is sensitive to platform,
+    CPython version, GC timing, and json codec caching)."""
+    import sys
+
+    monkeypatch.setenv("AGENT_OBSERVATIONS_ROOT", str(tmp_path))
+    base = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    # 500 entries, out of timestamp order: earliest ts is written last, so
+    # the bounded path must evict entries as it scans (not just at the end).
+    for i in range(500):
+        record("agent-x", "friction", "ctx", f"entry-{i}",
+               now=base + timedelta(minutes=i))
+
+    limit = 1
+    peak: list[int] = [0]
+
+    class _TrackingList(list):
+        """list subclass that records its maximum observed length."""
+        def __len__(self):
+            n = super().__len__()
+            if n > peak[0]:
+                peak[0] = n
+            return n
+
+        def insert(self, pos, item):
+            super().insert(pos, item)
+            if len(self) > peak[0]:
+                peak[0] = len(self)
+
+    # search()'s bounded path does `kept: list[...] = []` (a bare [] literal)
+    # then kept.insert()/kept.pop(). A bare [] literal is NOT a call to
+    # builtins.list, so patching the module's `list` name cannot intercept
+    # it. Instead, use sys.settrace to watch the search() frame: on the line
+    # that first inserts into `kept` (only the bounded path inserts into
+    # kept), replace the frame's local `kept` with a _TrackingList wrapper
+    # of identical contents. From then on, every len(kept)/insert/pop on the
+    # real object is observed through the wrapper's peak counter.
+    def _trace(frame, event, arg):
+        if event == "call":
+            # Only trace inside observations.search itself.
+            if frame.f_code.co_name == "search":
+                return _trace
+            return None
+        if event == "line" and frame.f_code.co_name == "search":
+            if "kept" in frame.f_locals:
+                kept = frame.f_locals["kept"]
+                if isinstance(kept, list) and not isinstance(kept, _TrackingList):
+                    # Only the bounded path inserts into kept; an empty
+                    # plain list at this point is the retention list before
+                    # its first insert. Replace it with a wrapper that
+                    # records peak length.
+                    wrapper = _TrackingList(kept)
+                    frame.f_locals["kept"] = wrapper
+        return None
+
+    sys.settrace(_trace)
+    try:
+        res = search(limit=limit)
+    finally:
+        sys.settrace(None)
+
+    assert len(res) == 1
+    assert res[0]["content"] == "entry-0"
+    # The retention list must never have held more than `limit` entries at
+    # any point during the 500-entry scan. A regression to
+    # full-scan-then-slice (kept = every match, sliced at the end) would
+    # observe peak == 500 here and fail.
+    assert peak[0] <= limit, (
+        f"bounded path retention peaked at {peak[0]} entries over a "
+        f"{limit}-limited scan of 500 matching entries — search(limit=1) "
+        "appears to materialise the full result set"
+    )

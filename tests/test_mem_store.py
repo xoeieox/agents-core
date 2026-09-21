@@ -62,3 +62,33 @@ def test_delete_and_stats(tmp_path: Path):
     assert store.delete("a") is False
     assert store.stats()["total_memories"] == 1
     store.close()
+
+
+def test_db_path_env_override_resolved_at_init(tmp_path: Path, monkeypatch):
+    """MEM_DB_PATH is honored at construction time, not import time
+    (reviewer debt b1683758dc): DB_PATH stays a static constant while
+    MemoryStore() with no explicit path picks up the env override."""
+    from agents_core import mem as mem_mod
+    # DB_PATH must remain the static production constant
+    assert mem_mod.DB_PATH == Path("/data/memory/mem.db")
+
+    db = tmp_path / "env_override.db"
+    monkeypatch.setenv("MEM_DB_PATH", str(db))
+    store = MemoryStore()
+    try:
+        assert store.db_path == db
+        store.set("k", "v")
+        assert store.get("k") is not None
+        assert db.exists()
+    finally:
+        store.close()
+
+
+def test_db_path_env_override_absent_defaults_to_constant(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("MEM_DB_PATH", raising=False)
+    from agents_core import mem as mem_mod
+    store = MemoryStore()
+    try:
+        assert store.db_path == mem_mod.DB_PATH
+    finally:
+        store.close()
