@@ -954,6 +954,34 @@ class _NodeState:
         self._flashnext_window: str | None = None
         self._flashnext_window_since: float | None = None
         self._flashnext_window_closed_at: float | None = None
+        # The ACTUAL exception class name from the most recent blind (or
+        # cold) seat probe (e.g. "Timeout", "ConnectionRefusedError",
+        # "ConnectionError"), or None on a definitive read — carried by
+        # the D1 blind-withhold idle-log rows and the one-shot transition
+        # warning so the operator sees the real failure class, not a
+        # static placeholder (the D4 BLIND-proceed precedent).
+        self._flashnext_error_class: str | None = None
+        # Flash-next idle-awareness (gw-doorman-flashnext-idle-awareness-v0,
+        # D1/D2): the stop-path partition consumes _flashnext_state
+        # (up/blind/down/foreign); these two fields are the bookkeeping the
+        # partition needs. _flashnext_blind_since: epoch armed on the first
+        # blind (or cold/None) read since the last definitive read, cleared
+        # on any definitive read (down / up_registered / up_unverified /
+        # up_foreign) — the continuous-blindness clock the bounded
+        # blind-withhold is measured against. None = not currently blind
+        # (definitive, or never blind since the last definitive read).
+        # _flashnext_last_activity_ts: the D2 legibility clock — probe-stamp
+        # time of the last successful activity-gauge read that observed
+        # running/waiting >= 1; NEVER consumed by the stop decision (D2:
+        # legibility only), never set by failed/zero-activity reads, cleared
+        # by a definitive "down" probe. None = no observation yet.
+        self._flashnext_blind_since: float | None = None
+        self._flashnext_last_activity_ts: float | None = None
+        # One-shot journal latch for the transition into a new withhold
+        # state (D3: one WARNING per transition; steady-state withhold =
+        # idle-log rows only). Set by _decide_idle_stop, cleared on a
+        # definitive non-withhold read (the next transition warns again).
+        self._flashnext_withhold_warned: bool = False
         # Tri-state dual-slot activity probe (gw-doorman-vllm-activity-probe-v0):
         # True when the most recent _probe_slot_activity() tick was indeterminate
         # (at least one probe ambiguous, none confirmed activity) — read by the
