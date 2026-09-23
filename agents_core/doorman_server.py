@@ -3547,11 +3547,23 @@ class _NodeState:
                 # confirmed-idle park from one taken only because the
                 # blindness bound was exceeded, so the journal line is
                 # diagnosable rather than reading as one undifferentiated
-                # "stopped" event.
-                stop_reason = (
-                    "probe_blind_bound_exceeded"
-                    if self._probe_indeterminate else "confirmed_idle"
-                )
+                # "stopped" event. The flash-next idle-awareness axis
+                # (gw-doorman-flashnext-idle-awareness-v0, D1) adds a
+                # THIRD distinct reason: the seat probe was blind past
+                # its bound and the vLLM axis was NOT the deciding factor
+                # (vLLM confirmed idle) — the stop fired because the
+                # seat's own probe went blind, not because the 27B-axis
+                # probe did.
+                if (
+                    self._flashnext_state == "blind"
+                    and not self._probe_indeterminate
+                ):
+                    stop_reason = "flashnext_probe_blind_bound_exceeded"
+                else:
+                    stop_reason = (
+                        "probe_blind_bound_exceeded"
+                        if self._probe_indeterminate else "confirmed_idle"
+                    )
                 indeterminate_sources = [
                     name for name, v in (self._last_probe_raw or {}).items()
                     if v is None
