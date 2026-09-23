@@ -1614,6 +1614,81 @@ class _NodeState:
         # out: a listener exists, identity unverified (SGLang mid-load).
         return ("up_unverified", None, None, None)
 
+    def _probe_flashnext_activity(self) -> bool | None:
+        """D2 legibility probe (gw-doorman-flashnext-idle-awareness-v0):
+        GET {GW_FLASHNEXT_URL}/metrics (SGLang's Prometheus plaintext
+        exposition, same shape as the vLLM /metrics probes) and read the
+        running/waiting request gauges.
+
+        Returns:
+          True  — a target gauge was found and parsed with a nonzero value
+                  (running/waiting >= 1: confirmed activity).
+          False — all target gauges were found and parsed, all zero
+                  (confirmed idle).
+          None  — the call failed (timeout/connection-refused/non-200), the
+                  body contained no target gauge, or the gauges were
+                  unparsable: the "unknown" substate. Never a stop
+                  authorization, never an idle reading (D2: a 404 /
+                  non-200 / unparseable activity gauge is unknown, not idle).
+
+        LEGIBILITY ONLY (D2): this probe NEVER feeds the stop decision — the
+        stop path consumes the seat-STATE probe (_probe_flashnext_seat)
+        exclusively. It feeds only the _flashnext_last_activity_ts clock
+        (rendered as withheld-active vs withheld-up-idle and on /status).
+
+        DoD-0 live check (2026-09-22/23): the seat was down (port refused)
+        at implementation time, so the gauge names are confirmed by reading
+        SGLang's source (sglang/srt/metrics/collector.py: sglang:num_running_
+        requests / sglang:num_queue_requests) — the same
+        source-confirmed-not-live-verified convention the vLLM activity
+        gauges above follow. A missing endpoint degrades the substate to
+        "unknown"; it cannot authorize a stop.
+
+        Never raises. Must be called OUTSIDE self.lock (blocking HTTP,
+        2.5s timeout, no-redirect pin — same discipline as the seat probe).
+        """
+        try:
+            resp = requests.get(
+                f"{GW_FLASHNEXT_URL}/metrics",
+                timeout=2.5,
+                allow_redirects=False,
+            )
+            if resp.status_code != 200:
+                return None
+            total = 0.0
+            found = False
+            for line in resp.text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                for metric in _SGLANG_ACTIVITY_METRICS:
+                    if line.startswith(metric + "{"):
+                        # Brace-aware parse (same convention as the vLLM
+                        # activity probe): the value starts right after the
+                        # closing brace, not at the last space.
+                        brace_end = line.find("}")
+                        if brace_end == -1:
+                            continue
+                        value_str = line[brace_end + 1:].strip().split()
+                    elif line.startswith(metric + " "):
+                        value_str = line[len(metric):].strip().split()
+                    else:
+                        continue
+                    if not value_str:
+                        continue
+                    try:
+                        total += float(value_str[0])
+                    except ValueError:
+                        continue
+                    else:
+                        found = True
+            if not found:
+                return None
+            return total > 0
+        except Exception as exc:
+            log.debug(f"[{self.node_name}] flashnext activity probe inconclusive: {exc}")
+            return None
+
     def _probe_slot_activity(self) -> bool | None:
         """Tri-state unmediated-caller activity probe across all signal sources
         (gw-doorman-vllm-activity-probe-v0, extended by agents-core-doorman-
