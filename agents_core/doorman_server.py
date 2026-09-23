@@ -1867,6 +1867,45 @@ class _NodeState:
                 self._flashnext_window = window
                 self._flashnext_window_since = None
 
+            # Flash-next idle-awareness D1 bookkeeping
+            # (gw-doorman-flashnext-idle-awareness-v0): the continuous-
+            # blindness clock for the stop path's bounded blind-withhold.
+            # Bookkeeping lives HERE, in the tick's probe pass under the
+            # lock (Council open question 1, resolved): the probe method
+            # stays stateless; this block already mutates per-tick state
+            # (window_since/window_closed_at) from this tick's own probe
+            # result. Armed on the first blind (or cold/None) read since
+            # the last definitive read, cleared on any definitive read.
+            # The COLD-START rule (D1): before the first definitive probe
+            # read the state is None — treated as BLIND here (bounded
+            # withhold), never as down/idle-ok.
+            if flashnext_state in ("blind", None):
+                if self._flashnext_blind_since is None:
+                    self._flashnext_blind_since = time.time()
+                # A definitive "down" probe clears the D2 activity stamp
+                # (a dead seat cannot withhold via a stale stamp); blind
+                # and cold reads leave it unchanged.
+            else:
+                self._flashnext_blind_since = None
+                if flashnext_state == "down":
+                    self._flashnext_last_activity_ts = None
+            # D3 legibility: a steady-state withhold is a normal safety
+            # state, not a failure — entering it does not set last_error;
+            # leaving it (a definitive non-withhold read) re-arms the
+            # one-shot transition warning.
+            if flashnext_state not in ("up_registered", "up_unverified"):
+                self._flashnext_withhold_warned = False
+            # D2 stamp rule (one sentence): the clock is stamped only by a
+            # successful probe that observed running/waiting >= 1;
+            # successful zero-activity reads, failed reads, and the cold
+            # state (None = no observation) leave it unchanged; a
+            # definitive "down" probe clears it (handled above). The clock
+            # is probe-stamp time, not request-end time (45s sampling — a
+            # withhold therefore releases up to ~645-660s after the last
+            # confirmed activity, inherent to the tick resolution).
+            if flashnext_activity is True:
+                self._flashnext_last_activity_ts = time.time()
+
             if DOORMAN_MODE_AWARE_ADMISSION:
                 self._cached_topology_state = topology_state
                 controller_owns = self._controller_lease_active()
