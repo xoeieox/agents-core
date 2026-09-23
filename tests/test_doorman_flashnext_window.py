@@ -48,14 +48,18 @@ from agents_core.doorman_server import (
 def node(tmp_path, monkeypatch):
     """In-process _NodeState; the idle log points at a tmp file so the
     tests can assert the D3 idle-log rows (the durable machine-parseable
-    audit substrate), not just the journal."""
+    audit substrate), not just the journal.
+
+    HERMETIC GUARD: status_snapshot() reads the gw_topology importability
+    check (the "actuator_available" field) — on this host the live deploy
+    tree makes that import take a slow path that can exceed the test
+    budget. The field is out of scope for this spec, so it is pinned to a
+    fast constant here (the value is never asserted)."""
     idle_log = tmp_path / "idle.jsonl"
     monkeypatch.setattr(ds, "DOORMAN_IDLE_LOG", str(idle_log))
+    monkeypatch.setattr(ds, "_gw_topology_importable", lambda: False)
     state = _NodeState(gw_url="http://mock.internal/", node_name="gravitywell")
     yield state
-    # teardown: never leave a lock held (a test that deadlocks would
-    # hang the suite rather than fail cleanly — the barrier below makes
-    # the suite fail fast instead).
 
 
 def idle_rows(node) -> list[dict]:
