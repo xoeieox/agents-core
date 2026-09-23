@@ -1795,9 +1795,17 @@ class _NodeState:
         # the window determination must work regardless of that flag) and
         # never joined to the activity vote lists (Invariant 8: :30000
         # activity is irrelevant to the 27B axis's idle clock).
-        flashnext_state, flashnext_served_id, flashnext_registered, _fn_err = (
+        flashnext_state, flashnext_served_id, flashnext_registered, flashnext_error_class = (
             self._probe_flashnext_seat(sequential=False)
         )
+        # Flash-next D2 legibility activity probe
+        # (gw-doorman-flashnext-idle-awareness-v0): unconditional, beside
+        # the two existing :30000 GETs, same 2.5s timeout and no-redirect
+        # pin. Deliberately NOT in _probe_slot_activity's flag-gated pool —
+        # the flag's rollback lever must not be able to starve this
+        # legibility source. A clock not refreshed this tick renders
+        # "unknown", never idle.
+        flashnext_activity: bool | None = self._probe_flashnext_activity()
 
         # Single topology resolution — outside the lock (blocking HTTP).
         topology_state = None
