@@ -36,7 +36,6 @@ import requests
 from agents_core import doorman_server as ds
 from agents_core.doorman_server import (
     _NodeState,
-    _probe_flashnext_activity_unbound,
     _SGLANG_ACTIVITY_METRICS,
 )
 
