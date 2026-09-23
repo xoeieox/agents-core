@@ -3347,6 +3347,159 @@ class _NodeState:
         ):
             idle_elapsed = time.time() - self.idle_since
 
+            # Flash-next idle-awareness (gw-doorman-flashnext-
+            # idle-awareness-v0, D1): the stop decision consumes the
+            # existing seat-state probe (the D7 probe pass, unmodified).
+            # The 2026-09-22 GPU1-wedge incident: the idle-eject fired
+            # while the day seat was UP-and-idle and the live brain was
+            # the flash-next seat on :30000 — the D3 window guard
+            # withholds only the handover case (seat up + day seat
+            # DOWN); the overlap case (seat up + day seat up-idle) left
+            # the window "none", the guard inert, and the eject enabled
+            # a guard-correct suspend that killed the unsupervised seat.
+            # Partition (D1):
+            #   seat UP (up_registered / up_unverified): withhold
+            #   UNCONDITIONALLY — regardless of request activity (a live
+            #   run with a >600s request gap must not become stop-
+            #   eligible; the gap is exactly the incident's 292k-run
+            #   shape). The D3 window guard already withholds unbounded
+            #   in the handover case; this extends the same knowledge-
+            #   based withhold to the overlap case.
+            #   seat BLIND (or cold/None — COLD START, D1): withhold,
+            #   BOUNDED, mirroring the vLLM-axis bound below: a
+            #   continuous-blindness clock (armed on the first blind read
+            #   since the last definitive read, cleared on a definitive
+            #   read — bookkeeping in the tick's probe pass, the probe
+            #   method stays stateless); while blind and
+            #   idle_elapsed < GW_STOP_GRACE_SEC +
+            #   DOORMAN_PROBE_BLINDNESS_SEC the grace clock pauses
+            #   (idle-log row, no verb). Past the bound this axis stops
+            #   withholding and, where it is the deciding factor, the
+            #   stop proceeds with a distinct stop_reason
+            #   (flashnext_probe_blind_bound_exceeded) at CRITICAL.
+            #   DOORMAN_PROBE_BLINDNESS_SEC == 0 is the sentinel for
+            #   UNBOUNDED (withhold on blind forever — the operator
+            #   chooses burning fuel over risking the seat).
+            #   seat DOWN or UP_FOREIGN: definitive; this axis does not
+            #   withhold (the vLLM axis decides, as today).
+            # PRECEDENCE: the stop proceeds only when every withhold
+            # condition has fallen through — this block (D1), the
+            # topology-unknown no-park, and the vLLM blind-within-bound
+            # below. A withheld tick writes no stopped idle-log row and
+            # computes no stop_reason for a stop that does not happen.
+            # The activity clock (D2) is legibility-only — it selects the
+            # substate (withheld-active vs withheld-up-idle) and renders
+            # on /status; it is NEVER consumed by the stop decision.
+            _fn_state = self._flashnext_state
+            if _fn_state in ("up_registered", "up_unverified"):
+                _fn_last_activity = self._flashnext_last_activity_ts
+                _fn_active = (
+                    _fn_last_activity is not None
+                    and (time.time() - _fn_last_activity) < GW_STOP_GRACE_SEC
+                )
+                _write_idle_log(
+                    self.node_name,
+                    "flashnext_withheld_active" if _fn_active
+                    else "flashnext_withheld_up_idle",
+                    0,
+                    idle_secs=idle_elapsed,
+                    seat_state=_fn_state,
+                    last_activity_ts=_fn_last_activity,
+                )
+                if not self._flashnext_withhold_warned:
+                    self._flashnext_withhold_warned = True
+                    log.warning(
+                        f"[{self.node_name}] flashnext-seat-up — :30000 "
+                        f"seat {_fn_state} (served_id="
+                        f"{self._flashnext_served_id!r}); withholding "
+                        f"gw-serve stop (idle {idle_elapsed:.0f}s). The "
+                        f"seat is the live brain; the stop path must not "
+                        f"take a visible seat out of reach."
+                    )
+                return True
+            if _fn_state == "blind" or _fn_state is None:
+                # BLIND (or COLD START: state None before the first
+                # definitive read — D1: treat as blind, never down/idle-
+                # ok). The blind clock is armed in the tick's probe pass
+                # (None until the first blind/cold read, so a cold start
+                # is bounded from the first tick, not from a later
+                # arming).
+                _fn_blind_elapsed = (
+                    time.time() - self._flashnext_blind_since
+                    if self._flashnext_blind_since is not None
+                    else 0.0
+                )
+                if DOORMAN_PROBE_BLINDNESS_SEC != 0:
+                    _fn_blind_bound = (
+                        GW_STOP_GRACE_SEC + DOORMAN_PROBE_BLINDNESS_SEC
+                    )
+                    if _fn_blind_elapsed < _fn_blind_bound:
+                        _write_idle_log(
+                            self.node_name, "flashnext_blind_hold", 0,
+                            idle_secs=idle_elapsed,
+                            seat_state=_fn_state,
+                            blind_secs=round(_fn_blind_elapsed, 2),
+                            error_class=self._flashnext_error_class,
+                        )
+                        if not self._flashnext_withhold_warned:
+                            self._flashnext_withhold_warned = True
+                            log.warning(
+                                f"[{self.node_name}] flashnext-seat-blind — "
+                                f":30000 probe indeterminate (state="
+                                f"{_fn_state}, error_class="
+                                f"{self._flashnext_error_class}); "
+                                f"withholding gw-serve stop (idle "
+                                f"{idle_elapsed:.0f}s, blind "
+                                f"{_fn_blind_elapsed:.0f}s < bound "
+                                f"{_fn_blind_bound}s). Fail-closed on "
+                                f"stop: the probe cannot distinguish a "
+                                f"dead seat from an invisible one."
+                            )
+                        return True
+                else:
+                    # Sentinel 0: unbounded — withhold on blind forever
+                    # (the operator chooses burning fuel over risking the
+                    # seat).
+                    _write_idle_log(
+                        self.node_name, "flashnext_blind_hold", 0,
+                        idle_secs=idle_elapsed,
+                        seat_state=_fn_state,
+                        blind_secs=round(_fn_blind_elapsed, 2),
+                        error_class=self._flashnext_error_class,
+                    )
+                    if not self._flashnext_withhold_warned:
+                        self._flashnext_withhold_warned = True
+                        log.warning(
+                            f"[{self.node_name}] flashnext-seat-blind — "
+                            f":30000 probe indeterminate (state="
+                            f"{_fn_state}, error_class="
+                            f"{self._flashnext_error_class}); "
+                            f"withholding gw-serve stop UNBOUNDED "
+                            f"(DOORMAN_PROBE_BLINDNESS_SEC=0 sentinel; "
+                            f"idle {idle_elapsed:.0f}s, blind "
+                            f"{_fn_blind_elapsed:.0f}s)."
+                        )
+                    return True
+                # Bound exceeded: this axis stops withholding. The stop
+                # proceeds only if every other withhold has also fallen
+                # through (topology-unknown no-park, vLLM blind-within-
+                # bound below); where this axis is the deciding factor
+                # the stop_reason is distinct (below) and the event logs
+                # at CRITICAL (bootstrap basicConfig level=INFO —
+                # CRITICAL always renders; no alert hook keys off log
+                # level).
+                log.critical(
+                    f"[{self.node_name}] flashnext_probe_blind_bound_"
+                    f"exceeded — :30000 probe blind for "
+                    f"{_fn_blind_elapsed:.0f}s (bound "
+                    f"{GW_STOP_GRACE_SEC + DOORMAN_PROBE_BLINDNESS_SEC}s); "
+                    f"the blind-withhold no longer withholds the stop "
+                    f"(idle {idle_elapsed:.0f}s). A permanently broken "
+                    f"probe must not pin the box awake forever."
+                )
+            # _fn_state in ("down", "up_foreign"): definitive — this axis
+            # does not withhold; the vLLM axis decides, as today.
+
             # Unknown topology (Erah ruling 2026-08-19, agents-core-
             # doorman-class-aware-activity-probe-v0 D2/D3): a keeper
             # who does not know the nature of the room does not close
