@@ -492,7 +492,7 @@ class TestFlashnextActivityProbe:
             "sglang:num_queue_requests{engine=\"0\"} 0.0\n"
         )
         with patch("requests.get", return_value=self._resp(200, body)):
-            assert _probe_flashnext_activity_unbound(node) is True
+            assert node._probe_flashnext_activity() is True
 
     def test_confirmed_idle(self):
         node = _NodeState(gw_url="http://mock.internal/")
@@ -501,30 +501,30 @@ class TestFlashnextActivityProbe:
             "sglang:num_queue_requests{engine=\"0\"} 0.0\n"
         )
         with patch("requests.get", return_value=self._resp(200, body)):
-            assert _probe_flashnext_activity_unbound(node) is False
+            assert node._probe_flashnext_activity() is False
 
     @pytest.mark.parametrize("status", [404, 500])
     def test_non_200_is_unknown(self, status):
         node = _NodeState(gw_url="http://mock.internal/")
         with patch("requests.get", return_value=self._resp(status, "x")):
-            assert _probe_flashnext_activity_unbound(node) is None
+            assert node._probe_flashnext_activity() is None
 
     def test_missing_gauges_is_unknown(self):
         node = _NodeState(gw_url="http://mock.internal/")
         body = "some_other_metric 1.0\n"
         with patch("requests.get", return_value=self._resp(200, body)):
-            assert _probe_flashnext_activity_unbound(node) is None
+            assert node._probe_flashnext_activity() is None
 
     def test_unparsable_value_is_unknown(self):
         node = _NodeState(gw_url="http://mock.internal/")
         body = "sglang:num_running_requests{engine=\"0\"} notanumber\n"
         with patch("requests.get", return_value=self._resp(200, body)):
-            assert _probe_flashnext_activity_unbound(node) is None
+            assert node._probe_flashnext_activity() is None
 
     def test_connection_error_is_unknown(self):
         node = _NodeState(gw_url="http://mock.internal/")
         with patch("requests.get", side_effect=requests.exceptions.ConnectionError("refused")):
-            assert _probe_flashnext_activity_unbound(node) is None
+            assert node._probe_flashnext_activity() is None
 
     def test_gauge_names_are_the_sglang_pair(self):
         assert set(_SGLANG_ACTIVITY_METRICS) == {
