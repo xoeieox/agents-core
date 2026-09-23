@@ -212,10 +212,11 @@ class TestStopPathSeatPartition:
         assert "flashnext_probe_blind_bound_exceeded" in crit_text
 
     def test_double_blind_past_both_bounds_stop_proceeds(self, node):
-        """Both axes blind past both bounds: the stop proceeds (the
-        vLLM-axis reason — probe_blind_bound_exceeded — is the deciding
-        factor; the seat axis has already fallen through)."""
-        self._idle_node(node)
+        """Both axes blind past both bounds (idle past the vLLM-axis bound
+        too): the stop proceeds with the vLLM-axis's own distinct reason
+        (probe_blind_bound_exceeded — the vLLM axis is the deciding
+        factor); the seat axis has already fallen through its bound."""
+        self._idle_node(node, idle_secs=1600.0)
         set_seat(node, "blind")
         bound = ds.GW_STOP_GRACE_SEC + ds.DOORMAN_PROBE_BLINDNESS_SEC
         with node.lock:
