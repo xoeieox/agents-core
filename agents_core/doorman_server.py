@@ -318,6 +318,20 @@ DOORMAN_PROBE_LLAMA_ACTIVITY = os.environ.get(
 # as satisfied.
 _VLLM_ACTIVITY_METRICS = ("vllm:num_requests_running", "vllm:num_requests_waiting")
 
+# Prometheus gauge names read from the flash-next seat's (SGLang on :30000)
+# /metrics for the D2 legibility activity clock
+# (gw-doorman-flashnext-idle-awareness-v0). LEGIBILITY ONLY — never part of
+# the stop decision (the stop path consumes the seat-STATE probe). DoD-0
+# live check (2026-09-22/23): the seat was down at implementation time, so
+# these names are source-confirmed (sglang/srt/metrics/collector.py:
+# sglang:num_running_requests / sglang:num_queue_requests), the same
+# convention the vLLM gauges above follow. A missing/unparsable gauge
+# degrades the substate to "unknown" — it can never authorize a stop.
+_SGLANG_ACTIVITY_METRICS = (
+    "sglang:num_running_requests",
+    "sglang:num_queue_requests",
+)
+
 # ---------------------------------------------------------------------------
 # Capacity shadow (agents-core-doorman-capacity-shadow-v0) — instrumentation
 # only. Takes a fresh capacity reading on every would-defer deferrable acquire
