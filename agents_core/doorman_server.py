@@ -3846,6 +3846,39 @@ class _NodeState:
                     "window_since": self._flashnext_window_since,
                     "window_closed_at": self._flashnext_window_closed_at,
                     "last_vote": self._flashnext_state,
+                    # Flash-next idle-awareness (gw-doorman-flashnext-
+                    # idle-awareness-v0, D3): the operator surface for
+                    # "is the stop path withholding on the seat axis, and
+                    # why?". last_activity_ts is the D2 legibility clock
+                    # (probe-stamp time of the last successful activity
+                    # read observing running/waiting >= 1; null = no
+                    # observation — a 404 / non-200 / unparseable gauge is
+                    # unknown, never idle). eject_state is the stop-path
+                    # substate: idle-ok (no withhold on the seat axis —
+                    # the vLLM axis decides), withheld-active (seat up +
+                    # activity within grace), withheld-up-idle (seat up,
+                    # stamp stale/absent), withheld-blind (seat blind or
+                    # cold, within bound — or unbounded under the
+                    # DOORMAN_PROBE_BLINDNESS_SEC=0 sentinel). A withhold
+                    # is a normal safety state, not a failure: this block
+                    # never sets last_error (the 2026-09-13 cockpit wake-
+                    # collapse precedent — last_error stays reserved for
+                    # real errors).
+                    "last_activity_ts": self._flashnext_last_activity_ts,
+                    "eject_state": (
+                        "withheld-active"
+                        if self._flashnext_state
+                        in ("up_registered", "up_unverified")
+                        and self._flashnext_last_activity_ts is not None
+                        and (time.time() - self._flashnext_last_activity_ts)
+                        < GW_STOP_GRACE_SEC
+                        else "withheld-up-idle"
+                        if self._flashnext_state
+                        in ("up_registered", "up_unverified")
+                        else "withheld-blind"
+                        if self._flashnext_state in ("blind", None)
+                        else "idle-ok"
+                    ),
                 },
             }
 
