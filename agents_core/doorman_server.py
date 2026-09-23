@@ -1837,6 +1837,7 @@ class _NodeState:
             self._flashnext_state = flashnext_state
             self._flashnext_served_id = flashnext_served_id
             self._flashnext_registered = flashnext_registered
+            self._flashnext_error_class = flashnext_error_class
             # Window determination (D2): ACTIVE iff the :30000 probe reports
             # a seat listener (up_registered OR up_unverified — the safe
             # direction) AND the :8081 day-seat probe reports down. When the
