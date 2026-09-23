@@ -3554,8 +3554,13 @@ class _NodeState:
                 # (vLLM confirmed idle) — the stop fired because the
                 # seat's own probe went blind, not because the 27B-axis
                 # probe did.
+                # The flash-next axis is the deciding factor when it is
+                # NOT the vLLM axis that blew its bound (the vLLM axis's
+                # own bound-exceeded keeps its distinct reason, as
+                # today); a COLD-START state (None, treated as blind per
+                # D1) is the same deciding-factor class.
                 if (
-                    self._flashnext_state == "blind"
+                    self._flashnext_state in ("blind", None)
                     and not self._probe_indeterminate
                 ):
                     stop_reason = "flashnext_probe_blind_bound_exceeded"
