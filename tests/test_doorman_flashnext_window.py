@@ -263,7 +263,9 @@ class TestStopPathSeatPartition:
         """Both axes blind past both bounds (idle past the vLLM-axis bound
         too): the stop proceeds with the vLLM-axis's own distinct reason
         (probe_blind_bound_exceeded — the vLLM axis is the deciding
-        factor); the seat axis has already fallen through its bound."""
+        factor); the seat axis has already fallen through its bound.
+        The seat's blind clock is armed at idle_start here, so it is
+        past the bound too (both clocks coincide in this fixture)."""
         self._idle_node(node, idle_secs=1600.0)
         set_seat(node, "blind")
         bound = ds.GW_STOP_GRACE_SEC + ds.DOORMAN_PROBE_BLINDNESS_SEC
