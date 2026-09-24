@@ -3428,10 +3428,21 @@ class _NodeState:
             if _fn_state == "blind" or _fn_state is None:
                 # BLIND (or COLD START: state None before the first
                 # definitive read — D1: treat as blind, never down/idle-
-                # ok). The blind clock is armed in the tick's probe pass
-                # (None until the first blind/cold read, so a cold start
-                # is bounded from the first tick, not from a later
-                # arming).
+                # ok). The bound is measured on idle_elapsed (the grace
+                # clock — the spec's grace-pause semantics and the
+                # vLLM-axis precedent below), NOT on the continuous-
+                # blindness duration: the two clocks coincide only when
+                # the seat went blind at idle_start; if the seat goes
+                # blind after idle has already accumulated, the
+                # idle_elapsed bound releases the withhold at the same
+                # absolute idle age regardless of when blindness began
+                # (matching the vLLM axis, which also keys on
+                # idle_elapsed). The blindness clock
+                # (_flashnext_blind_since, armed in the tick's probe
+                # pass) is the fail-closed floor for COLD START, where
+                # idle_since is unanchored (None) and idle_elapsed does
+                # not exist yet — a cold start is bounded from the
+                # first tick, not from a later arming.
                 _fn_blind_elapsed = (
                     time.time() - self._flashnext_blind_since
                     if self._flashnext_blind_since is not None
@@ -3441,7 +3452,7 @@ class _NodeState:
                     _fn_blind_bound = (
                         GW_STOP_GRACE_SEC + DOORMAN_PROBE_BLINDNESS_SEC
                     )
-                    if _fn_blind_elapsed < _fn_blind_bound:
+                    if idle_elapsed < _fn_blind_bound:
                         _write_idle_log(
                             self.node_name, "flashnext_blind_hold", 0,
                             idle_secs=idle_elapsed,
