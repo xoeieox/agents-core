@@ -218,10 +218,10 @@ class TestStopPathSeatPartition:
         withhold on idle_elapsed (the vLLM-axis precedent), so the stop
         proceeds with the distinct stop_reason. Under the old
         blind-since clock this fixture would have withheld."""
-        self._idle_node(node, idle_secs=1000.0)
+        self._idle_node(node, idle_secs=1600.0)
         set_seat(node, "blind", error_class="Timeout")
         bound = ds.GW_STOP_GRACE_SEC + ds.DOORMAN_PROBE_BLINDNESS_SEC
-        assert 400.0 < bound < 1000.0  # blind duration within, idle past
+        assert 400.0 < bound < 1600.0  # blind duration within, idle past
         with node.lock:
             node._flashnext_blind_since = time.time() - 400.0
         with patch("subprocess.run", return_value=MagicMock(
