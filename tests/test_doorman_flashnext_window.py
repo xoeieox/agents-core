@@ -241,9 +241,9 @@ class TestStopPathSeatPartition:
         the vLLM axis is confirmed idle, so the stop proceeds with
         stop_reason EXACTLY flashnext_probe_blind_bound_exceeded (D1)
         and the event logs at CRITICAL."""
-        self._idle_node(node)
-        set_seat(node, "blind", error_class="Timeout")
         bound = ds.GW_STOP_GRACE_SEC + ds.DOORMAN_PROBE_BLINDNESS_SEC
+        self._idle_node(node, idle_secs=bound + 60.0)
+        set_seat(node, "blind", error_class="Timeout")
         with node.lock:
             node._flashnext_blind_since = time.time() - (bound + 60.0)
         with patch("subprocess.run", return_value=MagicMock(
