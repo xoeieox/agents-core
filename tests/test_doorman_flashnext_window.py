@@ -266,9 +266,9 @@ class TestStopPathSeatPartition:
         factor); the seat axis has already fallen through its bound.
         The seat's blind clock is armed at idle_start here, so it is
         past the bound too (both clocks coincide in this fixture)."""
-        self._idle_node(node, idle_secs=1600.0)
-        set_seat(node, "blind")
         bound = ds.GW_STOP_GRACE_SEC + ds.DOORMAN_PROBE_BLINDNESS_SEC
+        self._idle_node(node, idle_secs=bound + 60.0)
+        set_seat(node, "blind")
         with node.lock:
             node._flashnext_blind_since = time.time() - (bound + 60.0)
             node._probe_indeterminate = True
