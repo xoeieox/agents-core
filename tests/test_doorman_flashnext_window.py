@@ -26,7 +26,6 @@ close re-anchor one-shot semantics are asserted unchanged.
 from __future__ import annotations
 
 import json
-import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -285,22 +284,29 @@ class TestStopPathSeatPartition:
         assert idle_rows(node) == []
 
     def test_vllm_serving_no_stop(self, node):
-        """The vLLM axis is NOT idle (the day seat is serving, so
-        idle_since would not be set this way in production — here we
-        force the precondition to assert the existing rule: serving
-        blocks the stop)."""
+        """A serving vLLM axis blocks the stop: while the day seat is
+        serving the refresh loop re-anchors idle_since every tick
+        (source 'probe', _refresh_serving_cache), so the stop block
+        never sees idle_since at all — and _decide_idle_stop() with
+        idle_since=None issues no verb (the documented precondition
+        this method relies on)."""
         self._idle_node(node)
         set_seat(node, "down")
         with node.lock:
-            node._cached_serving = True
-        # idle_since is set but the serving cache says serving — the
-        # existing grace gate does not re-check serving here; instead
-        # assert the documented precondition via the D9-style field:
-        # a serving read resets idle_since in acquire, so this is the
-        # loop's job. The stop block itself only sees idle_since.
-        # (Kept as a matrix cell: seat down + idle past grace stops with
-        # confirmed_idle — the vLLM axis's own idle reading is what
-        # produced idle_since.)
+            node.idle_since = None  # the serving read re-anchored the clock
+            node._idle_since_source = "probe"
+        result, calls = run_stop(node)
+        assert result is False  # the stop block is skipped entirely
+        assert calls == []  # the gw-serve stop verb NEVER fires
+        assert idle_rows(node) == []
+
+    def test_seat_down_idle_past_grace_stops_confirmed_idle(self, node):
+        """The vLLM axis's own idle reading is what produced idle_since:
+        seat definitively down + idle past grace -> the stop fires with
+        confirmed_idle (the matrix cell the misnamed predecessor test
+        actually covered)."""
+        self._idle_node(node)
+        set_seat(node, "down")
         with patch("subprocess.run", return_value=MagicMock(
                 returncode=0, stdout="", stderr="")) as run_mock, \
              patch.object(node, "_is_serving", return_value=False):
