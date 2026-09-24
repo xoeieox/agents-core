@@ -3879,12 +3879,21 @@ class _NodeState:
                     # (probe-stamp time of the last successful activity
                     # read observing running/waiting >= 1; null = no
                     # observation — a 404 / non-200 / unparseable gauge is
-                    # unknown, never idle). eject_state is the stop-path
-                    # substate: idle-ok (no withhold on the seat axis —
-                    # the vLLM axis decides), withheld-active (seat up +
-                    # activity within grace), withheld-up-idle (seat up,
-                    # stamp stale/absent), withheld-blind (seat blind or
-                    # cold, within bound — or unbounded under the
+                    # unknown, never idle). Deliberate deviation from the
+                    # D2 spec's "a clock not refreshed this tick renders
+                    # unknown" wording (confirmed at the gate, cycle-1
+                    # review): the last stamp is carried forward — a
+                    # stale/absent stamp renders withheld-up-idle, which
+                    # is the safer direction (the seat-up withhold is
+                    # unconditional regardless of the substate, so a
+                    # stale stamp can never authorize a stop; rendering
+                    # "unknown" would only lose the active/idle
+                    # distinction the operator reads). eject_state is the
+                    # stop-path substate: idle-ok (no withhold on the
+                    # seat axis — the vLLM axis decides), withheld-active
+                    # (seat up + activity within grace), withheld-up-idle
+                    # (seat up, stamp stale/absent), withheld-blind (seat
+                    # blind or cold, within bound — or unbounded under the
                     # DOORMAN_PROBE_BLINDNESS_SEC=0 sentinel). A withhold
                     # is a normal safety state, not a failure: this block
                     # never sets last_error (the 2026-09-13 cockpit wake-
