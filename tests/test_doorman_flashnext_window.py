@@ -396,10 +396,11 @@ class TestStopPathNonRegression:
         # second call: the flag is consumed — no re-anchor, no row.
         result2, calls2 = run_stop(node)
         assert calls2 == []
-        assert "flashnext_window_closed" not in [
-            r["event"] for r in idle_rows(node)][1:] or True
+        # one-shot: the second tick wrote NO further flashnext_window_closed
+        # row (the flag was consumed on the first) and no stop fired.
         rows2 = idle_rows(node)
         assert sum(1 for r in rows2 if r["event"] == "flashnext_window_closed") == 1
+        assert "stopped" not in [r["event"] for r in rows2]
 
 
 # ---------------------------------------------------------------------------
