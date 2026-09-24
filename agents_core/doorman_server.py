@@ -3367,15 +3367,23 @@ class _NodeState:
             #   based withhold to the overlap case.
             #   seat BLIND (or cold/None — COLD START, D1): withhold,
             #   BOUNDED, mirroring the vLLM-axis bound below: a
-            #   continuous-blindness clock (armed on the first blind read
-            #   since the last definitive read, cleared on a definitive
-            #   read — bookkeeping in the tick's probe pass, the probe
-            #   method stays stateless); while blind and
-            #   idle_elapsed < GW_STOP_GRACE_SEC +
+            #   while blind and idle_elapsed < GW_STOP_GRACE_SEC +
             #   DOORMAN_PROBE_BLINDNESS_SEC the grace clock pauses
-            #   (idle-log row, no verb). Past the bound this axis stops
-            #   withholding and, where it is the deciding factor, the
-            #   stop proceeds with a distinct stop_reason
+            #   (idle-log row, no verb) — the bound is measured on
+            #   idle_elapsed (the grace clock), exactly like the
+            #   vLLM-axis precedent below, NOT on the continuous-
+            #   blindness duration: the two clocks coincide only when
+            #   the seat went blind at idle_start, and the spec's
+            #   grace-pause semantics bind on idle_elapsed. The
+            #   continuous-blindness clock (armed on the first blind
+            #   read since the last definitive read, cleared on a
+            #   definitive read — bookkeeping in the tick's probe
+            #   pass, the probe method stays stateless) remains the
+            #   fail-closed floor for COLD START, where idle_since is
+            #   unanchored (None) and idle_elapsed does not exist yet.
+            #   Past the bound this axis stops withholding and, where
+            #   it is the deciding factor, the stop proceeds with a
+            #   distinct stop_reason
             #   (flashnext_probe_blind_bound_exceeded) at CRITICAL.
             #   DOORMAN_PROBE_BLINDNESS_SEC == 0 is the sentinel for
             #   UNBOUNDED (withhold on blind forever — the operator
