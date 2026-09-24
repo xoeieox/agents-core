@@ -170,9 +170,12 @@ class TestStopPathSeatPartition:
     # -- the blind bound ---------------------------------------------------
 
     def test_blind_within_bound_withholds(self, node):
-        """Seat blind, idle past grace, blind clock within the bound
+        """Seat blind, idle past grace, grace clock within the bound
         (grace + DOORMAN_PROBE_BLINDNESS_SEC): no verb; a
-        flashnext_blind_hold row."""
+        flashnext_blind_hold row. The bound is measured on idle_elapsed
+        (the grace clock — the spec's grace-pause semantics and the
+        vLLM-axis precedent), so the blind-since fixture is armed at
+        idle_start here (both clocks coincide in this fixture)."""
         self._idle_node(node)
         set_seat(node, "blind", error_class="Timeout")
         with node.lock:
@@ -186,12 +189,58 @@ class TestStopPathSeatPartition:
         assert row["error_class"] == "Timeout"
         assert "stopped" not in [r["event"] for r in rows]
 
+    def test_blind_after_idle_accumulated_bound_is_idle_elapsed(self, node):
+        """The two clocks coincide ONLY when the seat went blind at
+        idle_start. Here the seat went blind 400s AFTER idle already
+        had 632s accumulated: the continuous-blindness duration (400s)
+        is within the bound, but the spec's grace-pause semantics bind
+        on idle_elapsed (632s + 900s bound -> still withheld; this
+        fixture pins the divergence case the blind-since fixtures
+        cannot). No verb."""
+        self._idle_node(node, idle_secs=632.0)
+        set_seat(node, "blind", error_class="Timeout")
+        bound = ds.GW_STOP_GRACE_SEC + ds.DOORMAN_PROBE_BLINDNESS_SEC
+        assert 400.0 < bound  # blind duration alone is within the bound
+        with node.lock:
+            node._flashnext_blind_since = time.time() - 400.0
+        result, calls = run_stop(node)
+        assert result is True
+        assert calls == []
+        rows = idle_rows(node)
+        assert any(r["event"] == "flashnext_blind_hold" for r in rows)
+        assert "stopped" not in [r["event"] for r in rows]
+
+    def test_blind_after_idle_accumulated_past_bound_proceeds(self, node):
+        """The divergence case in the other direction: idle 1000s
+        accumulated, the seat went blind only 400s ago. The continuous-
+        blindness duration (400s) is within the bound, but idle_elapsed
+        (1000s) is past it — the grace-pause semantics release the
+        withhold on idle_elapsed (the vLLM-axis precedent), so the stop
+        proceeds with the distinct stop_reason. Under the old
+        blind-since clock this fixture would have withheld."""
+        self._idle_node(node, idle_secs=1000.0)
+        set_seat(node, "blind", error_class="Timeout")
+        bound = ds.GW_STOP_GRACE_SEC + ds.DOORMAN_PROBE_BLINDNESS_SEC
+        assert 400.0 < bound < 1000.0  # blind duration within, idle past
+        with node.lock:
+            node._flashnext_blind_since = time.time() - 400.0
+        with patch("subprocess.run", return_value=MagicMock(
+                returncode=0, stdout="", stderr="")) as run_mock, \
+             patch.object(node, "_is_serving", return_value=False), \
+             patch.object(ds.log, "critical") as crit_mock:
+            result = node._decide_idle_stop()
+        assert result is True
+        assert run_mock.called
+        assert stopped_reason(node) == "flashnext_probe_blind_bound_exceeded"
+        assert crit_mock.called
+
     def test_blind_bound_exceeded_stop_proceeds_distinct_reason(self, node):
         """Continuous blind past GW_STOP_GRACE_SEC +
-        DOORMAN_PROBE_BLINDNESS_SEC: this axis stops withholding; the vLLM
-        axis is confirmed idle, so the stop proceeds with stop_reason
-        EXACTLY flashnext_probe_blind_bound_exceeded (D1) and the event
-        logs at CRITICAL."""
+        DOORMAN_PROBE_BLINDNESS_SEC (armed at idle_start, so the blind
+        clock and idle_elapsed coincide): this axis stops withholding;
+        the vLLM axis is confirmed idle, so the stop proceeds with
+        stop_reason EXACTLY flashnext_probe_blind_bound_exceeded (D1)
+        and the event logs at CRITICAL."""
         self._idle_node(node)
         set_seat(node, "blind", error_class="Timeout")
         bound = ds.GW_STOP_GRACE_SEC + ds.DOORMAN_PROBE_BLINDNESS_SEC
