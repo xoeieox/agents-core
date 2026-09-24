@@ -3510,11 +3510,13 @@ class _NodeState:
                 log.critical(
                     f"[{self.node_name}] flashnext_probe_blind_bound_"
                     f"exceeded — :30000 probe blind for "
-                    f"{_fn_blind_elapsed:.0f}s (bound "
-                    f"{GW_STOP_GRACE_SEC + DOORMAN_PROBE_BLINDNESS_SEC}s); "
-                    f"the blind-withhold no longer withholds the stop "
-                    f"(idle {idle_elapsed:.0f}s). A permanently broken "
-                    f"probe must not pin the box awake forever."
+                    f"{_fn_blind_elapsed:.0f}s, idle "
+                    f"{idle_elapsed:.0f}s >= bound "
+                    f"{GW_STOP_GRACE_SEC + DOORMAN_PROBE_BLINDNESS_SEC}s "
+                    f"(measured on the grace clock, like the vLLM axis); "
+                    f"the blind-withhold no longer withholds the stop. "
+                    f"A permanently broken probe must not pin the box "
+                    f"awake forever."
                 )
             # _fn_state in ("down", "up_foreign"): definitive — this axis
             # does not withhold; the vLLM axis decides, as today.
