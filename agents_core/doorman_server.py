@@ -73,6 +73,22 @@ Environment variables:
                            requires /v1/models data[0].id == this value; an
                            identifiable foreign occupant never admits a
                            window (never guess).
+  DOORMAN_FLASHNEXT_ACTIVITY_METRICS
+                        — comma-separated Prometheus gauge names read from
+                           the flash-next seat's /metrics for the D2
+                           LEGIBILITY activity clock
+                           (gw-doorman-flashnext-idle-awareness-v0; default
+                           sglang:num_running_reqs,sglang:num_queue_reqs —
+                           DoD-0 live-confirmed against the SGLang source
+                           tree 2026-09-26). LEGIBILITY ONLY: never consumed
+                           by the stop decision. The seat currently runs
+                           with enable_metrics=False, so /metrics answers
+                           404 and the probe falls back to /get_load
+                           (num_reqs / num_waiting_reqs); a gauge rename in
+                           a future SGLang is an env change, not a code
+                           change. Any failure on both legs is "unknown",
+                           never an idle reading and never a stop
+                           authorization.
   GW_SERVE_STOP_GIVEUP_SEC — seconds a stop may report stop_in_progress before the
                            background reconciler gives up and surfaces a genuine
                            failure (last_error + a stop_failed idle-log row),
@@ -321,16 +337,40 @@ _VLLM_ACTIVITY_METRICS = ("vllm:num_requests_running", "vllm:num_requests_waitin
 # Prometheus gauge names read from the flash-next seat's (SGLang on :30000)
 # /metrics for the D2 legibility activity clock
 # (gw-doorman-flashnext-idle-awareness-v0). LEGIBILITY ONLY — never part of
-# the stop decision (the stop path consumes the seat-STATE probe). DoD-0
-# live check (2026-09-22/23): the seat was down at implementation time, so
-# these names are source-confirmed (sglang/srt/metrics/collector.py:
-# sglang:num_running_requests / sglang:num_queue_requests), the same
-# convention the vLLM gauges above follow. A missing/unparsable gauge
-# degrades the substate to "unknown" — it can never authorize a stop.
-_SGLANG_ACTIVITY_METRICS = (
-    "sglang:num_running_requests",
-    "sglang:num_queue_requests",
+# the stop decision (the stop path consumes the seat-STATE probe).
+# DoD-0 LIVE check (2026-09-26, seat UP): the seat runs with
+# enable_metrics=False, so GET :30000/metrics answers 404 ({"detail":"Not
+# Found"}) and the Prometheus gauges are NOT exposed at all on this
+# deployment — the probe therefore falls back to the always-on /get_load
+# endpoint below (see _probe_flashnext_activity). When metrics ARE enabled
+# the gauge names are the ones the running SGLang builds actually emit,
+# confirmed against the live source tree
+# (python/sglang/srt/observability/metrics_collector.py, SchedulerMetrics
+# Collector.__init__): "sglang:num_running_reqs" and
+# "sglang:num_queue_reqs" — NOT the "..._requests" spellings the earlier
+# (seat-down) source read recorded; those names exist in no SGLang build and
+# would have pinned the substate to "unknown" forever. Overridable via
+# DOORMAN_FLASHNEXT_ACTIVITY_METRICS (comma-separated) so a SGLang version
+# bump that renames the gauges does not require a code change. A
+# missing/unparsable gauge degrades the substate to "unknown" — it can never
+# authorize a stop.
+_SGLANG_ACTIVITY_METRICS = tuple(
+    m.strip()
+    for m in os.environ.get(
+        "DOORMAN_FLASHNEXT_ACTIVITY_METRICS",
+        "sglang:num_running_reqs,sglang:num_queue_reqs",
+    ).split(",")
+    if m.strip()
 )
+
+# Keys read from the flash-next seat's /get_load for the same D2 clock —
+# the DoD-0-live-confirmed activity source on THIS deployment (2026-09-26:
+# GET :30000/get_load -> [{"dp_rank":0,"num_reqs":0,"num_waiting_reqs":0,
+# "num_tokens":0,"num_pending_tokens":0,"ts_tic":...}], HTTP 200 with
+# enable_metrics=False). The running/waiting pair maps to the two gauges
+# above; the other keys are ignored. As with the gauges, LEGIBILITY ONLY.
+_SGLANG_LOAD_RUNNING_KEYS = ("num_reqs", "num_running_reqs")
+_SGLANG_LOAD_WAITING_KEYS = ("num_waiting_reqs", "num_queue_reqs")
 
 # ---------------------------------------------------------------------------
 # Capacity shadow (agents-core-doorman-capacity-shadow-v0) — instrumentation
@@ -979,9 +1019,13 @@ class _NodeState:
         self._flashnext_last_activity_ts: float | None = None
         # One-shot journal latch for the transition into a new withhold
         # state (D3: one WARNING per transition; steady-state withhold =
-        # idle-log rows only). Set by _decide_idle_stop, cleared on a
-        # definitive non-withhold read (the next transition warns again).
-        self._flashnext_withhold_warned: bool = False
+        # idle-log rows only). Holds the LAST-WARNED withhold substate
+        # ("up:<registered|unverified>:<active|idle>" / "blind" / "cold");
+        # _decide_idle_stop warns only when THIS tick's substate differs
+        # from it, so a steady-state withhold writes idle-log rows and no
+        # journal line. Cleared on a definitive non-withhold seat read
+        # (down / up_foreign) so the next transition warns again.
+        self._flashnext_withhold_substate: str | None = None
         # Tri-state dual-slot activity probe (gw-doorman-vllm-activity-probe-v0):
         # True when the most recent _probe_slot_activity() tick was indeterminate
         # (at least one probe ambiguous, none confirmed activity) — read by the
@@ -1616,33 +1660,43 @@ class _NodeState:
 
     def _probe_flashnext_activity(self) -> bool | None:
         """D2 legibility probe (gw-doorman-flashnext-idle-awareness-v0):
-        GET {GW_FLASHNEXT_URL}/metrics (SGLang's Prometheus plaintext
-        exposition, same shape as the vLLM /metrics probes) and read the
-        running/waiting request gauges.
+        read the flash-next seat's running/waiting request counters, from
+        either of two sources on {GW_FLASHNEXT_URL}:
+
+          1. GET /metrics — SGLang's Prometheus plaintext exposition (same
+             shape as the vLLM /metrics probes), read for the
+             running/queued request gauges (_SGLANG_ACTIVITY_METRICS).
+          2. GET /get_load — the DoD-0-live-confirmed fallback for THIS
+             deployment (2026-09-26, seat UP): the seat runs with
+             enable_metrics=False, so /metrics answers 404 and the gauges
+             are never exposed; /get_load answers 200 with one object per
+             dp_rank carrying num_reqs (running) and num_waiting_reqs
+             (waiting).
+
+        /metrics is tried first and only a NON-200 / unparsable / empty
+        gauge read falls through to /get_load — a confirmed reading from
+        either source is authoritative for the tick. A 404 (or any other
+        failure) on BOTH is "unknown".
 
         Returns:
-          True  — a target gauge was found and parsed with a nonzero value
-                  (running/waiting >= 1: confirmed activity).
-          False — all target gauges were found and parsed, all zero
+          True  — a target gauge/field was found and parsed with a nonzero
+                  value (running/waiting >= 1: confirmed activity).
+          False — the target gauges/fields were found and parsed, all zero
                   (confirmed idle).
-          None  — the call failed (timeout/connection-refused/non-200), the
-                  body contained no target gauge, or the gauges were
+          None  — both calls failed (timeout/connection-refused/non-200),
+                  neither body contained a target field, or the values were
                   unparsable: the "unknown" substate. Never a stop
                   authorization, never an idle reading (D2: a 404 /
-                  non-200 / unparseable activity gauge is unknown, not idle).
+                  non-200 / unparseable activity gauge is unknown, not idle
+                  — the whole reason the 404-on-/metrics deployment needs
+                  the /get_load fallback rather than a permanently-unknown
+                  clock).
 
         LEGIBILITY ONLY (D2): this probe NEVER feeds the stop decision — the
         stop path consumes the seat-STATE probe (_probe_flashnext_seat)
         exclusively. It feeds only the _flashnext_last_activity_ts clock
-        (rendered as withheld-active vs withheld-up-idle and on /status).
-
-        DoD-0 live check (2026-09-22/23): the seat was down (port refused)
-        at implementation time, so the gauge names are confirmed by reading
-        SGLang's source (sglang/srt/metrics/collector.py: sglang:num_running_
-        requests / sglang:num_queue_requests) — the same
-        source-confirmed-not-live-verified convention the vLLM activity
-        gauges above follow. A missing endpoint degrades the substate to
-        "unknown"; it cannot authorize a stop.
+        (rendered as withheld-active vs withheld-up-idle and on /status). A
+        clock not refreshed this tick renders "unknown", never idle.
 
         Never raises. Must be called OUTSIDE self.lock (blocking HTTP,
         2.5s timeout, no-redirect pin — same discipline as the seat probe).
@@ -1653,41 +1707,95 @@ class _NodeState:
                 timeout=2.5,
                 allow_redirects=False,
             )
-            if resp.status_code != 200:
-                return None
-            total = 0.0
-            found = False
-            for line in resp.text.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                for metric in _SGLANG_ACTIVITY_METRICS:
-                    if line.startswith(metric + "{"):
-                        # Brace-aware parse (same convention as the vLLM
-                        # activity probe): the value starts right after the
-                        # closing brace, not at the last space.
-                        brace_end = line.find("}")
-                        if brace_end == -1:
+            if resp.status_code == 200:
+                total = 0.0
+                found = False
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    for metric in _SGLANG_ACTIVITY_METRICS:
+                        if line.startswith(metric + "{"):
+                            # Brace-aware parse (same convention as the vLLM
+                            # activity probe): the value starts right after the
+                            # closing brace, not at the last space.
+                            brace_end = line.find("}")
+                            if brace_end == -1:
+                                continue
+                            value_str = line[brace_end + 1:].strip().split()
+                        elif line.startswith(metric + " "):
+                            value_str = line[len(metric):].strip().split()
+                        else:
                             continue
-                        value_str = line[brace_end + 1:].strip().split()
-                    elif line.startswith(metric + " "):
-                        value_str = line[len(metric):].strip().split()
-                    else:
-                        continue
-                    if not value_str:
-                        continue
-                    try:
-                        total += float(value_str[0])
-                    except ValueError:
-                        continue
-                    else:
-                        found = True
-            if not found:
-                return None
-            return total > 0
+                        if not value_str:
+                            continue
+                        try:
+                            total += float(value_str[0])
+                        except ValueError:
+                            continue
+                        else:
+                            found = True
+                if found:
+                    return total > 0
         except Exception as exc:
-            log.debug(f"[{self.node_name}] flashnext activity probe inconclusive: {exc}")
+            # Never a stop authorization, never an idle reading — just an
+            # inconclusive metrics leg.
+            log.debug(
+                f"[{self.node_name}] flashnext metrics leg inconclusive "
+                f"(falling through to /get_load): {exc}"
+            )
+        # Metrics leg inconclusive (non-200 — the enable_metrics=False
+        # deployment answers 404 — an empty body, no target gauge, or a
+        # failed call): fall through to the /get_load leg.
+        try:
+            return self._probe_flashnext_load()
+        except Exception as exc:
+            log.debug(
+                f"[{self.node_name}] flashnext /get_load leg inconclusive "
+                f"too: {exc}"
+            )
             return None
+
+    def _probe_flashnext_load(self) -> bool | None:
+        """The /get_load leg of the D2 legibility activity probe
+        (gw-doorman-flashnext-idle-awareness-v0, DoD-0 live 2026-09-26):
+        GET {GW_FLASHNEXT_URL}/get_load and sum the running/waiting request
+        counts across the dp_rank objects.
+
+        Same tri-state contract as the /metrics leg: True on any nonzero
+        running/waiting count, False when the fields were present and all
+        zero, None (unknown) on any failure — non-200, non-JSON, a JSON body
+        that is not a list of objects, or objects carrying none of the
+        target keys. A malformed response is never an idle reading and never
+        a stop authorization. Never raises. Must be called OUTSIDE self.lock.
+        """
+        resp = requests.get(
+            f"{GW_FLASHNEXT_URL}/get_load",
+            timeout=2.5,
+            allow_redirects=False,
+        )
+        if resp.status_code != 200:
+            return None
+        entries = resp.json()
+        if not isinstance(entries, list):
+            return None
+        total = 0.0
+        found = False
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            for key in _SGLANG_LOAD_RUNNING_KEYS + _SGLANG_LOAD_WAITING_KEYS:
+                if key not in entry:
+                    continue
+                try:
+                    total += float(entry[key])
+                except (TypeError, ValueError):
+                    continue
+                else:
+                    found = True
+        if not found:
+            return None
+        return total > 0
 
     def _probe_slot_activity(self) -> bool | None:
         """Tri-state unmediated-caller activity probe across all signal sources
@@ -1795,9 +1903,6 @@ class _NodeState:
         # the window determination must work regardless of that flag) and
         # never joined to the activity vote lists (Invariant 8: :30000
         # activity is irrelevant to the 27B axis's idle clock).
-        flashnext_state, flashnext_served_id, flashnext_registered, flashnext_error_class = (
-            self._probe_flashnext_seat(sequential=False)
-        )
         # Flash-next D2 legibility activity probe
         # (gw-doorman-flashnext-idle-awareness-v0): unconditional, beside
         # the two existing :30000 GETs, same 2.5s timeout and no-redirect
@@ -1805,7 +1910,43 @@ class _NodeState:
         # the flag's rollback lever must not be able to starve this
         # legibility source. A clock not refreshed this tick renders
         # "unknown", never idle.
-        flashnext_activity: bool | None = self._probe_flashnext_activity()
+        # The two :30000 legs run as CONCURRENT tasks of a small private
+        # pool (D2 placement: "widen the worker pool or add a concurrent
+        # task") so the legibility leg never adds its 2.5s (metrics leg) +
+        # 2.5s (/get_load leg) to the tick's wall time on top of the seat
+        # probe's own 2.5s: the whole :30000 probe pass stays ~2.5s, the
+        # slowest single leg, never additive.
+        with ThreadPoolExecutor(max_workers=2) as _fn_pool:
+            _fn_seat_fut = _fn_pool.submit(
+                self._probe_flashnext_seat, sequential=False
+            )
+            _fn_activity_fut = _fn_pool.submit(self._probe_flashnext_activity)
+            try:
+                flashnext_state, flashnext_served_id, flashnext_registered, flashnext_error_class = (
+                    _fn_seat_fut.result()
+                )
+            except Exception as exc:
+                # The seat probe is documented never to raise; a raise is a
+                # bug, and the fail-closed reading of a bug on this axis is
+                # BLIND (Invariant 7: blindness is never a no), never
+                # "down" — and never an exception that takes the refresh
+                # tick (and with it the whole idle-stop loop) down.
+                log.warning(
+                    f"[{self.node_name}] flashnext seat probe raised "
+                    f"{type(exc).__name__} ({exc}) — treating as blind"
+                )
+                flashnext_state, flashnext_served_id = "blind", None
+                flashnext_registered, flashnext_error_class = None, type(exc).__name__
+            try:
+                flashnext_activity: bool | None = _fn_activity_fut.result()
+            except Exception as exc:
+                # Legibility leg: any failure is "unknown", never idle
+                # (D2) — and never allowed to break the tick.
+                log.debug(
+                    f"[{self.node_name}] flashnext activity probe raised "
+                    f"{type(exc).__name__} ({exc}) — unknown substate"
+                )
+                flashnext_activity = None
 
         # Single topology resolution — outside the lock (blocking HTTP).
         topology_state = None
@@ -1891,10 +2032,12 @@ class _NodeState:
                     self._flashnext_last_activity_ts = None
             # D3 legibility: a steady-state withhold is a normal safety
             # state, not a failure — entering it does not set last_error;
-            # leaving it (a definitive non-withhold read) re-arms the
-            # one-shot transition warning.
-            if flashnext_state not in ("up_registered", "up_unverified"):
-                self._flashnext_withhold_warned = False
+            # a definitive non-withhold seat read (down / up_foreign — the
+            # states where this axis does not withhold) re-arms the
+            # one-shot transition warning, so the next entry into any
+            # withhold substate journals once again.
+            if flashnext_state in ("down", "up_foreign"):
+                self._flashnext_withhold_substate = None
             # D2 stamp rule (one sentence): the clock is stamped only by a
             # successful probe that observed running/waiting >= 1;
             # successful zero-activity reads, failed reads, and the cold
@@ -3414,8 +3557,14 @@ class _NodeState:
                     seat_state=_fn_state,
                     last_activity_ts=_fn_last_activity,
                 )
-                if not self._flashnext_withhold_warned:
-                    self._flashnext_withhold_warned = True
+                # D3 journal: one-shot WARNING on the transition INTO a new
+                # withhold substate; a steady-state withhold (the same
+                # substate as the previous tick) writes idle-log rows only.
+                _fn_substate = (
+                    f"up:{_fn_state}:{'active' if _fn_active else 'idle'}"
+                )
+                if self._flashnext_withhold_substate != _fn_substate:
+                    self._flashnext_withhold_substate = _fn_substate
                     log.warning(
                         f"[{self.node_name}] flashnext-seat-up — :30000 "
                         f"seat {_fn_state} (served_id="
@@ -3460,8 +3609,13 @@ class _NodeState:
                             blind_secs=round(_fn_blind_elapsed, 2),
                             error_class=self._flashnext_error_class,
                         )
-                        if not self._flashnext_withhold_warned:
-                            self._flashnext_withhold_warned = True
+                        # D3 journal: one-shot on the transition into the
+                        # blind withhold substate (cold/None is its own
+                        # substate, so a cold start that later turns blind
+                        # journals once more).
+                        _fn_substate = "cold" if _fn_state is None else "blind"
+                        if self._flashnext_withhold_substate != _fn_substate:
+                            self._flashnext_withhold_substate = _fn_substate
                             log.warning(
                                 f"[{self.node_name}] flashnext-seat-blind — "
                                 f":30000 probe indeterminate (state="
@@ -3486,8 +3640,14 @@ class _NodeState:
                         blind_secs=round(_fn_blind_elapsed, 2),
                         error_class=self._flashnext_error_class,
                     )
-                    if not self._flashnext_withhold_warned:
-                        self._flashnext_withhold_warned = True
+                    # D3 journal: one-shot on the transition into the
+                    # unbounded-blind withhold substate.
+                    _fn_substate = (
+                        "cold-unbounded" if _fn_state is None
+                        else "blind-unbounded"
+                    )
+                    if self._flashnext_withhold_substate != _fn_substate:
+                        self._flashnext_withhold_substate = _fn_substate
                         log.warning(
                             f"[{self.node_name}] flashnext-seat-blind — "
                             f":30000 probe indeterminate (state="

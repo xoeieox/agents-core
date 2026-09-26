@@ -531,6 +531,146 @@ class TestProbePassBookkeeping:
             node._refresh_serving_cache()
         assert act_mock.called
 
+    def test_seat_probe_raise_is_blind_never_down(self, node):
+        """A raise out of the seat probe (documented never to happen; a bug
+        is read fail-closed) lands as BLIND with the real error class —
+        never "down", never an exception that kills the tick."""
+        with patch.object(node, "_probe_flashnext_seat",
+                          side_effect=RuntimeError("boom")), \
+             patch.object(node, "_probe_flashnext_activity", return_value=None), \
+             patch.object(node, "_is_serving", return_value=True), \
+             patch.object(node, "_is_creative_serving", return_value=False):
+            node._refresh_serving_cache()
+        assert node._flashnext_state == "blind"
+        assert node._flashnext_error_class == "RuntimeError"
+        assert node._flashnext_blind_since is not None
+
+    def test_activity_probe_raise_is_unknown(self, node):
+        """A raise out of the legibility probe renders the clock unknown:
+        the stamp is left unchanged and the tick completes."""
+        with node.lock:
+            node._flashnext_last_activity_ts = None
+        with patch.object(node, "_probe_flashnext_seat",
+                          return_value=("up_registered", "m", True, None)), \
+             patch.object(node, "_probe_flashnext_activity",
+                          side_effect=RuntimeError("boom")), \
+             patch.object(node, "_is_serving", return_value=True), \
+             patch.object(node, "_is_creative_serving", return_value=False):
+            node._refresh_serving_cache()
+        assert node._flashnext_last_activity_ts is None
+        assert node._flashnext_state == "up_registered"
+
+
+# ---------------------------------------------------------------------------
+# D3 journal: one-shot WARNING per withhold transition
+# ---------------------------------------------------------------------------
+
+class TestWithholdJournalOneShot:
+    """D3: one WARNING on the transition INTO a new withhold substate;
+    a steady-state withhold writes idle-log rows and NO journal line."""
+
+    def _idle_up(self, node, seat_state="up_registered", stamp_age=100.0):
+        with node.lock:
+            node.idle_since = time.time() - 632.0
+            node._cached_serving = True
+            node.service_stopped = False
+            node._stop_in_flight = False
+            node.leases = {}
+            node._probe_indeterminate = False
+            node._serving_is_big = False
+            node._cached_topology_state = None
+            node._flashnext_state = seat_state
+            node._flashnext_last_activity_ts = (
+                None if stamp_age is None else time.time() - stamp_age
+            )
+        return node
+
+    def test_steady_state_withhold_journals_once(self, node):
+        self._idle_up(node)
+        with patch.object(ds.log, "warning") as warn_mock:
+            run_stop(node)
+            run_stop(node)
+            run_stop(node)
+        msgs = [str(c.args[0]) for c in warn_mock.call_args_list if c.args]
+        held = [m for m in msgs if "flashnext-seat-up" in m]
+        assert len(held) == 1
+        # ...but the idle log carries one row per withheld tick.
+        rows = [r for r in idle_rows(node)
+                if r["event"] == "flashnext_withheld_active"]
+        assert len(rows) == 3
+
+    def test_substate_change_journals_again(self, node):
+        """active -> up-idle is a NEW withhold substate: it journals once
+        more (the operator's 'the seat went quiet' edge)."""
+        self._idle_up(node, stamp_age=100.0)
+        with patch.object(ds.log, "warning") as warn_mock:
+            run_stop(node)
+        with node.lock:
+            node._flashnext_last_activity_ts = None
+        with patch.object(ds.log, "warning") as warn_mock2:
+            run_stop(node)
+        first = [str(c.args[0]) for c in warn_mock.call_args_list if c.args]
+        second = [str(c.args[0]) for c in warn_mock2.call_args_list if c.args]
+        assert any("flashnext-seat-up" in m for m in first)
+        assert any("flashnext-seat-up" in m for m in second)
+
+    def test_definitive_read_rearms_the_warning(self, node):
+        """down/up_foreign clears the latch (in the tick's probe pass), so
+        re-entering the withhold journals again — a flap is visible, a
+        steady state is not."""
+        self._idle_up(node)
+        with patch.object(ds.log, "warning") as warn_mock:
+            run_stop(node)
+        first = [str(c.args[0]) for c in warn_mock.call_args_list if c.args]
+        assert any("flashnext-seat-up" in m for m in first)
+
+        def _tick(seat_result):
+            with patch.object(node, "_probe_flashnext_seat",
+                              return_value=seat_result), \
+                 patch.object(node, "_probe_flashnext_activity",
+                              return_value=None), \
+                 patch.object(node, "_is_serving", return_value=True), \
+                 patch.object(node, "_is_creative_serving", return_value=False):
+                node._refresh_serving_cache()
+
+        # A definitive down tick clears the latch.
+        _tick(("down", None, None, "ConnectionRefusedError"))
+        assert node._flashnext_withhold_substate is None
+        # ...and the seat coming back up re-enters the withhold: journals.
+        _tick(("up_registered", "m", True, None))
+        with node.lock:
+            node.idle_since = time.time() - 632.0
+            node.service_stopped = False
+            node._stop_in_flight = False
+            node.leases = {}
+            node._probe_indeterminate = False
+            node._serving_is_big = False
+            node._cached_topology_state = None
+        with patch.object(ds.log, "warning") as warn_mock2:
+            run_stop(node)
+        msgs = [str(c.args[0]) for c in warn_mock2.call_args_list if c.args]
+        assert any("flashnext-seat-up" in m for m in msgs)
+
+    def test_blind_steady_state_journals_once(self, node):
+        with node.lock:
+            node.idle_since = time.time() - 632.0
+            node._cached_serving = True
+            node.service_stopped = False
+            node._stop_in_flight = False
+            node.leases = {}
+            node._probe_indeterminate = False
+            node._serving_is_big = False
+            node._cached_topology_state = None
+            node._flashnext_state = "blind"
+            node._flashnext_blind_since = time.time() - 100.0
+        with patch.object(ds.log, "warning") as warn_mock:
+            run_stop(node)
+            run_stop(node)
+        msgs = [str(c.args[0]) for c in warn_mock.call_args_list if c.args]
+        assert len([m for m in msgs if "flashnext-seat-blind" in m]) == 1
+        assert len([r for r in idle_rows(node)
+                    if r["event"] == "flashnext_blind_hold"]) == 2
+
 
 # ---------------------------------------------------------------------------
 # D2: the legibility probe itself
@@ -550,9 +690,9 @@ class TestFlashnextActivityProbe:
     def test_confirmed_activity(self):
         node = _NodeState(gw_url="http://mock.internal/")
         body = (
-            "# HELP sglang:num_running_requests ...\n"
-            "sglang:num_running_requests{engine=\"0\"} 3.0\n"
-            "sglang:num_queue_requests{engine=\"0\"} 0.0\n"
+            "# HELP sglang:num_running_reqs ...\n"
+            "sglang:num_running_reqs{engine=\"0\"} 3.0\n"
+            "sglang:num_queue_reqs{engine=\"0\"} 0.0\n"
         )
         with patch("requests.get", return_value=self._resp(200, body)):
             assert node._probe_flashnext_activity() is True
@@ -560,8 +700,8 @@ class TestFlashnextActivityProbe:
     def test_confirmed_idle(self):
         node = _NodeState(gw_url="http://mock.internal/")
         body = (
-            "sglang:num_running_requests{engine=\"0\"} 0.0\n"
-            "sglang:num_queue_requests{engine=\"0\"} 0.0\n"
+            "sglang:num_running_reqs{engine=\"0\"} 0.0\n"
+            "sglang:num_queue_reqs{engine=\"0\"} 0.0\n"
         )
         with patch("requests.get", return_value=self._resp(200, body)):
             assert node._probe_flashnext_activity() is False
@@ -580,7 +720,7 @@ class TestFlashnextActivityProbe:
 
     def test_unparsable_value_is_unknown(self):
         node = _NodeState(gw_url="http://mock.internal/")
-        body = "sglang:num_running_requests{engine=\"0\"} notanumber\n"
+        body = "sglang:num_running_reqs{engine=\"0\"} notanumber\n"
         with patch("requests.get", return_value=self._resp(200, body)):
             assert node._probe_flashnext_activity() is None
 
@@ -590,9 +730,115 @@ class TestFlashnextActivityProbe:
             assert node._probe_flashnext_activity() is None
 
     def test_gauge_names_are_the_sglang_pair(self):
+        """DoD-0 live (2026-09-26, seat UP): the names the running SGLang
+        build actually emits are the *_reqs spellings
+        (python/sglang/srt/observability/metrics_collector.py:
+        SchedulerMetricsCollector.__init__ — "sglang:num_running_reqs",
+        "sglang:num_queue_reqs"). The earlier "..._requests" spellings
+        exist in no SGLang build and would have pinned the legibility
+        substate to "unknown" forever."""
         assert set(_SGLANG_ACTIVITY_METRICS) == {
-            "sglang:num_running_requests", "sglang:num_queue_requests",
+            "sglang:num_running_reqs", "sglang:num_queue_reqs",
         }
+
+    # -- the /get_load leg (DoD-0 live: this deployment runs
+    #    enable_metrics=False, so /metrics answers 404) ------------------
+
+    def _load_resp(self, payload, status=200):
+        m = MagicMock(spec=requests.Response)
+        m.status_code = status
+        m.json = MagicMock(return_value=payload)
+        return m
+
+    def _both_legs(self, metrics_resp, load_resp):
+        """Patch requests.get to serve /metrics then /get_load."""
+        responses = {
+            "/metrics": metrics_resp,
+            "/get_load": load_resp,
+        }
+
+        def _get(url, **kw):
+            for suffix, resp in responses.items():
+                if url.endswith(suffix):
+                    if isinstance(resp, Exception):
+                        raise resp
+                    return resp
+            raise AssertionError(f"unexpected url {url}")
+
+        return patch("requests.get", side_effect=_get)
+
+    def test_get_load_confirmed_activity(self):
+        """404 on /metrics (the enable_metrics=False deployment): the
+        /get_load num_reqs/num_waiting_reqs pair carries the reading."""
+        node = _NodeState(gw_url="http://mock.internal/")
+        load = [{"dp_rank": 0, "num_reqs": 2, "num_waiting_reqs": 0,
+                 "num_tokens": 128, "ts_tic": 1.0}]
+        with self._both_legs(self._resp(404, '{"detail":"Not Found"}'),
+                             self._load_resp(load)):
+            assert node._probe_flashnext_activity() is True
+
+    def test_get_load_confirmed_idle(self):
+        node = _NodeState(gw_url="http://mock.internal/")
+        load = [{"dp_rank": 0, "num_reqs": 0, "num_waiting_reqs": 0,
+                 "num_tokens": 0, "ts_tic": 1.0}]
+        with self._both_legs(self._resp(404, '{"detail":"Not Found"}'),
+                             self._load_resp(load)):
+            assert node._probe_flashnext_activity() is False
+
+    def test_get_load_waiting_only_counts_as_activity(self):
+        node = _NodeState(gw_url="http://mock.internal/")
+        load = [{"num_reqs": 0, "num_waiting_reqs": 3}]
+        with self._both_legs(self._resp(404, "x"), self._load_resp(load)):
+            assert node._probe_flashnext_activity() is True
+
+    def test_get_load_non_200_is_unknown(self):
+        node = _NodeState(gw_url="http://mock.internal/")
+        with self._both_legs(self._resp(404, "x"),
+                             self._load_resp([{"num_reqs": 5}], status=503)):
+            assert node._probe_flashnext_activity() is None
+
+    def test_get_load_non_list_body_is_unknown(self):
+        node = _NodeState(gw_url="http://mock.internal/")
+        with self._both_legs(self._resp(404, "x"),
+                             self._load_resp({"detail": "nope"})):
+            assert node._probe_flashnext_activity() is None
+
+    def test_get_load_no_target_keys_is_unknown(self):
+        """A body whose objects carry none of the running/waiting keys is
+        unknown — never an idle reading (D2)."""
+        node = _NodeState(gw_url="http://mock.internal/")
+        with self._both_legs(self._resp(404, "x"),
+                             self._load_resp([{"dp_rank": 0, "foo": 1}])):
+            assert node._probe_flashnext_activity() is None
+
+    def test_get_load_unparsable_value_is_unknown(self):
+        node = _NodeState(gw_url="http://mock.internal/")
+        with self._both_legs(self._resp(404, "x"),
+                             self._load_resp([{"num_reqs": "not-a-number"}])):
+            assert node._probe_flashnext_activity() is None
+
+    def test_metrics_leg_wins_when_gauges_present(self):
+        """When metrics ARE exposed, /get_load is not consulted: the
+        gauges are authoritative for the tick."""
+        node = _NodeState(gw_url="http://mock.internal/")
+        body = 'sglang:num_running_reqs{engine="0"} 0.0\n'
+        called = []
+
+        def _get(url, **kw):
+            called.append(url)
+            if url.endswith("/metrics"):
+                return self._resp(200, body)
+            raise AssertionError("/get_load must not be polled when the gauges answered")
+
+        with patch("requests.get", side_effect=_get):
+            assert node._probe_flashnext_activity() is False
+        assert any(u.endswith("/metrics") for u in called)
+
+    def test_both_legs_down_is_unknown(self):
+        node = _NodeState(gw_url="http://mock.internal/")
+        with self._both_legs(requests.exceptions.ConnectionError("refused"),
+                             requests.exceptions.ConnectionError("refused")):
+            assert node._probe_flashnext_activity() is None
 
 
 # ---------------------------------------------------------------------------
@@ -604,8 +850,10 @@ class TestStatusFlashnextBlock:
     "flashnext" object; a withhold never sets last_error."""
 
     def _status(self, node):
-        with node.lock:
-            return node.status_snapshot()
+        # status_snapshot() acquires node.lock itself (threading.Lock is
+        # non-reentrant — holding it here would deadlock the tick). Take
+        # the snapshot directly; the lock discipline belongs to the callee.
+        return node.status_snapshot()
 
     def test_withheld_active(self, node):
         with node.lock:
