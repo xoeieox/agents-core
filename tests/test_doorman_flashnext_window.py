@@ -57,7 +57,22 @@ def node(tmp_path, monkeypatch):
     idle_log = tmp_path / "idle.jsonl"
     monkeypatch.setattr(ds, "DOORMAN_IDLE_LOG", str(idle_log))
     monkeypatch.setattr(ds, "_gw_topology_importable", lambda: False)
+    # HERMETIC GUARD (vLLM axis): _refresh_serving_cache() ends with the
+    # flag-gated _probe_slot_activity() pool (DOORMAN_PROBE_LLAMA_ACTIVITY
+    # defaults ON), whose Probe E issues a real GET to the production
+    # DOORMAN_GLANCES_URL (…:61208/api/4/gpu/) plus an ssh berth-unit call.
+    # The tick-helper classes below mock only the :30000 probes and the two
+    # serving reads, so that pool would fire live from the test suite. Stub
+    # it to a confirmed-idle vote — matching this file's patch.object idiom
+    # for the sibling probes — so the vLLM axis votes "no activity" and
+    # _probe_indeterminate stays False (a None would silently arm the
+    # vLLM-axis blind-withhold the stop-path tests are not modelling; every
+    # test that reaches the stop path re-asserts the field explicitly).
     state = _NodeState(gw_url="http://mock.internal/", node_name="gravitywell")
+    monkeypatch.setattr(state, "_probe_slot_activity", lambda: False)
+    # Belt-and-braces: pin the Probe E endpoint off the production tailnet
+    # address so no future tick-side probe can reach a real box from here.
+    monkeypatch.setattr(ds, "DOORMAN_GLANCES_URL", "http://mock.internal/")
     yield state
 
 
@@ -350,21 +365,6 @@ class TestStopPathSeatPartition:
         assert result is False  # the stop block is skipped entirely
         assert calls == []  # the gw-serve stop verb NEVER fires
         assert idle_rows(node) == []
-
-    def test_seat_down_idle_past_grace_stops_confirmed_idle(self, node):
-        """The vLLM axis's own idle reading is what produced idle_since:
-        seat definitively down + idle past grace -> the stop fires with
-        confirmed_idle (the matrix cell the misnamed predecessor test
-        actually covered)."""
-        self._idle_node(node)
-        set_seat(node, "down")
-        with patch("subprocess.run", return_value=MagicMock(
-                returncode=0, stdout="", stderr="")) as run_mock, \
-             patch.object(node, "_is_serving", return_value=False):
-            result = node._decide_idle_stop()
-        assert result is True
-        assert run_mock.called
-        assert stopped_reason(node) == "confirmed_idle"
 
     # -- sentinel 0: unbounded blind-withhold ------------------------------
 

@@ -1007,8 +1007,12 @@ class _NodeState:
         # partition needs. _flashnext_blind_since: epoch armed on the first
         # blind (or cold/None) read since the last definitive read, cleared
         # on any definitive read (down / up_registered / up_unverified /
-        # up_foreign) — the continuous-blindness clock the bounded
-        # blind-withhold is measured against. None = not currently blind
+        # up_foreign) — the continuous-blindness clock. DIAGNOSTIC only:
+        # it feeds the blind_secs field of the flashnext_blind_hold
+        # idle-log rows and the blind-duration text of the withhold
+        # warning; the bounded blind-withhold itself is measured on
+        # idle_elapsed (the grace clock), not on this field.
+        # None = not currently blind
         # (definitive, or never blind since the last definitive read).
         # _flashnext_last_activity_ts: the D2 legibility clock — probe-stamp
         # time of the last successful activity-gauge read that observed
@@ -3521,9 +3525,16 @@ class _NodeState:
             #   continuous-blindness clock (armed on the first blind
             #   read since the last definitive read, cleared on a
             #   definitive read — bookkeeping in the tick's probe
-            #   pass, the probe method stays stateless) remains the
-            #   fail-closed floor for COLD START, where idle_since is
-            #   unanchored (None) and idle_elapsed does not exist yet.
+            #   pass, the probe method stays stateless) is DIAGNOSTIC
+            #   ONLY: it feeds the blind_secs field of the
+            #   flashnext_blind_hold idle-log row and the blind-
+            #   duration text of the withhold warning / bound-exceeded
+            #   CRITICAL. It is NOT a decision input anywhere. COLD
+            #   START (state None, never-observed seat) is withheld by
+            #   this same branch and bounded by the SAME idle_elapsed
+            #   gate below — a cold start is withheld while idle_since
+            #   is unanchored (None) because the stop block above never
+            #   runs, not because of any reading of the blindness clock.
             #   Past the bound this axis stops withholding and, where
             #   it is the deciding factor, the stop proceeds with a
             #   distinct stop_reason
@@ -3588,10 +3599,14 @@ class _NodeState:
                 # (matching the vLLM axis, which also keys on
                 # idle_elapsed). The blindness clock
                 # (_flashnext_blind_since, armed in the tick's probe
-                # pass) is the fail-closed floor for COLD START, where
-                # idle_since is unanchored (None) and idle_elapsed does
-                # not exist yet — a cold start is bounded from the
-                # first tick, not from a later arming.
+                # pass) is DIAGNOSTIC bookkeeping only — it supplies
+                # the blind_secs field of the flashnext_blind_hold
+                # idle-log row and the "blind Ns" text of the withhold
+                # warning, and is never consumed as a decision input.
+                # A COLD START (state None) is withheld by this branch
+                # and bounded by the SAME idle_elapsed gate below: the
+                # cold-start bound is the idle_elapsed gate, not the
+                # blindness clock.
                 _fn_blind_elapsed = (
                     time.time() - self._flashnext_blind_since
                     if self._flashnext_blind_since is not None
