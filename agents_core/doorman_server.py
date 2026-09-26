@@ -73,6 +73,22 @@ Environment variables:
                            requires /v1/models data[0].id == this value; an
                            identifiable foreign occupant never admits a
                            window (never guess).
+  DOORMAN_FLASHNEXT_ACTIVITY_METRICS
+                        — comma-separated Prometheus gauge names read from
+                           the flash-next seat's /metrics for the D2
+                           LEGIBILITY activity clock
+                           (gw-doorman-flashnext-idle-awareness-v0; default
+                           sglang:num_running_reqs,sglang:num_queue_reqs —
+                           DoD-0 live-confirmed against the SGLang source
+                           tree 2026-09-26). LEGIBILITY ONLY: never consumed
+                           by the stop decision. The seat currently runs
+                           with enable_metrics=False, so /metrics answers
+                           404 and the probe falls back to /get_load
+                           (num_reqs / num_waiting_reqs); a gauge rename in
+                           a future SGLang is an env change, not a code
+                           change. Any failure on both legs is "unknown",
+                           never an idle reading and never a stop
+                           authorization.
   GW_SERVE_STOP_GIVEUP_SEC — seconds a stop may report stop_in_progress before the
                            background reconciler gives up and surfaces a genuine
                            failure (last_error + a stop_failed idle-log row),
@@ -317,6 +333,44 @@ DOORMAN_PROBE_LLAMA_ACTIVITY = os.environ.get(
 # Re-verify against a live dual-mode /metrics response before treating DoD item 0
 # as satisfied.
 _VLLM_ACTIVITY_METRICS = ("vllm:num_requests_running", "vllm:num_requests_waiting")
+
+# Prometheus gauge names read from the flash-next seat's (SGLang on :30000)
+# /metrics for the D2 legibility activity clock
+# (gw-doorman-flashnext-idle-awareness-v0). LEGIBILITY ONLY — never part of
+# the stop decision (the stop path consumes the seat-STATE probe).
+# DoD-0 LIVE check (2026-09-26, seat UP): the seat runs with
+# enable_metrics=False, so GET :30000/metrics answers 404 ({"detail":"Not
+# Found"}) and the Prometheus gauges are NOT exposed at all on this
+# deployment — the probe therefore falls back to the always-on /get_load
+# endpoint below (see _probe_flashnext_activity). When metrics ARE enabled
+# the gauge names are the ones the running SGLang builds actually emit,
+# confirmed against the live source tree
+# (python/sglang/srt/observability/metrics_collector.py, SchedulerMetrics
+# Collector.__init__): "sglang:num_running_reqs" and
+# "sglang:num_queue_reqs" — NOT the "..._requests" spellings the earlier
+# (seat-down) source read recorded; those names exist in no SGLang build and
+# would have pinned the substate to "unknown" forever. Overridable via
+# DOORMAN_FLASHNEXT_ACTIVITY_METRICS (comma-separated) so a SGLang version
+# bump that renames the gauges does not require a code change. A
+# missing/unparsable gauge degrades the substate to "unknown" — it can never
+# authorize a stop.
+_SGLANG_ACTIVITY_METRICS = tuple(
+    m.strip()
+    for m in os.environ.get(
+        "DOORMAN_FLASHNEXT_ACTIVITY_METRICS",
+        "sglang:num_running_reqs,sglang:num_queue_reqs",
+    ).split(",")
+    if m.strip()
+)
+
+# Keys read from the flash-next seat's /get_load for the same D2 clock —
+# the DoD-0-live-confirmed activity source on THIS deployment (2026-09-26:
+# GET :30000/get_load -> [{"dp_rank":0,"num_reqs":0,"num_waiting_reqs":0,
+# "num_tokens":0,"num_pending_tokens":0,"ts_tic":...}], HTTP 200 with
+# enable_metrics=False). The running/waiting pair maps to the two gauges
+# above; the other keys are ignored. As with the gauges, LEGIBILITY ONLY.
+_SGLANG_LOAD_RUNNING_KEYS = ("num_reqs", "num_running_reqs")
+_SGLANG_LOAD_WAITING_KEYS = ("num_waiting_reqs", "num_queue_reqs")
 
 # ---------------------------------------------------------------------------
 # Capacity shadow (agents-core-doorman-capacity-shadow-v0) — instrumentation
@@ -940,6 +994,42 @@ class _NodeState:
         self._flashnext_window: str | None = None
         self._flashnext_window_since: float | None = None
         self._flashnext_window_closed_at: float | None = None
+        # The ACTUAL exception class name from the most recent blind (or
+        # cold) seat probe (e.g. "Timeout", "ConnectionRefusedError",
+        # "ConnectionError"), or None on a definitive read — carried by
+        # the D1 blind-withhold idle-log rows and the one-shot transition
+        # warning so the operator sees the real failure class, not a
+        # static placeholder (the D4 BLIND-proceed precedent).
+        self._flashnext_error_class: str | None = None
+        # Flash-next idle-awareness (gw-doorman-flashnext-idle-awareness-v0,
+        # D1/D2): the stop-path partition consumes _flashnext_state
+        # (up/blind/down/foreign); these two fields are the bookkeeping the
+        # partition needs. _flashnext_blind_since: epoch armed on the first
+        # blind (or cold/None) read since the last definitive read, cleared
+        # on any definitive read (down / up_registered / up_unverified /
+        # up_foreign) — the continuous-blindness clock. DIAGNOSTIC only:
+        # it feeds the blind_secs field of the flashnext_blind_hold
+        # idle-log rows and the blind-duration text of the withhold
+        # warning; the bounded blind-withhold itself is measured on
+        # idle_elapsed (the grace clock), not on this field.
+        # None = not currently blind
+        # (definitive, or never blind since the last definitive read).
+        # _flashnext_last_activity_ts: the D2 legibility clock — probe-stamp
+        # time of the last successful activity-gauge read that observed
+        # running/waiting >= 1; NEVER consumed by the stop decision (D2:
+        # legibility only), never set by failed/zero-activity reads, cleared
+        # by a definitive "down" probe. None = no observation yet.
+        self._flashnext_blind_since: float | None = None
+        self._flashnext_last_activity_ts: float | None = None
+        # One-shot journal latch for the transition into a new withhold
+        # state (D3: one WARNING per transition; steady-state withhold =
+        # idle-log rows only). Holds the LAST-WARNED withhold substate
+        # ("up:<registered|unverified>:<active|idle>" / "blind" / "cold");
+        # _decide_idle_stop warns only when THIS tick's substate differs
+        # from it, so a steady-state withhold writes idle-log rows and no
+        # journal line. Cleared on a definitive non-withhold seat read
+        # (down / up_foreign) so the next transition warns again.
+        self._flashnext_withhold_substate: str | None = None
         # Tri-state dual-slot activity probe (gw-doorman-vllm-activity-probe-v0):
         # True when the most recent _probe_slot_activity() tick was indeterminate
         # (at least one probe ambiguous, none confirmed activity) — read by the
@@ -1572,6 +1662,145 @@ class _NodeState:
         # out: a listener exists, identity unverified (SGLang mid-load).
         return ("up_unverified", None, None, None)
 
+    def _probe_flashnext_activity(self) -> bool | None:
+        """D2 legibility probe (gw-doorman-flashnext-idle-awareness-v0):
+        read the flash-next seat's running/waiting request counters, from
+        either of two sources on {GW_FLASHNEXT_URL}:
+
+          1. GET /metrics — SGLang's Prometheus plaintext exposition (same
+             shape as the vLLM /metrics probes), read for the
+             running/queued request gauges (_SGLANG_ACTIVITY_METRICS).
+          2. GET /get_load — the DoD-0-live-confirmed fallback for THIS
+             deployment (2026-09-26, seat UP): the seat runs with
+             enable_metrics=False, so /metrics answers 404 and the gauges
+             are never exposed; /get_load answers 200 with one object per
+             dp_rank carrying num_reqs (running) and num_waiting_reqs
+             (waiting).
+
+        /metrics is tried first and only a NON-200 / unparsable / empty
+        gauge read falls through to /get_load — a confirmed reading from
+        either source is authoritative for the tick. A 404 (or any other
+        failure) on BOTH is "unknown".
+
+        Returns:
+          True  — a target gauge/field was found and parsed with a nonzero
+                  value (running/waiting >= 1: confirmed activity).
+          False — the target gauges/fields were found and parsed, all zero
+                  (confirmed idle).
+          None  — both calls failed (timeout/connection-refused/non-200),
+                  neither body contained a target field, or the values were
+                  unparsable: the "unknown" substate. Never a stop
+                  authorization, never an idle reading (D2: a 404 /
+                  non-200 / unparseable activity gauge is unknown, not idle
+                  — the whole reason the 404-on-/metrics deployment needs
+                  the /get_load fallback rather than a permanently-unknown
+                  clock).
+
+        LEGIBILITY ONLY (D2): this probe NEVER feeds the stop decision — the
+        stop path consumes the seat-STATE probe (_probe_flashnext_seat)
+        exclusively. It feeds only the _flashnext_last_activity_ts clock
+        (rendered as withheld-active vs withheld-up-idle and on /status). A
+        clock not refreshed this tick renders "unknown", never idle.
+
+        Never raises. Must be called OUTSIDE self.lock (blocking HTTP,
+        2.5s timeout, no-redirect pin — same discipline as the seat probe).
+        """
+        try:
+            resp = requests.get(
+                f"{GW_FLASHNEXT_URL}/metrics",
+                timeout=2.5,
+                allow_redirects=False,
+            )
+            if resp.status_code == 200:
+                total = 0.0
+                found = False
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    for metric in _SGLANG_ACTIVITY_METRICS:
+                        if line.startswith(metric + "{"):
+                            # Brace-aware parse (same convention as the vLLM
+                            # activity probe): the value starts right after the
+                            # closing brace, not at the last space.
+                            brace_end = line.find("}")
+                            if brace_end == -1:
+                                continue
+                            value_str = line[brace_end + 1:].strip().split()
+                        elif line.startswith(metric + " "):
+                            value_str = line[len(metric):].strip().split()
+                        else:
+                            continue
+                        if not value_str:
+                            continue
+                        try:
+                            total += float(value_str[0])
+                        except ValueError:
+                            continue
+                        else:
+                            found = True
+                if found:
+                    return total > 0
+        except Exception as exc:
+            # Never a stop authorization, never an idle reading — just an
+            # inconclusive metrics leg.
+            log.debug(
+                f"[{self.node_name}] flashnext metrics leg inconclusive "
+                f"(falling through to /get_load): {exc}"
+            )
+        # Metrics leg inconclusive (non-200 — the enable_metrics=False
+        # deployment answers 404 — an empty body, no target gauge, or a
+        # failed call): fall through to the /get_load leg.
+        try:
+            return self._probe_flashnext_load()
+        except Exception as exc:
+            log.debug(
+                f"[{self.node_name}] flashnext /get_load leg inconclusive "
+                f"too: {exc}"
+            )
+            return None
+
+    def _probe_flashnext_load(self) -> bool | None:
+        """The /get_load leg of the D2 legibility activity probe
+        (gw-doorman-flashnext-idle-awareness-v0, DoD-0 live 2026-09-26):
+        GET {GW_FLASHNEXT_URL}/get_load and sum the running/waiting request
+        counts across the dp_rank objects.
+
+        Same tri-state contract as the /metrics leg: True on any nonzero
+        running/waiting count, False when the fields were present and all
+        zero, None (unknown) on any failure — non-200, non-JSON, a JSON body
+        that is not a list of objects, or objects carrying none of the
+        target keys. A malformed response is never an idle reading and never
+        a stop authorization. Never raises. Must be called OUTSIDE self.lock.
+        """
+        resp = requests.get(
+            f"{GW_FLASHNEXT_URL}/get_load",
+            timeout=2.5,
+            allow_redirects=False,
+        )
+        if resp.status_code != 200:
+            return None
+        entries = resp.json()
+        if not isinstance(entries, list):
+            return None
+        total = 0.0
+        found = False
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            for key in _SGLANG_LOAD_RUNNING_KEYS + _SGLANG_LOAD_WAITING_KEYS:
+                if key not in entry:
+                    continue
+                try:
+                    total += float(entry[key])
+                except (TypeError, ValueError):
+                    continue
+                else:
+                    found = True
+        if not found:
+            return None
+        return total > 0
+
     def _probe_slot_activity(self) -> bool | None:
         """Tri-state unmediated-caller activity probe across all signal sources
         (gw-doorman-vllm-activity-probe-v0, extended by agents-core-doorman-
@@ -1678,9 +1907,50 @@ class _NodeState:
         # the window determination must work regardless of that flag) and
         # never joined to the activity vote lists (Invariant 8: :30000
         # activity is irrelevant to the 27B axis's idle clock).
-        flashnext_state, flashnext_served_id, flashnext_registered, _fn_err = (
-            self._probe_flashnext_seat(sequential=False)
-        )
+        # Flash-next D2 legibility activity probe
+        # (gw-doorman-flashnext-idle-awareness-v0): unconditional, beside
+        # the two existing :30000 GETs, same 2.5s timeout and no-redirect
+        # pin. Deliberately NOT in _probe_slot_activity's flag-gated pool —
+        # the flag's rollback lever must not be able to starve this
+        # legibility source. A clock not refreshed this tick renders
+        # "unknown", never idle.
+        # The two :30000 legs run as CONCURRENT tasks of a small private
+        # pool (D2 placement: "widen the worker pool or add a concurrent
+        # task") so the legibility leg never adds its 2.5s (metrics leg) +
+        # 2.5s (/get_load leg) to the tick's wall time on top of the seat
+        # probe's own 2.5s: the whole :30000 probe pass stays ~2.5s, the
+        # slowest single leg, never additive.
+        with ThreadPoolExecutor(max_workers=2) as _fn_pool:
+            _fn_seat_fut = _fn_pool.submit(
+                self._probe_flashnext_seat, sequential=False
+            )
+            _fn_activity_fut = _fn_pool.submit(self._probe_flashnext_activity)
+            try:
+                flashnext_state, flashnext_served_id, flashnext_registered, flashnext_error_class = (
+                    _fn_seat_fut.result()
+                )
+            except Exception as exc:
+                # The seat probe is documented never to raise; a raise is a
+                # bug, and the fail-closed reading of a bug on this axis is
+                # BLIND (Invariant 7: blindness is never a no), never
+                # "down" — and never an exception that takes the refresh
+                # tick (and with it the whole idle-stop loop) down.
+                log.warning(
+                    f"[{self.node_name}] flashnext seat probe raised "
+                    f"{type(exc).__name__} ({exc}) — treating as blind"
+                )
+                flashnext_state, flashnext_served_id = "blind", None
+                flashnext_registered, flashnext_error_class = None, type(exc).__name__
+            try:
+                flashnext_activity: bool | None = _fn_activity_fut.result()
+            except Exception as exc:
+                # Legibility leg: any failure is "unknown", never idle
+                # (D2) — and never allowed to break the tick.
+                log.debug(
+                    f"[{self.node_name}] flashnext activity probe raised "
+                    f"{type(exc).__name__} ({exc}) — unknown substate"
+                )
+                flashnext_activity = None
 
         # Single topology resolution — outside the lock (blocking HTTP).
         topology_state = None
@@ -1712,6 +1982,7 @@ class _NodeState:
             self._flashnext_state = flashnext_state
             self._flashnext_served_id = flashnext_served_id
             self._flashnext_registered = flashnext_registered
+            self._flashnext_error_class = flashnext_error_class
             # Window determination (D2): ACTIVE iff the :30000 probe reports
             # a seat listener (up_registered OR up_unverified — the safe
             # direction) AND the :8081 day-seat probe reports down. When the
@@ -1740,6 +2011,47 @@ class _NodeState:
                     self._flashnext_window_closed_at = time.time()
                 self._flashnext_window = window
                 self._flashnext_window_since = None
+
+            # Flash-next idle-awareness D1 bookkeeping
+            # (gw-doorman-flashnext-idle-awareness-v0): the continuous-
+            # blindness clock for the stop path's bounded blind-withhold.
+            # Bookkeeping lives HERE, in the tick's probe pass under the
+            # lock (Council open question 1, resolved): the probe method
+            # stays stateless; this block already mutates per-tick state
+            # (window_since/window_closed_at) from this tick's own probe
+            # result. Armed on the first blind (or cold/None) read since
+            # the last definitive read, cleared on any definitive read.
+            # The COLD-START rule (D1): before the first definitive probe
+            # read the state is None — treated as BLIND here (bounded
+            # withhold), never as down/idle-ok.
+            if flashnext_state in ("blind", None):
+                if self._flashnext_blind_since is None:
+                    self._flashnext_blind_since = time.time()
+                # A definitive "down" probe clears the D2 activity stamp
+                # (a dead seat cannot withhold via a stale stamp); blind
+                # and cold reads leave it unchanged.
+            else:
+                self._flashnext_blind_since = None
+                if flashnext_state == "down":
+                    self._flashnext_last_activity_ts = None
+            # D3 legibility: a steady-state withhold is a normal safety
+            # state, not a failure — entering it does not set last_error;
+            # a definitive non-withhold seat read (down / up_foreign — the
+            # states where this axis does not withhold) re-arms the
+            # one-shot transition warning, so the next entry into any
+            # withhold substate journals once again.
+            if flashnext_state in ("down", "up_foreign"):
+                self._flashnext_withhold_substate = None
+            # D2 stamp rule (one sentence): the clock is stamped only by a
+            # successful probe that observed running/waiting >= 1;
+            # successful zero-activity reads, failed reads, and the cold
+            # state (None = no observation) leave it unchanged; a
+            # definitive "down" probe clears it (handled above). The clock
+            # is probe-stamp time, not request-end time (45s sampling — a
+            # withhold therefore releases up to ~645-660s after the last
+            # confirmed activity, inherent to the tick resolution).
+            if flashnext_activity is True:
+                self._flashnext_last_activity_ts = time.time()
 
             if DOORMAN_MODE_AWARE_ADMISSION:
                 self._cached_topology_state = topology_state
@@ -3182,6 +3494,208 @@ class _NodeState:
         ):
             idle_elapsed = time.time() - self.idle_since
 
+            # Flash-next idle-awareness (gw-doorman-flashnext-
+            # idle-awareness-v0, D1): the stop decision consumes the
+            # existing seat-state probe (the D7 probe pass, unmodified).
+            # The 2026-09-22 GPU1-wedge incident: the idle-eject fired
+            # while the day seat was UP-and-idle and the live brain was
+            # the flash-next seat on :30000 — the D3 window guard
+            # withholds only the handover case (seat up + day seat
+            # DOWN); the overlap case (seat up + day seat up-idle) left
+            # the window "none", the guard inert, and the eject enabled
+            # a guard-correct suspend that killed the unsupervised seat.
+            # Partition (D1):
+            #   seat UP (up_registered / up_unverified): withhold
+            #   UNCONDITIONALLY — regardless of request activity (a live
+            #   run with a >600s request gap must not become stop-
+            #   eligible; the gap is exactly the incident's 292k-run
+            #   shape). The D3 window guard already withholds unbounded
+            #   in the handover case; this extends the same knowledge-
+            #   based withhold to the overlap case.
+            #   seat BLIND (or cold/None — COLD START, D1): withhold,
+            #   BOUNDED, mirroring the vLLM-axis bound below: a
+            #   while blind and idle_elapsed < GW_STOP_GRACE_SEC +
+            #   DOORMAN_PROBE_BLINDNESS_SEC the grace clock pauses
+            #   (idle-log row, no verb) — the bound is measured on
+            #   idle_elapsed (the grace clock), exactly like the
+            #   vLLM-axis precedent below, NOT on the continuous-
+            #   blindness duration: the two clocks coincide only when
+            #   the seat went blind at idle_start, and the spec's
+            #   grace-pause semantics bind on idle_elapsed. The
+            #   continuous-blindness clock (armed on the first blind
+            #   read since the last definitive read, cleared on a
+            #   definitive read — bookkeeping in the tick's probe
+            #   pass, the probe method stays stateless) is DIAGNOSTIC
+            #   ONLY: it feeds the blind_secs field of the
+            #   flashnext_blind_hold idle-log row and the blind-
+            #   duration text of the withhold warning / bound-exceeded
+            #   CRITICAL. It is NOT a decision input anywhere. COLD
+            #   START (state None, never-observed seat) is withheld by
+            #   this same branch and bounded by the SAME idle_elapsed
+            #   gate below — a cold start is withheld while idle_since
+            #   is unanchored (None) because the stop block above never
+            #   runs, not because of any reading of the blindness clock.
+            #   Past the bound this axis stops withholding and, where
+            #   it is the deciding factor, the stop proceeds with a
+            #   distinct stop_reason
+            #   (flashnext_probe_blind_bound_exceeded) at CRITICAL.
+            #   DOORMAN_PROBE_BLINDNESS_SEC == 0 is the sentinel for
+            #   UNBOUNDED (withhold on blind forever — the operator
+            #   chooses burning fuel over risking the seat).
+            #   seat DOWN or UP_FOREIGN: definitive; this axis does not
+            #   withhold (the vLLM axis decides, as today).
+            # PRECEDENCE: the stop proceeds only when every withhold
+            # condition has fallen through — this block (D1), the
+            # topology-unknown no-park, and the vLLM blind-within-bound
+            # below. A withheld tick writes no stopped idle-log row and
+            # computes no stop_reason for a stop that does not happen.
+            # The activity clock (D2) is legibility-only — it selects the
+            # substate (withheld-active vs withheld-up-idle) and renders
+            # on /status; it is NEVER consumed by the stop decision.
+            _fn_state = self._flashnext_state
+            if _fn_state in ("up_registered", "up_unverified"):
+                _fn_last_activity = self._flashnext_last_activity_ts
+                _fn_active = (
+                    _fn_last_activity is not None
+                    and (time.time() - _fn_last_activity) < GW_STOP_GRACE_SEC
+                )
+                _write_idle_log(
+                    self.node_name,
+                    "flashnext_withheld_active" if _fn_active
+                    else "flashnext_withheld_up_idle",
+                    0,
+                    idle_secs=idle_elapsed,
+                    seat_state=_fn_state,
+                    last_activity_ts=_fn_last_activity,
+                )
+                # D3 journal: one-shot WARNING on the transition INTO a new
+                # withhold substate; a steady-state withhold (the same
+                # substate as the previous tick) writes idle-log rows only.
+                _fn_substate = (
+                    f"up:{_fn_state}:{'active' if _fn_active else 'idle'}"
+                )
+                if self._flashnext_withhold_substate != _fn_substate:
+                    self._flashnext_withhold_substate = _fn_substate
+                    log.warning(
+                        f"[{self.node_name}] flashnext-seat-up — :30000 "
+                        f"seat {_fn_state} (served_id="
+                        f"{self._flashnext_served_id!r}); withholding "
+                        f"gw-serve stop (idle {idle_elapsed:.0f}s). The "
+                        f"seat is the live brain; the stop path must not "
+                        f"take a visible seat out of reach."
+                    )
+                return True
+            if _fn_state == "blind" or _fn_state is None:
+                # BLIND (or COLD START: state None before the first
+                # definitive read — D1: treat as blind, never down/idle-
+                # ok). The bound is measured on idle_elapsed (the grace
+                # clock — the spec's grace-pause semantics and the
+                # vLLM-axis precedent below), NOT on the continuous-
+                # blindness duration: the two clocks coincide only when
+                # the seat went blind at idle_start; if the seat goes
+                # blind after idle has already accumulated, the
+                # idle_elapsed bound releases the withhold at the same
+                # absolute idle age regardless of when blindness began
+                # (matching the vLLM axis, which also keys on
+                # idle_elapsed). The blindness clock
+                # (_flashnext_blind_since, armed in the tick's probe
+                # pass) is DIAGNOSTIC bookkeeping only — it supplies
+                # the blind_secs field of the flashnext_blind_hold
+                # idle-log row and the "blind Ns" text of the withhold
+                # warning, and is never consumed as a decision input.
+                # A COLD START (state None) is withheld by this branch
+                # and bounded by the SAME idle_elapsed gate below: the
+                # cold-start bound is the idle_elapsed gate, not the
+                # blindness clock.
+                _fn_blind_elapsed = (
+                    time.time() - self._flashnext_blind_since
+                    if self._flashnext_blind_since is not None
+                    else 0.0
+                )
+                if DOORMAN_PROBE_BLINDNESS_SEC != 0:
+                    _fn_blind_bound = (
+                        GW_STOP_GRACE_SEC + DOORMAN_PROBE_BLINDNESS_SEC
+                    )
+                    if idle_elapsed < _fn_blind_bound:
+                        _write_idle_log(
+                            self.node_name, "flashnext_blind_hold", 0,
+                            idle_secs=idle_elapsed,
+                            seat_state=_fn_state,
+                            blind_secs=round(_fn_blind_elapsed, 2),
+                            error_class=self._flashnext_error_class,
+                        )
+                        # D3 journal: one-shot on the transition into the
+                        # blind withhold substate (cold/None is its own
+                        # substate, so a cold start that later turns blind
+                        # journals once more).
+                        _fn_substate = "cold" if _fn_state is None else "blind"
+                        if self._flashnext_withhold_substate != _fn_substate:
+                            self._flashnext_withhold_substate = _fn_substate
+                            log.warning(
+                                f"[{self.node_name}] flashnext-seat-blind — "
+                                f":30000 probe indeterminate (state="
+                                f"{_fn_state}, error_class="
+                                f"{self._flashnext_error_class}); "
+                                f"withholding gw-serve stop (idle "
+                                f"{idle_elapsed:.0f}s, blind "
+                                f"{_fn_blind_elapsed:.0f}s < bound "
+                                f"{_fn_blind_bound}s). Fail-closed on "
+                                f"stop: the probe cannot distinguish a "
+                                f"dead seat from an invisible one."
+                            )
+                        return True
+                else:
+                    # Sentinel 0: unbounded — withhold on blind forever
+                    # (the operator chooses burning fuel over risking the
+                    # seat).
+                    _write_idle_log(
+                        self.node_name, "flashnext_blind_hold", 0,
+                        idle_secs=idle_elapsed,
+                        seat_state=_fn_state,
+                        blind_secs=round(_fn_blind_elapsed, 2),
+                        error_class=self._flashnext_error_class,
+                    )
+                    # D3 journal: one-shot on the transition into the
+                    # unbounded-blind withhold substate.
+                    _fn_substate = (
+                        "cold-unbounded" if _fn_state is None
+                        else "blind-unbounded"
+                    )
+                    if self._flashnext_withhold_substate != _fn_substate:
+                        self._flashnext_withhold_substate = _fn_substate
+                        log.warning(
+                            f"[{self.node_name}] flashnext-seat-blind — "
+                            f":30000 probe indeterminate (state="
+                            f"{_fn_state}, error_class="
+                            f"{self._flashnext_error_class}); "
+                            f"withholding gw-serve stop UNBOUNDED "
+                            f"(DOORMAN_PROBE_BLINDNESS_SEC=0 sentinel; "
+                            f"idle {idle_elapsed:.0f}s, blind "
+                            f"{_fn_blind_elapsed:.0f}s)."
+                        )
+                    return True
+                # Bound exceeded: this axis stops withholding. The stop
+                # proceeds only if every other withhold has also fallen
+                # through (topology-unknown no-park, vLLM blind-within-
+                # bound below); where this axis is the deciding factor
+                # the stop_reason is distinct (below) and the event logs
+                # at CRITICAL (bootstrap basicConfig level=INFO —
+                # CRITICAL always renders; no alert hook keys off log
+                # level).
+                log.critical(
+                    f"[{self.node_name}] flashnext_probe_blind_bound_"
+                    f"exceeded — :30000 probe blind for "
+                    f"{_fn_blind_elapsed:.0f}s, idle "
+                    f"{idle_elapsed:.0f}s >= bound "
+                    f"{GW_STOP_GRACE_SEC + DOORMAN_PROBE_BLINDNESS_SEC}s "
+                    f"(measured on the grace clock, like the vLLM axis); "
+                    f"the blind-withhold no longer withholds the stop. "
+                    f"A permanently broken probe must not pin the box "
+                    f"awake forever."
+                )
+            # _fn_state in ("down", "up_foreign"): definitive — this axis
+            # does not withhold; the vLLM axis decides, as today.
+
             # Unknown topology (Erah ruling 2026-08-19, agents-core-
             # doorman-class-aware-activity-probe-v0 D2/D3): a keeper
             # who does not know the nature of the room does not close
@@ -3229,11 +3743,28 @@ class _NodeState:
                 # confirmed-idle park from one taken only because the
                 # blindness bound was exceeded, so the journal line is
                 # diagnosable rather than reading as one undifferentiated
-                # "stopped" event.
-                stop_reason = (
-                    "probe_blind_bound_exceeded"
-                    if self._probe_indeterminate else "confirmed_idle"
-                )
+                # "stopped" event. The flash-next idle-awareness axis
+                # (gw-doorman-flashnext-idle-awareness-v0, D1) adds a
+                # THIRD distinct reason: the seat probe was blind past
+                # its bound and the vLLM axis was NOT the deciding factor
+                # (vLLM confirmed idle) — the stop fired because the
+                # seat's own probe went blind, not because the 27B-axis
+                # probe did.
+                # The flash-next axis is the deciding factor when it is
+                # NOT the vLLM axis that blew its bound (the vLLM axis's
+                # own bound-exceeded keeps its distinct reason, as
+                # today); a COLD-START state (None, treated as blind per
+                # D1) is the same deciding-factor class.
+                if (
+                    self._flashnext_state in ("blind", None)
+                    and not self._probe_indeterminate
+                ):
+                    stop_reason = "flashnext_probe_blind_bound_exceeded"
+                else:
+                    stop_reason = (
+                        "probe_blind_bound_exceeded"
+                        if self._probe_indeterminate else "confirmed_idle"
+                    )
                 indeterminate_sources = [
                     name for name, v in (self._last_probe_raw or {}).items()
                     if v is None
@@ -3516,6 +4047,48 @@ class _NodeState:
                     "window_since": self._flashnext_window_since,
                     "window_closed_at": self._flashnext_window_closed_at,
                     "last_vote": self._flashnext_state,
+                    # Flash-next idle-awareness (gw-doorman-flashnext-
+                    # idle-awareness-v0, D3): the operator surface for
+                    # "is the stop path withholding on the seat axis, and
+                    # why?". last_activity_ts is the D2 legibility clock
+                    # (probe-stamp time of the last successful activity
+                    # read observing running/waiting >= 1; null = no
+                    # observation — a 404 / non-200 / unparseable gauge is
+                    # unknown, never idle). Deliberate deviation from the
+                    # D2 spec's "a clock not refreshed this tick renders
+                    # unknown" wording (confirmed at the gate, cycle-1
+                    # review): the last stamp is carried forward — a
+                    # stale/absent stamp renders withheld-up-idle, which
+                    # is the safer direction (the seat-up withhold is
+                    # unconditional regardless of the substate, so a
+                    # stale stamp can never authorize a stop; rendering
+                    # "unknown" would only lose the active/idle
+                    # distinction the operator reads). eject_state is the
+                    # stop-path substate: idle-ok (no withhold on the
+                    # seat axis — the vLLM axis decides), withheld-active
+                    # (seat up + activity within grace), withheld-up-idle
+                    # (seat up, stamp stale/absent), withheld-blind (seat
+                    # blind or cold, within bound — or unbounded under the
+                    # DOORMAN_PROBE_BLINDNESS_SEC=0 sentinel). A withhold
+                    # is a normal safety state, not a failure: this block
+                    # never sets last_error (the 2026-09-13 cockpit wake-
+                    # collapse precedent — last_error stays reserved for
+                    # real errors).
+                    "last_activity_ts": self._flashnext_last_activity_ts,
+                    "eject_state": (
+                        "withheld-active"
+                        if self._flashnext_state
+                        in ("up_registered", "up_unverified")
+                        and self._flashnext_last_activity_ts is not None
+                        and (time.time() - self._flashnext_last_activity_ts)
+                        < GW_STOP_GRACE_SEC
+                        else "withheld-up-idle"
+                        if self._flashnext_state
+                        in ("up_registered", "up_unverified")
+                        else "withheld-blind"
+                        if self._flashnext_state in ("blind", None)
+                        else "idle-ok"
+                    ),
                 },
             }
 
