@@ -2131,7 +2131,14 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         if ok:
             ok = _locality_result is not None
         _locality_record_call_operator(
-            operator_class=operator_class, model=model,
+            operator_class=operator_class,
+            # S2: for the registry lane, reuse the already-resolved served id
+            # rather than letting the record helper re-read the registry for
+            # its OPERATOR_DEFAULTS fallback guess (a second read could
+            # disagree with the call across a seat handover). served_model_observed
+            # stays False: a registry pin is a contract, not a wire observation.
+            model=(model or (getattr(_locality_lane_obj, "served_model", None)
+                             if operator_class == "flashnext" else None)),
             prov=_locality_prov, served=_locality_served,
             start=_locality_start, ok=ok,
             lane_obj=_locality_lane_obj if operator_class == "flashnext" else None,
