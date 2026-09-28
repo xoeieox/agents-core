@@ -3373,6 +3373,14 @@ class _NodeState:
           mode: optional requested serve mode, already validated by the endpoint
                 (agents-core-doorman-mode-bearing-acquire-v0). Passed through to
                 ensure_serving(); see that method for when it's acted on vs. ignored.
+          accept_flashnext_seat: S2 opt-in — passed through to ensure_serving(); see
+                that method. When the grant fires, the registered lease dict gains the
+                additive serve_axis="flashnext" field (bookkeeping otherwise byte-
+                identical, I3) and drain semantics are unchanged.
+          serve_axis_out: optional single-element list the endpoint passes to learn
+                whether THIS call's lease landed on the flashnext axis (the grant
+                already paid for the probe; the endpoint must not re-probe to answer
+                this). Stays untouched on every non-grant path.
 
         self.lock is taken exactly once per call, for the short bookkeeping that spans
         idle-tracking reset, the atomic drain-gate check, and lease registration (see the
