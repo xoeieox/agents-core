@@ -1522,6 +1522,18 @@ def _apply_wave_voicing_provenance(run: dict, seat_adapters: list) -> None:
     seat's adapter.
     """
     all_events = [e for adapter in seat_adapters for e in adapter.voicing_events]
+    lane = getattr(seat_adapters[0], "lane", None) if seat_adapters else None
+    if lane is not None:
+        # S4 (gate-lanes-registry-driven-flashnext-v0-agents-core): wave seats
+        # voiced on a registry lane are labeled by the lane, not by
+        # "gravitywell" — a flash-next wave must never read as a 122B wave
+        # (the phala explicit-banner rule), and a clean lane run is not
+        # "degraded".
+        served = getattr(lane, "served_model", None)
+        label = f"flashnext:{served}" if served else "flashnext"
+        run["effective_voicing"] = label
+        run["voicing_degraded"] = False
+        return
     if not all_events:
         run["effective_voicing"] = "gravitywell"
         run["voicing_degraded"] = False
