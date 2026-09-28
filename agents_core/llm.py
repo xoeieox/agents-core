@@ -2044,10 +2044,9 @@ def _locality_record_call_operator(*, operator_class, model, prov, served, start
         cost_class = _LOCALITY_COST_CLASS_BY_OPERATOR.get(operator_class, "unknown")
         host = _LOCALITY_HOST_BY_OPERATOR.get(operator_class)
         if operator_class == "flashnext":
-            # Registry-resolved host (the seat's base_url is not a literal —
-            # S2). Fail-soft: a blind registry records no host rather than a
-            # stale one; the ledger never blocks a call.
-            lane_obj, _reason = _flashnext_lane()
+            # Registry-resolved host: the lane the call actually resolved
+            # (passed in by the wrapper — S2). None (blind) records no host
+            # rather than a stale one; the ledger never blocks a call.
             host = lane_obj.base_url if lane_obj is not None else None
         duration_ms = (time.monotonic() - start) * 1000
 
