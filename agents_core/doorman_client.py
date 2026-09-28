@@ -262,7 +262,7 @@ class DoormanClient:
         except httpx.TimeoutException as e:
             raise DoormanUnreachable(f"doorman timeout at {self._base_url}: {e}") from e
 
-    def acquire(self, node: str, work_id: str, ttl_sec: int, reason: str, role: str = "worker", timeout: float | None = None, principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference", lease_class: str | None = None, mode: str | None = None) -> dict:
+    def acquire(self, node: str, work_id: str, ttl_sec: int, reason: str, role: str = "worker", timeout: float | None = None, principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference", lease_class: str | None = None, mode: str | None = None, accept_flashnext_seat: bool = False) -> dict:
         """Acquire a lease for node.
 
         Args:
