@@ -1391,6 +1391,42 @@ def _build_adapter(voicing: str, ClaudeAdapter, LlamaAdapter, run_id: str | None
     if voicing == "gravitywell":
         principal = gw_principal or (f"council-delib-{run_id}" if run_id else None)
         return GravityWellAdapter(temperature=0.8, principal=principal)
+    if voicing == "flashnext":
+        # S4 (gate-lanes-registry-driven-flashnext-v0-agents-core): voicing
+        # flashnext constructs the SAME adapter class gravitywell voicing
+        # uses, carrying the registry-resolved lane (base_url + served id
+        # from agents_core.lane_registry.resolve_gate_lane — never a
+        # hardcoded port/id, the f0fb039 fixer_flash precedent). The adapter
+        # takes no gravitywell doorman lease on this path (the flash-next
+        # seat is leased through the doorman's flashnext window; a
+        # gravitywell acquire here is the live-409 shape the parent's S8
+        # fold kills).
+        #
+        # Caller contract (inherited from the parent's stand-aside folds):
+        # an explicitly-requested lane that the registry does not show
+        # serving raises an honest leg_down here — NEVER a silent fallback
+        # to the gravitywell adapter (a "lying leg": a run that asked for
+        # flash-next and quietly voiced on the 122B). Registry-blind is
+        # reported as such so the caller can decide whether the legacy path
+        # is legitimate (the blind case is the only one that may fall back,
+        # and the fallback belongs to the gate runtime's leg bookkeeping,
+        # not to this construction site).
+        from agents_core import lane_registry
+
+        lane_obj, reason = lane_registry.lane_state(
+            lane=lane_registry.FLASHNEXT_LANE_NAME
+        )
+        if lane_obj is None:
+            raise ValueError(
+                f"flashnext voicing unavailable: {reason} — the gw-seats "
+                "registry does not show the flashnext gate lane serving "
+                "(GW_SEATS_URL, default "
+                f"{lane_registry.DEFAULT_GW_SEATS_URL}). Voicing degrades to "
+                "an honest leg_down; it will NOT silently fall back to the "
+                "gravitywell seat (registry-blind is the only case a caller "
+                "may legitimately run the legacy path, and it must say so)."
+            )
+        return GravityWellAdapter(temperature=0.8, lane=lane_obj)
     if voicing == "phala":
         return PhalaAdapter(temperature=0.8)
     if voicing in ("haiku", "sonnet", "opus"):
