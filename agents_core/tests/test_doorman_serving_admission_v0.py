@@ -587,23 +587,22 @@ class TestS3LlmDictSide:
         assert out is None
         assert ("gw_seat_occupied", "gravitywell") in prov
 
-    def test_admission_names_it_once_no_soft_retry_repay(self):
+    def test_admission_names_it_once_no_soft_retry_repay(self, tmp_path, monkeypatch):
         """The measured win: a named refusal is not an acquire_soft_error, so the
-        ticket settles on the FIRST response instead of re-paying the loop."""
-        import os
-
+        ticket settles on the FIRST response instead of re-paying the loop
+        (pre-S1 the escaping HTTPStatusError fell into the soft-error branch and
+        re-paid the admission loop up to MAX_SOFT_ERROR_RETRIES times)."""
         from agents_core.llm import call_operator
 
-        dc, _ = self._dc(
+        monkeypatch.setenv("GW_ADMISSION_MODE", "enforce")
+        monkeypatch.setenv("ELEVATOR_DB_PATH", str(tmp_path / "q.db"))
+        monkeypatch.setenv("GW_ADMISSION_POLL_INTERVAL_SEC", "0.01")
+
+        dc, instance = self._dc(
             {"ok": False, "flashnext_occupied": True,
              "reason": "flashnext-window-holding-gpu0"})
         prov: list = []
-        es = MagicMock()
-        es.try_admit.return_value = True
-        es.get.return_value = {"status": "claimed", "claim_owner": "p"}
-        with patch.dict(os.environ, {"GW_ADMISSION_MODE": "enforce"}), \
-             patch("agents_core.elevator.IS_MASTER", True), \
-             patch("agents_core.elevator.ElevatorStore", return_value=es), \
+        with patch("agents_core.elevator.IS_MASTER", True), \
              patch("agents_core.doorman_client.DoormanClient", dc):
             out = call_operator(
                 "gravitywell", "hello", on_wake_fail="skip",
@@ -611,8 +610,16 @@ class TestS3LlmDictSide:
             )
         assert out is None
         assert ("gw_flashnext_window", "gravitywell") in prov
-        # exactly one acquire call — no 6-probe soft-retry re-pay loop
-        assert dc.return_value.acquire.call_count == 1
-        es.fail.assert_called_once()
-        assert es.fail.call_args.kwargs.get("reason") == GW_REASON_FLASHNEXT_WINDOW
-        es.requeue.assert_not_called()
+        # exactly one acquire call — no soft-retry re-pay loop
+        assert instance.acquire.call_count == 1
+
+        from agents_core.elevator import ElevatorStore
+        store = ElevatorStore(tmp_path / "q.db")
+        with store._lock:
+            rows = store._conn.execute(
+                "SELECT * FROM queue_items WHERE kind='gw-admission'"
+            ).fetchall()
+        store.close()
+        assert len(rows) == 1
+        assert rows[0]["status"] == "failed"
+        assert rows[0]["failure_reason"] == GW_REASON_FLASHNEXT_WINDOW
