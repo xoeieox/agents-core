@@ -246,6 +246,44 @@ class PhalaOperatorUnavailable(OperatorUnreachableError):
         )
 
 
+class FlashnextLaneUnavailable(OperatorUnreachableError):
+    """Raised when the registry-resolved flashnext gate lane cannot be voiced on.
+
+    gate-lanes-registry-driven-flashnext-v0-agents-core (S2): the flashnext
+    operator is a REGISTRY lane, so "unavailable" has two shapes and they are
+    NOT interchangeable — ``reason`` carries which one this is:
+
+      * ``"registry_blind"`` — the gw-seats registry is unreachable/malformed
+        (no information). This is the ONLY shape whose caller may fall back to
+        the legacy gravitywell path (GW_URL/SWARM_URL) byte-identically,
+        because that is what a blind gate leg ran on before this target.
+      * anything else (``"flashnext_not_serving"``, ``"flashnext_unreachable"``)
+        — the registry is readable and the explicitly-requested lane is
+        inactive. The caller records an honest ``leg_down`` and NEVER
+        re-routes the leg to the gravitywell lane; a silent legacy fallback
+        here is the "lying leg" the parent's re-gate fold kills.
+
+    Never falls back to a paid operator: the lane is a local seat, so
+    unreachable is fail-closed (phala precedent).
+    """
+
+    def __init__(self, url: str, reason: str, last_error: Exception | None = None):
+        self.url = url
+        self.reason = reason
+        self.last_error = last_error
+        # Exception.__init__ (not super()): OperatorUnreachableError's own
+        # __init__ demands a last_error it would then describe as an
+        # "unreachable after retries" — this error carries a lane STATE, not a
+        # retry exhaustion (phala precedent).
+        Exception.__init__(
+            self,
+            f"[flashnext] gate lane unavailable at {url!r} (reason={reason!r}) — "
+            "no legacy or paid fallback was attempted (fail-closed by design; only "
+            "reason='registry_blind' may fall back to the gravitywell path). "
+            f"last_error={last_error}",
+        )
+
+
 class GWParkedError(OperatorUnreachableError):
     """Raised when GW cannot be woken and on_wake_fail='park' (fail-closed default).
 
@@ -294,7 +332,7 @@ class GWServingModeMismatchError(Exception):
 # Multi-operator routing
 # ---------------------------------------------------------------------------
 
-OPERATOR_DEFAULTS: dict[str, str] = {
+OPERATOR_DEFAULTS: dict[str, str | None] = {
     "qwen":                 "qwen3.6-35b-a3b",
     "quest":                "quest-35b-rl",
     "sonnet":               "claude-sonnet-4-6",
@@ -303,7 +341,82 @@ OPERATOR_DEFAULTS: dict[str, str] = {
     "gravitywell":          "gravitywell-122b",
     "gravitywell-creative": "gravitywell-llama-70b",
     "phala":                "deepseek/deepseek-v4-flash-0731",
+    # flashnext (gate-lanes-registry-driven-flashnext-v0-agents-core, S2): the
+    # served id is REGISTRY-resolved at call time, never a literal — the value
+    # stored here is a None marker and _OperatorDefaults resolves it through
+    # agents_core.lane_registry on every read (the f0fb039 fixer_flash
+    # precedent: served-id + backend resolved, never hardcoded). None-valued
+    # also means "registry blind => operator unavailable": a read raises
+    # KeyError rather than inventing a model id.
+    "flashnext":            None,
 }
+
+# Operators whose OPERATOR_DEFAULTS entry resolves through the gw-seats
+# registry at CALL time (mirrors the _gw_default_model() / corroboration
+# _llm_url call-time-read precedent; a module-load read would freeze a seat
+# that comes and goes with the GPU handover).
+_CALL_TIME_RESOLVED_OPERATORS = ("flashnext",)
+
+
+class _OperatorDefaults(dict):
+    """OPERATOR_DEFAULTS with call-time resolution for the registry lanes.
+
+    Keys/iteration/``in`` behave like the plain dict literal above (so
+    ``"flashnext" in OPERATOR_DEFAULTS`` is True and the unknown-operator
+    ValueError still lists it), but reading a call-time-resolved key goes
+    through the gw-seats registry instead of a stored literal:
+
+      * resolved lane -> the registry's served model id (the
+        served-model-name pin).
+      * registry blind / lane not serving -> KeyError (and ``.get`` returns
+        its default). That is the honest "operator unavailable" shape: there
+        is no model id to claim, so none is invented, and the caller decides
+        what an unavailable lane means (blind -> legacy fallback; dead lane ->
+        honest leg_down).
+    """
+
+    def __getitem__(self, key):
+        if key in _CALL_TIME_RESOLVED_OPERATORS:
+            model = _registry_resolved_model(key)
+            if not model:
+                raise KeyError(key)
+            return model
+        return dict.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+def _registry_resolved_model(operator_class: str) -> str | None:
+    """The registry-resolved served id for a call-time-resolved operator.
+
+    Returns None when the registry is blind or the lane is not serving —
+    never a guessed/hardcoded id. ``fetcher`` (lane_registry.lane_state /
+    resolve_gate_lane) is the hermetic test seam.
+    """
+    from agents_core import lane_registry
+
+    lane_obj, _reason = lane_registry.lane_state(lane=operator_class)
+    return lane_obj.served_model if lane_obj is not None else None
+
+
+OPERATOR_DEFAULTS = _OperatorDefaults(OPERATOR_DEFAULTS)
+
+
+def _flashnext_lane() -> tuple[object, str]:
+    """Resolve the flashnext gate lane at CALL time (S2).
+
+    Returns (GateLane | None, reason) straight from
+    ``agents_core.lane_registry.lane_state`` — see that function for the
+    reason taxonomy ("" / "registry_blind" / "flashnext_not_serving").
+    """
+    from agents_core import lane_registry
+
+    return lane_registry.lane_state(lane=lane_registry.FLASHNEXT_LANE_NAME)
+
 
 
 def _gw_explicit_model() -> str | None:
@@ -1113,7 +1226,7 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
     """Route a completion request to the appropriate backend operator.
 
     operator_class ∈ {"qwen", "quest", "sonnet", "opus", "haiku", "gravitywell",
-    "gravitywell-creative", "phala"}. Raises ValueError for unknown classes.
+    "gravitywell-creative", "phala", "flashnext"}. Raises ValueError for unknown classes.
 
     Default models:
         qwen                 → "qwen3.6-35b-a3b"
@@ -1125,6 +1238,10 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
         gravitywell-creative → "gravitywell-llama-70b" (Llama-70B instruct, :8093, direct)
         phala                → "deepseek/deepseek-v4-flash-0731" (sealed TEE seat,
                                 PHALA_URL :8413, OpenAI-compat, direct)
+        flashnext            → registry-reserved (None in the table): the served id
+                                AND the base_url resolve through the gw-seats registry
+                                at call time (agents_core.lane_registry), never a
+                                hardcoded string.
 
     qwen routes via the local llama-server (same path as call_llm()).
 
@@ -1754,6 +1871,98 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
             _provenance_out.append(("success", "phala"))
         return result
 
+    if operator_class == "flashnext":
+        # S2 (gate-lanes-registry-driven-flashnext-v0-agents-core): the
+        # flashnext lane resolves through the gw-seats registry AT CALL TIME
+        # — base_url and served id both come from the registry row, never a
+        # hardcoded string (the f0fb039 fixer_flash precedent). Registry-blind
+        # is reported as reason="registry_blind" and is the ONLY shape whose
+        # caller may fall back to the legacy gravitywell path; a readable
+        # registry with the lane down raises a non-blind reason, which the
+        # caller must surface as an honest leg_down, never a silent legacy
+        # fallback (the "lying leg"). No doorman lease: the seat is the
+        # flash-next sglang box, leased by the doorman's flashnext window, not
+        # by this call site. No paid fallback of any kind (phala precedent).
+        #
+        # ``_lane`` (optional): either a caller-resolved lane (a GateLane-shaped
+        # object with base_url/served_model — the council adapter passes the
+        # lane it was constructed with, S4, so the endpoint it was built for is
+        # exactly the endpoint it dials) or the (lane_obj, reason) pair the
+        # call_operator wrapper already resolved for the locality record. Both
+        # shapes skip the registry re-read; every other caller leaves it unset
+        # and gets the call-time registry read.
+        lane_arg = kwargs.get("_lane")
+        if isinstance(lane_arg, tuple) and len(lane_arg) == 2:
+            resolved, reason = lane_arg
+        elif lane_arg is not None and isinstance(getattr(lane_arg, "base_url", None), str):
+            resolved, reason = lane_arg, ""
+        else:
+            resolved, reason = _flashnext_lane()
+        if resolved is None:
+            # PM-review fold (fix 4): the default reason for a None lane is
+            # "flashnext_unavailable", NEVER "registry_blind". registry_blind
+            # is the caller-licensed key for the legacy gravitywell fallback,
+            # so inventing it when the resolver gave no reason would hand a
+            # caller permission to silently re-route a lane that may simply be
+            # down. An absent reason is fail-closed (provenance already
+            # defaults the same way one line above — the two must not disagree).
+            if _provenance_out is not None:
+                _provenance_out.append((reason or "flashnext_unavailable", "flashnext"))
+            raise FlashnextLaneUnavailable("", reason or "flashnext_unavailable")
+        resolved_model = resolved.served_model or swarm_model(resolved.base_url)
+        if not resolved_model:
+            if _provenance_out is not None:
+                _provenance_out.append(("flashnext_not_serving", "flashnext"))
+            raise FlashnextLaneUnavailable(
+                resolved.base_url, f"{resolved.name}_not_serving"
+            )
+        if model is not None and model != resolved_model:
+            raise ValueError(
+                f"call_operator(operator_class='flashnext', model={model!r}): the "
+                f"registry-resolved lane serves a single fixed model "
+                f"({resolved_model!r}); model swaps are an infrastructure operation "
+                "(the seat's serve script), not a per-call parameter. Either pass "
+                "model=None to use the registry pin, or do the swap out-of-band."
+            )
+        # max_tokens is on the allowlist (PM-review fold, fix 2): wave-mode
+        # seats pass WAVE_SEAT_MAX_TOKENS (500) through the adapter, and the
+        # D6 compounding-prefill cap only exists if the lane path forwards it.
+        # Dropping it here silently re-inflated every flashnext-voiced wave
+        # seat to the GW_MAX_TOKENS default (4096) — the exact cost shape D6
+        # exists to prevent. Unset stays unset (None -> _post_chat_completion's
+        # own env-overridable default, byte-identical to the pre-fold shape).
+        fx_kwargs = {
+            k: kwargs[k] for k in (
+                "system", "timeout", "json_mode", "temperature", "log", "max_tokens"
+            ) if k in kwargs
+        }
+        try:
+            result = _post_chat_completion(
+                base_url=resolved.base_url,
+                model=resolved_model,
+                messages=(
+                    ([{"role": "system", "content": fx_kwargs["system"]}]
+                     if fx_kwargs.get("system") else [])
+                    + [{"role": "user", "content": prompt}]
+                ),
+                timeout=int(fx_kwargs.get("timeout", 300)),
+                json_mode=bool(fx_kwargs.get("json_mode", False)),
+                temperature=float(fx_kwargs.get("temperature", 0.7)),
+                log=fx_kwargs.get("log"),
+                max_tokens=(int(fx_kwargs["max_tokens"])
+                            if fx_kwargs.get("max_tokens") is not None else None),
+                _no_thinking=True,
+            )
+        except OperatorUnreachableError as exc:
+            if _provenance_out is not None:
+                _provenance_out.append(("serving_http_error", "flashnext"))
+            raise FlashnextLaneUnavailable(
+                resolved.base_url, f"{resolved.name}_unreachable", exc
+            ) from exc
+        if _provenance_out is not None:
+            _provenance_out.append(("success", "flashnext"))
+        return result
+
     # Anthropic-family: route via ClaudeQueue → call_claude_cli.
     # No direct Anthropic-API code path (decision/no-anthropic-api-direct).
     resolved_model = model or OPERATOR_DEFAULTS[operator_class]
@@ -1786,6 +1995,12 @@ _LOCALITY_COST_CLASS_BY_OPERATOR = {
     "quest": "local-gw",
     "gravitywell": "local-gw",
     "gravitywell-creative": "local-gw",
+    # flashnext: the flash-next sglang seat on the GravityWell box — a local
+    # seat, zero paid watts (gate-lanes-registry-driven-flashnext-v0-agents-core,
+    # S2). Its host is registry-resolved at call time (see
+    # _locality_record_call_operator), so it is deliberately absent from
+    # _LOCALITY_HOST_BY_OPERATOR below.
+    "flashnext": "local-gw",
     "sonnet": "paid-anthropic",
     "opus": "paid-anthropic",
     "haiku": "paid-anthropic",
@@ -1801,10 +2016,14 @@ _LOCALITY_HOST_BY_OPERATOR = {
     "opus": "claude-cli",
     "haiku": "claude-cli",
     "phala": PHALA_URL,
+    # "flashnext" is intentionally absent: its base_url is a registry row that
+    # comes and goes with the GPU handover, so a module-load literal would
+    # record a host the call never dialed.
 }
 
 
-def _locality_record_call_operator(*, operator_class, model, prov, served, start, ok):
+def _locality_record_call_operator(*, operator_class, model, prov, served, start, ok,
+                                   lane_obj=None):
     """Derive and write one ledger record for a call_operator() invocation.
 
     prov is the (reason, effective_operator) list _call_operator_impl populated
@@ -1846,6 +2065,11 @@ def _locality_record_call_operator(*, operator_class, model, prov, served, start
             extra = None
         cost_class = _LOCALITY_COST_CLASS_BY_OPERATOR.get(operator_class, "unknown")
         host = _LOCALITY_HOST_BY_OPERATOR.get(operator_class)
+        if operator_class == "flashnext":
+            # Registry-resolved host: the lane the call actually resolved
+            # (passed in by the wrapper — S2). None (blind) records no host
+            # rather than a stale one; the ledger never blocks a call.
+            host = lane_obj.base_url if lane_obj is not None else None
         duration_ms = (time.monotonic() - start) * 1000
 
         _locality_record(
@@ -1889,6 +2113,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
     _locality_prov = _provenance_out if _provenance_out is not None else []
     _locality_served: list = []
     _impl_kwargs = dict(kwargs)
+    _locality_lane_obj = _impl_kwargs.get("_lane")
     if operator_class == "gravitywell":
         # Only the gravitywell branch's gw_kwargs allowlist forwards this key
         # (llm.py ~1078-1082); injecting it for other operator classes would
@@ -1896,6 +2121,19 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         # non-autospec test mock of _call_qwen_backend accepts and records
         # any kwarg, breaking assert_called_once_with(prompt=...) assertions).
         _impl_kwargs.setdefault("_served_model_out", _locality_served)
+    elif operator_class == "flashnext":
+        # S2: resolve the registry lane ONCE per call and hand the same
+        # resolved lane to the implementation, so the ledger records the host
+        # the call actually dialed instead of reading the registry twice (a
+        # second read could disagree with the first across a seat handover,
+        # and a blind second read would record a stale host). Accept either
+        # shape a caller may have passed: a GateLane object (adapter-built,
+        # S4) or an already-resolved (lane_obj, reason) pair.
+        if isinstance(_locality_lane_obj, tuple) and len(_locality_lane_obj) == 2:
+            _locality_lane_obj = _locality_lane_obj[0]
+        elif not isinstance(getattr(_locality_lane_obj, "base_url", None), str):
+            _locality_lane_obj, _locality_reason = _flashnext_lane()
+            _impl_kwargs["_lane"] = (_locality_lane_obj, _locality_reason)
 
     ok = True
     _locality_result = None
@@ -1915,9 +2153,17 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         if ok:
             ok = _locality_result is not None
         _locality_record_call_operator(
-            operator_class=operator_class, model=model,
+            operator_class=operator_class,
+            # S2: for the registry lane, reuse the already-resolved served id
+            # rather than letting the record helper re-read the registry for
+            # its OPERATOR_DEFAULTS fallback guess (a second read could
+            # disagree with the call across a seat handover). served_model_observed
+            # stays False: a registry pin is a contract, not a wire observation.
+            model=(model or (getattr(_locality_lane_obj, "served_model", None)
+                             if operator_class == "flashnext" else None)),
             prov=_locality_prov, served=_locality_served,
             start=_locality_start, ok=ok,
+            lane_obj=_locality_lane_obj if operator_class == "flashnext" else None,
         )
 
 

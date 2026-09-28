@@ -58,7 +58,12 @@ from pathlib import Path
 
 import yaml
 
-from agents_core.llm import call_operator, _is_gw_result_degraded, OPERATOR_DEFAULTS  # noqa: E402
+from agents_core.llm import (  # noqa: E402
+    call_operator,
+    _is_gw_result_degraded,
+    OPERATOR_DEFAULTS,
+    FlashnextLaneUnavailable,
+)
 from agents_core.cards import cards_root, load_deck_cards
 from agents_core.council.gravitywell_adapter import GravityWellAdapter
 from agents_core.council.phala_adapter import PhalaAdapter
@@ -1242,7 +1247,44 @@ def _apply_voicing_provenance(run: dict, adapter) -> None:
 
     requested_voicing = run.get("voicing", "sonnet")
 
-    if isinstance(adapter, GravityWellAdapter):
+    if isinstance(adapter, GravityWellAdapter) and adapter.lane is not None:
+        # S4 (gate-lanes-registry-driven-flashnext-v0-agents-core): a
+        # registry-lane-voiced adapter (voicing flashnext) is labeled by the
+        # lane name + the served id it dialed, mirroring the phala
+        # explicit-banner rule — a flash-next verdict must never read as a
+        # 122B one. The lane IS the requested seat, so a clean run is NOT
+        # degraded (calling it degraded would both mislabel the run and trip
+        # the paid_spend derivation). Gated on the isinstance check so a
+        # duck-typed adapter that merely *has* a .lane attribute can never be
+        # mistaken for a registry-lane adapter.
+        served = adapter.lane.served_model
+        label = f"flashnext:{served}" if served else "flashnext"
+        if adapter.voicing_events:
+            operators = [e.get("effective_operator") for e in adapter.voicing_events]
+            reasons = [e.get("reason") for e in adapter.voicing_events]
+            if all(op == "flashnext" for op in operators) and all(
+                r == "success" for r in reasons
+            ):
+                run["effective_voicing"] = label
+                run["voicing_degraded"] = False
+            else:
+                run["effective_voicing"] = label
+                run["voicing_degraded"] = True
+                failure_reasons = [
+                    r for r in reasons if r != "success" and r != "fallback"
+                ]
+                run["voicing_degraded_reason"] = (
+                    failure_reasons[0] if failure_reasons else "unknown"
+                )
+            for i, turn in enumerate(run.get("turns", [])):
+                if i < len(adapter.voicing_events):
+                    turn["effective_voicing"] = adapter.voicing_events[i].get(
+                        "effective_operator"
+                    )
+        else:
+            run["effective_voicing"] = label
+            run["voicing_degraded"] = False
+    elif isinstance(adapter, GravityWellAdapter):
         if adapter.voicing_events:
             # Aggregate voicing events: check if all are gravitywell (clean) or mixed
             operators = [e.get("effective_operator") for e in adapter.voicing_events]
@@ -1391,6 +1433,51 @@ def _build_adapter(voicing: str, ClaudeAdapter, LlamaAdapter, run_id: str | None
     if voicing == "gravitywell":
         principal = gw_principal or (f"council-delib-{run_id}" if run_id else None)
         return GravityWellAdapter(temperature=0.8, principal=principal)
+    if voicing == "flashnext":
+        # S4 (gate-lanes-registry-driven-flashnext-v0-agents-core): voicing
+        # flashnext constructs the SAME adapter class gravitywell voicing
+        # uses, carrying the registry-resolved lane (base_url + served id
+        # from agents_core.lane_registry.resolve_gate_lane — never a
+        # hardcoded port/id, the f0fb039 fixer_flash precedent). The adapter
+        # takes no gravitywell doorman lease on this path (the flash-next
+        # seat is leased through the doorman's flashnext window; a
+        # gravitywell acquire here is the live-409 shape the parent's S8
+        # fold kills).
+        #
+        # Caller contract (inherited from the parent's stand-aside folds):
+        # an explicitly-requested lane that the registry does not show
+        # serving raises an honest leg_down here — NEVER a silent fallback
+        # to the gravitywell adapter (a "lying leg": a run that asked for
+        # flash-next and quietly voiced on the 122B). Registry-blind is
+        # reported as such so the caller can decide whether the legacy path
+        # is legitimate (the blind case is the only one that may fall back,
+        # and the fallback belongs to the gate runtime's leg bookkeeping,
+        # not to this construction site).
+        from agents_core import lane_registry
+
+        lane_obj, reason = lane_registry.lane_state(
+            lane=lane_registry.FLASHNEXT_LANE_NAME
+        )
+        if lane_obj is None:
+            # PM-review fold (fix 3): raise the typed lane error, not a bare
+            # ValueError, so a caller can branch on ``exc.reason`` and tell the
+            # one caller-licensed legacy fallback (reason="registry_blind")
+            # apart from an honest leg_down (reason="<lane>_not_serving").
+            # It is still an Exception with the same message, so the run-level
+            # `except Exception` bookkeeping in run_deliberation is unchanged.
+            raise FlashnextLaneUnavailable(
+                "", reason or "flashnext_unavailable",
+                ValueError(
+                    f"flashnext voicing unavailable: {reason} — the gw-seats "
+                    "registry does not show the flashnext gate lane serving "
+                    "(GW_SEATS_URL, default "
+                    f"{lane_registry.DEFAULT_GW_SEATS_URL}). Voicing degrades to "
+                    "an honest leg_down; it will NOT silently fall back to the "
+                    "gravitywell seat (registry-blind is the only case a caller "
+                    "may legitimately run the legacy path, and it must say so)."
+                ),
+            )
+        return GravityWellAdapter(temperature=0.8, lane=lane_obj)
     if voicing == "phala":
         return PhalaAdapter(temperature=0.8)
     if voicing in ("haiku", "sonnet", "opus"):
@@ -1451,6 +1538,30 @@ def _apply_wave_voicing_provenance(run: dict, seat_adapters: list) -> None:
     seat's adapter.
     """
     all_events = [e for adapter in seat_adapters for e in adapter.voicing_events]
+    first = seat_adapters[0] if seat_adapters else None
+    lane = first.lane if isinstance(first, GravityWellAdapter) else None
+    if lane is not None:
+        # S4 (gate-lanes-registry-driven-flashnext-v0-agents-core): wave seats
+        # voiced on a registry lane are labeled by the lane, not by
+        # "gravitywell" — a flash-next wave must never read as a 122B wave
+        # (the phala explicit-banner rule), and a clean lane run is not
+        # "degraded" (the lane IS the requested seat). A turn that failed is
+        # still reported honestly.
+        served = lane.served_model
+        label = f"flashnext:{served}" if served else "flashnext"
+        run["effective_voicing"] = label
+        reasons = [e.get("reason") for e in all_events]
+        clean = bool(all_events) and all(
+            e.get("effective_operator") == "flashnext" and r == "success"
+            for e, r in zip(all_events, reasons)
+        )
+        run["voicing_degraded"] = not clean
+        if not clean:
+            failure_reasons = [r for r in reasons if r not in ("success", "fallback")]
+            run["voicing_degraded_reason"] = (
+                failure_reasons[0] if failure_reasons else "unknown"
+            )
+        return
     if not all_events:
         run["effective_voicing"] = "gravitywell"
         run["voicing_degraded"] = False
@@ -1512,6 +1623,35 @@ def _run_wave_deliberation(
     # converts a 7-seat wave into 7 separate GW admission groups.
     wave_principal = run.get("gw_principal") or f"council-delib-{run_id}"
 
+    # S4 (gate-lanes-registry-driven-flashnext-v0-agents-core): wave seats
+    # ride the same lane path as _build_adapter — voicing flashnext resolves
+    # the registry lane ONCE for the whole wave (one read, one shared truth
+    # across seats) and every seat adapter carries it, taking no gravitywell
+    # principal/lease. A lane the registry does not show serving raises here
+    # — an honest leg_down, never a silent wave on the gravitywell seat.
+    wave_lane = None
+    if run.get("voicing") == "flashnext":
+        from agents_core import lane_registry
+
+        wave_lane, _reason = lane_registry.lane_state(
+            lane=lane_registry.FLASHNEXT_LANE_NAME
+        )
+        if wave_lane is None:
+            # PM-review fold (fix 3): same typed raise as the _build_adapter
+            # site — callers branch on ``exc.reason`` (registry_blind is the
+            # only caller-licensed legacy fallback; anything else is an
+            # honest leg_down for the wave).
+            raise FlashnextLaneUnavailable(
+                "", _reason or "flashnext_unavailable",
+                ValueError(
+                    f"flashnext voicing unavailable (wave mode): {_reason} — the "
+                    "gw-seats registry does not show the flashnext gate lane "
+                    f"serving (GW_SEATS_URL, default "
+                    f"{lane_registry.DEFAULT_GW_SEATS_URL}). No silent fallback to "
+                    "the gravitywell seat."
+                ),
+            )
+
     entities = []
     seat_adapters = []
     for sel in run["selected_entities"]:
@@ -1520,6 +1660,7 @@ def _run_wave_deliberation(
             principal=wave_principal,
             timeout=WAVE_SEAT_TIMEOUT_S,  # H2: seats queue behind each other's prefill
             max_tokens=WAVE_SEAT_MAX_TOKENS,  # D6: cap compounding re-prefill cost
+            lane=wave_lane,  # S4: None on the gravitywell path (byte-identical)
         )
         entities.append(_build_entity(sel, seat_adapter, CharacterEntity, NarratorEntity))
         seat_adapters.append(seat_adapter)
@@ -2116,13 +2257,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--n", type=int, default=None)
     sp.add_argument("--turns", type=int, default=DEFAULT_TURNS)
     sp.add_argument(
-        "--voicing", choices=["local", "gravitywell", "phala"],
+        "--voicing", choices=["local", "gravitywell", "phala", "flashnext"],
         default=DEFAULT_VOICING,
         help="Voicing operator. gravitywell (default, GW queue), local (LlamaAdapter) and "
         "phala (sealed TEE seat, PhalaAdapter) are available. Paid-model (Anthropic) "
         "voicing was removed to prevent the per-turn subprocess firehose. phala voices "
         "are always labeled by model id in effective_voicing - a sealed channel is a "
-        "privacy claim, not a content-trust claim, and must never read as the 122B.",
+        "privacy claim, not a content-trust claim, and must never read as the 122B. "
+        "flashnext (gate-lanes-registry-driven-flashnext-v0-agents-core, S4) voices on "
+        "the flash-next seat through the gw-seats registry (GW_SEATS_URL, base_url and "
+        "served id both registry-resolved): the same adapter class as gravitywell on a "
+        "registry lane, no gravitywell lease, and a lane the registry does not show "
+        "serving refuses the run rather than silently voicing on the 122B.",
     )
     sp.add_argument("--with", dest="with_entity", default=None)
     sp.add_argument(
