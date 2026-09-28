@@ -2476,6 +2476,12 @@ class _NodeState:
                 when role != "mode-controller" (AC2a).
           work_id: the caller's own work_id, used only for the identity-aware foreign-
                    controller check (AC3a) when mode is supplied and role=="mode-controller".
+          accept_flashnext_seat: S2 opt-in (doorman-flashnext-serving-admission-v0).
+                   Forwarded to ensure_serving(): when True AND mode is None AND
+                   role != "mode-controller" AND the guard's fresh seat probe reads
+                   up_registered, the already-serving flash-next seat is granted WITHOUT
+                   a wake and the registered lease dict carries the additive
+                   serve_axis="flashnext" field. Default False = byte-identical to today.
 
         Flow (gravitywell-doorman-clean-stop-v0 + doorman-mode-deference-v0):
           0. Mode-aware deference (HOLE 1 fix, flag ON only): if controller owns the
