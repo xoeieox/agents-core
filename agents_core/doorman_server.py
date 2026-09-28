@@ -2618,9 +2618,14 @@ class _NodeState:
                 and seat_state == "up_registered"
             ):
                 # No wake was issued, so this is NOT a wake: the caller's lease is
-                # registered by acquire_lease on the FAST-PATH write-set (see below)
-                # and the served_id is carried out on the result object so the audit
-                # line needs no extra probe.
+                # registered by acquire_lease on the FAST-PATH write-set (last_error /
+                # service_stopped only — deliberately NOT _cached_serving, which would
+                # widen the day-seat axis, and NOT last_wake_at, which would lie about a
+                # wake that never happened). _place_hold DOES apply (real work is in
+                # flight) and happens in acquire_lease's registration block.
+                with self.lock:
+                    self.last_error = None
+                    self.service_stopped = False
                 log.info(
                     f"[{self.node_name}] flashnext-seat-already-serving — S2 grant: "
                     f"seat probe {seat_state} (served_id={seat_served_id!r}); skipping "
