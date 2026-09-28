@@ -205,14 +205,32 @@ def test_blind_payloads_resolve_none(payload):
 
 
 def test_transport_error_is_blind():
+    """The unstubbed live-read path collapses a transport error to blind.
+
+    (The shim's contract, kept byte-identically: an INJECTED fetcher's own
+    errors propagate — only the live ``_fetch_payload`` read is swallowed.)
+    """
+    from agents_core import lane_registry
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("registry unreachable")
+
+    with patch.object(lane_registry, "_fetch_payload", _boom):
+        assert lane_registry.resolve_gate_lane(lane="flashnext") is None
+        lane_obj, reason = lane_registry.lane_state(lane="flashnext")
+    assert lane_obj is None and reason == "registry_blind"
+
+
+def test_injected_fetcher_errors_propagate_shim_contract():
+    """The shim lets an injected fetcher's exception escape (only the live
+    read is fail-soft); the promoted helper must do the same."""
     from agents_core import lane_registry
 
     def _boom():
-        raise RuntimeError("registry unreachable")
+        raise RuntimeError("caller-side fetcher bug")
 
-    assert lane_registry.resolve_gate_lane(fetcher=_boom) is None
-    lane_obj, reason = lane_registry.lane_state(lane="flashnext", fetcher=_boom)
-    assert lane_obj is None and reason == "registry_blind"
+    with pytest.raises(RuntimeError, match="caller-side fetcher bug"):
+        lane_registry.resolve_gate_lane(lane="flashnext", fetcher=_boom)
 
 
 # ---------------------------------------------------------------------------
