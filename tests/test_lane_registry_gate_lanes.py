@@ -21,6 +21,42 @@ import json
 import pytest
 from unittest.mock import MagicMock, patch
 
+
+@pytest.fixture(autouse=True)
+def _no_live_network(monkeypatch):
+    """Module-level hermeticity guard (PM-review fold, fix 1).
+
+    Every test in this module must reach the gw-seats registry through the
+    ``fetcher`` seam or an explicitly patched read. The guard makes any real
+    socket connect from here fail loudly rather than silently passing on
+    whatever the live registry happens to say — without it, an unstubbed
+    ``lane_state`` call reads the real :8408 and the test's verdict depends on
+    which seat holds the GPU at run time (that is exactly how the
+    OPERATOR_DEFAULTS assertion passed while proving nothing).
+    """
+    import socket
+
+    def _blocked(*args, **kwargs):
+        raise AssertionError(
+            "hermetic test attempted a live network call "
+            "(stub agents_core.lane_registry.lane_state / resolve_gate_lane, "
+            "or pass fetcher=...)"
+        )
+
+    monkeypatch.setattr(socket.socket, "connect", _blocked)
+    monkeypatch.setattr(socket.socket, "connect_ex", _blocked)
+    monkeypatch.setattr(socket, "create_connection", _blocked)
+
+    # Companion pin: the resolved base_url's HOST follows GW_SEATS_URL at call
+    # time, so an ambient GW_SEATS_URL in the runner's environment would flip
+    # every expected base_url (the payloads here are stubs, but their host is
+    # not). Pin it to the contract default; tests that deliberately exercise a
+    # different registry origin set the var themselves inside the test body,
+    # which overrides this.
+    from agents_core import lane_registry as _lr
+
+    monkeypatch.setenv("GW_SEATS_URL", _lr.DEFAULT_GW_SEATS_URL)
+
 # ---------------------------------------------------------------------------
 # Stub registry payloads (shapes verified live against :8408 2026-09-25;
 # see agents_core/lane_registry module docstring)
@@ -345,11 +381,30 @@ def test_flashnext_in_operator_defaults_but_none_valued():
 
 def test_operator_default_resolves_served_id_from_registry(monkeypatch):
     """A readable registry resolves the model to the registry's served id —
-    the pin, not a literal."""
+    the pin, not a literal.
+
+    PM-review fold (fix 1): the serving case is STUBBED at the top of the
+    test. Previously the first assert ran unstubbed and live-read the gw-seats
+    registry at :8408, so it passed only because the flash-next seat happened
+    to hold the GPU — a blind registry (27B up, or registry down) would have
+    flipped it to KeyError, and the module's socket guard now makes that live
+    read fail loudly instead of passing on luck. The post-stub blind asserts
+    are kept: they pin the "blind => no model id to claim" shape.
+    """
     from agents_core import lane_registry
     from agents_core.llm import OPERATOR_DEFAULTS
 
+    monkeypatch.setattr(
+        lane_registry, "lane_state",
+        lambda lane=None, fetcher=None: (
+            lane_registry.GateLane(
+                name="flashnext",
+                base_url="http://203.0.113.11:30000",
+                served_model="Qwen3.8-Flash-Next-NVFP4-SSD-Stream"),
+            "")),
+
     assert OPERATOR_DEFAULTS["flashnext"] == "Qwen3.8-Flash-Next-NVFP4-SSD-Stream"
+    assert OPERATOR_DEFAULTS.get("flashnext") == "Qwen3.8-Flash-Next-NVFP4-SSD-Stream"
 
     monkeypatch.setattr(
         lane_registry, "lane_state",
@@ -359,6 +414,116 @@ def test_operator_default_resolves_served_id_from_registry(monkeypatch):
         OPERATOR_DEFAULTS["flashnext"]
     assert OPERATOR_DEFAULTS.get("flashnext") is None
     assert OPERATOR_DEFAULTS.get("flashnext", "fallback") == "fallback"
+
+
+def test_wave_max_tokens_reaches_the_lane_post(monkeypatch):
+    """PM-review fold (fix 2): max_tokens must survive the flashnext allowlist.
+
+    Wave mode passes WAVE_SEAT_MAX_TOKENS (500) through GravityWellAdapter
+    (D6: cap the compounding re-prefill a long seat statement causes across
+    every later round). If the lane path dropped the kwarg, every
+    flashnext-voiced wave seat would silently fall back to the GW_MAX_TOKENS
+    default (4096) — the exact cost shape D6 exists to prevent.
+    """
+    from agents_core import lane_registry
+    from agents_core.council.cli import WAVE_SEAT_MAX_TOKENS
+    import agents_core.llm as llm
+
+    captured = {}
+
+    def _fake_post(**kwargs):
+        captured.update(kwargs)
+        return "voiced"
+
+    monkeypatch.setattr(lane_registry, "lane_state",
+                        lambda lane=None, fetcher=None: (
+                            lane_registry.GateLane(
+                                name="flashnext",
+                                base_url="http://203.0.113.11:30000",
+                                served_model="Qwen3.8-Flash-Next-NVFP4-SSD-Stream"),
+                            ""))
+    monkeypatch.setattr(llm, "_post_chat_completion", _fake_post)
+
+    prov = []
+    out = llm.call_operator("flashnext", prompt="seat statement",
+                            max_tokens=WAVE_SEAT_MAX_TOKENS, _provenance_out=prov)
+
+    assert out == "voiced"
+    assert captured["max_tokens"] == 500 == WAVE_SEAT_MAX_TOKENS
+    assert prov == [("success", "flashnext")]
+
+
+def test_max_tokens_unset_stays_unset(monkeypatch):
+    """The fold must not invent a cap: unset -> None, letting
+    _post_chat_completion apply its own env-overridable default
+    (byte-identical to the pre-fold shape for non-wave callers)."""
+    from agents_core import lane_registry
+    import agents_core.llm as llm
+
+    captured = {}
+
+    def _fake_post(**kwargs):
+        captured.update(kwargs)
+        return "voiced"
+
+    monkeypatch.setattr(lane_registry, "lane_state",
+                        lambda lane=None, fetcher=None: (
+                            lane_registry.GateLane(
+                                name="flashnext",
+                                base_url="http://203.0.113.11:30000",
+                                served_model="Qwen3.8-Flash-Next-NVFP4-SSD-Stream"),
+                            ""))
+    monkeypatch.setattr(llm, "_post_chat_completion", _fake_post)
+
+    llm.call_operator("flashnext", prompt="hi")
+
+    assert captured["max_tokens"] is None
+
+
+def test_adapter_max_tokens_threads_through_the_lane(monkeypatch):
+    """The wave seat's adapter-level cap reaches call_operator on the lane
+    path (the D6 plumbing end-to-end, adapter -> call_operator)."""
+    from agents_core import lane_registry
+    from agents_core.council.gravitywell_adapter import GravityWellAdapter
+
+    adapter = GravityWellAdapter(
+        temperature=0.8, max_tokens=500,
+        lane=lane_registry.GateLane(
+            name="flashnext", base_url="http://203.0.113.11:30000",
+            served_model="Qwen3.8-Flash-Next-NVFP4-SSD-Stream"))
+
+    with patch("agents_core.council.gravitywell_adapter.call_operator",
+               return_value="voiced") as mock_op:
+        adapter.chat("CARD", [MagicMock(role="user", content="hi")])
+
+    _args, kwargs = mock_op.call_args
+    assert kwargs["max_tokens"] == 500
+
+
+def test_no_reason_defaults_to_unavailable_not_blind(monkeypatch):
+    """PM-review fold (fix 4): a None lane with NO reason must not be
+    reported as registry_blind. registry_blind is the key that licenses the
+    caller's legacy gravitywell fallback, so inventing it for an
+    unknown-state lane would hand a silent re-route to the 122B — fail-closed
+    means the default is the non-blind flashnext_unavailable.
+    """
+    from agents_core import lane_registry
+    from agents_core.llm import FlashnextLaneUnavailable, call_operator
+
+    monkeypatch.setattr(lane_registry, "lane_state",
+                        lambda lane=None, fetcher=None: (None, ""))
+
+    prov = []
+    with patch("agents_core.llm._post_chat_completion") as mock_post:
+        with pytest.raises(FlashnextLaneUnavailable) as exc:
+            call_operator("flashnext", prompt="p", _provenance_out=prov)
+
+    mock_post.assert_not_called()
+    assert exc.value.reason == "flashnext_unavailable"
+    assert exc.value.reason != "registry_blind"
+    # Provenance and the raised reason must agree — a caller reading either
+    # must reach the same conclusion about whether legacy fallback is licensed.
+    assert prov == [("flashnext_unavailable", "flashnext")]
 
 
 def test_blind_registry_call_operator_is_unavailable_blind():
@@ -505,19 +670,34 @@ def test_build_adapter_flashnext_carries_registry_lane():
 
 def test_build_adapter_flashnext_refuses_inactive_lane():
     """No lying leg: an explicitly-requested inactive lane raises here rather
-    than constructing a gravitywell adapter."""
+    than constructing a gravitywell adapter.
+
+    PM-review fold (fix 3): the raise is the typed FlashnextLaneUnavailable
+    carrying .reason, so a caller can tell the one legacy-licensed shape
+    (registry_blind) from an honest leg_down (<lane>_not_serving) without
+    string-matching the message.
+    """
     from agents_core import lane_registry
     from agents_core.council.cli import _build_adapter
+    from agents_core.llm import FlashnextLaneUnavailable
 
     with patch.object(lane_registry, "lane_state",
                       return_value=(None, "flashnext_not_serving")):
-        with pytest.raises(ValueError, match="flashnext voicing unavailable"):
+        with pytest.raises(FlashnextLaneUnavailable,
+                           match="flashnext voicing unavailable") as exc:
             _build_adapter("flashnext", ClaudeAdapter=None, LlamaAdapter=None)
+    assert exc.value.reason == "flashnext_not_serving"
+    assert exc.value.reason != "registry_blind"
 
     with patch.object(lane_registry, "lane_state",
                       return_value=(None, "registry_blind")):
-        with pytest.raises(ValueError, match="registry_blind"):
+        with pytest.raises(FlashnextLaneUnavailable, match="registry_blind") as exc:
             _build_adapter("flashnext", ClaudeAdapter=None, LlamaAdapter=None)
+    assert exc.value.reason == "registry_blind"
+
+    # The reason must be carried on the exception object, not only in the
+    # message — that is the whole point of the typed raise.
+    assert "reason=" in str(exc.value)
 
 
 def test_flashnext_adapter_voices_lane_without_gw_lease():
@@ -605,13 +785,18 @@ def test_voicing_provenance_records_lane_failure_honestly():
 
 def test_wave_seats_share_registry_lane():
     """Wave mode resolves the lane once for the whole wave and refuses a dead
-    lane rather than waving on the gravitywell seat."""
+    lane rather than waving on the gravitywell seat.
+
+    PM-review fold (fix 3): the refusal is the typed FlashnextLaneUnavailable
+    carrying .reason (callers branch on it), not a bare ValueError.
+    """
     from agents_core import lane_registry
+    from agents_core.llm import FlashnextLaneUnavailable
     import agents_core.council.cli as cli
 
     with patch.object(lane_registry, "lane_state",
                       return_value=(None, "flashnext_not_serving")):
-        with pytest.raises(ValueError, match="wave mode"):
+        with pytest.raises(FlashnextLaneUnavailable, match="wave mode") as exc:
             cli._run_wave_deliberation(
                 run={"voicing": "flashnext", "selected_entities": [], "decision": "d",
                      "turns_cap": 2, "turns": [], "gw_principal": None},
@@ -619,6 +804,7 @@ def test_wave_seats_share_registry_lane():
                 hold_work_id="w", hold_principal="p", refresh_threads=[],
                 CharacterEntity=MagicMock(), NarratorEntity=MagicMock(),
             )
+    assert exc.value.reason == "flashnext_not_serving"
 
 
 # ---------------------------------------------------------------------------

@@ -1899,9 +1899,16 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
         else:
             resolved, reason = _flashnext_lane()
         if resolved is None:
+            # PM-review fold (fix 4): the default reason for a None lane is
+            # "flashnext_unavailable", NEVER "registry_blind". registry_blind
+            # is the caller-licensed key for the legacy gravitywell fallback,
+            # so inventing it when the resolver gave no reason would hand a
+            # caller permission to silently re-route a lane that may simply be
+            # down. An absent reason is fail-closed (provenance already
+            # defaults the same way one line above — the two must not disagree).
             if _provenance_out is not None:
                 _provenance_out.append((reason or "flashnext_unavailable", "flashnext"))
-            raise FlashnextLaneUnavailable("", reason or "registry_blind")
+            raise FlashnextLaneUnavailable("", reason or "flashnext_unavailable")
         resolved_model = resolved.served_model or swarm_model(resolved.base_url)
         if not resolved_model:
             if _provenance_out is not None:
@@ -1917,9 +1924,17 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                 "(the seat's serve script), not a per-call parameter. Either pass "
                 "model=None to use the registry pin, or do the swap out-of-band."
             )
+        # max_tokens is on the allowlist (PM-review fold, fix 2): wave-mode
+        # seats pass WAVE_SEAT_MAX_TOKENS (500) through the adapter, and the
+        # D6 compounding-prefill cap only exists if the lane path forwards it.
+        # Dropping it here silently re-inflated every flashnext-voiced wave
+        # seat to the GW_MAX_TOKENS default (4096) — the exact cost shape D6
+        # exists to prevent. Unset stays unset (None -> _post_chat_completion's
+        # own env-overridable default, byte-identical to the pre-fold shape).
         fx_kwargs = {
-            k: kwargs[k] for k in ("system", "timeout", "json_mode", "temperature", "log")
-            if k in kwargs
+            k: kwargs[k] for k in (
+                "system", "timeout", "json_mode", "temperature", "log", "max_tokens"
+            ) if k in kwargs
         }
         try:
             result = _post_chat_completion(
@@ -1934,6 +1949,8 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                 json_mode=bool(fx_kwargs.get("json_mode", False)),
                 temperature=float(fx_kwargs.get("temperature", 0.7)),
                 log=fx_kwargs.get("log"),
+                max_tokens=(int(fx_kwargs["max_tokens"])
+                            if fx_kwargs.get("max_tokens") is not None else None),
                 _no_thinking=True,
             )
         except OperatorUnreachableError as exc:

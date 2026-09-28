@@ -58,7 +58,12 @@ from pathlib import Path
 
 import yaml
 
-from agents_core.llm import call_operator, _is_gw_result_degraded, OPERATOR_DEFAULTS  # noqa: E402
+from agents_core.llm import (  # noqa: E402
+    call_operator,
+    _is_gw_result_degraded,
+    OPERATOR_DEFAULTS,
+    FlashnextLaneUnavailable,
+)
 from agents_core.cards import cards_root, load_deck_cards
 from agents_core.council.gravitywell_adapter import GravityWellAdapter
 from agents_core.council.phala_adapter import PhalaAdapter
@@ -1454,14 +1459,23 @@ def _build_adapter(voicing: str, ClaudeAdapter, LlamaAdapter, run_id: str | None
             lane=lane_registry.FLASHNEXT_LANE_NAME
         )
         if lane_obj is None:
-            raise ValueError(
-                f"flashnext voicing unavailable: {reason} — the gw-seats "
-                "registry does not show the flashnext gate lane serving "
-                "(GW_SEATS_URL, default "
-                f"{lane_registry.DEFAULT_GW_SEATS_URL}). Voicing degrades to "
-                "an honest leg_down; it will NOT silently fall back to the "
-                "gravitywell seat (registry-blind is the only case a caller "
-                "may legitimately run the legacy path, and it must say so)."
+            # PM-review fold (fix 3): raise the typed lane error, not a bare
+            # ValueError, so a caller can branch on ``exc.reason`` and tell the
+            # one caller-licensed legacy fallback (reason="registry_blind")
+            # apart from an honest leg_down (reason="<lane>_not_serving").
+            # It is still an Exception with the same message, so the run-level
+            # `except Exception` bookkeeping in run_deliberation is unchanged.
+            raise FlashnextLaneUnavailable(
+                "", reason or "flashnext_unavailable",
+                ValueError(
+                    f"flashnext voicing unavailable: {reason} — the gw-seats "
+                    "registry does not show the flashnext gate lane serving "
+                    "(GW_SEATS_URL, default "
+                    f"{lane_registry.DEFAULT_GW_SEATS_URL}). Voicing degrades to "
+                    "an honest leg_down; it will NOT silently fall back to the "
+                    "gravitywell seat (registry-blind is the only case a caller "
+                    "may legitimately run the legacy path, and it must say so)."
+                ),
             )
         return GravityWellAdapter(temperature=0.8, lane=lane_obj)
     if voicing == "phala":
@@ -1623,12 +1637,19 @@ def _run_wave_deliberation(
             lane=lane_registry.FLASHNEXT_LANE_NAME
         )
         if wave_lane is None:
-            raise ValueError(
-                f"flashnext voicing unavailable (wave mode): {_reason} — the "
-                "gw-seats registry does not show the flashnext gate lane "
-                f"serving (GW_SEATS_URL, default "
-                f"{lane_registry.DEFAULT_GW_SEATS_URL}). No silent fallback to "
-                "the gravitywell seat."
+            # PM-review fold (fix 3): same typed raise as the _build_adapter
+            # site — callers branch on ``exc.reason`` (registry_blind is the
+            # only caller-licensed legacy fallback; anything else is an
+            # honest leg_down for the wave).
+            raise FlashnextLaneUnavailable(
+                "", _reason or "flashnext_unavailable",
+                ValueError(
+                    f"flashnext voicing unavailable (wave mode): {_reason} — the "
+                    "gw-seats registry does not show the flashnext gate lane "
+                    f"serving (GW_SEATS_URL, default "
+                    f"{lane_registry.DEFAULT_GW_SEATS_URL}). No silent fallback to "
+                    "the gravitywell seat."
+                ),
             )
 
     entities = []
