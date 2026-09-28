@@ -199,6 +199,7 @@ def _acquire_with_defer_retry(
     log: Callable[[str], None] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
     rand_fn: Callable[[], float] = random.random,
+    accept_flashnext_seat: bool = False,
 ) -> tuple[dict, bool]:
     """Retry a `deferrable`-class acquire on "pending_defer" up to a client-owned budget.
 
