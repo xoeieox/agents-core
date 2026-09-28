@@ -1154,14 +1154,26 @@ def run_deliberation(run_id: str) -> None:
                     if _hold_active and _doorman:
                         def _refresh(_step=sd.step):
                             try:
-                                _doorman.acquire(
+                                _ref = _doorman.acquire(
                                     "gravitywell", _hold_work_id,
                                     ttl_sec=COUNCIL_STALL_S,
                                     reason="council-deliberation-heartbeat",
                                     timeout=5.0,
                                     principal=_hold_principal,
                                     lease_class="protected",
+                                    # Same opt-in as the initial hold: a refresh
+                                    # that omitted it would be refused by the
+                                    # window guard on a flashnext-solo box and the
+                                    # lease would silently TTL-lapse mid-deliberation.
+                                    accept_flashnext_seat=True,
                                 )
+                                if _ref.get("status") != "serving":
+                                    print(
+                                        f"[council] hold refresh not serving "
+                                        f"step={_step}: status={_ref.get('status')} "
+                                        f"flags={[k for k in _ref if k.endswith('_occupied')]}",
+                                        flush=True,
+                                    )
                             except Exception as _ref_err:
                                 print(
                                     f"[council] hold refresh failed step={_step}: {_ref_err}",
