@@ -622,6 +622,26 @@ CREATIVE_OCCUPIED = object()
 # guard supersedes the controller-deference machinery and no lease registers.
 FLASHNEXT_OCCUPIED = object()
 
+
+class _FlashnextServed:
+    """ensure_serving() result for an S2 already-serving grant
+    (doorman-flashnext-serving-admission-v0, S2).
+
+    Distinct from the plain ``True`` so acquire_lease can stamp the additive
+    ``serve_axis="flashnext"`` field on the lease dict (and log the registration
+    audit line with the probe's served_id) WITHOUT a second :30000 probe — the
+    value is carried out of the guard's single fresh probe pair. Truthy, so any
+    legacy truthiness check reads it as success exactly like ``True``.
+    """
+
+    __slots__ = ("served_id",)
+
+    def __init__(self, served_id: str | None = None):
+        self.served_id = served_id
+
+    def __bool__(self) -> bool:
+        return True
+
 # Sentinel principal for worker leases acquired without an explicit principal.
 # Never excluded from drain_count — makes a forgotten-principal diagnosable instead of invisible.
 GHOST_PRINCIPAL = "__GHOST_LEASE__"
