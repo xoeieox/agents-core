@@ -4774,6 +4774,8 @@ def create_app(gw_url: str | None = None) -> FastAPI:
             work_id, ttl_sec, reason, role=role, principal=principal,
             require_drain_clear=require_drain_clear, lease_kind=lease_kind,
             lease_class=lease_class, mode=mode,
+            accept_flashnext_seat=accept_flashnext_seat,
+            serve_axis_out=_serve_axis_out,
         )
 
         if ok is CREATIVE_OCCUPIED:
