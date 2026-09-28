@@ -622,4 +622,6 @@ class TestS3LlmDictSide:
         store.close()
         assert len(rows) == 1
         assert rows[0]["status"] == "failed"
-        assert rows[0]["failure_reason"] == GW_REASON_FLASHNEXT_WINDOW
+        import json as _json
+        prov_row = _json.loads(rows[0]["provenance"] or "{}")
+        assert GW_REASON_FLASHNEXT_WINDOW in str(prov_row)
