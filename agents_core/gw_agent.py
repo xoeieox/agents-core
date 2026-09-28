@@ -2620,13 +2620,13 @@ def _call_gw_agent_impl(
                 else:
                     raise ValueError(f"unknown on_wake_fail: {on_wake_fail}")
             except httpx.HTTPStatusError as e:
-                # 409: another seat holds the GPU lane (creative_occupied or
-                # flashnext_occupied). Route through on_wake_fail with the
-                # distinct reason "gw_seat_occupied" — distinguishable from
-                # "gw_unreachable" and "gw_not_serving".
-                # (agents-core-doorman-flashnext-handover-v0, Deliverable 4:
-                # the identical hole exists today for creative_occupied 409s;
-                # this branch repairs both.)
+                # LEGACY-SERVER path (doorman-flashnext-serving-admission-v0, S1/S3):
+                # post-S1 a named 409 arrives from client.acquire() as a REFUSAL DICT
+                # (handled dict-side below), so an escaping HTTPStatusError here means a
+                # pre-S1 doorman, a 409 whose body carries no known flag, or another
+                # 4xx-shape error the client could not name. Keep the pre-S1 behavior:
+                # route a 409 through on_wake_fail with the flat "gw_seat_occupied"
+                # reason (agents-core-doorman-flashnext-handover-v0, Deliverable 4).
                 if e.response.status_code == 409:
                     if log:
                         log(f"[gw_agent] doorman 409 (seat occupied): {e}")
