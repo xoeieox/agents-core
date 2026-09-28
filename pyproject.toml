@@ -5,8 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agents-core"
 version = "0.3.0"
-description = "Shared infrastructure primitives for StarHouse Claude agents (llm, forgejo, notify, targets, comments, gpu, mem)."
+description = "Shared infrastructure primitives for the StarHouse agent fleet: LLM plumbing, Forgejo client, notifications, targets/comments, GPU queue, memory (SQLite+FTS5), shaped agent execution, doorman leases, slots, and thin FastAPI servers over the mem and gpu modules."
 requires-python = ">=3.12"
+license = "Apache-2.0"
 dependencies = [
     "httpx",
     "requests",
@@ -20,7 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest", "respx", "pytest-asyncio", "httpx"]
+test = ["pytest", "respx", "pytest-asyncio", "httpx", "pytest-timeout"]
 
 [project.scripts]
 narrative-emit = "agents_core.narrative.emit:main"
@@ -51,3 +52,5 @@ markers = [
     "smoke: real end-to-end dispatch through live ClaudeQueue; run with -m smoke",
 ]
 addopts = "-m 'not smoke'"
+timeout = 20
+timeout_method = "signal"
