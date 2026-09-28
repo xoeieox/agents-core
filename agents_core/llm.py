@@ -1862,6 +1862,67 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
             _provenance_out.append(("success", "phala"))
         return result
 
+    if operator_class == "flashnext":
+        # S2 (gate-lanes-registry-driven-flashnext-v0-agents-core): the
+        # flashnext lane resolves through the gw-seats registry AT CALL TIME
+        # — base_url and served id both come from the registry row, never a
+        # hardcoded string (the f0fb039 fixer_flash precedent). Registry-blind
+        # is reported as reason="registry_blind" and is the ONLY shape whose
+        # caller may fall back to the legacy gravitywell path; a readable
+        # registry with the lane down raises a non-blind reason, which the
+        # caller must surface as an honest leg_down, never a silent legacy
+        # fallback (the "lying leg"). No doorman lease: the seat is the
+        # flash-next sglang box, leased by the doorman's flashnext window, not
+        # by this call site. No paid fallback of any kind (phala precedent).
+        lane_obj, reason = _flashnext_lane()
+        if lane_obj is None:
+            if _provenance_out is not None:
+                _provenance_out.append((reason or "flashnext_unavailable", "flashnext"))
+            raise FlashnextLaneUnavailable("", reason or "registry_blind")
+        resolved_model = lane_obj.served_model or swarm_model(lane_obj.base_url)
+        if not resolved_model:
+            if _provenance_out is not None:
+                _provenance_out.append(("flashnext_not_serving", "flashnext"))
+            raise FlashnextLaneUnavailable(
+                lane_obj.base_url, f"{lane_obj.name}_not_serving"
+            )
+        if model is not None and model != resolved_model:
+            raise ValueError(
+                f"call_operator(operator_class='flashnext', model={model!r}): the "
+                f"registry-resolved lane serves a single fixed model "
+                f"({resolved_model!r}); model swaps are an infrastructure operation "
+                "(the seat's serve script), not a per-call parameter. Either pass "
+                "model=None to use the registry pin, or do the swap out-of-band."
+            )
+        fx_kwargs = {
+            k: kwargs[k] for k in ("system", "timeout", "json_mode", "temperature", "log")
+            if k in kwargs
+        }
+        try:
+            result = _post_chat_completion(
+                base_url=lane_obj.base_url,
+                model=resolved_model,
+                messages=(
+                    ([{"role": "system", "content": fx_kwargs["system"]}]
+                     if fx_kwargs.get("system") else [])
+                    + [{"role": "user", "content": prompt}]
+                ),
+                timeout=int(fx_kwargs.get("timeout", 300)),
+                json_mode=bool(fx_kwargs.get("json_mode", False)),
+                temperature=float(fx_kwargs.get("temperature", 0.7)),
+                log=fx_kwargs.get("log"),
+                _no_thinking=True,
+            )
+        except OperatorUnreachableError as exc:
+            if _provenance_out is not None:
+                _provenance_out.append(("serving_http_error", "flashnext"))
+            raise FlashnextLaneUnavailable(
+                lane_obj.base_url, f"{lane_obj.name}_unreachable", exc
+            ) from exc
+        if _provenance_out is not None:
+            _provenance_out.append(("success", "flashnext"))
+        return result
+
     # Anthropic-family: route via ClaudeQueue → call_claude_cli.
     # No direct Anthropic-API code path (decision/no-anthropic-api-direct).
     resolved_model = model or OPERATOR_DEFAULTS[operator_class]
