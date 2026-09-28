@@ -291,32 +291,45 @@ def resolve_gate_lane(
     return _resolve_from_payload(payload, lane)
 
 
-def lane_availability(
+def lane_state(
     lane: Optional[str] = None,
     fetcher: Optional[Callable[[], dict]] = None,
-) -> tuple[bool, str]:
-    """Blind-vs-lane-absent sense for callers that must report an honest
-    leg_down (mirrors the reason strings the vendored shim's
-    ``gate_lane_serving`` reports, minus the local-voicing lease guard,
-    which is the parent's S8 scope on the lapis-pm side).
+) -> tuple[Optional[GateLane], str]:
+    """One registry read -> (lane_obj | None, reason).
 
-    Returns (available, reason):
-      * (True, "") — the lane resolved (registry readable + serving row).
-      * (False, "registry_blind") — the ONLY case a caller may fall back to
-        legacy GW_URL behavior.
-      * (False, "<lane>_not_serving") — registry readable, lane absent or
+    This is the sense callers use when they must tell blind apart from
+    lane-absent without reading the registry twice:
+
+      * (GateLane, "") — registry readable, lane registered and serving.
+      * (None, "registry_blind") — the registry is unreachable/malformed or
+        carries no seats. The ONLY case in which a caller may fall back to
+        the legacy GW_URL path.
+      * (None, "<lane>_not_serving") — registry readable, lane absent or
         declared down. An honest leg_down; NEVER a masked legacy fallback.
+
+    The reason strings match the vendored shim's ``gate_lane_serving``
+    report (minus the local-voicing lease guard, which is the parent's S8
+    scope on the lapis-pm side).
     """
-    lane_obj = resolve_gate_lane(lane=lane, fetcher=fetcher)
-    if lane_obj is not None:
-        return (True, "")
     if fetcher is not None:
         payload = fetcher()
     else:
         try:
             payload = _fetch_payload()
         except Exception:
-            payload = None
+            payload = None  # blind — transport error
+    lane_obj = _resolve_from_payload(payload, lane)
+    if lane_obj is not None:
+        return (lane_obj, "")
     if isinstance(payload, dict) and _seat_rows(payload):
-        return (False, f"{lane or 'gate'}_not_serving")
-    return (False, "registry_blind")
+        return (None, f"{lane or 'gate'}_not_serving")
+    return (None, "registry_blind")
+
+
+def lane_availability(
+    lane: Optional[str] = None,
+    fetcher: Optional[Callable[[], dict]] = None,
+) -> tuple[bool, str]:
+    """Boolean face of ``lane_state`` — (available, reason)."""
+    lane_obj, reason = lane_state(lane=lane, fetcher=fetcher)
+    return (lane_obj is not None, "" if lane_obj is not None else reason)
