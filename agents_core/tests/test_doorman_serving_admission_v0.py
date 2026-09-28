@@ -425,7 +425,9 @@ class TestS2Route:
         body = resp.json()
         assert body["status"] == "serving"
         assert body["serve_axis"] == "flashnext"
-        mock_run.assert_not_called()
+        assert not any("wake-gravitywell" in str(c) for c in mock_run.call_args_list), \
+            "S2 grant must not issue a wake (the only subprocesses here are the " \
+            "keepawake pin, which correctly DOES apply)"
 
     def test_non_opt_in_answers_the_today_409(self):
         resp, mock_run = self._route(
