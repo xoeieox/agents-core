@@ -1583,6 +1583,28 @@ def _run_wave_deliberation(
     # converts a 7-seat wave into 7 separate GW admission groups.
     wave_principal = run.get("gw_principal") or f"council-delib-{run_id}"
 
+    # S4 (gate-lanes-registry-driven-flashnext-v0-agents-core): wave seats
+    # ride the same lane path as _build_adapter — voicing flashnext resolves
+    # the registry lane ONCE for the whole wave (one read, one shared truth
+    # across seats) and every seat adapter carries it, taking no gravitywell
+    # principal/lease. A lane the registry does not show serving raises here
+    # — an honest leg_down, never a silent wave on the gravitywell seat.
+    wave_lane = None
+    if run.get("voicing") == "flashnext":
+        from agents_core import lane_registry
+
+        wave_lane, _reason = lane_registry.lane_state(
+            lane=lane_registry.FLASHNEXT_LANE_NAME
+        )
+        if wave_lane is None:
+            raise ValueError(
+                f"flashnext voicing unavailable (wave mode): {_reason} — the "
+                "gw-seats registry does not show the flashnext gate lane "
+                f"serving (GW_SEATS_URL, default "
+                f"{lane_registry.DEFAULT_GW_SEATS_URL}). No silent fallback to "
+                "the gravitywell seat."
+            )
+
     entities = []
     seat_adapters = []
     for sel in run["selected_entities"]:
@@ -1591,6 +1613,7 @@ def _run_wave_deliberation(
             principal=wave_principal,
             timeout=WAVE_SEAT_TIMEOUT_S,  # H2: seats queue behind each other's prefill
             max_tokens=WAVE_SEAT_MAX_TOKENS,  # D6: cap compounding re-prefill cost
+            lane=wave_lane,  # S4: None on the gravitywell path (byte-identical)
         )
         entities.append(_build_entity(sel, seat_adapter, CharacterEntity, NarratorEntity))
         seat_adapters.append(seat_adapter)
