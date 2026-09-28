@@ -136,8 +136,15 @@ class _Guard:
 
     @property
     def wake_issued(self) -> bool:
-        """True iff the wake-gravitywell subprocess was actually invoked."""
-        return self._run.call_count > 0
+        """True iff the wake-gravitywell subprocess was actually invoked.
+
+        Checked by argv, not by call_count: _place_hold() legitimately shells
+        out for the keepawake pin on a granted lease, so a bare call_count would
+        read a granted (wake-free) lease as a wake.
+        """
+        return any(
+            "wake-gravitywell" in str(c) for c in self._run.call_args_list
+        )
 
 
 # ===========================================================================
