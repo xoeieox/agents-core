@@ -1,6 +1,6 @@
 # agents-core
 
-Shared infrastructure primitives for StarHouse Claude agents. Editable-install
+Shared infrastructure primitives for StarHouse local agents. Editable-install
 locally; every Python process on the box gets `import agents_core.*` without
 `sys.path` tricks.
 
@@ -8,7 +8,7 @@ locally; every Python process on the box gets `import agents_core.*` without
 
 | Import | What it does |
 |--------|--------------|
-| `agents_core.llm` | `call_llm` (llama-server), `call_claude_cli` (Claude CLI, Max subscription) |
+| `agents_core.llm` | `call_llm` (local fleet model lanes), `call_claude_cli` (Claude CLI, Max subscription) |
 | `agents_core.forgejo` | Forgejo REST helper: `create_pr`, `merge_pr`, `get_pr_diff`, `add_comment`, ... |
 | `agents_core.notify` | `send_notification`, `Priority` — Pushover wrapper |
 | `agents_core.targets` | `Target`, `TargetStore` — YAML targets at `/srv/lapis/targets/` |
@@ -21,29 +21,27 @@ locally; every Python process on the box gets `import agents_core.*` without
 | `agents_core.gpu_client` | `GPUClient` — HTTP client for `gpu-queue-server` |
 | `agents_core.observations` | `record`, `search`, `root` — append-only per-agent observation substrate |
 
-The `mem` CLI stays at `/srv/agents/scripts/mem.py` (imports `MemoryStore` from
-this package) and is invoked via `/usr/local/bin/mem`.
-
 ## Install
 
 ```bash
-pip install -e /srv/git/agents-core-working
+git clone https://github.com/xoeieox/agents-core.git
+cd agents-core
+pip install -e .
 ```
 
-Install is already done on StarHouse. After editing any file in this repo, the
-change is live in every Python process that re-imports the module.
+Editable install: after editing any file in this repo, the change is live in
+every Python process that re-imports the module.
 
 ## Tests
 
 ```bash
-cd /srv/git/agents-core-working && python3 -m pytest
+python3 -m pytest
 ```
 
 ## Agent Observation Substrate
 
 Cross-cutting primitive for substrate-mediated learning across all Lapis agents. Every
-agent (Lapis PM, Tech-Kami, Code Reviewer, Harness Engineer, future Experts) can record
-observations — friction, decisions, lessons, anomalies, interventions — to a shared
+agent in the fleet can record observations — friction, decisions, lessons, anomalies, interventions — to a shared
 append-only JSONL store. Sessions can then query prior observations to avoid re-discovering
 the same lessons.
 
@@ -193,7 +191,8 @@ result = invoke(
 
 | Class | Backend | Notes |
 |-------|---------|-------|
-| `qwen` | Local llama-server (synchronous) | Production path |
+| `qwen` | Local fleet lane - GravityWell vLLM slots, llama.cpp-wire-compatible endpoint (synchronous) | Production path |
+| `gravitywell` | GravityWell queue lane (vLLM slots + SGLang seat, doorman-leased) | Synchronous; lease-managed via `call_operator` |
 | `sonnet` | ClaudeQueue → `claude -p` | Synchronous via `submit_and_wait`; production path |
 | `opus` | ClaudeQueue → `claude -p` | Synchronous via `submit_and_wait`; production path |
 | `haiku` | ClaudeQueue → `claude -p` | Synchronous via `submit_and_wait`; production path |

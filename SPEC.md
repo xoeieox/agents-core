@@ -2,8 +2,8 @@
 
 ## Identity
 
-**agents-core** is the shared-primitives package for all Claude-driven agents
-running on StarHouse. It provides the minimum contract surface an agent needs
+**agents-core** is the shared-primitives package for the local agent
+fleet running on StarHouse. It provides the minimum contract surface an agent needs
 to participate in the StarHouse ecosystem: talk to the LLM, talk to Forgejo,
 notify humans, track work threads and comments, dispatch GPU tasks, and
 read/write the cross-instance memory store.
