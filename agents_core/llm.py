@@ -1415,7 +1415,13 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                 return _apply_wake_fail(on_wake_fail, operator_class, prompt,
                                        _provenance_out=_provenance_out, **wake_fail_kwargs)
 
-        from agents_core.doorman_client import DoormanClient, DoormanUnreachable, _gw_acquire_timeout
+        from agents_core.doorman_client import (
+            DoormanClient,
+            DoormanUnreachable,
+            _gw_acquire_timeout,
+            is_creative_occupied,
+            is_flashnext_occupied,
+        )
 
         admission_mode = os.environ.get("GW_ADMISSION_MODE", "off")
         if principal is not None and not principal:
