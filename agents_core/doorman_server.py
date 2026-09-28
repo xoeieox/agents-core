@@ -4770,6 +4770,7 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         # sections around bookkeeping, self.wake_lock around ensure_serving) —
         # it must NOT be wrapped in self.lock here, or a cold wake would once
         # again freeze every other endpoint for this node.
+        _serve_axis_out: list = []
         ok = state.acquire_lease(
             work_id, ttl_sec, reason, role=role, principal=principal,
             require_drain_clear=require_drain_clear, lease_kind=lease_kind,
