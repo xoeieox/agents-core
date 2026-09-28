@@ -2671,9 +2671,36 @@ def _call_gw_agent_impl(
                 else:
                     raise ValueError(f"unknown on_wake_fail: {on_wake_fail}")
 
-            if res.get("status") != "serving":
+            # ── S3 named 409 outcomes (doorman-flashnext-serving-admission-v0) ──
+            # Post-S1 the doorman's named refusals arrive HERE as dicts instead of as
+            # an escaping httpx.HTTPStatusError, so branch on the body flags and NAME
+            # the state — today every one of these collapsed into the flat
+            # "gw_not_serving" (or, pre-S1, into the flat "gw_seat_occupied"). The
+            # distinction is what the fleet's plate/lane layers need: a flashnext
+            # window is an expected state to wait out, creative is a different seat,
+            # contended is a same-box peer to retry against.
+            # Body flags are ADVISORY (loopback trust model): an unparseable/unknown
+            # body never reaches here — it stays on the error path above (I4).
+            _seat_refusal_reason = _acquire_refusal_reason(res)
+            if _seat_refusal_reason is not None:
                 if log:
-                    log(f"[gw_agent] GW not serving: {res.get('status')}")
+                    log(f"[gw_agent] GW acquire refused ({_seat_refusal_reason})")
+                if on_wake_fail == "skip":
+                    if writeable:
+                        return (_build_fixer_result(cwd, transcript, concluded=False), transcript)
+                    if reason_out is not None:
+                        reason_out.append(_seat_refusal_reason)
+                    return (None, transcript) if return_transcript else None
+                elif on_wake_fail == "error":
+                    raise Exception(f"GW acquire refused: {_seat_refusal_reason}")
+                elif on_wake_fail == "claude":
+                    return _fallback_claude_cli(
+                        prompt, system, cwd, json_mode, log, return_transcript, transcript
+                    )
+                else:
+                    raise ValueError(f"unknown on_wake_fail: {on_wake_fail}")
+
+            if res.get("status") != "serving":
                 if on_wake_fail == "skip":
                     if writeable:
                         return (_build_fixer_result(cwd, transcript, concluded=False), transcript)
