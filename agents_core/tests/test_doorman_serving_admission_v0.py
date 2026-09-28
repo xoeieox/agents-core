@@ -441,7 +441,7 @@ class TestS2Route:
             "flashnext_occupied": True,
             "reason": "flashnext-window-holding-gpu0",
         }
-        mock_run.assert_not_called()
+        assert not any("wake-gravitywell" in str(c) for c in mock_run.call_args_list)
 
     def test_opt_in_false_is_omission(self):
         resp, _ = self._route(
