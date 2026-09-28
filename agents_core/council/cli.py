@@ -1748,6 +1748,11 @@ def _run_wave_deliberation(
                     timeout=5.0,
                     principal=hold_principal,
                     lease_class="protected",
+                    # Same S2 opt-in as the initial hold and the deliberation
+                    # heartbeat: a refresh that omitted it would be refused by
+                    # the window guard on a flashnext-solo box, silently lapsing
+                    # the wave's hold mid-run.
+                    accept_flashnext_seat=True,
                 )
             except Exception as _ref_err:
                 print(f"[council] wave hold refresh failed ({reason}): {_ref_err}", flush=True)
