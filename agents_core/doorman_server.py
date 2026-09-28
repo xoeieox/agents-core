@@ -3340,7 +3340,7 @@ class _NodeState:
             _write_idle_log(self.node_name, "idle_start", 0)
         return expired
 
-    def acquire_lease(self, work_id: str, ttl_sec: int, reason: str, role: str = "worker", principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference", lease_class: str = DEFAULT_LEASE_CLASS, mode: str | None = None, accept_flashnext_seat: bool = False) -> bool | object:
+    def acquire_lease(self, work_id: str, ttl_sec: int, reason: str, role: str = "worker", principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference", lease_class: str = DEFAULT_LEASE_CLASS, mode: str | None = None, accept_flashnext_seat: bool = False, serve_axis_out: list | None = None) -> bool | object:
         """Try to ensure GW is serving, then register the lease.
 
         Returns True on success, DEFERRED if a foreign caller acquires during controller
