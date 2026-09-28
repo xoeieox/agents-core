@@ -299,8 +299,24 @@ class DoormanClient:
                       fixers, code-review, subagents, Hermes). Omitting sends no `class`
                       field — the server defaults missing class to "deferrable" (safe).
                       Invalid values are rejected 400 by the server.
+          accept_flashnext_seat: OPT-IN to being served by an ALREADY-SERVING flash-next
+                      seat without a wake (doorman-flashnext-serving-admission-v0, S2).
+                      When True AND no `mode` was supplied AND role != "mode-controller"
+                      AND the doorman's own guard-computed seat probe reads
+                      up_registered, the doorman SKIPS the 27B wake, registers the lease
+                      normally and answers status "serving" with serve_axis="flashnext"
+                      on the lease dict. Default False is byte-identical to today: the
+                      flash-next window guard refuses with the flashnext_occupied 409.
+                      Set it only when the caller can actually dial the flash-next seat
+                      — a day-seat-only caller that opts in would consume a lease and
+                      then fail against :8081. `up_unverified` (identity unverified, e.g.
+                      mid-load) keeps today's refusal: a refused acquire is cheap, a
+                      grant to a squatter is not.
 
-        Returns dict with status field (or contended/creative_occupied sentinel):
+        Returns dict with status field (or contended/creative_occupied/flashnext_occupied
+        sentinel). Post-S1 a /lease/acquire refusal is a NAMED OUTCOME in the dict, not
+        an exception — httpx.HTTPStatusError no longer escapes this path for the
+        server's named 409 bodies (transport failures still raise DoormanUnreachable):
           "serving" — GW is serving; lease registered and keepawake hold placed
           "deferred" — GW is serving a controller-owned non-big mode; no lease registered
           "pending_defer" — a `deferrable` acquire is queued behind an active `protected`
@@ -310,6 +326,9 @@ class DoormanClient:
                             possible when a mode was supplied); no subprocess was invoked
           {"ok": False, "contended": True} — drain gate active; another group holds a lease
           {"ok": False, "creative_occupied": True} — Llama-3.3-70B holds the GPU; check is_creative_occupied()
+          {"ok": False, "flashnext_occupied": True} — the flash-next seat holds GPU 0 (active
+                            handover window) and this acquire needed a wake; check
+                            is_flashnext_occupied()
         """
         body: dict = {
             "node": node,
