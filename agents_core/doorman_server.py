@@ -2592,6 +2592,42 @@ class _NodeState:
             seat_state, seat_served_id, _seat_registered, seat_error_class = (
                 self._probe_flashnext_seat(sequential=True)
             )
+            # S2 already-serving grant (doorman-flashnext-serving-admission-v0):
+            # an OPT-IN caller that needs NO wake takes the seat that is already
+            # serving on :30000 instead of being refused by the window guard. The
+            # grant consumes the guard's OWN freshly-computed probe pair — no second
+            # :30000 probe, no second :8081 GET per acquire (probe economy). Every
+            # condition below is load-bearing (I1):
+            #   accept_flashnext_seat  — opt-in only; False is byte-identical to today.
+            #   mode is None           — ANY supplied mode is a request to wake/flip
+            #                            the 27B onto a GPU-0 whole-card sglang = OOM;
+            #                            that keeps the refusal below verbatim.
+            #   role != mode-controller — the controller lease is a lever (flips
+            #                            deference, DEFERs other acquires); a no-mode
+            #                            controller grant would reinstate the exact
+            #                            window state D4 rules out and let any loopback
+            #                            caller squat the controller lease.
+            #   up_registered ONLY     — up_unverified means a listener answered
+            #                            /health but its identity never verified
+            #                            (health-before-models mid-load): a refused
+            #                            acquire is cheap, a grant to a squatter is not.
+            if (
+                accept_flashnext_seat
+                and mode is None
+                and role != "mode-controller"
+                and seat_state == "up_registered"
+            ):
+                # No wake was issued, so this is NOT a wake: the caller's lease is
+                # registered by acquire_lease on the FAST-PATH write-set (see below)
+                # and the served_id is carried out on the result object so the audit
+                # line needs no extra probe.
+                log.info(
+                    f"[{self.node_name}] flashnext-seat-already-serving — S2 grant: "
+                    f"seat probe {seat_state} (served_id={seat_served_id!r}); skipping "
+                    f"the 27B wake, registering lease without a wake "
+                    f"(serve_axis=flashnext, work_id={work_id!r}, role={role!r})"
+                )
+                return _FlashnextServed(seat_served_id)
             if seat_state in ("up_registered", "up_unverified"):
                 # The seat holds (or is loading onto) GPU 0 whole-card at
                 # --mem-fraction-static 0.985: waking the 27B here would put
