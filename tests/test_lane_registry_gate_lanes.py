@@ -232,7 +232,11 @@ SHIM_ACCEPTANCE_VECTORS = [
     (None, SLOT1_UP_PAYLOAD,
      ("slot1", "http://203.0.113.11:8081", "gravitywell-27b")),
     ("flashnext", FLASHNEXT_DOWN_PAYLOAD, None),
-    (None, FLASHNEXT_DOWN_PAYLOAD, ("slot1", "http://203.0.113.11:8081", "gravitywell-122b")),
+    # reality_view is the authority for lane=None: reality says flashnext-solo,
+    # so the live lane IS flashnext — and it is down, so None (the shim's
+    # reality-first contract; the slot1 row serving underneath does NOT
+    # silently become the live lane).
+    (None, FLASHNEXT_DOWN_PAYLOAD, None),
     ("flashnext", {}, None),
     ("bogus", FLASHNEXT_SOLO_PAYLOAD, None),
 ]
