@@ -1600,6 +1600,36 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                             time.sleep(backoff)
                             continue
 
+                        if is_flashnext_occupied(res) or is_creative_occupied(res):
+                            # S3 dict-side named outcome
+                            # (doorman-flashnext-serving-admission-v0). Pre-S1 this
+                            # refusal raised httpx.HTTPStatusError out of acquire() and
+                            # landed in the acquire_soft_error branch above, which re-paid
+                            # the whole admission loop up to _max_se times (the measured
+                            # 6-probe soft-retry re-pay loop this unit kills: a named
+                            # outcome is not a soft error). It is also NOT retryable
+                            # in-run: the flash-next handover window does not self-clear
+                            # while the seat is resident, and the creative collider is a
+                            # different seat — so settle the ticket once and NAME the
+                            # state instead of sleeping on it.
+                            _seat_state = (
+                                "gw_flashnext_window" if is_flashnext_occupied(res)
+                                else "gw_seat_occupied"
+                            )
+                            _log.warning(
+                                "[gw-admission] acquire refused work_id=%s state=%s "
+                                "(no in-run retry: the seat refusal does not self-clear)",
+                                work_id, _seat_state,
+                            )
+                            if _provenance_out is not None:
+                                _provenance_out.append((_seat_state, "gravitywell"))
+                            elevator.fail(ticket, reason=_seat_state)
+                            _loop_ticket_settled = True
+                            return _apply_wake_fail(
+                                on_wake_fail, operator_class, prompt,
+                                _provenance_out=_provenance_out, **wake_fail_kwargs,
+                            )
+
                         if DoormanClient.is_contended(res):
                             # Leg 1: drain-gate contended was previously a bare sleep-and-continue
                             # that held the claim indefinitely (root cause of the two-principal
