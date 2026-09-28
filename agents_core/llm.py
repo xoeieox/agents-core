@@ -2107,8 +2107,10 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         # second read could disagree with the first across a seat handover,
         # and a blind second read would record a stale host).
         if _locality_lane_obj is None:
-            _locality_lane_obj, _ = _flashnext_lane()
-            _impl_kwargs["_lane"] = _locality_lane_obj
+            _locality_lane_obj, _locality_reason = _flashnext_lane()
+            _impl_kwargs["_lane"] = (_locality_lane_obj, _locality_reason)
+        else:
+            _locality_lane_obj, _ = _locality_lane_obj
 
     ok = True
     _locality_result = None
