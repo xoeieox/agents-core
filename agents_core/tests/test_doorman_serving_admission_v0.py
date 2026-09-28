@@ -124,15 +124,16 @@ class _Guard:
 
     @property
     def probe_calls(self) -> int:
-        return self.mock_probe.call_count
+        return self._probe.call_count
 
     @property
     def serving_calls(self) -> int:
-        return self.mock_serving.call_count
+        return self._serving_call_count
 
     @property
     def wake_issued(self) -> bool:
-        return self.mock_run.call_count > 0
+        """True iff the wake-gravitywell subprocess was actually invoked."""
+        return self._run.call_count > 0
 
 
 # ===========================================================================
