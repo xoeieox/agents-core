@@ -224,12 +224,27 @@ class DoormanClient:
             timeout=_timeout,
         )
 
-    def _post(self, path: str, body: dict, timeout: float | None = None) -> dict:
+    def _post(self, path: str, body: dict, timeout: float | None = None,
+              named_refusals: bool = False) -> dict:
+        """POST a JSON body and return the parsed response dict.
+
+        named_refusals=True (the /lease/acquire path, S1) turns a 409 whose body
+        carries one of the server's named refusal flags into a returned dict
+        instead of an escaping httpx.HTTPStatusError. Any other non-2xx — and a
+        409 with an unparseable / flag-less body — keeps raise_for_status()'s
+        today's-error-path behavior (I4 fail-open; no new silent skip).
+        named_refusals defaults False: every other endpoint is byte-identical.
+        Transport failures keep raising DoormanUnreachable (unchanged).
+        """
         try:
             kwargs = {"json": body}
             if timeout is not None:
                 kwargs["timeout"] = timeout
             resp = self._client.post(path, **kwargs)
+            if named_refusals and resp.status_code == 409:
+                refusal = _parse_acquire_refusal(resp)
+                if refusal is not None:
+                    return refusal
             resp.raise_for_status()
             return resp.json()
         except httpx.TransportError as e:
