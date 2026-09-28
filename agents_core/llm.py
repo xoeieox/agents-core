@@ -2105,12 +2105,14 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         # resolved lane to the implementation, so the ledger records the host
         # the call actually dialed instead of reading the registry twice (a
         # second read could disagree with the first across a seat handover,
-        # and a blind second read would record a stale host).
-        if _locality_lane_obj is None:
+        # and a blind second read would record a stale host). Accept either
+        # shape a caller may have passed: a GateLane object (adapter-built,
+        # S4) or an already-resolved (lane_obj, reason) pair.
+        if isinstance(_locality_lane_obj, tuple) and len(_locality_lane_obj) == 2:
+            _locality_lane_obj = _locality_lane_obj[0]
+        elif not isinstance(getattr(_locality_lane_obj, "base_url", None), str):
             _locality_lane_obj, _locality_reason = _flashnext_lane()
             _impl_kwargs["_lane"] = (_locality_lane_obj, _locality_reason)
-        else:
-            _locality_lane_obj, _ = _locality_lane_obj
 
     ok = True
     _locality_result = None
