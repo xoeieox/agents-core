@@ -264,6 +264,24 @@ Full deployment guide (systemd, Tailscale bind, BRIX-as-canonical-host note):
 
 Port: **8405** (Lapis web-services 84xx range).
 
+## Private siblings
+
+This repo is the public layer of a larger agent-fleet stack. A few
+optional surfaces integrate with sibling packages that stay in private
+repos:
+
+- `council/` (multi-agent deliberation) needs the private `lapis_engine`
+  package and the Archetypal Intelligence cards library (set
+  `ARCHETYPAL_CARDS_PATH` to a cards checkout).
+- `mem_server`'s optional quality gate uses `lapis_engine.rag` when
+  present; a guarded import falls back to built-in BM25 retrieval
+  without it.
+
+Everything else - the library surface, the mem/gpu/slot/doorman servers,
+the shaped runner - works with public dependencies only. Off a fleet
+host, fleet-host test families skip cleanly rather than hang (see the
+root `conftest.py`).
+
 ## Scope
 
 See [SPEC.md](SPEC.md) for what this package owns vs. doesn't, and the shim
