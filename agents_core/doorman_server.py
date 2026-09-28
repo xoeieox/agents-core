@@ -3384,7 +3384,17 @@ class _NodeState:
         # ensure_serving serializes concurrent wakes internally via its own wake_lock —
         # this call intentionally runs without self.lock held, so a cold wake never freezes
         # the bookkeeping critical section below for other callers.
-        ok = self.ensure_serving(role=role, mode=mode, work_id=work_id)
+        ok = self.ensure_serving(role=role, mode=mode, work_id=work_id,
+                                  accept_flashnext_seat=accept_flashnext_seat)
+        serve_axis: str | None = None
+        served_id: str | None = None
+        if isinstance(ok, _FlashnextServed):
+            # S2 grant: the seat is already serving on :30000; fall through to the
+            # normal registration path below (the lease is real, real work is in
+            # flight) while recording the axis for the additive lease field + audit.
+            serve_axis = "flashnext"
+            served_id = ok.served_id
+            ok = True
         if ok is CREATIVE_OCCUPIED:
             return CREATIVE_OCCUPIED
         if ok is FLASHNEXT_OCCUPIED:
