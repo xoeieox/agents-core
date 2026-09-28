@@ -114,8 +114,8 @@ class _Guard:
     def __enter__(self):
         self.mock_serving.start()
         self.mock_creative.start()
-        self.mock_probe.start()
-        self.mock_run.start()
+        self._probe = self.mock_probe.start()
+        self._run = self.mock_run.start()
         return self
 
     def __exit__(self, *_):
