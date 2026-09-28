@@ -362,7 +362,7 @@ class TestS2Grant:
             state.acquire_lease("w-status", 300, "t", role="worker",
                                 principal="pm-dod", accept_flashnext_seat=True)
         snap = state.status_snapshot()
-        assert snap["serving"] is False, "day-seat axis unchanged (I2)"
+        assert not snap["serving"], "day-seat axis unchanged (I2)"
         leases = {l["work_id"]: l for l in snap["leases"]}
         assert leases["w-status"]["serve_axis"] == "flashnext"
         # drain-gate semantics unchanged (I3): the flashnext-axis inference lease
