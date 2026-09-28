@@ -116,6 +116,10 @@ class _Guard:
         self.mock_creative.start()
         self._probe = self.mock_probe.start()
         self._run = self.mock_run.start()
+        # A successful wake-gravitywell subprocess (rc=0) so the wake path can be
+        # followed to completion in the tests that pin "the wake still happens";
+        # the refusal tests only assert wake_issued, which stays False.
+        self._run.return_value = MagicMock(returncode=0, stdout="", stderr="")
         return self
 
     def __exit__(self, *_):
