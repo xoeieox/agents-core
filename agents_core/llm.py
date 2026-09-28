@@ -1998,7 +1998,8 @@ _LOCALITY_HOST_BY_OPERATOR = {
 }
 
 
-def _locality_record_call_operator(*, operator_class, model, prov, served, start, ok):
+def _locality_record_call_operator(*, operator_class, model, prov, served, start, ok,
+                                   lane_obj=None):
     """Derive and write one ledger record for a call_operator() invocation.
 
     prov is the (reason, effective_operator) list _call_operator_impl populated
