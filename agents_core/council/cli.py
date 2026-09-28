@@ -1524,7 +1524,8 @@ def _apply_wave_voicing_provenance(run: dict, seat_adapters: list) -> None:
     seat's adapter.
     """
     all_events = [e for adapter in seat_adapters for e in adapter.voicing_events]
-    lane = getattr(seat_adapters[0], "lane", None) if seat_adapters else None
+    first = seat_adapters[0] if seat_adapters else None
+    lane = first.lane if isinstance(first, GravityWellAdapter) else None
     if lane is not None:
         # S4 (gate-lanes-registry-driven-flashnext-v0-agents-core): wave seats
         # voiced on a registry lane are labeled by the lane, not by
