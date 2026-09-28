@@ -2222,13 +2222,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--n", type=int, default=None)
     sp.add_argument("--turns", type=int, default=DEFAULT_TURNS)
     sp.add_argument(
-        "--voicing", choices=["local", "gravitywell", "phala"],
+        "--voicing", choices=["local", "gravitywell", "phala", "flashnext"],
         default=DEFAULT_VOICING,
         help="Voicing operator. gravitywell (default, GW queue), local (LlamaAdapter) and "
         "phala (sealed TEE seat, PhalaAdapter) are available. Paid-model (Anthropic) "
         "voicing was removed to prevent the per-turn subprocess firehose. phala voices "
         "are always labeled by model id in effective_voicing - a sealed channel is a "
-        "privacy claim, not a content-trust claim, and must never read as the 122B.",
+        "privacy claim, not a content-trust claim, and must never read as the 122B. "
+        "flashnext (gate-lanes-registry-driven-flashnext-v0-agents-core, S4) voices on "
+        "the flash-next seat through the gw-seats registry (GW_SEATS_URL, base_url and "
+        "served id both registry-resolved): the same adapter class as gravitywell on a "
+        "registry lane, no gravitywell lease, and a lane the registry does not show "
+        "serving refuses the run rather than silently voicing on the 122B.",
     )
     sp.add_argument("--with", dest="with_entity", default=None)
     sp.add_argument(
