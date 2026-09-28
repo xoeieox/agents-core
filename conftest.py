@@ -10,9 +10,10 @@ that only exists on a fleet host and will hang or error elsewhere:
   serving loop, which is enabled on fleet hosts (set
   ``DOORMAN_SERVING_ADMISSION=1`` to run them).
 
-Off-host, these files are excluded from collection so a clean
-``pip install -e '.[test]' && pytest`` completes. The ``integration`` and
-``smoke`` markers cover the remaining live-backend suites (see pyproject).
+Off-host, these files are excluded from collection. The remaining
+suites still aim at a fleet host: live-backend families are gated by the
+``integration`` and ``smoke`` markers (see pyproject), and lane tests skip
+without ``GATE_LANE_*`` env.
 """
 
 import os
