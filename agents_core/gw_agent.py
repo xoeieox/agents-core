@@ -132,6 +132,44 @@ GW_DEFER_RETRY_JITTER_FRAC: Final[float] = 0.25
 # a genuine same-call not-serving response.
 GW_REASON_DEFER_TIMEOUT: Final[str] = "gw_defer_timeout"
 
+# Additive to the reason_out vocabulary — S3 named 409 outcomes
+# (doorman-flashnext-serving-admission-v0). Post-S1 the doorman's named refusals
+# arrive as dicts, so these replace the single flat "gw_seat_occupied" bucket for
+# the cases the fleet actually needs to tell apart:
+#   GW_REASON_FLASHNEXT_WINDOW — the flash-next seat holds GPU 0 during an active
+#       handover window and this acquire needed a wake. Expected, wait-out state:
+#       the window does not self-clear while the seat is resident, so the caller
+#       must NOT re-pay for it in-run (leg 2 classifies it observability-only).
+#   GW_REASON_CONTENDED — the drain gate found another principal's worker lease
+#       (same-box peer; a retry-within-deadline outcome). Named to match llm.py's
+#       existing "gw_contended" provenance token.
+# The creative 70B refusal KEEPS the existing "gw_seat_occupied" token: its
+# meaning narrows to "another seat holds the lane" rather than becoming a fourth
+# bucket, and existing ceiling/plate keys stay readable.
+GW_REASON_FLASHNEXT_WINDOW: Final[str] = "gw_flashnext_window"
+GW_REASON_SEAT_OCCUPIED: Final[str] = "gw_seat_occupied"
+GW_REASON_CONTENDED: Final[str] = "gw_contended"
+
+
+def _acquire_refusal_reason(res: object) -> str | None:
+    """Map a named /lease/acquire refusal dict to its reason_out token.
+
+    Returns None for anything that is not a named refusal (so the caller's
+    existing status handling is untouched). Uses the client's own predicates so
+    there is exactly one place that reads the server's flag vocabulary.
+    """
+    from agents_core.doorman_client import is_flashnext_occupied, is_creative_occupied
+
+    if not isinstance(res, dict):
+        return None
+    if is_flashnext_occupied(res):
+        return GW_REASON_FLASHNEXT_WINDOW
+    if is_creative_occupied(res):
+        return GW_REASON_SEAT_OCCUPIED
+    if res.get("contended") is True:
+        return GW_REASON_CONTENDED
+    return None
+
 
 def _compute_defer_retry_sleep_s(attempt: int, rand_fn: Callable[[], float] = random.random) -> float:
     """Compute the jittered, capped-exponential sleep for defer-retry attempt N (1-indexed).
