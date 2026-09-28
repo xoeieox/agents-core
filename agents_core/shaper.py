@@ -146,6 +146,16 @@ class DispatchResult:
     output_path: str    # where the queue runner will write the result
     joined_task_id: str | None = None  # set when submit() deduped: the id this
                                         # dispatch generated before joining task_id
+    # agents-core-lane-reality-preflight-v0: the lane-reality tag for this
+    # dispatch. "" on a normal fire (byte-identical to today). A PARKED
+    # dispatch carries the operator-facing tag (noop:lane_down:model=... /
+    # noop:lane_unknown:probe_in_flight) AND empty task_id/spec_path/
+    # output_path, which is the caller's signal that NOTHING was submitted:
+    # no queue row exists, so no fixer/reviewer attempt was burned and the
+    # target stays pending. lane_rerouted names the registry-active lane a
+    # reviewer-family row was re-routed onto.
+    lane_tag: str = ""
+    lane_rerouted: str | None = None
 
 
 class Shaper:
@@ -338,6 +348,69 @@ class Shaper:
         if agent.max_steps is not None:
             spec["max_steps"] = agent.max_steps
 
+        # -----------------------------------------------------------------
+        # Lane-reality preflight (agents-core-lane-reality-preflight-v0).
+        #
+        # Sense-only gate at the dispatch decision point the daemon fires
+        # through: resolve the dispatching row's model -> seat through the
+        # gw-seats REGISTRY ROOT endpoint (15 s cache, never a /v0/status
+        # guess) and DO NOT FIRE when that seat's registry state is not
+        # "serving". A parked dispatch submits NOTHING - no queue row, so no
+        # fixer/reviewer cycle and no attempt-counter increment (attempts are
+        # counted from queue records) - and returns the tagged result
+        # noop:lane_down:model=<model> so the caller/PM sees WHY the target
+        # sits. Registry-blind is UNKNOWN, not down: one probe dispatch per
+        # target per 10-min tick fires with the WARNING tag lane_unknown
+        # (fail-open - the preflight must never become the new SPOF).
+        # Reviewer-family rows follow the registry's ACTIVE lane instead of
+        # the :8081 pin. When the lane is up this block is a no-op: the spec
+        # dict and the queue row are byte-identical to today.
+        # -----------------------------------------------------------------
+        from agents_core import lane_preflight as _lane_preflight
+
+        lane_decision = _lane_preflight.preflight(spec)
+        if lane_decision.reroute_base_url:
+            # Deliverable 3: the reviewer follows the ACTIVE lane. Pin both
+            # the endpoint and the served id from the registry row (the
+            # f0fb039 precedent - resolved, never hardcoded).
+            spec["backend_url"] = lane_decision.reroute_base_url
+            if lane_decision.reroute_model:
+                spec["model"] = lane_decision.reroute_model
+        _lane_preflight.record_lane_tag(
+            lane_decision,
+            target_id=target_id,
+            agent_type=agent.name,
+            engine=agent.engine,
+        )
+        if not lane_decision.fire:
+            if lane_decision.tag:
+                print(
+                    f"INFO: lane-preflight: parked {agent.name} dispatch for "
+                    f"{target_id} ({lane_decision.tag}; seat={lane_decision.seat} "
+                    f"port={lane_decision.port} reason={lane_decision.reason}) - "
+                    "nothing submitted, target stays pending",
+                    file=sys.stderr,
+                )
+            return DispatchResult(
+                task_id="",
+                agent_type=agent.name,
+                spec_path="",
+                spec_id="",
+                output_path="",
+                lane_tag=lane_decision.tag,
+                lane_rerouted=lane_decision.reroute_base_url,
+            )
+        if lane_decision.tag:
+            # lane_unknown probe (or a lane_down that was re-routed onto the
+            # active lane): WARNING-level, the dispatch still fires.
+            print(
+                f"WARN: lane-preflight: {agent.name} dispatch for {target_id} "
+                f"fired on {lane_decision.tag} (seat={lane_decision.seat} "
+                f"port={lane_decision.port} reason={lane_decision.reason} "
+                f"probe={lane_decision.probe})",
+                file=sys.stderr,
+            )
+
         spec_id = uuid.uuid4().hex[:12]
         spec_path = SPEC_DIR / f"{target_id}-{agent.name}-{spec_id}.json"
         # The slot_id IS the spec_id: stable, unique per dispatch, already carried on
@@ -420,12 +493,23 @@ class Shaper:
             )
             spec_path.write_text(json.dumps(spec, ensure_ascii=False))
             generated_task_id = task_id
+            # A reviewer row re-pinned onto the registry's ACTIVE lane must
+            # also QUEUE under that seat's model: the serialized-seat guard in
+            # claim() keys admission on the row's model, so the row has to pin
+            # the seat it actually dials (the flash-next ops cap), not the dead
+            # one it was written for. Un-rerouted dispatches keep agent.model
+            # byte-identically.
+            _row_model = (
+                lane_decision.reroute_model
+                if lane_decision.reroute_base_url and lane_decision.reroute_model
+                else agent.model
+            )
             task_id = queue.submit({
                 "task_type": "subprocess",
                 "priority": priority,
                 "timeout_seconds": agent.timeout_s + 60,
                 "submitted_by": submitted_by,
-                "model": agent.model,
+                "model": _row_model,
                 "description": f"{agent.name}:{target_id}",
                 "notify": agent.notify,
                 "notify_policy": agent.notify_policy,
@@ -467,4 +551,9 @@ class Shaper:
             spec_id=spec_id,
             output_path=output_path,
             joined_task_id=joined_task_id,
+            # "" on every clean fire (lane up, claude tier): the two
+            # tagged-fire cases (lane_unknown probe, lane_down re-pinned onto
+            # the active lane) are the only ones that populate these.
+            lane_tag=lane_decision.tag,
+            lane_rerouted=lane_decision.reroute_base_url,
         )

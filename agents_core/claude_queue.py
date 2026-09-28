@@ -242,9 +242,60 @@ def _serial_seat_entries() -> list[tuple[str, str | None, str]]:
     return entries
 
 
+def _task_spec_dict(task: dict) -> dict:
+    """Read the task's spec JSON as a dict (lane-reality-preflight-v0).
+    Same fail-open contract as ``_task_backend_url``: any failure shape
+    (missing spec_path, unreadable file, JSON error, non-dict top level)
+    returns ``{}``, which the preflight reads as "nothing to gate" and the
+    run's own error paths report. Never raises.
+    """
+    try:
+        payload = task.get("payload") or {}
+        spec_path = payload.get("spec_path")
+        if not spec_path:
+            return {}
+        data = json.loads(Path(spec_path).read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _task_spec_write(task: dict, spec: dict) -> bool:
+    """Atomically rewrite the task's spec JSON (lane-reality-preflight-v0,
+    Deliverable 3 at the claim point).
+
+    Used ONLY to re-pin a reviewer-family row onto the registry's ACTIVE lane
+    (backend_url + served model). Best-effort: any failure returns False and
+    the run proceeds against its original spec (the pre-existing behavior) -
+    a failed re-pin must never lose the queued work.
+    """
+    try:
+        payload = task.get("payload") or {}
+        spec_path = payload.get("spec_path")
+        if not spec_path:
+            return False
+        path = Path(spec_path)
+        if not path.parent.is_dir():
+            return False
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp",
+                                   prefix="lane-spec-")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(spec, fh, ensure_ascii=False)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _task_backend_url(task: dict) -> str | None:
     """Read backend_url from the task's spec JSON (payload.spec_path).
-
     Fail-open contract: ANY failure shape (missing field, unreadable file,
     JSON parse error, non-dict top level, missing/non-string backend_url)
     returns None. The catch is deliberately broad (`except Exception`) so no
@@ -588,6 +639,15 @@ class ClaudeQueue:
         # on successful claim, so they stay bounded in a long-lived daemon.
         self._logged_deferrals: set[str] = set()
         self._warned_spec_ids: set[str] = set()
+        # Lane-reality preflight log/ledger dedup (lane-reality-preflight-v0):
+        # (task_id, tag) pairs already surfaced / already written to the
+        # lane-status ledger, so a parked row does not re-log or re-append on
+        # every 2 s poll. Pruned to pending stems, like the sets above. The
+        # park line keeps its OWN set so a row that was earlier deferred by
+        # the serialized-seat guard still logs its lane_down park (and vice
+        # versa) instead of one guard silencing the other.
+        self._logged_lane_tags: set[tuple] = set()
+        self._logged_lane_parks: set[str] = set()
         self._ensure_dirs()
 
     def _ensure_dirs(self):
@@ -846,6 +906,11 @@ class ClaudeQueue:
         pending_stems = {p.stem for p in pending_files}
         self._logged_deferrals &= pending_stems
         self._warned_spec_ids &= pending_stems
+        self._logged_lane_tags = {
+            k for k in self._logged_lane_tags
+            if isinstance(k, tuple) and k[0] in pending_stems
+        }
+        self._logged_lane_parks &= pending_stems
 
         tasks = []
         for p in pending_files:
@@ -918,6 +983,94 @@ class ClaudeQueue:
                     _coord_log.info(log_line)
                 continue
 
+            # -----------------------------------------------------------------
+            # Lane-reality preflight at the CLAIM decision point
+            # (agents-core-lane-reality-preflight-v0, Deliverable 1/2).
+            #
+            # Covers rows that were already queued when the lane died - the
+            # 2026-09-27 shape (reviewer rows pinned :8081 while the registry
+            # reported 8081:down, and the plain fixer that died "local seat
+            # returned no text"). A parked candidate is SKIPPED, exactly like
+            # the serialized-seat deferral above: it stays pending, other
+            # candidates claim normally in this same call (no head-of-line
+            # block), and NOTHING is written to completed/ or failed/ - so the
+            # PM's fixer/reviewer attempt counters (which count queue records)
+            # cannot increment and the gw_seat_occupied ceiling keys stop
+            # accumulating. Registry-blind fails open: one probe per target
+            # per 10-min tick claims, the rest of the window is skipped.
+            # Fail-open on any internal fault - this gate must never become a
+            # single point of failure for the whole queue.
+            # -----------------------------------------------------------------
+            try:
+                from agents_core import lane_preflight as _lane_preflight
+
+                _lane_spec = _task_spec_dict(chosen)
+                _lane_decision = _lane_preflight.preflight(
+                    _lane_spec,
+                    probe_key=(
+                        str(_lane_spec.get("target_id")
+                            or chosen.get("description") or chosen.get("id", "")),
+                        chosen.get("model"),
+                    ),
+                )
+                # Record EVERY decision (including a clean fire), deduped per
+                # (task, tag): read_lane_status reports the last line per
+                # target, so a fire line is what clears a stale lane_down once
+                # the lane comes back.
+                _lane_key = (chosen.get("id"), _lane_decision.tag)
+                if _lane_key not in self._logged_lane_tags:
+                    self._logged_lane_tags.add(_lane_key)
+                    _lane_preflight.record_lane_tag(
+                        _lane_decision,
+                        target_id=str(_lane_spec.get("target_id") or ""),
+                        task_id=chosen.get("id", ""),
+                        agent_type=str(_lane_spec.get("agent_type") or ""),
+                        engine=str(_lane_spec.get("engine") or ""),
+                    )
+                if not _lane_decision.fire:
+                    if chosen.get("id") not in self._logged_lane_parks:
+                        self._logged_lane_parks.add(chosen.get("id", ""))
+                        _coord_log.info(
+                            "claude-queue: parking %s - %s (seat=%s port=%s "
+                            "reason=%s); stays pending, no failure record",
+                            chosen.get("id", "<unknown>"), _lane_decision.tag,
+                            _lane_decision.seat, _lane_decision.port,
+                            _lane_decision.reason,
+                        )
+                    continue
+                if _lane_decision.reroute_base_url:
+                    # Deliverable 3 at the claim point: a reviewer-family row
+                    # queued BEFORE the lane died follows the registry's
+                    # ACTIVE lane. The spec is rewritten (endpoint + served id
+                    # from the registry row) so the run dials the live seat
+                    # instead of the dead pin.
+                    _task_spec_write(chosen, {
+                        **_lane_spec,
+                        "backend_url": _lane_decision.reroute_base_url,
+                        **({"model": _lane_decision.reroute_model}
+                           if _lane_decision.reroute_model else {}),
+                    })
+                    # Keep the queue row's model in step with the seat it now
+                    # dials: the serialized-seat guard keys on task["model"],
+                    # so a re-routed row must pin the ACTIVE seat's admission
+                    # cap (the flash-next ops cap), not the dead seat's.
+                    if _lane_decision.reroute_model:
+                        chosen["model"] = _lane_decision.reroute_model
+                if _lane_decision.tag:
+                    _coord_log.warning(
+                        "claude-queue: firing %s on %s (seat=%s port=%s "
+                        "reason=%s probe=%s)",
+                        chosen.get("id", "<unknown>"), _lane_decision.tag,
+                        _lane_decision.seat, _lane_decision.port,
+                        _lane_decision.reason, _lane_decision.probe,
+                    )
+            except Exception as _lane_exc:
+                _coord_log.warning(
+                    "claude-queue: lane-preflight failed for %s (%s) - firing "
+                    "fail-open", chosen.get("id", "<unknown>"),
+                    type(_lane_exc).__name__,
+                )
+
             src_path = Path(chosen.pop("_path"))
             chosen["status"] = "running"
             chosen["started_at"] = _now_iso()
@@ -940,6 +1093,10 @@ class ClaudeQueue:
             # The claimed task leaves pending/: drop its dedup entries.
             self._logged_deferrals.discard(chosen["id"])
             self._warned_spec_ids.discard(chosen["id"])
+            self._logged_lane_parks.discard(chosen["id"])
+            self._logged_lane_tags = {
+                k for k in self._logged_lane_tags if k[0] != chosen["id"]
+            }
 
             # D5 (attestation-contract-v0, leg 1): on a successful
             # GW-backend claim, best-effort acquire the doorman claim lease
@@ -1138,13 +1295,41 @@ class ClaudeQueue:
         self._write_state(state)
         return True
 
+    def lane_status(self, target_id: str | None = None) -> dict:
+        """Latest lane-reality tag per target (lane-reality-preflight-v0,
+        Deliverable 4).
+
+        ``{target_id: {tag, action, reason, model, port, seat, ts,
+        agent_type}}`` read from the lane-status ledger, so a target parked by
+        the preflight is visible as ``noop:lane_down:model=...`` in the
+        operator-facing queue status rather than only in JSONL. Best-effort:
+        an unreadable ledger reads as {} (never raises).
+        """
+        from agents_core.lane_preflight import read_lane_status
+
+        return read_lane_status(target_id)
+
     def status(self) -> dict:
         state = self._read_state()
         self._refresh_state(state)
-        return {
+        out = {
             "depth": state["queue_depth"],
             "in_flight": state["in_flight"],
         }
+        # Lane-reality surfacing (lane-reality-preflight-v0, Deliverable 4):
+        # per-target lane tags ride the queue status the PM already reads, so
+        # a parked target's WHY is operator-visible. Only targets whose LATEST
+        # decision was a park or a tagged fire are listed - a clean fire
+        # (recorded so a recovered lane clears its stale tag) is not
+        # interesting to a PM asking "why is this target sitting?", and with
+        # nothing to report the dict keeps its pre-preflight shape exactly.
+        lane = {
+            tid: entry for tid, entry in self.lane_status().items()
+            if entry.get("action") != "fire" or entry.get("tag")
+        }
+        if lane:
+            out["lane_status"] = lane
+        return out
 
     def get_pending(self) -> list[dict]:
         tasks = []
