@@ -3498,6 +3498,9 @@ class _NodeState:
                         lease_entry["served_id"] = served_id
                 self.leases[work_id] = lease_entry
                 self._place_hold()
+                if serve_axis is not None and serve_axis_out is not None:
+                    # Only on the registered path — a contended call registers nothing.
+                    serve_axis_out.append(serve_axis)
                 if serve_axis is not None:
                     # Registration audit line (interim answer for the missing
                     # /lease/release ownership check — see Known-deferred): who took
