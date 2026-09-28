@@ -246,6 +246,39 @@ class PhalaOperatorUnavailable(OperatorUnreachableError):
         )
 
 
+class FlashnextLaneUnavailable(OperatorUnreachableError):
+    """Raised when the registry-resolved flashnext gate lane cannot be voiced on.
+
+    gate-lanes-registry-driven-flashnext-v0-agents-core (S2): the flashnext
+    operator is a REGISTRY lane, so "unavailable" has two shapes and they are
+    NOT interchangeable — ``reason`` carries which one this is:
+
+      * ``"registry_blind"`` — the gw-seats registry is unreachable/malformed
+        (no information). This is the ONLY shape whose caller may fall back to
+        the legacy gravitywell path (GW_URL/SWARM_URL) byte-identically,
+        because that is what a blind gate leg ran on before this target.
+      * anything else (``"flashnext_not_serving"``, ``"flashnext_unreachable"``)
+        — the registry is readable and the explicitly-requested lane is
+        inactive. The caller records an honest ``leg_down`` and NEVER
+        re-routes the leg to the gravitywell lane; a silent legacy fallback
+        here is the "lying leg" the parent's re-gate fold kills.
+
+    Never falls back to a paid operator: the lane is a local seat, so
+    unreachable is fail-closed (phala precedent).
+    """
+
+    def __init__(self, url: str, reason: str, last_error: Exception | None = None):
+        self.url = url
+        self.reason = reason
+        self.last_error = last_error
+        super().__init__(
+            f"[flashnext] gate lane unavailable at {url!r} (reason={reason!r}) — "
+            "no legacy or paid fallback was attempted (fail-closed by design; only "
+            "reason='registry_blind' may fall back to the gravitywell path). "
+            f"last_error={last_error}"
+        )
+
+
 class GWParkedError(OperatorUnreachableError):
     """Raised when GW cannot be woken and on_wake_fail='park' (fail-closed default).
 
