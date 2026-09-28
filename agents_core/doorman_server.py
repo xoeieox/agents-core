@@ -2450,7 +2450,7 @@ class _NodeState:
     # ensure_serving — serializes wakes via self.wake_lock, not self.lock
     # ------------------------------------------------------------------
 
-    def ensure_serving(self, role: str | None = None, mode: str | None = None, work_id: str | None = None) -> bool | object:
+    def ensure_serving(self, role: str | None = None, mode: str | None = None, work_id: str | None = None, accept_flashnext_seat: bool = False) -> bool | object:
         """Wake GW if needed, start the serving unit, and wait until it serves.
 
         Returns True on success, DEFERRED if controller owns the mode, False on failure.
