@@ -741,6 +741,13 @@ async def _run_shaped_task(queue: ClaudeQueue, task: dict) -> None:
 
     log.info(f"claim {task_id} model={task.get('model')} timeout={timeout}s")
 
+    # Lane-reality preflight (agents-core-lane-reality-preflight-v0) lives at
+    # the CLAIM decision point - ClaudeQueue.claim() - not here: a requeue at
+    # this point would head-of-line-block the queue (claim() hands back the
+    # single highest-priority row, so a parked row would starve every other
+    # pending row behind it). claim() skips parked candidates instead, so a
+    # dead lane never burns a cycle and never starves another lane's work.
+
     # D5 (attestation-contract-v0, leg 1): the claim-time doorman lease.
     # Best-effort: scoped to GW-backend tasks (the spec's backend_url names
     # the doorman's seat), probe-gated (no cold-wake of a down seat),

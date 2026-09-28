@@ -81,3 +81,49 @@ def _mem_allowlist_isolated(tmp_path, monkeypatch):
         p.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
         monkeypatch.setenv("MEM_MACHINE_STATE_PREFIXES_PATH", str(p))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _lane_preflight_isolated(tmp_path, monkeypatch):
+    """Make the lane-reality preflight (agents-core-lane-reality-preflight-v0)
+    invisible to tests that are not about it.
+
+    Two live-state dependencies would otherwise leak into every dispatch-path
+    test on this host:
+
+      * the gw-seats registry read - which seat holds the GPU at run time
+        would decide whether a local-fixer / local-reviewer dispatch fires or
+        parks, so pre-existing shaper/queue tests would flip green/red with
+        the seat handover (exactly the failure mode
+        tests/test_lane_registry_gate_lanes.py documents for OPERATOR_DEFAULTS);
+      * the lane-status ledger under the live /room claude-queue dir.
+
+    The fixture installs an ALL-SERVING canned registry payload (the
+    byte-identical-to-today branch: every gateable seat is serving, so every
+    dispatch fires exactly as before this target) and redirects the ledger via
+    the existing CLAUDE_QUEUE_DIR room-path env. Tests that exercise the
+    preflight itself pass an explicit ``fetcher=`` (which bypasses the
+    override) or install their own via ``set_registry_fetcher``.
+    """
+    from agents_core import lane_preflight
+
+    all_serving = {
+        "reality_view": {"reality": "slot1-solo", "anchor": "gravitywell-27b",
+                         "primary": {"port": 8081, "model_root": "/data/models/27b"}},
+        "seats": [
+            {"port": 8081, "state": "serving", "bind": None,
+             "model": "gravitywell-27b", "model_root": "/data/models/27b"},
+            {"port": 8082, "state": "down", "bind": None, "model": None},
+            {"port": 30000, "state": "serving", "bind": None,
+             "model": "Qwen3.8-Flash-Next-NVFP4-SSD-Stream",
+             "model_root": "/data/models/flash-next"},
+        ],
+    }
+    prev = lane_preflight.set_registry_fetcher(lambda: all_serving)
+    monkeypatch.setenv("CLAUDE_QUEUE_DIR", str(tmp_path / "claude-queue"))
+    lane_preflight.reset_state_for_tests()
+    try:
+        yield
+    finally:
+        lane_preflight.set_registry_fetcher(prev)
+        lane_preflight.reset_state_for_tests()
