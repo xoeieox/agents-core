@@ -1879,18 +1879,20 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
         # flash-next sglang box, leased by the doorman's flashnext window, not
         # by this call site. No paid fallback of any kind (phala precedent).
         #
-        # ``_lane`` (optional): a caller-resolved lane (a GateLane-shaped
-        # object with base_url/served_model). The council adapter passes the
-        # lane it was constructed with (S4) so the endpoint it was built for is
-        # exactly the endpoint it dials; every other caller leaves it unset and
-        # gets the call-time registry read.
-        lane_obj = kwargs.get("_lane")
-        if lane_obj is not None and not isinstance(getattr(lane_obj, "base_url", None), str):
-            lane_obj = None
-        if lane_obj is None:
-            resolved, reason = _flashnext_lane()
+        # ``_lane`` (optional): either a caller-resolved lane (a GateLane-shaped
+        # object with base_url/served_model — the council adapter passes the
+        # lane it was constructed with, S4, so the endpoint it was built for is
+        # exactly the endpoint it dials) or the (lane_obj, reason) pair the
+        # call_operator wrapper already resolved for the locality record. Both
+        # shapes skip the registry re-read; every other caller leaves it unset
+        # and gets the call-time registry read.
+        lane_arg = kwargs.get("_lane")
+        if isinstance(lane_arg, tuple) and len(lane_arg) == 2:
+            resolved, reason = lane_arg
+        elif lane_arg is not None and isinstance(getattr(lane_arg, "base_url", None), str):
+            resolved, reason = lane_arg, ""
         else:
-            resolved, reason = lane_obj, ""
+            resolved, reason = _flashnext_lane()
         if resolved is None:
             if _provenance_out is not None:
                 _provenance_out.append((reason or "flashnext_unavailable", "flashnext"))
