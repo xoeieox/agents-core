@@ -1242,15 +1242,17 @@ def _apply_voicing_provenance(run: dict, adapter) -> None:
 
     requested_voicing = run.get("voicing", "sonnet")
 
-    if getattr(adapter, "lane", None) is not None:
+    if isinstance(adapter, GravityWellAdapter) and adapter.lane is not None:
         # S4 (gate-lanes-registry-driven-flashnext-v0-agents-core): a
         # registry-lane-voiced adapter (voicing flashnext) is labeled by the
         # lane name + the served id it dialed, mirroring the phala
         # explicit-banner rule — a flash-next verdict must never read as a
         # 122B one. The lane IS the requested seat, so a clean run is NOT
         # degraded (calling it degraded would both mislabel the run and trip
-        # the paid_spend derivation).
-        served = getattr(adapter.lane, "served_model", None)
+        # the paid_spend derivation). Gated on the isinstance check so a
+        # duck-typed adapter that merely *has* a .lane attribute can never be
+        # mistaken for a registry-lane adapter.
+        served = adapter.lane.served_model
         label = f"flashnext:{served}" if served else "flashnext"
         if adapter.voicing_events:
             operators = [e.get("effective_operator") for e in adapter.voicing_events]
