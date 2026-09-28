@@ -271,11 +271,16 @@ class FlashnextLaneUnavailable(OperatorUnreachableError):
         self.url = url
         self.reason = reason
         self.last_error = last_error
-        super().__init__(
+        # Exception.__init__ (not super()): OperatorUnreachableError's own
+        # __init__ demands a last_error it would then describe as an
+        # "unreachable after retries" — this error carries a lane STATE, not a
+        # retry exhaustion (phala precedent).
+        Exception.__init__(
+            self,
             f"[flashnext] gate lane unavailable at {url!r} (reason={reason!r}) — "
             "no legacy or paid fallback was attempted (fail-closed by design; only "
             "reason='registry_blind' may fall back to the gravitywell path). "
-            f"last_error={last_error}"
+            f"last_error={last_error}",
         )
 
 
