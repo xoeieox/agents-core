@@ -1814,6 +1814,27 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                     _provenance_out.append(("gw_deferred_swarm", "gravitywell"))
                 return _apply_wake_fail(on_wake_fail, operator_class, prompt,
                                        _provenance_out=_provenance_out, **wake_fail_kwargs)
+            elif is_flashnext_occupied(res) or is_creative_occupied(res):
+                # S3 dict-side named outcome
+                # (doorman-flashnext-serving-admission-v0). This is a DAY-SEAT
+                # caller: it deliberately does NOT pass accept_flashnext_seat, so it
+                # keeps the clean refusal rather than a lease it cannot dial (an S2
+                # grant here would consume a lease + a keepawake pin for a lane this
+                # path cannot serve from). Post-S1 the refusal is a dict rather than
+                # an escaping httpx.HTTPStatusError, so NAME the state instead of
+                # flattening it into "gw_not_serving".
+                _seat_state = (
+                    "gw_flashnext_window" if is_flashnext_occupied(res)
+                    else "gw_seat_occupied"
+                )
+                _log.warning(
+                    "[gw-admission] direct-dispatch acquire refused work_id=%s state=%s",
+                    work_id, _seat_state,
+                )
+                if _provenance_out is not None:
+                    _provenance_out.append((_seat_state, "gravitywell"))
+                return _apply_wake_fail(on_wake_fail, operator_class, prompt,
+                                       _provenance_out=_provenance_out, **wake_fail_kwargs)
             elif res.get("status") != "serving":
                 if _provenance_out is not None:
                     _provenance_out.append(("gw_not_serving", "gravitywell"))
