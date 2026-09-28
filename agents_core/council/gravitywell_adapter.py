@@ -60,6 +60,17 @@ class GravityWellAdapter:
     seat statement is re-prefilled by every seat in every later round, so
     an uncapped seat compounds cost across the whole run (council-wave-
     mode-v0 D6). Deliberation/scene leave this unset (unchanged behavior).
+
+    lane: S4 (gate-lanes-registry-driven-flashnext-v0-agents-core) — a
+    registry-resolved gate lane (an agents_core.lane_registry.GateLane) to
+    voice on instead of the gravitywell seat. When set, this is the SAME
+    adapter class gravitywell voicing uses, dialing the lane's registry
+    base_url with the lane's registry served-id (resolved by
+    ``resolve_gate_lane``, never hardcoded), and it takes NO gravitywell
+    doorman lease — the flash-next seat is leased through the doorman's
+    flashnext window, so acquiring a gravitywell lease here is exactly the
+    409 shape the parent's S8 fold kills. Unset (None) = the gravitywell
+    path, byte-identical to today.
     """
     temperature: float = 0.8
     timeout: int = 300
@@ -67,6 +78,7 @@ class GravityWellAdapter:
     voicing_events: list = None
     principal: str | None = None
     max_tokens: int | None = None
+    lane: object | None = None
 
     def __post_init__(self):
         if self.voicing_events is None:
@@ -86,6 +98,11 @@ class GravityWellAdapter:
             no paid fallback is attempted. Callers passing a paid-fallback
             on_wake_fail (e.g. 'sonnet') get str always, never raising.
 
+            With lane= set (S4), raises FlashnextLaneUnavailable when the lane
+            cannot be voiced on — fail-closed, and NEVER re-routed to the
+            gravitywell seat (a requested-but-dead lane is reported, not
+            masked).
+
         Side effect: appends to voicing_events list with per-call provenance.
         """
         prompt = _flatten_messages(messages)
@@ -93,17 +110,33 @@ class GravityWellAdapter:
         call_kwargs = {}
         if self.max_tokens is not None:
             call_kwargs["max_tokens"] = self.max_tokens
-        result = call_operator(
-            "gravitywell", prompt,
-            system=system,
-            temperature=self.temperature,
-            timeout=self.timeout,
-            on_wake_fail=self.on_wake_fail,
-            principal=self.principal,
-            _provenance_out=provenance,
-            lease_class="protected",
-            **call_kwargs,
-        )
+        if self.lane is not None:
+            # S4: same adapter class, registry-resolved lane. The lane object
+            # is threaded into call_operator so the call dials exactly the
+            # base_url/served-id it was constructed with (no second registry
+            # read that could disagree across a seat handover), and no
+            # gravitywell lease/principal is requested on this path.
+            result = call_operator(
+                "flashnext", prompt,
+                system=system,
+                temperature=self.temperature,
+                timeout=self.timeout,
+                _provenance_out=provenance,
+                _lane=self.lane,
+                **call_kwargs,
+            )
+        else:
+            result = call_operator(
+                "gravitywell", prompt,
+                system=system,
+                temperature=self.temperature,
+                timeout=self.timeout,
+                on_wake_fail=self.on_wake_fail,
+                principal=self.principal,
+                _provenance_out=provenance,
+                lease_class="protected",
+                **call_kwargs,
+            )
         # provenance is a list of (reason, operator) tuples.
         # Find the effective operator and the actual failure reason (if any).
         # The effective operator is from the last "success" entry.
