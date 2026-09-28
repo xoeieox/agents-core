@@ -3475,8 +3475,36 @@ class _NodeState:
                 }
                 if role == "worker":
                     lease_entry["principal"] = principal if principal is not None else GHOST_PRINCIPAL
+                # S2 additive-only field (I3: bookkeeping byte-identical EXCEPT this).
+                # It surfaces in /status via the **info spread in status_snapshot, so
+                # an operator can distinguish "a lease is held on the flashnext axis"
+                # from "the day seat is held" — /status `serving` still reports the
+                # DAY-SEAT (:8081) axis and is unchanged (I2). Drain semantics are
+                # unchanged too: a flashnext-axis inference lease stays COUNTED here
+                # (safe direction — a box-level stop hurts flashnext inference as
+                # well), coordination-kind leases stay exempt. Consequence named: a
+                # window-close hand-back may wait out a flashnext lease TTL.
+                if serve_axis is not None:
+                    lease_entry["serve_axis"] = serve_axis
+                    if served_id:
+                        lease_entry["served_id"] = served_id
                 self.leases[work_id] = lease_entry
                 self._place_hold()
+                if serve_axis is not None:
+                    # Registration audit line (interim answer for the missing
+                    # /lease/release ownership check — see Known-deferred): who took
+                    # which axis against which verified served id. Sink:
+                    #   journalctl --user -u doorman-server
+                    log.info(
+                        "[doorman] flashnext-axis-lease-registered work_id=%s "
+                        "principal=%s role=%s serve_axis=%s served_id=%s lease_kind=%s",
+                        work_id,
+                        lease_entry.get("principal", GHOST_PRINCIPAL),
+                        role,
+                        serve_axis,
+                        served_id,
+                        lease_kind,
+                    )
 
         if was_idle:
             _write_idle_log(self.node_name, "resumed", lease_count_for_log)
