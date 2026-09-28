@@ -1878,17 +1878,29 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
         # fallback (the "lying leg"). No doorman lease: the seat is the
         # flash-next sglang box, leased by the doorman's flashnext window, not
         # by this call site. No paid fallback of any kind (phala precedent).
-        lane_obj, reason = _flashnext_lane()
+        #
+        # ``_lane`` (optional): a caller-resolved lane (a GateLane-shaped
+        # object with base_url/served_model). The council adapter passes the
+        # lane it was constructed with (S4) so the endpoint it was built for is
+        # exactly the endpoint it dials; every other caller leaves it unset and
+        # gets the call-time registry read.
+        lane_obj = kwargs.get("_lane")
+        if lane_obj is not None and not isinstance(getattr(lane_obj, "base_url", None), str):
+            lane_obj = None
         if lane_obj is None:
+            resolved, reason = _flashnext_lane()
+        else:
+            resolved, reason = lane_obj, ""
+        if resolved is None:
             if _provenance_out is not None:
                 _provenance_out.append((reason or "flashnext_unavailable", "flashnext"))
             raise FlashnextLaneUnavailable("", reason or "registry_blind")
-        resolved_model = lane_obj.served_model or swarm_model(lane_obj.base_url)
+        resolved_model = resolved.served_model or swarm_model(resolved.base_url)
         if not resolved_model:
             if _provenance_out is not None:
                 _provenance_out.append(("flashnext_not_serving", "flashnext"))
             raise FlashnextLaneUnavailable(
-                lane_obj.base_url, f"{lane_obj.name}_not_serving"
+                resolved.base_url, f"{resolved.name}_not_serving"
             )
         if model is not None and model != resolved_model:
             raise ValueError(
@@ -1904,7 +1916,7 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
         }
         try:
             result = _post_chat_completion(
-                base_url=lane_obj.base_url,
+                base_url=resolved.base_url,
                 model=resolved_model,
                 messages=(
                     ([{"role": "system", "content": fx_kwargs["system"]}]
@@ -1921,7 +1933,7 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
             if _provenance_out is not None:
                 _provenance_out.append(("serving_http_error", "flashnext"))
             raise FlashnextLaneUnavailable(
-                lane_obj.base_url, f"{lane_obj.name}_unreachable", exc
+                resolved.base_url, f"{resolved.name}_unreachable", exc
             ) from exc
         if _provenance_out is not None:
             _provenance_out.append(("success", "flashnext"))
