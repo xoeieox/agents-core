@@ -3049,7 +3049,10 @@ class TestLeaseKindDrainGate:
 
     def _serving_state(self) -> _NodeState:
         s = self._make_state()
-        s.ensure_serving = lambda role="worker", mode=None, work_id=None: True  # type: ignore[method-assign]
+        # **_kwargs: the S2 opt-in (accept_flashnext_seat) is threaded through by
+        # acquire_lease; a strict stub would TypeError on it. The drain-gate tests
+        # never exercise the grant, so the stub ignores it.
+        s.ensure_serving = lambda role="worker", mode=None, work_id=None, **_kwargs: True  # type: ignore[method-assign]
         s._place_hold = lambda: None  # type: ignore[method-assign]
         return s
 
@@ -4376,7 +4379,7 @@ class TestWakeLockDecoupledFromStateLock:
         wake_started = threading.Event()
         release_wake = threading.Event()
 
-        def blocking_ensure_serving(role=None, mode=None, work_id=None):
+        def blocking_ensure_serving(role=None, mode=None, work_id=None, **_kwargs):
             wake_started.set()
             assert release_wake.wait(timeout=5), "release never signaled"
             return True
@@ -4405,7 +4408,7 @@ class TestWakeLockDecoupledFromStateLock:
         wake_started = threading.Event()
         release_wake = threading.Event()
 
-        def blocking_ensure_serving(self, role=None, mode=None, work_id=None):
+        def blocking_ensure_serving(self, role=None, mode=None, work_id=None, **_kwargs):
             wake_started.set()
             assert release_wake.wait(timeout=5), "release never signaled"
             return True
@@ -4441,7 +4444,7 @@ class TestWakeLockDecoupledFromStateLock:
         wake_started = threading.Event()
         release_wake = threading.Event()
 
-        def blocking_ensure_serving(self, role=None, mode=None, work_id=None):
+        def blocking_ensure_serving(self, role=None, mode=None, work_id=None, **_kwargs):
             wake_started.set()
             assert release_wake.wait(timeout=5), "release never signaled"
             return True
@@ -4477,7 +4480,7 @@ class TestWakeLockDecoupledFromStateLock:
         wake_started = threading.Event()
         release_wake = threading.Event()
 
-        def blocking_ensure_serving(self, role=None, mode=None, work_id=None):
+        def blocking_ensure_serving(self, role=None, mode=None, work_id=None, **_kwargs):
             wake_started.set()
             assert release_wake.wait(timeout=5), "release never signaled"
             return True
@@ -4514,7 +4517,7 @@ class TestWakeLockDecoupledFromStateLock:
         wake_started = threading.Event()
         release_wake = threading.Event()
 
-        def blocking_ensure_serving(self, role=None, mode=None, work_id=None):
+        def blocking_ensure_serving(self, role=None, mode=None, work_id=None, **_kwargs):
             wake_started.set()
             assert release_wake.wait(timeout=5), "release never signaled"
             return True

@@ -257,6 +257,7 @@ def _acquire_with_defer_retry(
         res = client.acquire(
             "gravitywell", work_id, ttl_sec=ttl_sec, reason=reason, timeout=timeout,
             principal=principal, lease_class=lease_class,
+            accept_flashnext_seat=accept_flashnext_seat,
         )
     return res, False
 

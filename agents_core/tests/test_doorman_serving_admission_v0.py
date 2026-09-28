@@ -625,3 +625,178 @@ class TestS3LlmDictSide:
         import json as _json
         prov_row = _json.loads(rows[0]["provenance"] or "{}")
         assert GW_REASON_FLASHNEXT_WINDOW in str(prov_row)
+
+
+# ===========================================================================
+# Salvage follow-ups (continuation on PR #374) — two verified gaps closed:
+#   G1: the defer-retry RETRY acquire must carry the same S2 opt-in as the
+#       initial acquire. A retry that dropped the field would be refused by the
+#       window guard on a flashnext-solo box even though the first acquire
+#       opted in — the caller would burn its whole defer budget on a refusal it
+#       had already been granted past.
+#   G2: return-blind refresh paths. Post-S1 a refusal is a returned DICT, not an
+#       exception, so a refresh that only wrapped the call in try/except reads a
+#       refused hold as a successful one and the hold silently TTL-lapses. Both
+#       the council wave refresh and the shared-deliberation span refresh now
+#       check status and NAME the outcome (same style as the deliberation
+#       heartbeat at council/cli.py).
+# ===========================================================================
+
+class TestS2DeferRetryCarriesOptIn:
+    """G1 — accept_flashnext_seat threads through the retry, not just the first call."""
+
+    def _run(self, responses, **kwargs):
+        from agents_core.gw_agent import _acquire_with_defer_retry
+
+        client = MagicMock()
+        client.acquire.side_effect = list(responses)
+        res, timed_out = _acquire_with_defer_retry(
+            client, "work-defer-1", ttl_sec=60, reason="gw_agent", timeout=5,
+            principal="p1", lease_class="deferrable", budget_sec=30,
+            sleep_fn=lambda s: None, rand_fn=lambda: 0.5, **kwargs,
+        )
+        return res, timed_out, client
+
+    def test_retry_acquire_keeps_opt_in(self):
+        """The pin: with the opt-in set, EVERY acquire in the defer loop — the
+        initial one and each retry — sends accept_flashnext_seat=True."""
+        res, timed_out, client = self._run(
+            [{"status": "pending_defer"}, {"status": "pending_defer"},
+             {"status": "serving"}],
+            accept_flashnext_seat=True,
+        )
+        assert timed_out is False
+        assert res["status"] == "serving"
+        assert client.acquire.call_count == 3
+        sent = [
+            c.kwargs.get("accept_flashnext_seat")
+            for c in client.acquire.call_args_list
+        ]
+        assert sent == [True, True, True], (
+            "defer-retry dropped the S2 opt-in: the retry acquire would be "
+            "refused by the window guard on a flashnext-solo box"
+        )
+
+    def test_default_stays_non_opt_in(self):
+        """Default-false is byte-identical to today: no acquire sends the field."""
+        res, timed_out, client = self._run(
+            [{"status": "pending_defer"}, {"status": "serving"}],
+        )
+        assert timed_out is False
+        assert client.acquire.call_count == 2
+        assert all(
+            not c.kwargs.get("accept_flashnext_seat")
+            for c in client.acquire.call_args_list
+        )
+
+    def test_opt_in_survives_budget_exhaustion(self):
+        """The timeout exit returns the LAST pending_defer response; the opt-in
+        must have been on the acquire that produced it too."""
+        from agents_core.gw_agent import _acquire_with_defer_retry
+
+        client = MagicMock()
+        client.acquire.side_effect = [{"status": "pending_defer"},
+                                      {"status": "pending_defer"}]
+        # Second budget check reads over-budget -> the loop exits on the retry's
+        # own response, so the retry acquire is the one that must carry the field.
+        with patch("agents_core.gw_agent.time.monotonic",
+                   side_effect=[0.0, 0.0, 100.0]):
+            res, timed_out = _acquire_with_defer_retry(
+                client, "work-defer-1", ttl_sec=60, reason="gw_agent", timeout=5,
+                principal="p1", lease_class="deferrable", budget_sec=30,
+                sleep_fn=lambda s: None, rand_fn=lambda: 0.5,
+                accept_flashnext_seat=True,
+            )
+        assert timed_out is True
+        assert res["status"] == "pending_defer"
+        assert client.acquire.call_count == 2
+        assert all(
+            c.kwargs.get("accept_flashnext_seat") is True
+            for c in client.acquire.call_args_list
+        )
+
+
+class TestS1RefreshPathsNameRefusals:
+    """G2 — a named-dict refusal on a refresh is LOGGED, never swallowed."""
+
+    def test_council_wave_refresh_names_refusal(self, capsys):
+        from agents_core.council.cli import _refresh_wave_hold
+
+        dm = MagicMock()
+        dm.acquire.return_value = {
+            "ok": False, "flashnext_occupied": True,
+            "reason": "flashnext-window-holding-gpu0",
+        }
+        out = []
+        res = _refresh_wave_hold(dm, "council-run-1", "council-delib-1", "floor", out.append)
+        assert res["flashnext_occupied"] is True
+        assert len(out) == 1
+        assert "not serving" in out[0]
+        assert "flashnext_occupied" in out[0]
+        # The refresh must still carry the S2 opt-in (it dials the flashnext seat).
+        assert dm.acquire.call_args.kwargs.get("accept_flashnext_seat") is True
+        assert dm.acquire.call_args.kwargs.get("lease_class") == "protected"
+
+    def test_council_wave_refresh_silent_on_serving(self, capsys):
+        from agents_core.council.cli import _refresh_wave_hold
+
+        dm = MagicMock()
+        dm.acquire.return_value = {"status": "serving", "serve_axis": "flashnext"}
+        out = []
+        _refresh_wave_hold(dm, "council-run-1", "council-delib-1", "floor", out.append)
+        assert out == []
+
+    def test_council_wave_refresh_prints_via_report(self, capsys):
+        """The CLI wires report to print(): the refusal is visible on stdout."""
+        from agents_core.council.cli import _refresh_wave_hold
+
+        dm = MagicMock()
+        dm.acquire.return_value = {"ok": False, "creative_occupied": True}
+        _refresh_wave_hold(
+            dm, "w", "p", "floor", lambda msg: print(msg, flush=True),
+        )
+        captured = capsys.readouterr().out
+        assert "wave hold refresh not serving" in captured
+        assert "creative_occupied" in captured
+
+    def test_span_refresh_names_refusal(self):
+        from agents_core.shared_deliberation.orchestrator import _refresh_span_hold
+
+        dm = MagicMock()
+        dm.acquire.return_value = {
+            "ok": False, "flashnext_occupied": True,
+            "reason": "flashnext-window-holding-gpu0",
+        }
+        out = []
+        res = _refresh_span_hold(dm, "shared-delib-1", 600, "pm-principal", out.append)
+        assert res["flashnext_occupied"] is True
+        assert len(out) == 1
+        assert "flashnext_occupied" in out[0]
+        # Day-seat coordination keepawake: must NOT opt in to the flashnext grant
+        # (it would consume a lease on an axis it never dials).
+        assert not dm.acquire.call_args.kwargs.get("accept_flashnext_seat")
+        assert dm.acquire.call_args.kwargs.get("lease_kind") == "coordination"
+
+    def test_span_refresh_silent_on_serving(self):
+        from agents_core.shared_deliberation.orchestrator import _refresh_span_hold
+
+        dm = MagicMock()
+        dm.acquire.return_value = {"status": "serving"}
+        out = []
+        _refresh_span_hold(dm, "shared-delib-1", 600, "pm", out.append)
+        assert out == []
+
+    def test_refresh_helpers_survive_non_dict_return(self):
+        """I4: a weird/None return degrades to 'not serving' naming, never a
+        crash inside a daemon refresh thread (which would silently kill the hold
+        refresh loop)."""
+        from agents_core.council.cli import _refresh_wave_hold
+        from agents_core.shared_deliberation.orchestrator import _refresh_span_hold
+
+        out = []
+        dm = MagicMock()
+        dm.acquire.return_value = None
+        assert _refresh_wave_hold(dm, "w", "p", "floor", out.append) == {}
+        assert _refresh_span_hold(dm, "w", 60, "p", out.append) == {}
+        assert len(out) == 2
+        assert all("not serving" in m or "status=None" in m for m in out)
