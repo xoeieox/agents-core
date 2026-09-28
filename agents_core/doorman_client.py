@@ -479,9 +479,21 @@ class DoormanClient:
         return resp.get("status") == "pending_defer"
 
     @staticmethod
+    def is_flashnext_occupied(resp: dict) -> bool:
+        """Return True if the acquire was refused because the flash-next seat
+        (:30000) holds GPU 0 whole-card during an active handover window.
+
+        Sibling of is_creative_occupied (doorman-flashnext-serving-admission-v0,
+        S1): post-S1 the 409 arrives as this named dict rather than as an
+        escaping httpx.HTTPStatusError, so consumers branch on this predicate and
+        NAME the state instead of flattening every 409 into "gw_seat_occupied".
+        """
+        return is_flashnext_occupied(resp)
+
+    @staticmethod
     def is_creative_occupied(resp: dict) -> bool:
         """Return True if the acquire was refused because the creative 70B holds the GPU."""
-        return bool(resp.get("creative_occupied"))
+        return is_creative_occupied(resp)
 
     @staticmethod
     def is_contended(resp: dict) -> bool:
