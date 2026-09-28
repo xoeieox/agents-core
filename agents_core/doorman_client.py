@@ -347,7 +347,9 @@ class DoormanClient:
             body["class"] = lease_class
         if mode:
             body["mode"] = mode
-        return self._post("/lease/acquire", body, timeout=timeout)
+        if accept_flashnext_seat:
+            body["accept_flashnext_seat"] = True
+        return self._post("/lease/acquire", body, timeout=timeout, named_refusals=True)
 
     def release(self, node: str, work_id: str) -> None:
         """Release a lease. Idempotent — unknown work_id is a no-op."""
