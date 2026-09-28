@@ -4808,6 +4808,11 @@ def create_app(gw_url: str | None = None) -> FastAPI:
             return {"status": "wake_failed", "detail": state.last_error or "wake failed"}
 
         resp: dict = {"status": "serving", "node": node, "work_id": work_id, "class": lease_class}
+        if _serve_axis_out:
+            # S2 additive-only: the lease was registered against the already-serving
+            # flash-next seat (no wake). Additive — absent on every day-seat grant,
+            # so existing consumers are byte-identical.
+            resp["serve_axis"] = _serve_axis_out[0]
         if require_drain_clear:
             resp["drain_cleared"] = True  # signals to client that drain check was honored (AC5a)
         if release_info is not None:
