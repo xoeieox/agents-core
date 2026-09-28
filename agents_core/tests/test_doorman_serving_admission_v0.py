@@ -128,7 +128,7 @@ class _Guard:
 
     @property
     def serving_calls(self) -> int:
-        return self._serving_call_count
+        return self._serving.call_count
 
     @property
     def wake_issued(self) -> bool:
