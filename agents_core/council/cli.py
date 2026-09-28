@@ -1242,7 +1242,42 @@ def _apply_voicing_provenance(run: dict, adapter) -> None:
 
     requested_voicing = run.get("voicing", "sonnet")
 
-    if isinstance(adapter, GravityWellAdapter):
+    if getattr(adapter, "lane", None) is not None:
+        # S4 (gate-lanes-registry-driven-flashnext-v0-agents-core): a
+        # registry-lane-voiced adapter (voicing flashnext) is labeled by the
+        # lane name + the served id it dialed, mirroring the phala
+        # explicit-banner rule — a flash-next verdict must never read as a
+        # 122B one. The lane IS the requested seat, so a clean run is NOT
+        # degraded (calling it degraded would both mislabel the run and trip
+        # the paid_spend derivation).
+        served = getattr(adapter.lane, "served_model", None)
+        label = f"flashnext:{served}" if served else "flashnext"
+        if adapter.voicing_events:
+            operators = [e.get("effective_operator") for e in adapter.voicing_events]
+            reasons = [e.get("reason") for e in adapter.voicing_events]
+            if all(op == "flashnext" for op in operators) and all(
+                r == "success" for r in reasons
+            ):
+                run["effective_voicing"] = label
+                run["voicing_degraded"] = False
+            else:
+                run["effective_voicing"] = label
+                run["voicing_degraded"] = True
+                failure_reasons = [
+                    r for r in reasons if r != "success" and r != "fallback"
+                ]
+                run["voicing_degraded_reason"] = (
+                    failure_reasons[0] if failure_reasons else "unknown"
+                )
+            for i, turn in enumerate(run.get("turns", [])):
+                if i < len(adapter.voicing_events):
+                    turn["effective_voicing"] = adapter.voicing_events[i].get(
+                        "effective_operator"
+                    )
+        else:
+            run["effective_voicing"] = label
+            run["voicing_degraded"] = False
+    elif isinstance(adapter, GravityWellAdapter):
         if adapter.voicing_events:
             # Aggregate voicing events: check if all are gravitywell (clean) or mixed
             operators = [e.get("effective_operator") for e in adapter.voicing_events]
