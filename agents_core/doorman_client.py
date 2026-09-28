@@ -152,6 +152,55 @@ class DoormanUnreachable(Exception):
     """HTTP transport failure reaching the doorman service."""
 
 
+# Named /lease/acquire refusals (doorman-flashnext-serving-admission-v0, S1).
+# These are the body flags the server already returns on a 409 — the 409 is an
+# EXPECTED outcome for a caller that needs no wake, not a transport failure, so
+# the acquire path answers with the parsed dict instead of letting
+# httpx.HTTPStatusError escape. A body that is unparseable or carries none of
+# these flags takes TODAY's error path (raise) — never a named skip (I4: the
+# preflight/lease layer must not become an availability SPOF, and an unknown
+# body is never read as a permission to skip).
+_ACQUIRE_REFUSAL_FLAGS = ("creative_occupied", "flashnext_occupied", "contended")
+
+
+def _parse_acquire_refusal(response: "httpx.Response") -> dict | None:
+    """Parse a 409 /lease/acquire body into the documented refusal dict.
+
+    Returns the body verbatim when it is a dict carrying at least one of the
+    server's named refusal flags with a truthy value; None otherwise (caller
+    re-raises — I4 fail-open to today's behavior).
+
+    Trust note: the body flags are ADVISORY within the ratified loopback trust
+    model (bearer auth unset, live-verified) — they classify a refusal the
+    server already made; they never grant anything.
+    """
+    try:
+        body = response.json()
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    if not any(body.get(flag) is True for flag in _ACQUIRE_REFUSAL_FLAGS):
+        return None
+    return body
+
+
+def is_flashnext_occupied(resp: dict) -> bool:
+    """Return True if the acquire was refused because the flash-next seat
+    (:30000) holds GPU 0 whole-card during an active handover window.
+
+    Module-level so consumers can call it without going through the class
+    (mock-safety: tests patch the DoormanClient class, and a MagicMock
+    attribute would read truthy for every response).
+    """
+    return bool(isinstance(resp, dict) and resp.get("flashnext_occupied"))
+
+
+def is_creative_occupied(resp: dict) -> bool:
+    """Return True if the acquire was refused because the creative 70B holds the GPU."""
+    return bool(isinstance(resp, dict) and resp.get("creative_occupied"))
+
+
 class DoormanClient:
     def __init__(
         self,
