@@ -2089,6 +2089,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
     _locality_prov = _provenance_out if _provenance_out is not None else []
     _locality_served: list = []
     _impl_kwargs = dict(kwargs)
+    _locality_lane_obj = _impl_kwargs.get("_lane")
     if operator_class == "gravitywell":
         # Only the gravitywell branch's gw_kwargs allowlist forwards this key
         # (llm.py ~1078-1082); injecting it for other operator classes would
@@ -2096,6 +2097,15 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
         # non-autospec test mock of _call_qwen_backend accepts and records
         # any kwarg, breaking assert_called_once_with(prompt=...) assertions).
         _impl_kwargs.setdefault("_served_model_out", _locality_served)
+    elif operator_class == "flashnext":
+        # S2: resolve the registry lane ONCE per call and hand the same
+        # resolved lane to the implementation, so the ledger records the host
+        # the call actually dialed instead of reading the registry twice (a
+        # second read could disagree with the first across a seat handover,
+        # and a blind second read would record a stale host).
+        if _locality_lane_obj is None:
+            _locality_lane_obj, _ = _flashnext_lane()
+            _impl_kwargs["_lane"] = _locality_lane_obj
 
     ok = True
     _locality_result = None
@@ -2118,6 +2128,7 @@ def call_operator(operator_class: str, prompt: str, model: str = None,
             operator_class=operator_class, model=model,
             prov=_locality_prov, served=_locality_served,
             start=_locality_start, ok=ok,
+            lane_obj=_locality_lane_obj if operator_class == "flashnext" else None,
         )
 
 
