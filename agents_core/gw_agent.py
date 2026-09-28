@@ -132,6 +132,44 @@ GW_DEFER_RETRY_JITTER_FRAC: Final[float] = 0.25
 # a genuine same-call not-serving response.
 GW_REASON_DEFER_TIMEOUT: Final[str] = "gw_defer_timeout"
 
+# Additive to the reason_out vocabulary — S3 named 409 outcomes
+# (doorman-flashnext-serving-admission-v0). Post-S1 the doorman's named refusals
+# arrive as dicts, so these replace the single flat "gw_seat_occupied" bucket for
+# the cases the fleet actually needs to tell apart:
+#   GW_REASON_FLASHNEXT_WINDOW — the flash-next seat holds GPU 0 during an active
+#       handover window and this acquire needed a wake. Expected, wait-out state:
+#       the window does not self-clear while the seat is resident, so the caller
+#       must NOT re-pay for it in-run (leg 2 classifies it observability-only).
+#   GW_REASON_CONTENDED — the drain gate found another principal's worker lease
+#       (same-box peer; a retry-within-deadline outcome). Named to match llm.py's
+#       existing "gw_contended" provenance token.
+# The creative 70B refusal KEEPS the existing "gw_seat_occupied" token: its
+# meaning narrows to "another seat holds the lane" rather than becoming a fourth
+# bucket, and existing ceiling/plate keys stay readable.
+GW_REASON_FLASHNEXT_WINDOW: Final[str] = "gw_flashnext_window"
+GW_REASON_SEAT_OCCUPIED: Final[str] = "gw_seat_occupied"
+GW_REASON_CONTENDED: Final[str] = "gw_contended"
+
+
+def _acquire_refusal_reason(res: object) -> str | None:
+    """Map a named /lease/acquire refusal dict to its reason_out token.
+
+    Returns None for anything that is not a named refusal (so the caller's
+    existing status handling is untouched). Uses the client's own predicates so
+    there is exactly one place that reads the server's flag vocabulary.
+    """
+    from agents_core.doorman_client import is_flashnext_occupied, is_creative_occupied
+
+    if not isinstance(res, dict):
+        return None
+    if is_flashnext_occupied(res):
+        return GW_REASON_FLASHNEXT_WINDOW
+    if is_creative_occupied(res):
+        return GW_REASON_SEAT_OCCUPIED
+    if res.get("contended") is True:
+        return GW_REASON_CONTENDED
+    return None
+
 
 def _compute_defer_retry_sleep_s(attempt: int, rand_fn: Callable[[], float] = random.random) -> float:
     """Compute the jittered, capped-exponential sleep for defer-retry attempt N (1-indexed).
@@ -161,6 +199,7 @@ def _acquire_with_defer_retry(
     log: Callable[[str], None] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
     rand_fn: Callable[[], float] = random.random,
+    accept_flashnext_seat: bool = False,
 ) -> tuple[dict, bool]:
     """Retry a `deferrable`-class acquire on "pending_defer" up to a client-owned budget.
 
@@ -194,6 +233,7 @@ def _acquire_with_defer_retry(
     res = client.acquire(
         "gravitywell", work_id, ttl_sec=ttl_sec, reason=reason, timeout=timeout,
         principal=principal, lease_class=lease_class,
+        accept_flashnext_seat=accept_flashnext_seat,
     )
     while DoormanClient.is_pending_defer(res):
         elapsed = time.monotonic() - start
@@ -217,6 +257,7 @@ def _acquire_with_defer_retry(
         res = client.acquire(
             "gravitywell", work_id, ttl_sec=ttl_sec, reason=reason, timeout=timeout,
             principal=principal, lease_class=lease_class,
+            accept_flashnext_seat=accept_flashnext_seat,
         )
     return res, False
 
@@ -2601,6 +2642,11 @@ def _call_gw_agent_impl(
                     principal=principal,
                     lease_class=lease_class,
                     log=log,
+                    # S2 opt-in (doorman-flashnext-serving-admission-v0): a
+                    # reviewer/worker session needs NO wake when the flash-next
+                    # seat is already serving — pre-S2 it was refused a lease by
+                    # the window guard and burned a dispatch cycle on a 409.
+                    accept_flashnext_seat=True,
                 )
             except DoormanUnreachable as e:
                 if log:
@@ -2620,13 +2666,13 @@ def _call_gw_agent_impl(
                 else:
                     raise ValueError(f"unknown on_wake_fail: {on_wake_fail}")
             except httpx.HTTPStatusError as e:
-                # 409: another seat holds the GPU lane (creative_occupied or
-                # flashnext_occupied). Route through on_wake_fail with the
-                # distinct reason "gw_seat_occupied" — distinguishable from
-                # "gw_unreachable" and "gw_not_serving".
-                # (agents-core-doorman-flashnext-handover-v0, Deliverable 4:
-                # the identical hole exists today for creative_occupied 409s;
-                # this branch repairs both.)
+                # LEGACY-SERVER path (doorman-flashnext-serving-admission-v0, S1/S3):
+                # post-S1 a named 409 arrives from client.acquire() as a REFUSAL DICT
+                # (handled dict-side below), so an escaping HTTPStatusError here means a
+                # pre-S1 doorman, a 409 whose body carries no known flag, or another
+                # 4xx-shape error the client could not name. Keep the pre-S1 behavior:
+                # route a 409 through on_wake_fail with the flat "gw_seat_occupied"
+                # reason (agents-core-doorman-flashnext-handover-v0, Deliverable 4).
                 if e.response.status_code == 409:
                     if log:
                         log(f"[gw_agent] doorman 409 (seat occupied): {e}")
@@ -2664,6 +2710,35 @@ def _call_gw_agent_impl(
                         f"GW acquire still pending_defer after {GW_DEFER_RETRY_BUDGET_SEC}s "
                         "retry budget"
                     )
+                elif on_wake_fail == "claude":
+                    return _fallback_claude_cli(
+                        prompt, system, cwd, json_mode, log, return_transcript, transcript
+                    )
+                else:
+                    raise ValueError(f"unknown on_wake_fail: {on_wake_fail}")
+
+            # ── S3 named 409 outcomes (doorman-flashnext-serving-admission-v0) ──
+            # Post-S1 the doorman's named refusals arrive HERE as dicts instead of as
+            # an escaping httpx.HTTPStatusError, so branch on the body flags and NAME
+            # the state — today every one of these collapsed into the flat
+            # "gw_not_serving" (or, pre-S1, into the flat "gw_seat_occupied"). The
+            # distinction is what the fleet's plate/lane layers need: a flashnext
+            # window is an expected state to wait out, creative is a different seat,
+            # contended is a same-box peer to retry against.
+            # Body flags are ADVISORY (loopback trust model): an unparseable/unknown
+            # body never reaches here — it stays on the error path above (I4).
+            _seat_refusal_reason = _acquire_refusal_reason(res)
+            if _seat_refusal_reason is not None:
+                if log:
+                    log(f"[gw_agent] GW acquire refused ({_seat_refusal_reason})")
+                if on_wake_fail == "skip":
+                    if writeable:
+                        return (_build_fixer_result(cwd, transcript, concluded=False), transcript)
+                    if reason_out is not None:
+                        reason_out.append(_seat_refusal_reason)
+                    return (None, transcript) if return_transcript else None
+                elif on_wake_fail == "error":
+                    raise Exception(f"GW acquire refused: {_seat_refusal_reason}")
                 elif on_wake_fail == "claude":
                     return _fallback_claude_cli(
                         prompt, system, cwd, json_mode, log, return_transcript, transcript

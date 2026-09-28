@@ -44,6 +44,46 @@ class GroundingHandoffError(Exception):
     """
 
 
+def _refresh_span_hold(
+    doorman,
+    work_id: str,
+    refresh_ttl: int,
+    principal: str,
+    report,
+) -> dict:
+    """Refresh the deliberation-span GW keepawake hold and NAME a post-S1 refusal.
+
+    Module-level (not a closure) so it is hermetically reachable from tests.
+    Post-S1 the doorman answers a refused acquire with a NAMED DICT instead of
+    raising (doorman-flashnext-serving-admission-v0, S1), so the refresh loop's
+    except-arm alone can no longer see it: a loop that only listened for the
+    exception would read a refused refresh as a successful one and the span hold
+    would silently TTL-lapse mid-deliberation — the exact idle-suspend this hold
+    exists to prevent. `report` receives the one-line outcome. Returns the
+    acquire response.
+
+    Deliberately NOT opt-in to the S2 flashnext grant: this is a day-seat
+    keepawake (a coordination lease the orchestrator never dials itself), so
+    consuming a flashnext-axis lease it cannot serve would be the
+    lease-then-fail degradation the spec rules out for day-seat callers.
+    """
+    _ref = doorman.acquire(
+        "gravitywell", work_id, refresh_ttl,
+        "shared-deliberation-span-refresh",
+        timeout=10.0,
+        principal=principal,
+        lease_kind="coordination",
+        lease_class="protected",
+    )
+    _ref = _ref if isinstance(_ref, dict) else {}
+    if _ref.get("status") != "serving":
+        report(
+            f"status={_ref.get('status')} "
+            f"flags={[k for k in _ref if k.endswith('_occupied')]}"
+        )
+    return _ref
+
+
 def _escalate_council_fast_fail(run_id: str, last_heartbeat, reason: str) -> None:
     """Fire the council fast-fail repair station (Leg 1 of repair-expert-v0).
 
@@ -787,13 +827,14 @@ async def run_deliberation(request: DeliberationRequest) -> DeliberationEnvelope
                             break
                         if now >= _next_refresh:
                             try:
-                                _dc.acquire(
-                                    "gravitywell", _wid, _refresh_ttl,
-                                    "shared-deliberation-span-refresh",
-                                    timeout=10.0,
-                                    principal=_principal,
-                                    lease_kind="coordination",
-                                    lease_class="protected",
+                                _refresh_span_hold(
+                                    _dc, _wid, _refresh_ttl, _principal,
+                                    lambda msg: log.warning(
+                                        "[shared-deliberation] span hold refresh NOT"
+                                        " serving: %s - GW may idle-suspend during"
+                                        " deliberation",
+                                        msg,
+                                    ),
                                 )
                             except Exception as _ref_err:
                                 log.warning(

@@ -620,7 +620,41 @@ CREATIVE_OCCUPIED = object()
 # (acquire_lease passthrough; 409 flashnext_occupied on /lease/acquire) —
 # including for role=mode-controller: during a confirmed window the window
 # guard supersedes the controller-deference machinery and no lease registers.
+#
+# AMENDED by doorman-flashnext-serving-admission-v0 (S2): there is now ONE
+# carve-out for NON-controller roles. A caller that opts in with
+# accept_flashnext_seat=true AND supplies NO mode AND is not role=
+# "mode-controller" AND whose guard-computed seat probe reads up_registered
+# gets the already-serving flash-next seat without a wake (the caller needs no
+# 27B wake at all, so the OOM the guard exists to prevent cannot occur) — see
+# _FlashnextServed. The carve-out is narrow on purpose: ANY supplied mode
+# ("big" or "dual" — the wake the guard exists to block) keeps this refusal
+# verbatim, and role="mode-controller" keeps this uniform refusal verbatim too.
+# A no-mode controller grant would hand any loopback caller the controller
+# lever (deference at the mode-owner check, DEFERs of other acquires) and
+# reinstate exactly the window state D4 rules out; squatting the controller
+# lease is not an inference grant. Controller refusals are NOT softened.
 FLASHNEXT_OCCUPIED = object()
+
+
+class _FlashnextServed:
+    """ensure_serving() result for an S2 already-serving grant
+    (doorman-flashnext-serving-admission-v0, S2).
+
+    Distinct from the plain ``True`` so acquire_lease can stamp the additive
+    ``serve_axis="flashnext"`` field on the lease dict (and log the registration
+    audit line with the probe's served_id) WITHOUT a second :30000 probe — the
+    value is carried out of the guard's single fresh probe pair. Truthy, so any
+    legacy truthiness check reads it as success exactly like ``True``.
+    """
+
+    __slots__ = ("served_id",)
+
+    def __init__(self, served_id: str | None = None):
+        self.served_id = served_id
+
+    def __bool__(self) -> bool:
+        return True
 
 # Sentinel principal for worker leases acquired without an explicit principal.
 # Never excluded from drain_count — makes a forgotten-principal diagnosable instead of invisible.
@@ -2416,7 +2450,7 @@ class _NodeState:
     # ensure_serving — serializes wakes via self.wake_lock, not self.lock
     # ------------------------------------------------------------------
 
-    def ensure_serving(self, role: str | None = None, mode: str | None = None, work_id: str | None = None) -> bool | object:
+    def ensure_serving(self, role: str | None = None, mode: str | None = None, work_id: str | None = None, accept_flashnext_seat: bool = False) -> bool | object:
         """Wake GW if needed, start the serving unit, and wait until it serves.
 
         Returns True on success, DEFERRED if controller owns the mode, False on failure.
@@ -2442,6 +2476,12 @@ class _NodeState:
                 when role != "mode-controller" (AC2a).
           work_id: the caller's own work_id, used only for the identity-aware foreign-
                    controller check (AC3a) when mode is supplied and role=="mode-controller".
+          accept_flashnext_seat: S2 opt-in (doorman-flashnext-serving-admission-v0).
+                   Forwarded to ensure_serving(): when True AND mode is None AND
+                   role != "mode-controller" AND the guard's fresh seat probe reads
+                   up_registered, the already-serving flash-next seat is granted WITHOUT
+                   a wake and the registered lease dict carries the additive
+                   serve_axis="flashnext" field. Default False = byte-identical to today.
 
         Flow (gravitywell-doorman-clean-stop-v0 + doorman-mode-deference-v0):
           0. Mode-aware deference (HOLE 1 fix, flag ON only): if controller owns the
@@ -2558,6 +2598,47 @@ class _NodeState:
             seat_state, seat_served_id, _seat_registered, seat_error_class = (
                 self._probe_flashnext_seat(sequential=True)
             )
+            # S2 already-serving grant (doorman-flashnext-serving-admission-v0):
+            # an OPT-IN caller that needs NO wake takes the seat that is already
+            # serving on :30000 instead of being refused by the window guard. The
+            # grant consumes the guard's OWN freshly-computed probe pair — no second
+            # :30000 probe, no second :8081 GET per acquire (probe economy). Every
+            # condition below is load-bearing (I1):
+            #   accept_flashnext_seat  — opt-in only; False is byte-identical to today.
+            #   mode is None           — ANY supplied mode is a request to wake/flip
+            #                            the 27B onto a GPU-0 whole-card sglang = OOM;
+            #                            that keeps the refusal below verbatim.
+            #   role != mode-controller — the controller lease is a lever (flips
+            #                            deference, DEFERs other acquires); a no-mode
+            #                            controller grant would reinstate the exact
+            #                            window state D4 rules out and let any loopback
+            #                            caller squat the controller lease.
+            #   up_registered ONLY     — up_unverified means a listener answered
+            #                            /health but its identity never verified
+            #                            (health-before-models mid-load): a refused
+            #                            acquire is cheap, a grant to a squatter is not.
+            if (
+                accept_flashnext_seat
+                and mode is None
+                and role != "mode-controller"
+                and seat_state == "up_registered"
+            ):
+                # No wake was issued, so this is NOT a wake: the caller's lease is
+                # registered by acquire_lease on the FAST-PATH write-set (last_error /
+                # service_stopped only — deliberately NOT _cached_serving, which would
+                # widen the day-seat axis, and NOT last_wake_at, which would lie about a
+                # wake that never happened). _place_hold DOES apply (real work is in
+                # flight) and happens in acquire_lease's registration block.
+                with self.lock:
+                    self.last_error = None
+                    self.service_stopped = False
+                log.info(
+                    f"[{self.node_name}] flashnext-seat-already-serving — S2 grant: "
+                    f"seat probe {seat_state} (served_id={seat_served_id!r}); skipping "
+                    f"the 27B wake, registering lease without a wake "
+                    f"(serve_axis=flashnext, work_id={work_id!r}, role={role!r})"
+                )
+                return _FlashnextServed(seat_served_id)
             if seat_state in ("up_registered", "up_unverified"):
                 # The seat holds (or is loading onto) GPU 0 whole-card at
                 # --mem-fraction-static 0.985: waking the 27B here would put
@@ -3259,7 +3340,7 @@ class _NodeState:
             _write_idle_log(self.node_name, "idle_start", 0)
         return expired
 
-    def acquire_lease(self, work_id: str, ttl_sec: int, reason: str, role: str = "worker", principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference", lease_class: str = DEFAULT_LEASE_CLASS, mode: str | None = None) -> bool | object:
+    def acquire_lease(self, work_id: str, ttl_sec: int, reason: str, role: str = "worker", principal: str | None = None, require_drain_clear: bool = False, lease_kind: str = "inference", lease_class: str = DEFAULT_LEASE_CLASS, mode: str | None = None, accept_flashnext_seat: bool = False, serve_axis_out: list | None = None) -> bool | object:
         """Try to ensure GW is serving, then register the lease.
 
         Returns True on success, DEFERRED if a foreign caller acquires during controller
@@ -3292,6 +3373,14 @@ class _NodeState:
           mode: optional requested serve mode, already validated by the endpoint
                 (agents-core-doorman-mode-bearing-acquire-v0). Passed through to
                 ensure_serving(); see that method for when it's acted on vs. ignored.
+          accept_flashnext_seat: S2 opt-in — passed through to ensure_serving(); see
+                that method. When the grant fires, the registered lease dict gains the
+                additive serve_axis="flashnext" field (bookkeeping otherwise byte-
+                identical, I3) and drain semantics are unchanged.
+          serve_axis_out: optional single-element list the endpoint passes to learn
+                whether THIS call's lease landed on the flashnext axis (the grant
+                already paid for the probe; the endpoint must not re-probe to answer
+                this). Stays untouched on every non-grant path.
 
         self.lock is taken exactly once per call, for the short bookkeeping that spans
         idle-tracking reset, the atomic drain-gate check, and lease registration (see the
@@ -3303,7 +3392,17 @@ class _NodeState:
         # ensure_serving serializes concurrent wakes internally via its own wake_lock —
         # this call intentionally runs without self.lock held, so a cold wake never freezes
         # the bookkeeping critical section below for other callers.
-        ok = self.ensure_serving(role=role, mode=mode, work_id=work_id)
+        ok = self.ensure_serving(role=role, mode=mode, work_id=work_id,
+                                  accept_flashnext_seat=accept_flashnext_seat)
+        serve_axis: str | None = None
+        served_id: str | None = None
+        if isinstance(ok, _FlashnextServed):
+            # S2 grant: the seat is already serving on :30000; fall through to the
+            # normal registration path below (the lease is real, real work is in
+            # flight) while recording the axis for the additive lease field + audit.
+            serve_axis = "flashnext"
+            served_id = ok.served_id
+            ok = True
         if ok is CREATIVE_OCCUPIED:
             return CREATIVE_OCCUPIED
         if ok is FLASHNEXT_OCCUPIED:
@@ -3384,8 +3483,39 @@ class _NodeState:
                 }
                 if role == "worker":
                     lease_entry["principal"] = principal if principal is not None else GHOST_PRINCIPAL
+                # S2 additive-only field (I3: bookkeeping byte-identical EXCEPT this).
+                # It surfaces in /status via the **info spread in status_snapshot, so
+                # an operator can distinguish "a lease is held on the flashnext axis"
+                # from "the day seat is held" — /status `serving` still reports the
+                # DAY-SEAT (:8081) axis and is unchanged (I2). Drain semantics are
+                # unchanged too: a flashnext-axis inference lease stays COUNTED here
+                # (safe direction — a box-level stop hurts flashnext inference as
+                # well), coordination-kind leases stay exempt. Consequence named: a
+                # window-close hand-back may wait out a flashnext lease TTL.
+                if serve_axis is not None:
+                    lease_entry["serve_axis"] = serve_axis
+                    if served_id:
+                        lease_entry["served_id"] = served_id
                 self.leases[work_id] = lease_entry
                 self._place_hold()
+                if serve_axis is not None and serve_axis_out is not None:
+                    # Only on the registered path — a contended call registers nothing.
+                    serve_axis_out.append(serve_axis)
+                if serve_axis is not None:
+                    # Registration audit line (interim answer for the missing
+                    # /lease/release ownership check — see Known-deferred): who took
+                    # which axis against which verified served id. Sink:
+                    #   journalctl --user -u doorman-server
+                    log.info(
+                        "[doorman] flashnext-axis-lease-registered work_id=%s "
+                        "principal=%s role=%s serve_axis=%s served_id=%s lease_kind=%s",
+                        work_id,
+                        lease_entry.get("principal", GHOST_PRINCIPAL),
+                        role,
+                        serve_axis,
+                        served_id,
+                        lease_kind,
+                    )
 
         if was_idle:
             _write_idle_log(self.node_name, "resumed", lease_count_for_log)
@@ -4562,6 +4692,10 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         lease_kind = body.get("lease_kind", "inference")
         lease_class = body.get("class", DEFAULT_LEASE_CLASS)  # missing → deferrable (safe)
         mode = body.get("mode") or None  # missing/empty string → None (AC1 — omission)
+        # S2 opt-in (doorman-flashnext-serving-admission-v0): default False = today,
+        # byte-identical. Only ever consulted by ensure_serving()'s already-serving
+        # grant, which additionally requires mode is None and role != "mode-controller".
+        accept_flashnext_seat = bool(body.get("accept_flashnext_seat", False))
 
         if node not in nodes:
             return JSONResponse(
@@ -4636,10 +4770,13 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         # sections around bookkeeping, self.wake_lock around ensure_serving) —
         # it must NOT be wrapped in self.lock here, or a cold wake would once
         # again freeze every other endpoint for this node.
+        _serve_axis_out: list = []
         ok = state.acquire_lease(
             work_id, ttl_sec, reason, role=role, principal=principal,
             require_drain_clear=require_drain_clear, lease_kind=lease_kind,
             lease_class=lease_class, mode=mode,
+            accept_flashnext_seat=accept_flashnext_seat,
+            serve_axis_out=_serve_axis_out,
         )
 
         if ok is CREATIVE_OCCUPIED:
@@ -4671,6 +4808,11 @@ def create_app(gw_url: str | None = None) -> FastAPI:
             return {"status": "wake_failed", "detail": state.last_error or "wake failed"}
 
         resp: dict = {"status": "serving", "node": node, "work_id": work_id, "class": lease_class}
+        if _serve_axis_out:
+            # S2 additive-only: the lease was registered against the already-serving
+            # flash-next seat (no wake). Additive — absent on every day-seat grant,
+            # so existing consumers are byte-identical.
+            resp["serve_axis"] = _serve_axis_out[0]
         if require_drain_clear:
             resp["drain_cleared"] = True  # signals to client that drain check was honored (AC5a)
         if release_info is not None:

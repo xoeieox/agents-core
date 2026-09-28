@@ -1415,7 +1415,13 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                 return _apply_wake_fail(on_wake_fail, operator_class, prompt,
                                        _provenance_out=_provenance_out, **wake_fail_kwargs)
 
-        from agents_core.doorman_client import DoormanClient, DoormanUnreachable, _gw_acquire_timeout
+        from agents_core.doorman_client import (
+            DoormanClient,
+            DoormanUnreachable,
+            _gw_acquire_timeout,
+            is_creative_occupied,
+            is_flashnext_occupied,
+        )
 
         admission_mode = os.environ.get("GW_ADMISSION_MODE", "off")
         if principal is not None and not principal:
@@ -1593,6 +1599,36 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
                             is_ride_along = False
                             time.sleep(backoff)
                             continue
+
+                        if is_flashnext_occupied(res) or is_creative_occupied(res):
+                            # S3 dict-side named outcome
+                            # (doorman-flashnext-serving-admission-v0). Pre-S1 this
+                            # refusal raised httpx.HTTPStatusError out of acquire() and
+                            # landed in the acquire_soft_error branch above, which re-paid
+                            # the whole admission loop up to _max_se times (the measured
+                            # 6-probe soft-retry re-pay loop this unit kills: a named
+                            # outcome is not a soft error). It is also NOT retryable
+                            # in-run: the flash-next handover window does not self-clear
+                            # while the seat is resident, and the creative collider is a
+                            # different seat — so settle the ticket once and NAME the
+                            # state instead of sleeping on it.
+                            _seat_state = (
+                                "gw_flashnext_window" if is_flashnext_occupied(res)
+                                else "gw_seat_occupied"
+                            )
+                            _log.warning(
+                                "[gw-admission] acquire refused work_id=%s state=%s "
+                                "(no in-run retry: the seat refusal does not self-clear)",
+                                work_id, _seat_state,
+                            )
+                            if _provenance_out is not None:
+                                _provenance_out.append((_seat_state, "gravitywell"))
+                            elevator.fail(ticket, reason=_seat_state)
+                            _loop_ticket_settled = True
+                            return _apply_wake_fail(
+                                on_wake_fail, operator_class, prompt,
+                                _provenance_out=_provenance_out, **wake_fail_kwargs,
+                            )
 
                         if DoormanClient.is_contended(res):
                             # Leg 1: drain-gate contended was previously a bare sleep-and-continue
@@ -1776,6 +1812,27 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
             if DoormanClient.is_deferred(res):
                 if _provenance_out is not None:
                     _provenance_out.append(("gw_deferred_swarm", "gravitywell"))
+                return _apply_wake_fail(on_wake_fail, operator_class, prompt,
+                                       _provenance_out=_provenance_out, **wake_fail_kwargs)
+            elif is_flashnext_occupied(res) or is_creative_occupied(res):
+                # S3 dict-side named outcome
+                # (doorman-flashnext-serving-admission-v0). This is a DAY-SEAT
+                # caller: it deliberately does NOT pass accept_flashnext_seat, so it
+                # keeps the clean refusal rather than a lease it cannot dial (an S2
+                # grant here would consume a lease + a keepawake pin for a lane this
+                # path cannot serve from). Post-S1 the refusal is a dict rather than
+                # an escaping httpx.HTTPStatusError, so NAME the state instead of
+                # flattening it into "gw_not_serving".
+                _seat_state = (
+                    "gw_flashnext_window" if is_flashnext_occupied(res)
+                    else "gw_seat_occupied"
+                )
+                _log.warning(
+                    "[gw-admission] direct-dispatch acquire refused work_id=%s state=%s",
+                    work_id, _seat_state,
+                )
+                if _provenance_out is not None:
+                    _provenance_out.append((_seat_state, "gravitywell"))
                 return _apply_wake_fail(on_wake_fail, operator_class, prompt,
                                        _provenance_out=_provenance_out, **wake_fail_kwargs)
             elif res.get("status") != "serving":

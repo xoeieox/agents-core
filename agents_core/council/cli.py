@@ -962,6 +962,47 @@ def _cast_positions(run: dict, entities, adapter) -> list[dict]:
     return result
 
 
+def _refresh_wave_hold(
+    doorman,
+    hold_work_id: str,
+    hold_principal: str,
+    reason: str,
+    report,
+) -> dict:
+    """Refresh the wave's GW keepawake hold and NAME a post-S1 refusal.
+
+    Module-level (not a closure) so it is hermetically reachable from tests.
+    Post-S1 the doorman answers a refused acquire with a NAMED DICT instead of
+    raising (doorman-flashnext-serving-admission-v0, S1), so the caller's
+    except-arm alone can no longer see it: a refresh that only listened for the
+    exception would read a refused hold as a successful one and the wave's hold
+    would silently TTL-lapse mid-run. `report` receives the one-line,
+    human-readable outcome (print in the CLI, so a refusal is visible on stdout
+    next to the rest of the wave's output). Returns the acquire response.
+    """
+    _ref = doorman.acquire(
+        "gravitywell", hold_work_id,
+        ttl_sec=COUNCIL_STALL_S,
+        reason=f"council-wave-heartbeat-{reason}",
+        timeout=5.0,
+        principal=hold_principal,
+        lease_class="protected",
+        # Same S2 opt-in as the initial hold and the deliberation
+        # heartbeat: a refresh that omitted it would be refused by
+        # the window guard on a flashnext-solo box, silently lapsing
+        # the wave's hold mid-run.
+        accept_flashnext_seat=True,
+    )
+    _ref = _ref if isinstance(_ref, dict) else {}
+    if _ref.get("status") != "serving":
+        report(
+            f"[council] wave hold refresh not serving ({reason}): "
+            f"status={_ref.get('status')} "
+            f"flags={[k for k in _ref if k.endswith('_occupied')]}"
+        )
+    return _ref
+
+
 def run_deliberation(run_id: str) -> None:
     """Read /<COUNCIL_DIR>/<run_id>.yaml, drive the engine, write turns +
     synthesis + terminal status back to the same file.  Mutates in place via
@@ -1027,11 +1068,20 @@ def run_deliberation(run_id: str) -> None:
                 timeout=_gw_acquire_timeout(),
                 principal=_hold_principal,
                 lease_class="protected",
+                # S2 consumer (doorman-flashnext-serving-admission-v0): the
+                # deliberation hold needs no wake when the flash-next seat is
+                # already serving — pre-S2 this acquire was the 409 that killed
+                # the spec-review council leg on a flashnext-solo night.
+                accept_flashnext_seat=True,
             )
             _hold_active = _hold_res.get("status") == "serving"
             print(
                 f"[council] deliberation hold placed run_id={run_id} "
-                f"status={_hold_res.get('status')}",
+                f"status={_hold_res.get('status')}"
+                + (
+                    f" serve_axis={_hold_res.get('serve_axis')}"
+                    if _hold_res.get("serve_axis") else ""
+                ),
                 flush=True,
             )
         except Exception as _hold_err:
@@ -1145,14 +1195,26 @@ def run_deliberation(run_id: str) -> None:
                     if _hold_active and _doorman:
                         def _refresh(_step=sd.step):
                             try:
-                                _doorman.acquire(
+                                _ref = _doorman.acquire(
                                     "gravitywell", _hold_work_id,
                                     ttl_sec=COUNCIL_STALL_S,
                                     reason="council-deliberation-heartbeat",
                                     timeout=5.0,
                                     principal=_hold_principal,
                                     lease_class="protected",
+                                    # Same opt-in as the initial hold: a refresh
+                                    # that omitted it would be refused by the
+                                    # window guard on a flashnext-solo box and the
+                                    # lease would silently TTL-lapse mid-deliberation.
+                                    accept_flashnext_seat=True,
                                 )
+                                if _ref.get("status") != "serving":
+                                    print(
+                                        f"[council] hold refresh not serving "
+                                        f"step={_step}: status={_ref.get('status')} "
+                                        f"flags={[k for k in _ref if k.endswith('_occupied')]}",
+                                        flush=True,
+                                    )
                             except Exception as _ref_err:
                                 print(
                                     f"[council] hold refresh failed step={_step}: {_ref_err}",
@@ -1720,13 +1782,9 @@ def _run_wave_deliberation(
     def _wave_lease_refresh(reason: str) -> None:
         if hold_active and doorman:
             try:
-                doorman.acquire(
-                    "gravitywell", hold_work_id,
-                    ttl_sec=COUNCIL_STALL_S,
-                    reason=f"council-wave-heartbeat-{reason}",
-                    timeout=5.0,
-                    principal=hold_principal,
-                    lease_class="protected",
+                _refresh_wave_hold(
+                    doorman, hold_work_id, hold_principal, reason,
+                    lambda msg: print(msg, flush=True),
                 )
             except Exception as _ref_err:
                 print(f"[council] wave hold refresh failed ({reason}): {_ref_err}", flush=True)
