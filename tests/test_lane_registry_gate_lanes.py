@@ -644,10 +644,11 @@ def test_27b_up_gravitywell_path_unchanged():
     assert OPERATOR_DEFAULTS["gravitywell"] == "gravitywell-122b"
 
     prov = []
+    from agents_core.doorman_client import DoormanClient
     with patch("agents_core.llm._call_gravitywell_backend", return_value="gw answer") as gw, \
-         patch("agents_core.llm.DoormanClient") as dm:
+         patch.object(DoormanClient, "acquire", return_value={"status": "serving"}), \
+         patch.object(DoormanClient, "release"):
         from agents_core.llm import call_operator
-        dm.return_value.acquire.return_value = {"status": "serving"}
         out = call_operator("gravitywell", prompt="hi", _provenance_out=prov)
 
     assert out == "gw answer"
