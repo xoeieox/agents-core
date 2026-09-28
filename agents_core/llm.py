@@ -1955,6 +1955,12 @@ _LOCALITY_COST_CLASS_BY_OPERATOR = {
     "quest": "local-gw",
     "gravitywell": "local-gw",
     "gravitywell-creative": "local-gw",
+    # flashnext: the flash-next sglang seat on the GravityWell box — a local
+    # seat, zero paid watts (gate-lanes-registry-driven-flashnext-v0-agents-core,
+    # S2). Its host is registry-resolved at call time (see
+    # _locality_record_call_operator), so it is deliberately absent from
+    # _LOCALITY_HOST_BY_OPERATOR below.
+    "flashnext": "local-gw",
     "sonnet": "paid-anthropic",
     "opus": "paid-anthropic",
     "haiku": "paid-anthropic",
@@ -1970,6 +1976,9 @@ _LOCALITY_HOST_BY_OPERATOR = {
     "opus": "claude-cli",
     "haiku": "claude-cli",
     "phala": PHALA_URL,
+    # "flashnext" is intentionally absent: its base_url is a registry row that
+    # comes and goes with the GPU handover, so a module-load literal would
+    # record a host the call never dialed.
 }
 
 
