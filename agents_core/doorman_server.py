@@ -620,6 +620,20 @@ CREATIVE_OCCUPIED = object()
 # (acquire_lease passthrough; 409 flashnext_occupied on /lease/acquire) —
 # including for role=mode-controller: during a confirmed window the window
 # guard supersedes the controller-deference machinery and no lease registers.
+#
+# AMENDED by doorman-flashnext-serving-admission-v0 (S2): there is now ONE
+# carve-out for NON-controller roles. A caller that opts in with
+# accept_flashnext_seat=true AND supplies NO mode AND is not role=
+# "mode-controller" AND whose guard-computed seat probe reads up_registered
+# gets the already-serving flash-next seat without a wake (the caller needs no
+# 27B wake at all, so the OOM the guard exists to prevent cannot occur) — see
+# _FlashnextServed. The carve-out is narrow on purpose: ANY supplied mode
+# ("big" or "dual" — the wake the guard exists to block) keeps this refusal
+# verbatim, and role="mode-controller" keeps this uniform refusal verbatim too.
+# A no-mode controller grant would hand any loopback caller the controller
+# lever (deference at the mode-owner check, DEFERs of other acquires) and
+# reinstate exactly the window state D4 rules out; squatting the controller
+# lease is not an inference grant. Controller refusals are NOT softened.
 FLASHNEXT_OCCUPIED = object()
 
 
