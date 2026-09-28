@@ -4681,6 +4681,10 @@ def create_app(gw_url: str | None = None) -> FastAPI:
         lease_kind = body.get("lease_kind", "inference")
         lease_class = body.get("class", DEFAULT_LEASE_CLASS)  # missing → deferrable (safe)
         mode = body.get("mode") or None  # missing/empty string → None (AC1 — omission)
+        # S2 opt-in (doorman-flashnext-serving-admission-v0): default False = today,
+        # byte-identical. Only ever consulted by ensure_serving()'s already-serving
+        # grant, which additionally requires mode is None and role != "mode-controller".
+        accept_flashnext_seat = bool(body.get("accept_flashnext_seat", False))
 
         if node not in nodes:
             return JSONResponse(
