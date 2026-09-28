@@ -1531,11 +1531,22 @@ def _apply_wave_voicing_provenance(run: dict, seat_adapters: list) -> None:
         # voiced on a registry lane are labeled by the lane, not by
         # "gravitywell" — a flash-next wave must never read as a 122B wave
         # (the phala explicit-banner rule), and a clean lane run is not
-        # "degraded".
-        served = getattr(lane, "served_model", None)
+        # "degraded" (the lane IS the requested seat). A turn that failed is
+        # still reported honestly.
+        served = lane.served_model
         label = f"flashnext:{served}" if served else "flashnext"
         run["effective_voicing"] = label
-        run["voicing_degraded"] = False
+        reasons = [e.get("reason") for e in all_events]
+        clean = bool(all_events) and all(
+            e.get("effective_operator") == "flashnext" and r == "success"
+            for e, r in zip(all_events, reasons)
+        )
+        run["voicing_degraded"] = not clean
+        if not clean:
+            failure_reasons = [r for r in reasons if r not in ("success", "fallback")]
+            run["voicing_degraded_reason"] = (
+                failure_reasons[0] if failure_reasons else "unknown"
+            )
         return
     if not all_events:
         run["effective_voicing"] = "gravitywell"
