@@ -1027,11 +1027,20 @@ def run_deliberation(run_id: str) -> None:
                 timeout=_gw_acquire_timeout(),
                 principal=_hold_principal,
                 lease_class="protected",
+                # S2 consumer (doorman-flashnext-serving-admission-v0): the
+                # deliberation hold needs no wake when the flash-next seat is
+                # already serving — pre-S2 this acquire was the 409 that killed
+                # the spec-review council leg on a flashnext-solo night.
+                accept_flashnext_seat=True,
             )
             _hold_active = _hold_res.get("status") == "serving"
             print(
                 f"[council] deliberation hold placed run_id={run_id} "
-                f"status={_hold_res.get('status')}",
+                f"status={_hold_res.get('status')}"
+                + (
+                    f" serve_axis={_hold_res.get('serve_axis')}"
+                    if _hold_res.get("serve_axis") else ""
+                ),
                 flush=True,
             )
         except Exception as _hold_err:
