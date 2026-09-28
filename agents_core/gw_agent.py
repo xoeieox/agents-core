@@ -2641,6 +2641,11 @@ def _call_gw_agent_impl(
                     principal=principal,
                     lease_class=lease_class,
                     log=log,
+                    # S2 opt-in (doorman-flashnext-serving-admission-v0): a
+                    # reviewer/worker session needs NO wake when the flash-next
+                    # seat is already serving — pre-S2 it was refused a lease by
+                    # the window guard and burned a dispatch cycle on a 409.
+                    accept_flashnext_seat=True,
                 )
             except DoormanUnreachable as e:
                 if log:
