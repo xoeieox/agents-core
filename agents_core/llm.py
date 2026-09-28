@@ -327,7 +327,7 @@ class GWServingModeMismatchError(Exception):
 # Multi-operator routing
 # ---------------------------------------------------------------------------
 
-OPERATOR_DEFAULTS: dict[str, str] = {
+OPERATOR_DEFAULTS: dict[str, str | None] = {
     "qwen":                 "qwen3.6-35b-a3b",
     "quest":                "quest-35b-rl",
     "sonnet":               "claude-sonnet-4-6",
@@ -336,7 +336,82 @@ OPERATOR_DEFAULTS: dict[str, str] = {
     "gravitywell":          "gravitywell-122b",
     "gravitywell-creative": "gravitywell-llama-70b",
     "phala":                "deepseek/deepseek-v4-flash-0731",
+    # flashnext (gate-lanes-registry-driven-flashnext-v0-agents-core, S2): the
+    # served id is REGISTRY-resolved at call time, never a literal — the value
+    # stored here is a None marker and _OperatorDefaults resolves it through
+    # agents_core.lane_registry on every read (the f0fb039 fixer_flash
+    # precedent: served-id + backend resolved, never hardcoded). None-valued
+    # also means "registry blind => operator unavailable": a read raises
+    # KeyError rather than inventing a model id.
+    "flashnext":            None,
 }
+
+# Operators whose OPERATOR_DEFAULTS entry resolves through the gw-seats
+# registry at CALL time (mirrors the _gw_default_model() / corroboration
+# _llm_url call-time-read precedent; a module-load read would freeze a seat
+# that comes and goes with the GPU handover).
+_CALL_TIME_RESOLVED_OPERATORS = ("flashnext",)
+
+
+class _OperatorDefaults(dict):
+    """OPERATOR_DEFAULTS with call-time resolution for the registry lanes.
+
+    Keys/iteration/``in`` behave like the plain dict literal above (so
+    ``"flashnext" in OPERATOR_DEFAULTS`` is True and the unknown-operator
+    ValueError still lists it), but reading a call-time-resolved key goes
+    through the gw-seats registry instead of a stored literal:
+
+      * resolved lane -> the registry's served model id (the
+        served-model-name pin).
+      * registry blind / lane not serving -> KeyError (and ``.get`` returns
+        its default). That is the honest "operator unavailable" shape: there
+        is no model id to claim, so none is invented, and the caller decides
+        what an unavailable lane means (blind -> legacy fallback; dead lane ->
+        honest leg_down).
+    """
+
+    def __getitem__(self, key):
+        if key in _CALL_TIME_RESOLVED_OPERATORS:
+            model = _registry_resolved_model(key)
+            if not model:
+                raise KeyError(key)
+            return model
+        return dict.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+def _registry_resolved_model(operator_class: str) -> str | None:
+    """The registry-resolved served id for a call-time-resolved operator.
+
+    Returns None when the registry is blind or the lane is not serving —
+    never a guessed/hardcoded id. ``fetcher`` (lane_registry.lane_state /
+    resolve_gate_lane) is the hermetic test seam.
+    """
+    from agents_core import lane_registry
+
+    lane_obj, _reason = lane_registry.lane_state(lane=operator_class)
+    return lane_obj.served_model if lane_obj is not None else None
+
+
+OPERATOR_DEFAULTS = _OperatorDefaults(OPERATOR_DEFAULTS)
+
+
+def _flashnext_lane() -> tuple[object, str]:
+    """Resolve the flashnext gate lane at CALL time (S2).
+
+    Returns (GateLane | None, reason) straight from
+    ``agents_core.lane_registry.lane_state`` — see that function for the
+    reason taxonomy ("" / "registry_blind" / "flashnext_not_serving").
+    """
+    from agents_core import lane_registry
+
+    return lane_registry.lane_state(lane=lane_registry.FLASHNEXT_LANE_NAME)
+
 
 
 def _gw_explicit_model() -> str | None:
