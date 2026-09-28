@@ -1221,7 +1221,7 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
     """Route a completion request to the appropriate backend operator.
 
     operator_class ∈ {"qwen", "quest", "sonnet", "opus", "haiku", "gravitywell",
-    "gravitywell-creative", "phala"}. Raises ValueError for unknown classes.
+    "gravitywell-creative", "phala", "flashnext"}. Raises ValueError for unknown classes.
 
     Default models:
         qwen                 → "qwen3.6-35b-a3b"
@@ -1233,6 +1233,10 @@ def _call_operator_impl(operator_class: str, prompt: str, model: str = None,
         gravitywell-creative → "gravitywell-llama-70b" (Llama-70B instruct, :8093, direct)
         phala                → "deepseek/deepseek-v4-flash-0731" (sealed TEE seat,
                                 PHALA_URL :8413, OpenAI-compat, direct)
+        flashnext            → registry-reserved (None in the table): the served id
+                                AND the base_url resolve through the gw-seats registry
+                                at call time (agents_core.lane_registry), never a
+                                hardcoded string.
 
     qwen routes via the local llama-server (same path as call_llm()).
 
